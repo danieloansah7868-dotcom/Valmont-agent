@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
+import { demoModeEnabled } from "@/lib/config";
 import { DemoGitHubProvider } from "@/lib/github/demo";
 import {
   retrieveGitHubContext,
@@ -130,17 +131,40 @@ interface CreateTaskInput {
 }
 
 export class TaskWorkflowService {
+  private readonly github: GitHubProvider;
+  private modelProvider?: ModelProvider;
+  private readonly workspace: WorkspaceProvider;
+  private readonly sourceBaseDirectory: string;
+
   constructor(
     private readonly store: TaskStore,
-    private readonly github: GitHubProvider = new DemoGitHubProvider(),
-    private readonly model: ModelProvider = createModelProvider(),
-    private readonly workspace: WorkspaceProvider = createWorkspaceProvider(),
-    private readonly sourceBaseDirectory = path.join(
-      process.cwd(),
-      ".data",
-      "sources",
-    ),
-  ) {}
+    github?: GitHubProvider,
+    model?: ModelProvider,
+    workspace?: WorkspaceProvider,
+    sourceBaseDirectory = path.join(process.cwd(), ".data", "sources"),
+  ) {
+    this.github =
+      github ??
+      (demoModeEnabled()
+        ? new DemoGitHubProvider()
+        : (() => {
+            throw new Error(
+              "A GitHub provider is required. Connect GitHub before running a task.",
+            );
+          })());
+    this.modelProvider = model;
+    this.workspace = workspace ?? createWorkspaceProvider();
+    this.sourceBaseDirectory = sourceBaseDirectory;
+  }
+
+  /**
+   * Resolved lazily so approval actions that never need the model (rejections)
+   * do not fail when only GitHub is configured.
+   */
+  private get model(): ModelProvider {
+    this.modelProvider ??= createModelProvider();
+    return this.modelProvider;
+  }
 
   async create(input: CreateTaskInput): Promise<CodingTask> {
     const timestamp = now();
@@ -177,6 +201,11 @@ export class TaskWorkflowService {
     );
 
     let context: GitHubContextFile[] = [];
+    if (task.demo && !demoModeEnabled()) {
+      throw new Error(
+        "Demo mode is disabled. Connect GitHub and configure a model provider to run real tasks.",
+      );
+    }
     if (task.demo) {
       this.tool(
         task,

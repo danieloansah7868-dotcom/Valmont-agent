@@ -12,6 +12,7 @@ import {
   users,
 } from "@/db/schema";
 import type { SessionUser } from "@/lib/auth";
+import { demoModeEnabled } from "@/lib/config";
 import type {
   Approval,
   CodingTask,
@@ -160,7 +161,10 @@ export class JsonTaskStore implements TaskStore {
 
   async list(): Promise<CodingTask[]> {
     const data = await this.load();
-    return structuredClone(data.tasks).sort((a, b) =>
+    const visible = demoModeEnabled()
+      ? data.tasks
+      : data.tasks.filter((task) => !task.demo);
+    return structuredClone(visible).sort((a, b) =>
       b.updatedAt.localeCompare(a.updatedAt),
     );
   }
@@ -196,7 +200,11 @@ export class JsonTaskStore implements TaskStore {
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code !== "ENOENT")
         throw error;
-      return { version: 1, tasks: [structuredClone(SEED_TASK)] };
+      // The fictional seed task exists only for explicitly enabled demo mode.
+      return {
+        version: 1,
+        tasks: demoModeEnabled() ? [structuredClone(SEED_TASK)] : [],
+      };
     }
   }
 }

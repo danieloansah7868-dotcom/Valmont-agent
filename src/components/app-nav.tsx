@@ -17,59 +17,76 @@ const links = [
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
+function useIsActive(pathname: string) {
+  return (href: string) =>
+    pathname === href ||
+    (href !== "/dashboard" && pathname.startsWith(`${href}/`));
+}
+
 export function AppNav() {
   const pathname = usePathname();
+  const isActive = useIsActive(pathname);
   return (
     <>
+      {/* Desktop sidebar: navy surface, copper primary action, blue active state. */}
       <nav
         className="hidden flex-1 flex-col gap-1 px-3 pt-5 md:flex"
         aria-label="Main navigation"
       >
         <Link href="/tasks/new" className="btn-primary mb-4 w-full">
-          <Plus className="size-4" /> New coding task
+          <Plus className="size-4" aria-hidden="true" /> New coding task
         </Link>
         {links.map(({ href, label, icon: Icon }) => {
-          const active =
-            pathname === href ||
-            (href !== "/dashboard" && pathname.startsWith(`${href}/`));
+          const active = isActive(href);
           return (
             <Link
               key={href}
               href={href}
-              className={`flex min-h-10 items-center gap-3 rounded-lg px-3 text-[13px] font-semibold transition-colors ${active ? "bg-[#e8f1eb] text-[#205e47]" : "text-[#65726c] hover:bg-[#eef2ef] hover:text-[#24332d]"}`}
+              className={`flex min-h-10 items-center gap-3 rounded-lg px-3 text-[13px] font-semibold transition-colors ${
+                active
+                  ? "bg-brandblue text-ivory"
+                  : "text-ivory/65 hover:bg-ivory/10 hover:text-ivory"
+              }`}
               aria-current={active ? "page" : undefined}
             >
-              <Icon className="size-[17px]" strokeWidth={1.8} />
+              <Icon
+                className="size-[17px]"
+                strokeWidth={1.8}
+                aria-hidden="true"
+              />
               {label}
             </Link>
           );
         })}
       </nav>
+
+      {/* Mobile tab bar */}
       <nav
-        className="fixed inset-x-0 bottom-0 z-40 flex h-16 items-center justify-around border-t border-[#dbe3de] bg-white/95 px-2 backdrop-blur md:hidden"
+        className="fixed inset-x-0 bottom-0 z-40 flex h-16 items-center justify-around border-t border-navy-700 bg-navy px-2 md:hidden"
         aria-label="Mobile navigation"
       >
         {links.slice(0, 3).map(({ href, label, icon: Icon }) => {
-          const active =
-            pathname === href ||
-            (href !== "/dashboard" && pathname.startsWith(`${href}/`));
+          const active = isActive(href);
           return (
             <Link
               key={href}
               href={href}
-              className={`flex min-w-16 flex-col items-center gap-1 text-[10px] font-semibold ${active ? "text-[#1f6b4f]" : "text-[#738079]"}`}
+              className={`flex min-w-16 flex-col items-center gap-1 rounded-md py-1 text-[10px] font-semibold transition-colors ${
+                active ? "text-copper-300" : "text-ivory/60"
+              }`}
+              aria-current={active ? "page" : undefined}
             >
-              <Icon className="size-5" />
+              <Icon className="size-5" aria-hidden="true" />
               {label}
             </Link>
           );
         })}
         <Link
           href="/tasks/new"
-          className="flex min-w-16 flex-col items-center gap-1 text-[10px] font-semibold text-[#1f6b4f]"
+          className="flex min-w-16 flex-col items-center gap-1 rounded-md py-1 text-[10px] font-semibold text-ivory"
         >
-          <span className="flex size-7 items-center justify-center rounded-full bg-[#1f6b4f] text-white">
-            <Plus className="size-4" />
+          <span className="flex size-7 items-center justify-center rounded-full bg-copper-600 text-white">
+            <Plus className="size-4" aria-hidden="true" />
           </span>
           New task
         </Link>

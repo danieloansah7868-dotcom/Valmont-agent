@@ -5,59 +5,89 @@ import {
   Clock3,
   FolderGit2,
   GitPullRequest,
+  ListChecks,
   Plus,
   ShieldCheck,
 } from "lucide-react";
 import { DemoBadge } from "@/components/demo-badge";
+import { EmptyState, ErrorState, PageHeading } from "@/components/states";
 import { StatusBadge } from "@/components/status-badge";
-import { getSessionUser } from "@/lib/auth";
-import { DEMO_REPOSITORIES } from "@/lib/github/demo";
+import { requireSessionUser, tryGetGitHubProvider } from "@/lib/auth";
+import { missingLiveRequirements } from "@/lib/config";
 import { getTaskStore } from "@/lib/task-store";
+import type { CodingTask } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
 export default async function DashboardPage() {
-  const user = await getSessionUser();
-  const tasks = await getTaskStore(user).list();
+  const user = await requireSessionUser();
+
+  let tasks: CodingTask[] = [];
+  let loadError = "";
+  try {
+    tasks = await getTaskStore(user).list();
+  } catch (error) {
+    loadError =
+      error instanceof Error ? error.message : "Tasks could not be loaded.";
+  }
+
+  let repositoryCount: number | "—" = "—";
+  const provider = await tryGetGitHubProvider();
+  if (provider) {
+    try {
+      repositoryCount = (await provider.listRepositories()).length;
+    } catch {
+      repositoryCount = "—";
+    }
+  }
+
   const approvals = tasks.filter((task) =>
     task.state.includes("approval"),
   ).length;
   const completed = tasks.filter((task) => task.state === "completed").length;
+  const missing = missingLiveRequirements();
+  const firstApproval = tasks.find((task) => task.state.includes("approval"));
+
   return (
     <div className="mx-auto max-w-[1180px] px-4 py-7 sm:px-7 sm:py-9">
       {user.demo && (
-        <div className="mb-7 flex flex-col gap-3 rounded-xl border border-[#ecd8aa] bg-[#fff9e9] px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+        <div className="mb-7 flex flex-col gap-3 rounded-xl border border-copper-300 bg-copper-50 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-start gap-3">
             <DemoBadge />
-            <p className="text-[12px] leading-5 text-[#795c35]">
-              You’re viewing sample repositories and deterministic agent output.
-              No model or GitHub requests are being made.
+            <p className="text-[12px] leading-5 text-copper-700">
+              <strong>ENABLE_DEMO_MODE is on.</strong> Repositories and agent
+              output on this screen are sample data, not GitHub or model
+              results.
             </p>
           </div>
           <Link
             href="/settings"
-            className="shrink-0 text-[12px] font-bold text-[#815518] hover:underline"
+            className="shrink-0 text-[12px] font-bold text-copper-700 hover:underline"
           >
             Configure integrations →
           </Link>
         </div>
       )}
-      <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <p className="text-[12px] font-bold tracking-[0.08em] text-[#6c7b74] uppercase">
-            Workspace overview
-          </p>
-          <h1 className="mt-1.5 text-[27px] font-bold tracking-[-0.035em] sm:text-[31px]">
-            Good morning, {user.demo ? "builder" : user.name.split(" ")[0]}
-          </h1>
-          <p className="mt-2 text-sm text-[#6b7872]">
-            Review agent work and decide what moves forward.
+
+      {!user.demo && missing.length > 0 && (
+        <div className="mb-7 rounded-xl border border-copper-300 bg-copper-50 px-4 py-3.5">
+          <p className="text-[12px] leading-5 font-semibold text-copper-700">
+            Live mode is missing configuration: {missing.join(", ")}. Tasks
+            cannot run until these server variables are set.
           </p>
         </div>
-        <Link href="/tasks/new" className="btn-primary">
-          <Plus className="size-4" /> New coding task
-        </Link>
-      </div>
+      )}
+
+      <PageHeading
+        eyebrow="Workspace overview"
+        title={`Welcome back, ${user.demo ? "builder" : (user.name.split(" ")[0] ?? user.login)}`}
+        description="Review agent work and decide what moves forward."
+        actions={
+          <Link href="/tasks/new" className="btn-primary">
+            <Plus className="size-4" aria-hidden="true" /> New coding task
+          </Link>
+        }
+      />
 
       <section
         className="mt-8 grid gap-3 sm:grid-cols-2 lg:grid-cols-4"
@@ -66,10 +96,10 @@ export default async function DashboardPage() {
         {[
           {
             label: "Connected repositories",
-            value: user.demo ? DEMO_REPOSITORIES.length : "—",
+            value: repositoryCount,
             note: "Authorized access",
             icon: FolderGit2,
-            tone: "text-[#346552] bg-[#eaf3ed]",
+            tone: "text-brandblue bg-brandblue-50",
           },
           {
             label: "Active tasks",
@@ -79,21 +109,21 @@ export default async function DashboardPage() {
             ).length,
             note: "Across all repos",
             icon: Clock3,
-            tone: "text-[#47677a] bg-[#eaf0f4]",
+            tone: "text-brandblue bg-brandblue-50",
           },
           {
             label: "Awaiting your approval",
             value: approvals,
             note: approvals ? "Action required" : "Nothing blocked",
             icon: ShieldCheck,
-            tone: "text-[#9a5e16] bg-[#fff4dc]",
+            tone: "text-copper-700 bg-copper-50",
           },
           {
             label: "Pull requests created",
             value: completed,
             note: "Never auto-merged",
             icon: GitPullRequest,
-            tone: "text-[#576398] bg-[#eeeff8]",
+            tone: "text-navy bg-ivory-100",
           },
         ].map(({ label, value, note, icon: Icon, tone }) => (
           <div key={label} className="card p-4.5 sm:p-5">
@@ -101,120 +131,136 @@ export default async function DashboardPage() {
               <span
                 className={`flex size-9 items-center justify-center rounded-lg ${tone}`}
               >
-                <Icon className="size-[17px]" />
+                <Icon className="size-[17px]" aria-hidden="true" />
               </span>
-              <span className="text-[25px] font-bold tracking-[-0.03em]">
+              <span className="text-[25px] font-bold tracking-[-0.03em] text-navy">
                 {value}
               </span>
             </div>
-            <p className="mt-4 text-[12px] font-bold text-[#33423c]">{label}</p>
-            <p className="mt-1 text-[11px] text-[#849089]">{note}</p>
+            <p className="mt-4 text-[12px] font-bold text-navy">{label}</p>
+            <p className="mt-1 text-[11px] text-slate">{note}</p>
           </div>
         ))}
       </section>
 
       <div className="mt-7 grid gap-6 lg:grid-cols-[1fr_310px]">
         <section className="card overflow-hidden">
-          <div className="flex items-center justify-between border-b border-[#e1e7e3] px-5 py-4">
+          <div className="flex items-center justify-between border-b border-line px-5 py-4">
             <div>
-              <h2 className="text-sm font-bold">Recent tasks</h2>
-              <p className="mt-1 text-[11px] text-[#7a8780]">
+              <h2 className="text-sm font-bold text-navy">Recent tasks</h2>
+              <p className="mt-1 text-[11px] text-slate">
                 Latest activity across authorized repositories
               </p>
             </div>
-            <Link
-              href="/tasks"
-              className="text-[12px] font-bold text-[#27674e] hover:underline"
-            >
+            <Link href="/tasks" className="link-brand text-[12px]">
               View all
             </Link>
           </div>
-          <div className="divide-y divide-[#e7ebe8]">
-            {tasks.length === 0 ? (
-              <div className="p-10 text-center">
-                <p className="text-sm font-semibold">No tasks yet</p>
-                <Link
-                  href="/tasks/new"
-                  className="mt-3 inline-flex text-xs font-bold text-[#24664d]"
-                >
-                  Create your first task
+          {loadError ? (
+            <div className="p-5">
+              <ErrorState
+                title="Tasks could not be loaded"
+                description={loadError}
+              />
+            </div>
+          ) : tasks.length === 0 ? (
+            <EmptyState
+              icon={ListChecks}
+              title="No tasks yet"
+              description="Create a coding task against one of your authorized repositories. Valmont will inspect it and return a plan for your approval."
+              action={
+                <Link href="/tasks/new" className="btn-primary text-xs">
+                  <Plus className="size-3.5" aria-hidden="true" /> Create your
+                  first task
                 </Link>
-              </div>
-            ) : (
-              tasks.slice(0, 5).map((task) => (
+              }
+            />
+          ) : (
+            <div className="divide-y divide-line">
+              {tasks.slice(0, 5).map((task) => (
                 <Link
                   key={task.id}
                   href={`/tasks/${task.id}`}
-                  className="group flex items-center gap-4 px-5 py-4 hover:bg-[#fafbfa]"
+                  className="group flex items-center gap-4 px-5 py-4 transition-colors hover:bg-ivory-50"
                 >
-                  <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-[#dfe6e1] bg-[#f5f8f6] text-[#47705f]">
-                    <GitPullRequest className="size-4" />
+                  <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-line bg-ivory-100 text-brandblue">
+                    <GitPullRequest className="size-4" aria-hidden="true" />
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[13px] font-bold text-[#26362f] group-hover:text-[#1f6b4f]">
+                    <span className="block truncate text-[13px] font-bold text-navy group-hover:text-copper-700">
                       {task.title}
                     </span>
-                    <span className="mt-1 block truncate text-[11px] text-[#7a8781]">
+                    <span className="mt-1 block truncate text-[11px] text-slate">
                       {task.repositoryName} · {task.baseBranch} ·{" "}
                       {relativeTime(task.updatedAt)}
                     </span>
                   </span>
                   <StatusBadge state={task.state} />
-                  <ArrowRight className="hidden size-4 text-[#a1aba6] sm:block" />
+                  <ArrowRight
+                    className="hidden size-4 text-slate-400 sm:block"
+                    aria-hidden="true"
+                  />
                 </Link>
-              ))
-            )}
-          </div>
+              ))}
+            </div>
+          )}
         </section>
 
         <aside className="space-y-4">
           <div className="card p-5">
             <div className="flex items-center gap-2">
-              <ShieldCheck className="size-4 text-[#2d7256]" />
-              <h2 className="text-[13px] font-bold">Approval queue</h2>
+              <ShieldCheck className="size-4 text-copper" aria-hidden="true" />
+              <h2 className="text-[13px] font-bold text-navy">
+                Approval queue
+              </h2>
             </div>
             {approvals > 0 ? (
               <>
-                <p className="mt-3 text-[26px] font-bold tracking-[-0.03em]">
+                <p className="mt-3 text-[26px] font-bold tracking-[-0.03em] text-navy">
                   {approvals}
                 </p>
-                <p className="mt-1 text-[11px] leading-4 text-[#78847e]">
+                <p className="mt-1 text-[11px] leading-4 text-slate">
                   {approvals === 1 ? "task is" : "tasks are"} waiting for a
                   decision from you.
                 </p>
                 <Link
-                  href={
-                    tasks.find((task) => task.state.includes("approval"))
-                      ? `/tasks/${tasks.find((task) => task.state.includes("approval"))!.id}`
-                      : "/tasks"
-                  }
-                  className="btn-secondary mt-4 w-full text-xs"
+                  href={firstApproval ? `/tasks/${firstApproval.id}` : "/tasks"}
+                  className="btn-primary mt-4 w-full text-xs"
                 >
-                  Review now <ArrowRight className="size-3.5" />
+                  Review now{" "}
+                  <ArrowRight className="size-3.5" aria-hidden="true" />
                 </Link>
               </>
             ) : (
-              <div className="mt-4 flex items-center gap-3 rounded-lg bg-[#eef7f1] p-3">
-                <CheckCircle2 className="size-5 text-[#2d7b59]" />
-                <p className="text-[11px] font-semibold text-[#35634f]">
+              <div className="mt-4 flex items-center gap-3 rounded-lg bg-pass-soft p-3">
+                <CheckCircle2
+                  className="size-5 shrink-0 text-pass"
+                  aria-hidden="true"
+                />
+                <p className="text-[11px] font-semibold text-pass-strong">
                   You’re all caught up.
                 </p>
               </div>
             )}
           </div>
-          <div className="rounded-xl bg-[#173e31] p-5 text-white shadow-sm">
-            <p className="text-[11px] font-bold tracking-[0.08em] text-[#a5c8b9] uppercase">
+          <div className="panel-navy p-5">
+            <p className="text-[11px] font-bold tracking-[0.08em] text-copper-300 uppercase">
               Safety status
             </p>
-            <h3 className="mt-2 text-sm font-bold">All guardrails active</h3>
-            <ul className="mt-4 space-y-2.5 text-[11px] text-[#c5d9d0]">
+            <h3 className="mt-2 text-sm font-bold text-ivory">
+              All guardrails active
+            </h3>
+            <ul className="mt-4 space-y-2.5 text-[11px] text-ivory/70">
               {[
                 "Protected branch writes blocked",
                 "Validation commands allowlisted",
                 "Final approval enforced",
               ].map((item) => (
                 <li key={item} className="flex items-center gap-2">
-                  <CheckCircle2 className="size-3.5 text-[#77c5a2]" />
+                  <CheckCircle2
+                    className="size-3.5 shrink-0 text-copper"
+                    aria-hidden="true"
+                  />
                   {item}
                 </li>
               ))}

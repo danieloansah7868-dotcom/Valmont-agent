@@ -10,7 +10,7 @@ Valmont is an approval-first orchestration layer between an authorized GitHub re
 2. The user selects an authorized repository/base branch and submits a bounded task description.
 3. `TaskWorkflowService` records `draft → planning` plus audit events.
 4. Retrieval lists/searches/reads only filtered, bounded text. Model context is redacted.
-5. A `ModelProvider` produces a structured plan; without credentials the deterministic planner is explicitly marked demo.
+5. A `ModelProvider` produces a structured plan. Live mode is the default: without `MODEL_API_KEY` the provider factory throws instead of substituting sample output, and the deterministic planner is reachable only when `ENABLE_DEMO_MODE=true`.
 6. State becomes `awaiting_plan_approval`. No workspace mutation is available before explicit approval.
 7. The workspace provider applies approved changes and runs only listed/allowlisted validation commands.
 8. Diff, status, tools, and command output are persisted/redacted and shown for review.
@@ -86,7 +86,7 @@ Drizzle/PostgreSQL entities:
 - model/tool executions
 - pull request records
 
-`PostgresTaskStore` is selected automatically when `DATABASE_URL` is configured and enforces session ownership in every task query. It hydrates normalized event, approval, tool, and pull-request records. Raw repository content and prompts are not stored in these tables. Account token ciphertext is explicitly server-only. Demo mode uses `.data/demo-store.json`, atomic rename writes, and a process-local serialization queue.
+`PostgresTaskStore` is selected automatically when `DATABASE_URL` is configured and enforces session ownership in every task query. It hydrates normalized event, approval, tool, and pull-request records. Raw repository content and prompts are not stored in these tables. Account token ciphertext is explicitly server-only. The JSON fallback store uses `.data/demo-store.json`, atomic rename writes, and a process-local serialization queue; it hides demo-flagged tasks unless `ENABLE_DEMO_MODE=true`.
 
 ### Web security
 
@@ -106,3 +106,17 @@ Drizzle/PostgreSQL entities:
 - Add distributed rate limiting, managed envelope encryption, and centralized audit export.
 - Stream model/activity events through SSE while preserving persisted events as source of truth.
 - Add embedding retrieval behind `RepositoryRetriever` only when repository scale warrants it.
+
+## Runtime mode
+
+`src/lib/config.ts` centralizes runtime-mode resolution. `demoModeEnabled()` is the single source of truth and returns `false` unless `ENABLE_DEMO_MODE` is an explicit truthy value (`true`, `1`, `yes`, `on`).
+
+Live mode is enforced at every boundary rather than only in the UI:
+
+- `getSessionUser()` returns `null` instead of a fictional demo identity; `requireSessionUser()` redirects and `requireApiSessionUser()` raises a `NotConnectedError` mapped to HTTP 401.
+- `getGitHubProvider()` throws rather than returning `DemoGitHubProvider`.
+- `createModelProvider()` throws rather than returning `DemoModelProvider`; `tryCreateModelProvider()` is the non-throwing variant used by status surfaces.
+- `TaskWorkflowService` refuses to plan or execute demo-flagged tasks, and the task action route rejects them.
+- `JsonTaskStore` seeds and lists demo tasks only in demo mode.
+
+`missingLiveRequirements()` drives the connect prompts, settings page, and `/api/health` `missingConfiguration` array so operators see exactly which variables remain unset.

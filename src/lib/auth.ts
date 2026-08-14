@@ -1,4 +1,6 @@
 import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+import { demoModeEnabled, githubCredentialsConfigured } from "@/lib/config";
 import { DemoGitHubProvider } from "@/lib/github/demo";
 import { GitHubApiProvider } from "@/lib/github/github";
 import type { GitHubProvider } from "@/lib/github/types";
@@ -21,12 +23,18 @@ interface GitHubSessionPayload {
   expiresAt: number;
 }
 
+export const NOT_CONNECTED_MESSAGE =
+  "Connect GitHub to continue. Valmont runs against your real repositories.";
+
+export class NotConnectedError extends Error {
+  constructor(message = NOT_CONNECTED_MESSAGE) {
+    super(message);
+    this.name = "NotConnectedError";
+  }
+}
+
 export function githubConfigured(): boolean {
-  return Boolean(
-    process.env.GITHUB_CLIENT_ID &&
-    process.env.GITHUB_CLIENT_SECRET &&
-    process.env.SESSION_SECRET,
-  );
+  return githubCredentialsConfigured();
 }
 
 export async function getGitHubSession(): Promise<GitHubSessionPayload | null> {
@@ -44,16 +52,20 @@ export async function getGitHubSession(): Promise<GitHubSessionPayload | null> {
   }
 }
 
-export async function getSessionUser(): Promise<SessionUser> {
+const DEMO_USER: SessionUser = {
+  id: "demo-user",
+  login: "demo-user",
+  name: "Demo workspace",
+  demo: true,
+};
+
+/**
+ * Returns the signed-in GitHub user. In live mode (the default) an
+ * unauthenticated visitor gets `null` instead of a fictional demo identity.
+ */
+export async function getSessionUser(): Promise<SessionUser | null> {
   const session = await getGitHubSession();
-  if (!session) {
-    return {
-      id: "demo-user",
-      login: "demo-user",
-      name: "Demo workspace",
-      demo: true,
-    };
-  }
+  if (!session) return demoModeEnabled() ? { ...DEMO_USER } : null;
   return {
     id: session.id,
     login: session.login,
@@ -63,9 +75,33 @@ export async function getSessionUser(): Promise<SessionUser> {
   };
 }
 
+/** Server-component helper: sends unauthenticated visitors back to the landing page. */
+export async function requireSessionUser(): Promise<SessionUser> {
+  const user = await getSessionUser();
+  if (!user) redirect("/?connect=required");
+  return user;
+}
+
+/** Route-handler helper: throws a 401-mapped error instead of redirecting. */
+export async function requireApiSessionUser(): Promise<SessionUser> {
+  const user = await getSessionUser();
+  if (!user) throw new NotConnectedError();
+  return user;
+}
+
 export async function getGitHubProvider(): Promise<GitHubProvider> {
   const session = await getGitHubSession();
-  return session
-    ? new GitHubApiProvider({ accessToken: session.accessToken })
-    : new DemoGitHubProvider();
+  if (session)
+    return new GitHubApiProvider({ accessToken: session.accessToken });
+  if (demoModeEnabled()) return new DemoGitHubProvider();
+  throw new NotConnectedError();
+}
+
+/** Never throws; used by pages that render a "not connected" state themselves. */
+export async function tryGetGitHubProvider(): Promise<GitHubProvider | null> {
+  try {
+    return await getGitHubProvider();
+  } catch {
+    return null;
+  }
 }

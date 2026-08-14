@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { DemoModelProvider } from "@/lib/models/demo";
-import { createModelProvider } from "@/lib/models";
+import { createModelProvider, tryCreateModelProvider } from "@/lib/models";
 import { OpenAICompatibleProvider } from "@/lib/models/openai-compatible";
 import type { ModelProvider } from "@/lib/models/types";
 
@@ -12,8 +12,16 @@ function acceptsProvider(provider: ModelProvider): string {
 }
 
 describe("model provider abstraction", () => {
-  it("selects clearly labelled demo mode without credentials", async () => {
-    const provider = createModelProvider({});
+  it("refuses to fall back to demo output when no credentials are set", () => {
+    expect(() => createModelProvider({})).toThrow(/MODEL_API_KEY/);
+    expect(() => createModelProvider({ ENABLE_DEMO_MODE: "false" })).toThrow(
+      /MODEL_API_KEY/,
+    );
+    expect(tryCreateModelProvider({})).toBeNull();
+  });
+
+  it("selects clearly labelled demo mode only when explicitly enabled", async () => {
+    const provider = createModelProvider({ ENABLE_DEMO_MODE: "true" });
     expect(provider).toBeInstanceOf(DemoModelProvider);
     expect(provider.demo).toBe(true);
     expect(acceptsProvider(provider)).toBe("demo-provider");
@@ -22,6 +30,15 @@ describe("model provider abstraction", () => {
     });
     expect(response.content).toMatch(/Demo mode/);
     expect(response.usage.totalTokens).toBe(0);
+  });
+
+  it("prefers real credentials over demo mode", () => {
+    const provider = createModelProvider({
+      ENABLE_DEMO_MODE: "true",
+      MODEL_API_KEY: "server-only-key",
+    });
+    expect(provider).toBeInstanceOf(OpenAICompatibleProvider);
+    expect(provider.demo).toBe(false);
   });
 
   it("normalizes chat, usage, and tool calls from OpenAI-compatible APIs", async () => {

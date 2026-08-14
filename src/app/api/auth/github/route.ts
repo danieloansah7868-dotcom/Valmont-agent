@@ -1,11 +1,18 @@
 import { randomBytes } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 import { githubConfigured } from "@/lib/auth";
+import { demoModeEnabled } from "@/lib/config";
 import { encryptSessionValue } from "@/lib/security";
 
 export async function GET(request: NextRequest) {
-  if (!githubConfigured())
-    return NextResponse.redirect(new URL("/dashboard?mode=demo", request.url));
+  if (!githubConfigured()) {
+    return NextResponse.redirect(
+      new URL(
+        demoModeEnabled() ? "/dashboard" : "/?connect=unconfigured",
+        request.url,
+      ),
+    );
+  }
   const state = randomBytes(24).toString("base64url");
   const callback = `${process.env.APP_URL ?? request.nextUrl.origin}/api/auth/github/callback`;
   const authorize = new URL("https://github.com/login/oauth/authorize");

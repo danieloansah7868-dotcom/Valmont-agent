@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
-import { getGitHubProvider, getSessionUser } from "@/lib/auth";
+import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
+import { demoModeEnabled } from "@/lib/config";
 import { DemoGitHubProvider } from "@/lib/github/demo";
 import { assertCsrf } from "@/lib/security";
 import { getTaskStore } from "@/lib/task-store";
@@ -23,10 +24,15 @@ export async function POST(
     assertApiRateLimit(request, "task-action", 20);
     const { id } = await context.params;
     const input = actionInput.parse(await request.json());
-    const user = await getSessionUser();
+    const user = await requireApiSessionUser();
     const store = getTaskStore(user);
     const existing = await store.get(id);
     if (!existing) throw new Error("Task not found");
+    if (existing.demo && !demoModeEnabled()) {
+      throw new Error(
+        "This task was created in demo mode, which is now disabled. Create a new task against a real repository.",
+      );
+    }
     const github = existing.demo
       ? new DemoGitHubProvider()
       : await getGitHubProvider();
