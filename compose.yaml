@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: valmont
+      POSTGRES_USER: valmont
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-before-production}
+    volumes:
+      - valmont-postgres:/var/lib/postgresql/data
+      - ./src/db/migrations/0000_lazy_leopardon.sql:/docker-entrypoint-initdb.d/0000_valmont.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U valmont -d valmont"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Keep the app private behind Caddy/Nginx/Cloudflare Access.
+      - "127.0.0.1:3000:3000"
+    environment:
+      DATABASE_URL: postgresql://valmont:${POSTGRES_PASSWORD:-change-this-before-production}@postgres:5432/valmont
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.openai.com/v1}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_NAME: ${MODEL_NAME:-gpt-4.1-mini}
+      VALMONT_COMMAND_TIMEOUT_MS: ${VALMONT_COMMAND_TIMEOUT_MS:-180000}
+    volumes:
+      - valmont-workspaces:/app/.data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  valmont-postgres:
+  valmont-workspaces:
