@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Valmont Agent">
-  <rect width="64" height="64" rx="14" fill="#091534"/>
+  <rect width="64" height="64" rx="14" fill="#0A1F44"/>
   <path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/>
-  <path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#C26E2E"/>
+  <path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/>
 </svg>

@@ -230,7 +230,7 @@ function Progress({ state }: { state: CodingTask["state"] }) {
             <span
               className={`flex size-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
                 index < current
-                  ? "bg-copper-600 text-white"
+                  ? "bg-copper-700 text-white"
                   : index === current
                     ? "bg-navy text-ivory ring-4 ring-copper-100"
                     : "bg-ivory-200 text-slate"

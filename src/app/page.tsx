@@ -133,7 +133,7 @@ export default async function LandingPage({
             className="absolute -inset-16 -z-10 rounded-full bg-[radial-gradient(circle,#e3dfd1_0%,transparent_68%)]"
             aria-hidden="true"
           />
-          <div className="overflow-hidden rounded-2xl border border-line bg-white shadow-[0_24px_70px_rgba(9,21,52,0.16)]">
+          <div className="overflow-hidden rounded-2xl border border-line bg-white shadow-[0_24px_70px_rgba(10,31,68,0.16)]">
             <div className="flex h-12 items-center justify-between border-b border-line bg-navy px-4">
               <div className="flex items-center gap-2" aria-hidden="true">
                 <span className="size-2.5 rounded-full bg-copper" />

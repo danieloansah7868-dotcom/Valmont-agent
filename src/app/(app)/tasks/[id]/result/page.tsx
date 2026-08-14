@@ -54,7 +54,7 @@ export default async function TaskResultPage({
         <ArrowLeft className="size-3.5" aria-hidden="true" /> Back to task
       </Link>
 
-      <div className="mt-7 overflow-hidden rounded-2xl border border-line bg-white shadow-[0_16px_44px_rgba(9,21,52,0.10)]">
+      <div className="mt-7 overflow-hidden rounded-2xl border border-line bg-white shadow-[0_16px_44px_rgba(10,31,68,0.10)]">
         <div className="bg-navy px-6 py-8 text-center sm:px-10 sm:py-10">
           <span className="mx-auto flex size-12 items-center justify-center rounded-full bg-copper-600 text-white">
             <GitPullRequest className="size-6" aria-hidden="true" />

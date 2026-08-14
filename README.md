@@ -23,15 +23,17 @@ Valmont Agent is a private, web-based AI coding agent with explicit human approv
 
 The interface uses the Valmont Web visual identity from [valmontweb.com](https://valmontweb.com):
 
-| Token         | Hex       | Usage                                     |
-| ------------- | --------- | ----------------------------------------- |
-| Midnight navy | `#091534` | Strong backgrounds, sidebar, headings     |
-| Copper        | `#C26E2E` | Primary actions and approval boundaries   |
-| Warm ivory    | `#ECE9DE` | Page backgrounds and inverse text         |
-| Valmont blue  | `#14446C` | Secondary navigation and informational UI |
-| Slate         | `#606678` | Supporting body text                      |
+| Token        | Hex       | Usage                                     |
+| ------------ | --------- | ----------------------------------------- |
+| Navy blue    | `#0A1F44` | Strong backgrounds, sidebar, headings     |
+| Orange       | `#E8822B` | Primary actions and approval boundaries   |
+| Warm ivory   | `#ECE9DE` | Page backgrounds and inverse text         |
+| Valmont blue | `#14446C` | Secondary navigation and informational UI |
+| Slate        | `#606678` | Supporting body text                      |
 
-Palette tokens live in the `@theme` block of `src/app/globals.css` and are consumed as Tailwind utilities (`bg-navy`, `text-copper`, `bg-ivory-50`, `text-brandblue`, `text-slate`). Green and red are reserved exclusively for passed/failed validation status. Focus rings are copper and visible on every interactive element.
+Palette tokens live in the `@theme` block of `src/app/globals.css` and are consumed as Tailwind utilities (`bg-navy`, `text-copper`, `bg-ivory-50`, `text-brandblue`, `text-slate`). The `copper` token carries the orange ramp. Green and red are reserved exclusively for passed/failed validation status. Focus rings are orange and visible on every interactive element.
+
+Primary buttons use navy text on orange (5.93:1) because white on this orange measures only 3.51:1 and fails WCAG AA. Orange on navy is 5.93:1, ivory on navy is 13.37:1.
 
 ### Live only
 

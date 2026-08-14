@@ -17,9 +17,9 @@ export function LogoMark({
       <svg viewBox="0 0 64 64" className="size-[62%]" focusable="false">
         <path
           d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z"
-          fill={inverse ? "#091534" : "#ECE9DE"}
+          fill={inverse ? "#0A1F44" : "#ECE9DE"}
         />
-        <path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#C26E2E" />
+        <path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B" />
       </svg>
     </span>
   );
