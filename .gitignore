@@ -1,0 +1,20 @@
+# dependencies and builds
+node_modules/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+
+# local data and secrets
+.env
+.env.*
+!.env.example
+.data/
+*.pem
+*.key
+
+# tooling / OS
+.DS_Store
+.vscode/
+.idea/
+*.log
