@@ -33,16 +33,16 @@ The interface uses the Valmont Web visual identity from [valmontweb.com](https:/
 
 Palette tokens live in the `@theme` block of `src/app/globals.css` and are consumed as Tailwind utilities (`bg-navy`, `text-copper`, `bg-ivory-50`, `text-brandblue`, `text-slate`). Green and red are reserved exclusively for passed/failed validation status. Focus rings are copper and visible on every interactive element.
 
-### Live mode is the default
+### Live only
 
-Valmont runs against real GitHub repositories, your configured model provider, and real workspace execution. `ENABLE_DEMO_MODE` defaults to `false`, and with it off the application never invents repository data, plans, patches, validation output, diffs, branches, or pull-request results:
+Valmont has a single runtime. It always runs against real GitHub repositories, your configured model provider, and real workspace execution. There is no demo mode, no sample-data flag, and no fixture fallback anywhere in the product, so the application can never invent repository data, plans, patches, validation output, diffs, branches, or pull-request results:
 
 - unauthenticated visitors are redirected to connect GitHub instead of being given a fictional workspace;
 - `createModelProvider()` throws when `MODEL_API_KEY` is missing rather than substituting a deterministic planner;
 - the API returns `401` with a clear "connect GitHub" message, and the UI renders a connect prompt listing the exact server variables still required;
-- previously stored demo tasks are hidden and cannot be actioned.
+- `/api/health` reports `degraded` with a `missingConfiguration` list until every required variable is set.
 
-To explore the interface with fictional sample data, set `ENABLE_DEMO_MODE=true` explicitly. Everything produced in that mode stays clearly labelled with a demo badge, and demo tasks persist to `.data/demo-store.json`, which is ignored by Git.
+Missing credentials fail loudly and name the unset variable. Nothing is fabricated to fill the gap.
 
 The included local workspace adapter makes the complete flow usable on a trusted self-hosted machine. Before allowing untrusted repositories or users, replace it with an ephemeral container or external sandbox `WorkspaceProvider` as described below.
 
@@ -56,15 +56,14 @@ cp .env.example .env.local # set GitHub, model, and session values
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Live mode is the default, so configure `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `MODEL_API_KEY` first. Then connect GitHub, submit a task against a selected branch, approve the grounded plan, inspect the actual validation output and diff, and give final approval to create the real pull request. To preview the interface without credentials, set `ENABLE_DEMO_MODE=true`.
+Open [http://localhost:3000](http://localhost:3000). Configure `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `MODEL_API_KEY` first — without them Valmont reports what is missing rather than showing sample data. Then connect GitHub, submit a task against a selected branch, approve the grounded plan, inspect the actual validation output and diff, and give final approval to create the real pull request.
 
 ## Environment configuration
 
-Live mode requires `SESSION_SECRET`, the GitHub OAuth pair, and `MODEL_API_KEY`. Never prefix model or GitHub secrets with `NEXT_PUBLIC_`.
+Valmont requires `SESSION_SECRET`, the GitHub OAuth pair, and `MODEL_API_KEY`. Never prefix model or GitHub secrets with `NEXT_PUBLIC_`.
 
 | Variable                     | Purpose                                               |
 | ---------------------------- | ----------------------------------------------------- |
-| `ENABLE_DEMO_MODE`           | `false` (default) runs live; `true` uses sample data  |
 | `DATABASE_URL`               | PostgreSQL connection URL                             |
 | `SESSION_SECRET`             | 32+ random bytes for AES-GCM OAuth session encryption |
 | `APP_URL`                    | Public origin, e.g. `http://localhost:3000`           |
@@ -103,10 +102,9 @@ Credentials are read only in server modules. Add another provider by implementin
 ```bash
 createdb valmont
 npm run db:migrate
-npm run db:seed # optional sample row
 ```
 
-The migration is in `src/db/migrations`. When `DATABASE_URL` is set, Valmont automatically selects the session-scoped PostgreSQL task store and persists tasks, events, approvals, tool executions, validations, diffs, and pull-request records. Without it, tasks fall back to an ignored local JSON store so the application remains runnable during setup.
+Migrations are in `src/db/migrations`. When `DATABASE_URL` is set, Valmont automatically selects the session-scoped PostgreSQL task store and persists tasks, events, approvals, tool executions, validations, diffs, and pull-request records. Without it, tasks fall back to an ignored local JSON store so the application remains runnable during setup.
 
 ## Scripts
 
@@ -128,7 +126,7 @@ npm run db:migrate     # apply PostgreSQL migrations
 - `src/components` — application UI and approval controls
 - `src/lib/workflow.ts` — persisted workflow orchestration and approval gates
 - `src/lib/models` — provider-neutral model contract and adapters
-- `src/lib/github` — GitHub contract, API adapter, and labelled demo adapter
+- `src/lib/github` — GitHub contract and API adapter
 - `src/lib/retrieval.ts` — repository filtering and lexical retrieval
 - `src/lib/workspace.ts` — sandbox contract and restricted development adapter
 - `src/db` — Drizzle schema and SQL migrations

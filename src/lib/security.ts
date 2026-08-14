@@ -41,7 +41,7 @@ export function containsLikelySecret(value: string): boolean {
 }
 
 function sessionKey(secret = process.env.SESSION_SECRET): Buffer {
-  if (!secret) throw new Error("SESSION_SECRET is required outside demo mode");
+  if (!secret) throw new Error("SESSION_SECRET is required");
   return createHash("sha256").update(secret).digest();
 }
 

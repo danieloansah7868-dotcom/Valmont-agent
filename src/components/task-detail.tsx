@@ -22,7 +22,6 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
 import { InlineError } from "@/components/states";
 import { StatusBadge } from "@/components/status-badge";
 import { apiMutation } from "@/lib/client-api";
@@ -69,7 +68,6 @@ export function TaskDetail({ initialTask }: { initialTask: CodingTask }) {
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge state={task.state} />
-            {task.demo && <DemoBadge compact />}
             <span className="text-[10px] font-medium text-slate-400">
               {task.id.slice(0, 18)}
             </span>

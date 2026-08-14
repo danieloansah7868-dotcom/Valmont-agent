@@ -1,23 +1,14 @@
 /**
- * Runtime mode configuration.
+ * Runtime configuration.
  *
- * Valmont runs in live mode by default: every repository listing, plan, patch,
- * validation, diff, and pull request comes from the real GitHub account, model
- * provider, and workspace. Fictional sample data is only ever produced when an
- * operator explicitly opts in with `ENABLE_DEMO_MODE=true`.
+ * Valmont is live-only. Every repository listing, plan, patch, validation,
+ * diff, and pull request comes from the real GitHub account, the configured
+ * model provider, and real workspace execution. There is no demo mode and no
+ * sample-data fallback: when a credential is missing the application says so
+ * instead of inventing output.
  */
 
 export type RuntimeEnv = Record<string, string | undefined>;
-
-function flag(value: string | undefined): boolean {
-  if (!value) return false;
-  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
-}
-
-/** Demo mode is opt-in. Anything other than an explicit truthy value is live mode. */
-export function demoModeEnabled(env: RuntimeEnv = process.env): boolean {
-  return flag(env.ENABLE_DEMO_MODE);
-}
 
 export function githubCredentialsConfigured(
   env: RuntimeEnv = process.env,
@@ -38,11 +29,10 @@ export function databaseConfigured(env: RuntimeEnv = process.env): boolean {
 }
 
 export interface RuntimeReadiness {
-  demoMode: boolean;
   github: boolean;
   model: boolean;
   database: boolean;
-  /** True when the real end-to-end workflow can run without demo fallbacks. */
+  /** True when the real end-to-end workflow can run. */
   liveReady: boolean;
 }
 
@@ -52,16 +42,10 @@ export function runtimeReadiness(
   const github = githubCredentialsConfigured(env);
   const model = modelCredentialsConfigured(env);
   const database = databaseConfigured(env);
-  return {
-    demoMode: demoModeEnabled(env),
-    github,
-    model,
-    database,
-    liveReady: github && model,
-  };
+  return { github, model, database, liveReady: github && model };
 }
 
-/** Human-readable list of what still has to be configured for live mode. */
+/** Human-readable list of what still has to be configured before Valmont can run. */
 export function missingLiveRequirements(
   env: RuntimeEnv = process.env,
 ): string[] {

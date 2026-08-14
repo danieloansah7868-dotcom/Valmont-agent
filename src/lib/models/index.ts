@@ -1,5 +1,4 @@
-import { demoModeEnabled, type RuntimeEnv } from "@/lib/config";
-import { DemoModelProvider } from "@/lib/models/demo";
+import type { RuntimeEnv } from "@/lib/config";
 import { OpenAICompatibleProvider } from "@/lib/models/openai-compatible";
 import type { ModelProvider } from "@/lib/models/types";
 
@@ -7,17 +6,13 @@ export const MODEL_NOT_CONFIGURED_MESSAGE =
   "MODEL_API_KEY is not configured. Set a server-side model provider before running a task.";
 
 /**
- * Live mode is the default: without `MODEL_API_KEY` this throws instead of
- * silently substituting deterministic sample output. The demo planner is only
- * returned when an operator sets `ENABLE_DEMO_MODE=true`.
+ * Valmont is live-only: without `MODEL_API_KEY` this throws rather than
+ * substituting deterministic sample output.
  */
 export function createModelProvider(
   env: RuntimeEnv = process.env,
 ): ModelProvider {
-  if (!env.MODEL_API_KEY) {
-    if (demoModeEnabled(env)) return new DemoModelProvider();
-    throw new Error(MODEL_NOT_CONFIGURED_MESSAGE);
-  }
+  if (!env.MODEL_API_KEY) throw new Error(MODEL_NOT_CONFIGURED_MESSAGE);
   return new OpenAICompatibleProvider({
     apiKey: env.MODEL_API_KEY,
     baseUrl: env.MODEL_BASE_URL ?? "https://api.openai.com/v1",

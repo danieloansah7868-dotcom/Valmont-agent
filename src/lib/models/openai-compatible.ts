@@ -57,7 +57,6 @@ export class OpenAICompatibleProvider implements ModelProvider {
   readonly id: string;
   readonly model: string;
   readonly supportsStreaming = true;
-  readonly demo = false;
   private readonly apiKey: string;
   private readonly baseUrl: string;
   private readonly fetcher: typeof fetch;

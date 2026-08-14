@@ -2,13 +2,12 @@ import { sql } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { getDatabase } from "@/db";
 import { githubConfigured } from "@/lib/auth";
-import { demoModeEnabled, missingLiveRequirements } from "@/lib/config";
+import { missingLiveRequirements } from "@/lib/config";
 import { tryCreateModelProvider } from "@/lib/models";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  const demoMode = demoModeEnabled();
   let database: "not_configured" | "connected" | "unavailable" =
     "not_configured";
   if (process.env.DATABASE_URL) {
@@ -20,15 +19,13 @@ export async function GET() {
     }
   }
   const model = tryCreateModelProvider();
-  const modelReady = Boolean(model && !model.demo);
+  const modelReady = Boolean(model);
   const githubReady = githubConfigured();
   const missing = missingLiveRequirements();
-  const ready =
-    database !== "unavailable" && (demoMode || missing.length === 0);
+  const ready = database !== "unavailable" && missing.length === 0;
   return NextResponse.json(
     {
       status: ready ? "ready" : "degraded",
-      mode: demoMode ? "demo" : "live",
       dependencies: {
         database,
         github: githubReady ? "configured" : "not_configured",

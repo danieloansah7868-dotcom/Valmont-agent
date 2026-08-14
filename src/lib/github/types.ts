@@ -22,7 +22,6 @@ export interface CreatedPullRequest {
 }
 
 export interface GitHubProvider {
-  readonly demo: boolean;
   listRepositories(): Promise<RepositorySummary[]>;
   listBranches(owner: string, repository: string): Promise<string[]>;
   listFiles(owner: string, repository: string, ref: string): Promise<string[]>;

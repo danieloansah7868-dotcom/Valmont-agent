@@ -25,8 +25,6 @@ services:
       # Keep the app private behind Caddy/Nginx/Cloudflare Access.
       - "127.0.0.1:3000:3000"
     environment:
-      # Live mode by default; set to true only for a sample-data demo instance.
-      ENABLE_DEMO_MODE: ${ENABLE_DEMO_MODE:-false}
       DATABASE_URL: postgresql://valmont:${POSTGRES_PASSWORD:-change-this-before-production}@postgres:5432/valmont
       APP_URL: ${APP_URL:-http://localhost:3000}
       SESSION_SECRET: ${SESSION_SECRET:-}

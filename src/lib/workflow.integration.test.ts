@@ -54,7 +54,6 @@ class RealTestModel implements ModelProvider {
   readonly id = "test-provider";
   readonly model = "test-model";
   readonly supportsStreaming = false;
-  readonly demo = false;
 
   async chat(): Promise<ModelResponse> {
     return response("");
@@ -99,7 +98,6 @@ class RealTestModel implements ModelProvider {
 }
 
 class RealTestGitHub implements GitHubProvider {
-  readonly demo = false;
   createdBranch = "";
   committedFiles: FileChange[] = [];
 
@@ -235,7 +233,6 @@ describe("real repository workflow", () => {
       repositoryId: "repo-1",
       repositoryName: "acme/app",
       baseBranch: "main",
-      demo: false,
     });
     expect(planned.state).toBe("awaiting_plan_approval");
     expect(planned.plan?.generatedBy).toBe("model");

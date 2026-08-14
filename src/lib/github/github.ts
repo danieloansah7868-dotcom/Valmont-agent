@@ -35,7 +35,6 @@ export class GitHubApiError extends Error {
 }
 
 export class GitHubApiProvider implements GitHubProvider {
-  readonly demo = false;
   private readonly token: string;
   private readonly fetcher: typeof fetch;
 
@@ -59,7 +58,6 @@ export class GitHubApiProvider implements GitHubProvider {
       private: repository.private,
       language: repository.language ?? "Unknown",
       updatedAt: repository.updated_at,
-      demo: false,
     }));
   }
 

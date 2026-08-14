@@ -10,7 +10,6 @@ import {
   LockKeyhole,
   Sparkles,
 } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
 import { EmptyState, InlineError } from "@/components/states";
 import { apiMutation } from "@/lib/client-api";
 import type { CodingTask, RepositorySummary } from "@/lib/types";
@@ -150,7 +149,6 @@ export function NewTaskForm({
               {repositories.map((item) => (
                 <option key={item.id} value={item.id}>
                   {item.fullName}
-                  {item.demo ? " (demo)" : ""}
                 </option>
               ))}
             </select>
@@ -166,21 +164,9 @@ export function NewTaskForm({
               <option value={repository?.defaultBranch ?? "main"}>
                 {repository?.defaultBranch ?? "main"}
               </option>
-              {repository?.demo && repository.defaultBranch !== "develop" && (
-                <option value="develop">develop</option>
-              )}
             </select>
           </label>
         </div>
-
-        {repository?.demo && (
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <DemoBadge />
-            <span className="text-[10px] text-copper-700">
-              No GitHub request will be made for this repository.
-            </span>
-          </div>
-        )}
 
         <label className="mt-6 block">
           <span className="label">Task title</span>

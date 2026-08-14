@@ -9,7 +9,6 @@ import {
   GitPullRequest,
   ShieldCheck,
 } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
 import { EmptyState } from "@/components/states";
 import { requireSessionUser } from "@/lib/auth";
 import { getTaskStore } from "@/lib/task-store";
@@ -60,12 +59,9 @@ export default async function TaskResultPage({
           <span className="mx-auto flex size-12 items-center justify-center rounded-full bg-copper-600 text-white">
             <GitPullRequest className="size-6" aria-hidden="true" />
           </span>
-          <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-            <p className="text-[11px] font-bold tracking-[0.1em] text-copper-300 uppercase">
-              Pull request ready for review
-            </p>
-            {pr.demo && <DemoBadge compact />}
-          </div>
+          <p className="mt-4 text-[11px] font-bold tracking-[0.1em] text-copper-300 uppercase">
+            Pull request ready for review
+          </p>
           <h1 className="mx-auto mt-3 max-w-xl text-[24px] font-bold tracking-[-0.03em] text-ivory sm:text-[28px]">
             {pr.title}
           </h1>
@@ -81,14 +77,6 @@ export default async function TaskResultPage({
         </div>
 
         <div className="p-6 sm:p-8">
-          {pr.demo && (
-            <div className="mb-6 rounded-lg border border-copper-300 bg-copper-50 p-3.5 text-[11px] leading-5 text-copper-700">
-              <strong>Demo result:</strong> this pull request URL and branch are
-              sample data. No GitHub branch, commit, or pull request was
-              created.
-            </div>
-          )}
-
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="rounded-xl border border-line p-4">
               <p className="text-[9px] font-bold tracking-[0.09em] text-slate uppercase">

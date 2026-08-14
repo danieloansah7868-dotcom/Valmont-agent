@@ -1,7 +1,6 @@
 import Link from "next/link";
 import { CircleHelp, ShieldCheck } from "lucide-react";
 import { AppNav } from "@/components/app-nav";
-import { DemoBadge } from "@/components/demo-badge";
 import { Logo } from "@/components/logo";
 import { SignOutButton } from "@/components/sign-out-button";
 import type { SessionUser } from "@/lib/auth";
@@ -32,11 +31,6 @@ export function AppShell({
           <Logo />
         </div>
         <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
-          {user.demo && (
-            <div className="mr-1 hidden sm:block">
-              <DemoBadge />
-            </div>
-          )}
           <Link
             href="/docs/security"
             className="btn-quiet size-9 min-h-9 px-0"
@@ -57,11 +51,11 @@ export function AppShell({
                 {user.name}
               </span>
               <span className="block text-[10px] text-slate">
-                {user.demo ? "Demo workspace" : `@${user.login}`}
+                @{user.login}
               </span>
             </span>
           </Link>
-          {!user.demo && <SignOutButton />}
+          <SignOutButton />
         </div>
       </header>
 

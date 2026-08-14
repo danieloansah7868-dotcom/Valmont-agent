@@ -7,7 +7,6 @@ import {
   Search,
   Unlock,
 } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
 import {
   ConnectPrompt,
   EmptyState,
@@ -21,7 +20,7 @@ import type { RepositorySummary } from "@/lib/types";
 export const dynamic = "force-dynamic";
 
 export default async function RepositoriesPage() {
-  const user = await requireSessionUser();
+  await requireSessionUser();
   const provider = await tryGetGitHubProvider();
 
   let repositories: RepositorySummary[] = [];
@@ -45,23 +44,11 @@ export default async function RepositoriesPage() {
         description="Only repositories authorized through your GitHub account are available to the agent."
         actions={
           <Link href="/api/auth/github" className="btn-secondary">
-            <Github className="size-4" aria-hidden="true" />{" "}
-            {user.demo ? "Connect GitHub" : "Refresh authorization"}
+            <Github className="size-4" aria-hidden="true" /> Refresh
+            authorization
           </Link>
         }
       />
-
-      {provider?.demo && (
-        <div className="mt-7 flex items-start gap-3 rounded-xl border border-copper-300 bg-copper-50 p-4">
-          <DemoBadge compact />
-          <p className="text-[12px] leading-5 text-copper-700">
-            <strong>Sample data:</strong> these repositories are fictional
-            because <code>ENABLE_DEMO_MODE</code> is enabled. Set it to{" "}
-            <code>false</code> and connect GitHub to list your real
-            repositories.
-          </p>
-        </div>
-      )}
 
       {!provider ? (
         <div className="mt-7">

@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { DemoModelProvider } from "@/lib/models/demo";
 import { createModelProvider, tryCreateModelProvider } from "@/lib/models";
 import { OpenAICompatibleProvider } from "@/lib/models/openai-compatible";
 import type { ModelProvider } from "@/lib/models/types";
@@ -12,33 +11,22 @@ function acceptsProvider(provider: ModelProvider): string {
 }
 
 describe("model provider abstraction", () => {
-  it("refuses to fall back to demo output when no credentials are set", () => {
+  it("refuses to fabricate output when no credentials are set", () => {
     expect(() => createModelProvider({})).toThrow(/MODEL_API_KEY/);
-    expect(() => createModelProvider({ ENABLE_DEMO_MODE: "false" })).toThrow(
-      /MODEL_API_KEY/,
-    );
     expect(tryCreateModelProvider({})).toBeNull();
   });
 
-  it("selects clearly labelled demo mode only when explicitly enabled", async () => {
-    const provider = createModelProvider({ ENABLE_DEMO_MODE: "true" });
-    expect(provider).toBeInstanceOf(DemoModelProvider);
-    expect(provider.demo).toBe(true);
-    expect(acceptsProvider(provider)).toBe("demo-provider");
-    const response = await provider.chat({
-      messages: [{ role: "user", content: "hello" }],
-    });
-    expect(response.content).toMatch(/Demo mode/);
-    expect(response.usage.totalTokens).toBe(0);
+  it("ignores a legacy ENABLE_DEMO_MODE variable", () => {
+    expect(() => createModelProvider({ ENABLE_DEMO_MODE: "true" })).toThrow(
+      /MODEL_API_KEY/,
+    );
+    expect(tryCreateModelProvider({ ENABLE_DEMO_MODE: "true" })).toBeNull();
   });
 
-  it("prefers real credentials over demo mode", () => {
-    const provider = createModelProvider({
-      ENABLE_DEMO_MODE: "true",
-      MODEL_API_KEY: "server-only-key",
-    });
+  it("builds an OpenAI-compatible provider from real credentials", () => {
+    const provider = createModelProvider({ MODEL_API_KEY: "server-only-key" });
     expect(provider).toBeInstanceOf(OpenAICompatibleProvider);
-    expect(provider.demo).toBe(false);
+    expect(acceptsProvider(provider)).toBe("openai-compatible");
   });
 
   it("normalizes chat, usage, and tool calls from OpenAI-compatible APIs", async () => {

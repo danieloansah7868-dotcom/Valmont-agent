@@ -10,7 +10,7 @@ Valmont is an approval-first orchestration layer between an authorized GitHub re
 2. The user selects an authorized repository/base branch and submits a bounded task description.
 3. `TaskWorkflowService` records `draft → planning` plus audit events.
 4. Retrieval lists/searches/reads only filtered, bounded text. Model context is redacted.
-5. A `ModelProvider` produces a structured plan. Live mode is the default: without `MODEL_API_KEY` the provider factory throws instead of substituting sample output, and the deterministic planner is reachable only when `ENABLE_DEMO_MODE=true`.
+5. A `ModelProvider` produces a structured plan. Without `MODEL_API_KEY` the provider factory throws instead of substituting sample output; no deterministic planner exists.
 6. State becomes `awaiting_plan_approval`. No workspace mutation is available before explicit approval.
 7. The workspace provider applies approved changes and runs only listed/allowlisted validation commands.
 8. Diff, status, tools, and command output are persisted/redacted and shown for review.
@@ -39,7 +39,7 @@ Planning/execution/PR creation can fail; pending states can be cancelled. Termin
 - `chat()` with normalized messages, tools, usage, errors, and finish reason
 - `structured()` with JSON Schema plus caller validation
 - `stream()` as an async iterable
-- capability/demo metadata
+- capability metadata
 
 `OpenAICompatibleProvider` maps this contract to `/chat/completions`. API keys never enter React props, client bundles, API payloads, events, or the database. Anthropic/Gemini/self-hosted adapters can implement this interface without altering workflow state transitions.
 
@@ -51,8 +51,6 @@ Planning/execution/PR creation can fail; pending states can be cancelled. Termin
 - refuses non-`valmont/*` write branches;
 - updates refs with `force: false`;
 - has no merge, deployment, settings, or protected-branch method.
-
-`DemoGitHubProvider` returns deterministic fictional data and is labelled throughout the UI.
 
 ### Retrieval
 
@@ -86,7 +84,7 @@ Drizzle/PostgreSQL entities:
 - model/tool executions
 - pull request records
 
-`PostgresTaskStore` is selected automatically when `DATABASE_URL` is configured and enforces session ownership in every task query. It hydrates normalized event, approval, tool, and pull-request records. Raw repository content and prompts are not stored in these tables. Account token ciphertext is explicitly server-only. The JSON fallback store uses `.data/demo-store.json`, atomic rename writes, and a process-local serialization queue; it hides demo-flagged tasks unless `ENABLE_DEMO_MODE=true`.
+`PostgresTaskStore` is selected automatically when `DATABASE_URL` is configured and enforces session ownership in every task query. It hydrates normalized event, approval, tool, and pull-request records. Raw repository content and prompts are not stored in these tables. Account token ciphertext is explicitly server-only. The JSON fallback store uses `.data/task-store.json`, atomic rename writes, and a process-local serialization queue; it starts empty and is never seeded with fixtures.
 
 ### Web security
 
@@ -107,16 +105,16 @@ Drizzle/PostgreSQL entities:
 - Stream model/activity events through SSE while preserving persisted events as source of truth.
 - Add embedding retrieval behind `RepositoryRetriever` only when repository scale warrants it.
 
-## Runtime mode
+## Runtime
 
-`src/lib/config.ts` centralizes runtime-mode resolution. `demoModeEnabled()` is the single source of truth and returns `false` unless `ENABLE_DEMO_MODE` is an explicit truthy value (`true`, `1`, `yes`, `on`).
+Valmont has one runtime: live. There is no mode flag, no demo provider, and no fixture data anywhere in the product. `src/lib/config.ts` centralizes readiness resolution through `githubCredentialsConfigured()`, `modelCredentialsConfigured()`, `databaseConfigured()`, and `runtimeReadiness()`.
 
-Live mode is enforced at every boundary rather than only in the UI:
+Missing credentials fail loudly at every boundary rather than being papered over in the UI:
 
-- `getSessionUser()` returns `null` instead of a fictional demo identity; `requireSessionUser()` redirects and `requireApiSessionUser()` raises a `NotConnectedError` mapped to HTTP 401.
-- `getGitHubProvider()` throws rather than returning `DemoGitHubProvider`.
-- `createModelProvider()` throws rather than returning `DemoModelProvider`; `tryCreateModelProvider()` is the non-throwing variant used by status surfaces.
-- `TaskWorkflowService` refuses to plan or execute demo-flagged tasks, and the task action route rejects them.
-- `JsonTaskStore` seeds and lists demo tasks only in demo mode.
+- `getSessionUser()` returns `null` when no encrypted session exists; `requireSessionUser()` redirects and `requireApiSessionUser()` raises a `NotConnectedError` mapped to HTTP 401.
+- `getGitHubProvider()` throws unless a real GitHub session token is present; `tryGetGitHubProvider()` is the non-throwing variant used by status surfaces.
+- `createModelProvider()` throws naming `MODEL_API_KEY`; `tryCreateModelProvider()` is the non-throwing variant.
+- `TaskWorkflowService` requires a real `GitHubProvider` as a constructor argument and can only execute against a real workspace.
+- `JsonTaskStore` starts empty; the PostgreSQL schema carries no demo columns.
 
 `missingLiveRequirements()` drives the connect prompts, settings page, and `/api/health` `missingConfiguration` array so operators see exactly which variables remain unset.

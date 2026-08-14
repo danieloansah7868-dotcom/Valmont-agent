@@ -1,7 +1,6 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { demoModeEnabled, githubCredentialsConfigured } from "@/lib/config";
-import { DemoGitHubProvider } from "@/lib/github/demo";
+import { githubCredentialsConfigured } from "@/lib/config";
 import { GitHubApiProvider } from "@/lib/github/github";
 import type { GitHubProvider } from "@/lib/github/types";
 import { decryptSessionValue } from "@/lib/security";
@@ -11,7 +10,6 @@ export interface SessionUser {
   login: string;
   name: string;
   avatarUrl?: string;
-  demo: boolean;
 }
 
 interface GitHubSessionPayload {
@@ -52,26 +50,15 @@ export async function getGitHubSession(): Promise<GitHubSessionPayload | null> {
   }
 }
 
-const DEMO_USER: SessionUser = {
-  id: "demo-user",
-  login: "demo-user",
-  name: "Demo workspace",
-  demo: true,
-};
-
-/**
- * Returns the signed-in GitHub user. In live mode (the default) an
- * unauthenticated visitor gets `null` instead of a fictional demo identity.
- */
+/** Returns the signed-in GitHub user, or null when nobody is connected. */
 export async function getSessionUser(): Promise<SessionUser | null> {
   const session = await getGitHubSession();
-  if (!session) return demoModeEnabled() ? { ...DEMO_USER } : null;
+  if (!session) return null;
   return {
     id: session.id,
     login: session.login,
     name: session.name,
     avatarUrl: session.avatarUrl,
-    demo: false,
   };
 }
 
@@ -89,12 +76,11 @@ export async function requireApiSessionUser(): Promise<SessionUser> {
   return user;
 }
 
+/** Authorized GitHub client for the current session. Throws when not connected. */
 export async function getGitHubProvider(): Promise<GitHubProvider> {
   const session = await getGitHubSession();
-  if (session)
-    return new GitHubApiProvider({ accessToken: session.accessToken });
-  if (demoModeEnabled()) return new DemoGitHubProvider();
-  throw new NotConnectedError();
+  if (!session) throw new NotConnectedError();
+  return new GitHubApiProvider({ accessToken: session.accessToken });
 }
 
 /** Never throws; used by pages that render a "not connected" state themselves. */

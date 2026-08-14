@@ -8,6 +8,13 @@
       "when": 1786700718887,
       "tag": "0000_lazy_leopardon",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786730143494,
+      "tag": "0001_drop_demo_columns",
+      "breakpoints": true
     }
   ]
 }

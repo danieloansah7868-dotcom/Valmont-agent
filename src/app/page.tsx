@@ -9,10 +9,9 @@ import {
   ShieldCheck,
   TerminalSquare,
 } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
 import { Logo } from "@/components/logo";
 import { githubConfigured } from "@/lib/auth";
-import { demoModeEnabled, missingLiveRequirements } from "@/lib/config";
+import { missingLiveRequirements } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +22,6 @@ export default async function LandingPage({
 }) {
   const params = await searchParams;
   const configured = githubConfigured();
-  const demoMode = demoModeEnabled();
   const missing = missingLiveRequirements();
 
   const notice =
@@ -73,7 +71,6 @@ export default async function LandingPage({
               />
               Approval-first by design
             </span>
-            {demoMode && <DemoBadge compact />}
           </div>
           <h1 className="text-balance max-w-[680px] text-[43px] leading-[1.06] font-[750] tracking-[-0.045em] text-navy sm:text-[58px]">
             Ship code with an agent you stay{" "}

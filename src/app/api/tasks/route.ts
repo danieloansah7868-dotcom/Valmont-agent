@@ -47,7 +47,6 @@ export async function POST(request: NextRequest) {
       ...input,
       userId: user.id,
       repositoryName: repository.fullName,
-      demo: github.demo || model.demo || user.demo,
     });
     return NextResponse.json({ task }, { status: 201 });
   } catch (error) {

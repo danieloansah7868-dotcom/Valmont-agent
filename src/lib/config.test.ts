@@ -1,39 +1,51 @@
 import { describe, expect, it } from "vitest";
 import {
-  demoModeEnabled,
+  databaseConfigured,
+  githubCredentialsConfigured,
   missingLiveRequirements,
+  modelCredentialsConfigured,
   runtimeReadiness,
 } from "@/lib/config";
 
-describe("runtime mode configuration", () => {
-  it("defaults to live mode when ENABLE_DEMO_MODE is absent", () => {
-    expect(demoModeEnabled({})).toBe(false);
-    expect(runtimeReadiness({}).demoMode).toBe(false);
-  });
-
-  it("treats an explicit false as live mode", () => {
-    for (const value of ["false", "FALSE", "0", "no", "off", ""]) {
-      expect(demoModeEnabled({ ENABLE_DEMO_MODE: value })).toBe(false);
-    }
-  });
-
-  it("enables demo mode only for explicit truthy values", () => {
-    for (const value of ["true", "TRUE", " True ", "1", "yes", "on"]) {
-      expect(demoModeEnabled({ ENABLE_DEMO_MODE: value })).toBe(true);
-    }
-  });
-
-  it("reports live readiness from GitHub and model credentials", () => {
-    expect(runtimeReadiness({}).liveReady).toBe(false);
-    const ready = runtimeReadiness({
-      GITHUB_CLIENT_ID: "id",
-      GITHUB_CLIENT_SECRET: "secret",
-      SESSION_SECRET: "a".repeat(32),
-      MODEL_API_KEY: "key",
-      DATABASE_URL: "postgres://localhost/valmont",
+describe("runtime configuration", () => {
+  it("reports nothing as configured for an empty environment", () => {
+    expect(githubCredentialsConfigured({})).toBe(false);
+    expect(modelCredentialsConfigured({})).toBe(false);
+    expect(databaseConfigured({})).toBe(false);
+    expect(runtimeReadiness({})).toEqual({
+      github: false,
+      model: false,
+      database: false,
+      liveReady: false,
     });
-    expect(ready).toMatchObject({
-      demoMode: false,
+  });
+
+  it("requires the full GitHub OAuth triple before GitHub counts as configured", () => {
+    expect(
+      githubCredentialsConfigured({
+        GITHUB_CLIENT_ID: "id",
+        GITHUB_CLIENT_SECRET: "secret",
+      }),
+    ).toBe(false);
+    expect(
+      githubCredentialsConfigured({
+        GITHUB_CLIENT_ID: "id",
+        GITHUB_CLIENT_SECRET: "secret",
+        SESSION_SECRET: "a".repeat(32),
+      }),
+    ).toBe(true);
+  });
+
+  it("reports readiness from GitHub, model, and database credentials", () => {
+    expect(
+      runtimeReadiness({
+        GITHUB_CLIENT_ID: "id",
+        GITHUB_CLIENT_SECRET: "secret",
+        SESSION_SECRET: "a".repeat(32),
+        MODEL_API_KEY: "key",
+        DATABASE_URL: "postgres://localhost/valmont",
+      }),
+    ).toEqual({
       github: true,
       model: true,
       database: true,
@@ -41,7 +53,7 @@ describe("runtime mode configuration", () => {
     });
   });
 
-  it("lists exactly the variables still required for live mode", () => {
+  it("lists exactly the variables still required to run", () => {
     expect(missingLiveRequirements({})).toEqual([
       "SESSION_SECRET",
       "GITHUB_CLIENT_ID",
@@ -56,5 +68,16 @@ describe("runtime mode configuration", () => {
         MODEL_API_KEY: "key",
       }),
     ).toEqual([]);
+  });
+
+  it("ignores a legacy ENABLE_DEMO_MODE variable entirely", () => {
+    const env = {
+      ENABLE_DEMO_MODE: "true",
+      SESSION_SECRET: "a".repeat(32),
+      GITHUB_CLIENT_ID: "id",
+      GITHUB_CLIENT_SECRET: "secret",
+    };
+    expect(missingLiveRequirements(env)).toEqual(["MODEL_API_KEY"]);
+    expect(runtimeReadiness(env).liveReady).toBe(false);
   });
 });

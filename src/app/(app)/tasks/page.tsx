@@ -1,6 +1,5 @@
 import Link from "next/link";
 import { ArrowRight, GitBranch, ListChecks, Plus, Search } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
 import { EmptyState, ErrorState, PageHeading } from "@/components/states";
 import { StatusBadge } from "@/components/status-badge";
 import { requireSessionUser } from "@/lib/auth";
@@ -103,7 +102,6 @@ export default async function TasksPage() {
                           <h2 className="truncate text-[13px] font-bold text-navy group-hover:text-copper-700">
                             {task.title}
                           </h2>
-                          {task.demo && <DemoBadge compact />}
                         </div>
                         <p className="mt-1.5 truncate pl-6 text-[10px] text-slate">
                           Updated{" "}

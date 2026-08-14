@@ -2,8 +2,6 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
-import { demoModeEnabled } from "@/lib/config";
-import { DemoGitHubProvider } from "@/lib/github/demo";
 import { assertCsrf } from "@/lib/security";
 import { getTaskStore } from "@/lib/task-store";
 import { TaskWorkflowService } from "@/lib/workflow";
@@ -28,19 +26,7 @@ export async function POST(
     const store = getTaskStore(user);
     const existing = await store.get(id);
     if (!existing) throw new Error("Task not found");
-    if (existing.demo && !demoModeEnabled()) {
-      throw new Error(
-        "This task was created in demo mode, which is now disabled. Create a new task against a real repository.",
-      );
-    }
-    const github = existing.demo
-      ? new DemoGitHubProvider()
-      : await getGitHubProvider();
-    if (!existing.demo && github.demo) {
-      throw new Error(
-        "Your GitHub session expired. Reconnect GitHub before continuing.",
-      );
-    }
+    const github = await getGitHubProvider();
     const workflow = new TaskWorkflowService(store, github);
     const task =
       input.action === "approve_plan"

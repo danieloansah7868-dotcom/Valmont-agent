@@ -9,7 +9,6 @@ import {
   Plus,
   ShieldCheck,
 } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
 import { EmptyState, ErrorState, PageHeading } from "@/components/states";
 import { StatusBadge } from "@/components/status-badge";
 import { requireSessionUser, tryGetGitHubProvider } from "@/lib/auth";
@@ -50,26 +49,7 @@ export default async function DashboardPage() {
 
   return (
     <div className="mx-auto max-w-[1180px] px-4 py-7 sm:px-7 sm:py-9">
-      {user.demo && (
-        <div className="mb-7 flex flex-col gap-3 rounded-xl border border-copper-300 bg-copper-50 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-start gap-3">
-            <DemoBadge />
-            <p className="text-[12px] leading-5 text-copper-700">
-              <strong>ENABLE_DEMO_MODE is on.</strong> Repositories and agent
-              output on this screen are sample data, not GitHub or model
-              results.
-            </p>
-          </div>
-          <Link
-            href="/settings"
-            className="shrink-0 text-[12px] font-bold text-copper-700 hover:underline"
-          >
-            Configure integrations →
-          </Link>
-        </div>
-      )}
-
-      {!user.demo && missing.length > 0 && (
+      {missing.length > 0 && (
         <div className="mb-7 rounded-xl border border-copper-300 bg-copper-50 px-4 py-3.5">
           <p className="text-[12px] leading-5 font-semibold text-copper-700">
             Live mode is missing configuration: {missing.join(", ")}. Tasks
@@ -80,7 +60,7 @@ export default async function DashboardPage() {
 
       <PageHeading
         eyebrow="Workspace overview"
-        title={`Welcome back, ${user.demo ? "builder" : (user.name.split(" ")[0] ?? user.login)}`}
+        title={`Welcome back, ${user.name.split(" ")[0] ?? user.login}`}
         description="Review agent work and decide what moves forward."
         actions={
           <Link href="/tasks/new" className="btn-primary">

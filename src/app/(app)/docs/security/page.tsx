@@ -29,8 +29,8 @@ export default function SecurityPage() {
         <div className="space-y-6 p-6 sm:p-8">
           {[
             [
-              "Runtime mode",
-              "Live mode is the default. Without ENABLE_DEMO_MODE=true the application refuses to substitute fictional repository data, plans, patches, validations, or pull-request results; it asks you to connect GitHub and configure a model provider instead.",
+              "Live-only runtime",
+              "Valmont has no demo or sample-data mode. It never substitutes fictional repository data, plans, patches, validations, or pull-request results: when a credential is missing it names the unset variable and asks you to connect GitHub or configure a model provider.",
             ],
             [
               "Trust boundaries",

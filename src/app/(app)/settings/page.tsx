@@ -10,10 +10,9 @@ import {
   Server,
   ShieldCheck,
 } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
 import { PageHeading } from "@/components/states";
 import { githubConfigured, requireSessionUser } from "@/lib/auth";
-import { demoModeEnabled, missingLiveRequirements } from "@/lib/config";
+import { missingLiveRequirements } from "@/lib/config";
 import { tryCreateModelProvider } from "@/lib/models";
 
 export const dynamic = "force-dynamic";
@@ -21,11 +20,11 @@ export const dynamic = "force-dynamic";
 export default async function SettingsPage() {
   const user = await requireSessionUser();
   const model = tryCreateModelProvider();
-  const modelReady = Boolean(model && !model.demo);
+  const modelReady = Boolean(model);
   const githubReady = githubConfigured();
   const databaseReady = Boolean(process.env.DATABASE_URL);
-  const demoMode = demoModeEnabled();
   const missing = missingLiveRequirements();
+  const liveReady = missing.length === 0;
 
   return (
     <div className="mx-auto max-w-[940px] px-4 py-7 sm:px-7 sm:py-9">
@@ -35,59 +34,35 @@ export default async function SettingsPage() {
         description="Provider credentials are read from server environment variables and never sent to the browser."
       />
 
-      {/* Runtime mode is the headline setting now that live mode is the default. */}
-      <section
-        className={`mt-7 overflow-hidden rounded-xl border ${
-          demoMode ? "border-copper-300 bg-copper-50" : "border-line bg-white"
-        }`}
-      >
+      {/* Valmont has a single runtime: live. There is no demo fallback. */}
+      <section className="mt-7 overflow-hidden rounded-xl border border-line bg-white">
         <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
           <div className="flex gap-3">
-            <span
-              className={`flex size-9 shrink-0 items-center justify-center rounded-lg ${
-                demoMode
-                  ? "bg-copper-600 text-white"
-                  : "bg-navy text-copper-300"
-              }`}
-            >
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-navy text-copper-300">
               <Radio className="size-[17px]" aria-hidden="true" />
             </span>
             <div>
               <div className="flex flex-wrap items-center gap-2">
-                <h2 className="text-sm font-bold text-navy">Runtime mode</h2>
-                {demoMode ? (
-                  <DemoBadge compact />
-                ) : (
-                  <span className="rounded-full bg-pass-soft px-2 py-0.5 text-[9px] font-bold text-pass-strong ring-1 ring-inset ring-pass/30">
-                    LIVE
-                  </span>
-                )}
+                <h2 className="text-sm font-bold text-navy">Runtime</h2>
+                <span className="rounded-full bg-pass-soft px-2 py-0.5 text-[9px] font-bold text-pass-strong ring-1 ring-inset ring-pass/30">
+                  LIVE
+                </span>
               </div>
               <p className="mt-1.5 max-w-xl text-[11px] leading-5 text-slate">
-                {demoMode ? (
-                  <>
-                    <code>ENABLE_DEMO_MODE=true</code> is set. Repository
-                    listings, plans, patches, validations and pull-request
-                    results may be deterministic sample data. Set it to{" "}
-                    <code>false</code> for normal production use.
-                  </>
-                ) : (
-                  <>
-                    Valmont is running against real GitHub repositories, your
-                    configured model provider, and real workspace execution. No
-                    fictional demo data is produced.
-                  </>
-                )}
+                Valmont only runs against real GitHub repositories, your
+                configured model provider, and real workspace execution. There
+                is no demo or sample-data mode: when a credential is missing the
+                affected action fails and names the variable to set.
               </p>
             </div>
           </div>
           <code className="shrink-0 rounded-md bg-ivory-100 px-2.5 py-1.5 text-[10px] font-bold text-navy ring-1 ring-inset ring-line">
-            ENABLE_DEMO_MODE={String(demoMode)}
+            {liveReady ? "all systems configured" : "configuration incomplete"}
           </code>
         </div>
       </section>
 
-      {!demoMode && missing.length > 0 && (
+      {missing.length > 0 && (
         <div className="mt-4 rounded-xl border border-copper-300 bg-copper-50 p-4">
           <div className="flex gap-3">
             <CircleAlert
@@ -96,7 +71,7 @@ export default async function SettingsPage() {
             />
             <div>
               <p className="text-[11px] font-bold text-copper-700">
-                Live mode is missing required configuration
+                Valmont is missing required configuration
               </p>
               <ul className="mt-2 flex flex-wrap gap-2">
                 {missing.map((name) => (
@@ -126,22 +101,16 @@ export default async function SettingsPage() {
             title="GitHub OAuth"
             description={
               githubReady
-                ? user.demo
-                  ? "OAuth app configured; sign in to authorize repositories."
-                  : `Connected as @${user.login}`
+                ? `Connected as @${user.login}`
                 : "Not configured. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and SESSION_SECRET."
             }
-            ready={githubReady && !user.demo}
+            ready={githubReady}
             action={
               <Link
                 href="/api/auth/github"
                 className="btn-secondary min-h-8 text-[11px]"
               >
-                {githubReady
-                  ? user.demo
-                    ? "Connect GitHub"
-                    : "Reconnect"
-                  : "Setup guide"}
+                {githubReady ? "Reconnect" : "Setup guide"}
               </Link>
             }
           />
@@ -151,9 +120,7 @@ export default async function SettingsPage() {
             description={
               modelReady && model
                 ? `${model.id} · ${model.model} · credentials loaded server-side`
-                : demoMode
-                  ? "No API key configured. The deterministic demo planner is active."
-                  : "MODEL_API_KEY is not set. Tasks cannot generate plans or patches."
+                : "MODEL_API_KEY is not set. Tasks cannot generate plans or patches."
             }
             ready={modelReady}
           />

@@ -12,7 +12,6 @@ import {
   users,
 } from "@/db/schema";
 import type { SessionUser } from "@/lib/auth";
-import { demoModeEnabled } from "@/lib/config";
 import type {
   Approval,
   CodingTask,
@@ -32,139 +31,17 @@ export interface TaskStore {
   save(task: CodingTask): Promise<void>;
 }
 
-const SEED_TASK: CodingTask = {
-  id: "task-demo-1042",
-  title: "Add empty state to project dashboard",
-  description:
-    "Show a helpful empty state when a workspace has no active projects, including a link to create the first project.",
-  repositoryId: "demo-repo-1",
-  repositoryName: "acme-labs/atlas-web",
-  baseBranch: "main",
-  state: "awaiting_plan_approval",
-  createdAt: "2026-08-14T09:14:00.000Z",
-  updatedAt: "2026-08-14T09:15:23.000Z",
-  demo: true,
-  plan: {
-    summary:
-      "Add an accessible project-dashboard empty state by reusing the existing Button and EmptyState primitives, then cover both empty and populated paths.",
-    risk: "low",
-    generatedBy: "demo",
-    validationCommands: ["npm test", "npm run typecheck"],
-    steps: [
-      {
-        title: "Add an empty project state",
-        description:
-          "Render the shared EmptyState component when the projects query succeeds with zero records.",
-        files: ["src/features/projects/project-grid.tsx"],
-      },
-      {
-        title: "Preserve dashboard behavior",
-        description:
-          "Keep loading, error, and populated project-grid branches unchanged and add a clear create-project action.",
-        files: ["src/features/projects/project-grid.tsx"],
-      },
-      {
-        title: "Cover both render paths",
-        description:
-          "Add focused component tests for zero projects and a populated project response.",
-        files: ["src/features/projects/project-grid.test.tsx"],
-      },
-    ],
-  },
-  validations: [],
-  approvals: [],
-  toolExecutions: [
-    {
-      id: "tool-seed-1",
-      taskId: "task-demo-1042",
-      tool: "list_files",
-      inputSummary: "src/features/projects (depth 3)",
-      outputSummary:
-        "Found 12 relevant source and test files (demo repository)",
-      status: "succeeded",
-      durationMs: 81,
-      createdAt: "2026-08-14T09:14:15.000Z",
-    },
-    {
-      id: "tool-seed-2",
-      taskId: "task-demo-1042",
-      tool: "search_code",
-      inputSummary: 'Search: "project grid empty loading"',
-      outputSummary:
-        "Matched project-grid.tsx, project-card.tsx, and 2 test files (demo data)",
-      status: "succeeded",
-      durationMs: 128,
-      createdAt: "2026-08-14T09:14:17.000Z",
-    },
-    {
-      id: "tool-seed-3",
-      taskId: "task-demo-1042",
-      tool: "read_file",
-      inputSummary: "3 files selected by lexical retrieval",
-      outputSummary:
-        "Retrieved 286 lines; secrets and excluded paths were not accessed (demo data)",
-      status: "succeeded",
-      durationMs: 94,
-      createdAt: "2026-08-14T09:14:19.000Z",
-    },
-  ],
-  events: [
-    {
-      id: "event-seed-1",
-      taskId: "task-demo-1042",
-      type: "state",
-      title: "Task submitted",
-      detail: "Task moved from draft to planning.",
-      actor: "user",
-      createdAt: "2026-08-14T09:14:00.000Z",
-    },
-    {
-      id: "event-seed-2",
-      taskId: "task-demo-1042",
-      type: "tool",
-      title: "Repository context retrieved",
-      detail:
-        "Inspected 12 files and selected 3 relevant files. Demo repository data was used.",
-      actor: "agent",
-      createdAt: "2026-08-14T09:14:19.000Z",
-    },
-    {
-      id: "event-seed-3",
-      taskId: "task-demo-1042",
-      type: "model",
-      title: "Implementation plan prepared",
-      detail:
-        "Deterministic demo planner produced a 3-step plan. No external model was called.",
-      actor: "agent",
-      createdAt: "2026-08-14T09:15:20.000Z",
-    },
-    {
-      id: "event-seed-4",
-      taskId: "task-demo-1042",
-      type: "state",
-      title: "Plan approval required",
-      detail:
-        "Execution is blocked until you approve or reject the implementation plan.",
-      actor: "system",
-      createdAt: "2026-08-14T09:15:23.000Z",
-    },
-  ],
-};
-
 export class JsonTaskStore implements TaskStore {
   private readonly file: string;
   private writeQueue = Promise.resolve();
 
-  constructor(file = path.join(process.cwd(), ".data", "demo-store.json")) {
+  constructor(file = path.join(process.cwd(), ".data", "task-store.json")) {
     this.file = file;
   }
 
   async list(): Promise<CodingTask[]> {
     const data = await this.load();
-    const visible = demoModeEnabled()
-      ? data.tasks
-      : data.tasks.filter((task) => !task.demo);
-    return structuredClone(visible).sort((a, b) =>
+    return structuredClone(data.tasks).sort((a, b) =>
       b.updatedAt.localeCompare(a.updatedAt),
     );
   }
@@ -200,11 +77,7 @@ export class JsonTaskStore implements TaskStore {
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code !== "ENOENT")
         throw error;
-      // The fictional seed task exists only for explicitly enabled demo mode.
-      return {
-        version: 1,
-        tasks: demoModeEnabled() ? [structuredClone(SEED_TASK)] : [],
-      };
+      return { version: 1, tasks: [] };
     }
   }
 }
@@ -303,7 +176,6 @@ export class PostgresTaskStore implements TaskStore {
           branch: pull.branch,
           baseBranch: pull.baseBranch,
           status: "open",
-          demo: pull.isDemo,
           createdAt: pull.createdAt.toISOString(),
         }
       : undefined;
@@ -325,7 +197,6 @@ export class PostgresTaskStore implements TaskStore {
       approvals: taskApprovals,
       toolExecutions: tools,
       pullRequest,
-      demo: row.isDemo,
     };
   }
 
@@ -340,7 +211,7 @@ export class PostgresTaskStore implements TaskStore {
       .insert(users)
       .values({
         id: this.databaseUserId,
-        githubId: this.user.demo ? null : this.user.id,
+        githubId: this.user.id,
         name: this.user.name,
         avatarUrl: this.user.avatarUrl,
       })
@@ -365,7 +236,6 @@ export class PostgresTaskStore implements TaskStore {
         plan: task.plan,
         diff: task.diff,
         validations: task.validations,
-        isDemo: task.demo,
         createdAt: new Date(task.createdAt),
         updatedAt: new Date(task.updatedAt),
       })
@@ -449,7 +319,6 @@ export class PostgresTaskStore implements TaskStore {
           branch: pull.branch,
           baseBranch: pull.baseBranch,
           status: pull.status,
-          isDemo: pull.demo,
           createdAt: new Date(pull.createdAt),
         })
         .onConflictDoUpdate({

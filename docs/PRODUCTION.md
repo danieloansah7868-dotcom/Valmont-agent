@@ -28,7 +28,6 @@ After the DNS record points to the server, Caddy obtains and renews HTTPS automa
 
 ## Required configuration
 
-- `ENABLE_DEMO_MODE=false` (the default) so no fictional data can reach production users
 - A public HTTPS `APP_URL`
 - 32+ random bytes in `SESSION_SECRET`
 - GitHub OAuth App callback `${APP_URL}/api/auth/github/callback`

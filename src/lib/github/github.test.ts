@@ -39,7 +39,6 @@ describe("GitHub API adapter", () => {
       id: "12",
       fullName: "acme/app",
       private: true,
-      demo: false,
     });
     expect(fetcher).toHaveBeenCalledOnce();
     const [url, init] = fetcher.mock.calls[0]!;

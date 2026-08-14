@@ -8,7 +8,6 @@ export async function GET() {
     const provider = await getGitHubProvider();
     return NextResponse.json({
       repositories: await provider.listRepositories(),
-      demo: provider.demo,
     });
   } catch (error) {
     return safeApiError(error);
