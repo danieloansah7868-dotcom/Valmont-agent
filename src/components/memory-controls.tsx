@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { ChangeEvent, useState } from "react";
 import { Archive, Pencil, Trash2 } from "lucide-react";
-import { apiDelete, apiPatch } from "@/lib/client-api";
+import { apiDelete, apiMutation, apiPatch } from "@/lib/client-api";
 import type { ChatMemory } from "@/lib/chat-store";
 import type { ChatSession } from "@/lib/types";
 export function MemoryControls({
@@ -79,10 +79,20 @@ export function MemoryControls({
   async function importBackup(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
-    setError(
-      "Import is intentionally disabled until a backup can be verified and merged without overwriting local history.",
-    );
-    event.target.value = "";
+    try {
+      if (file.size > 25_000_000) throw new Error("Backup is too large");
+      const backup = JSON.parse(await file.text()) as unknown;
+      await apiMutation("/api/memories/import", backup);
+      window.location.reload();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Could not import backup",
+      );
+    } finally {
+      event.target.value = "";
+    }
   }
   return (
     <>
