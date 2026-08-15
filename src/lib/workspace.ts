@@ -254,11 +254,11 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
       15_000,
       this.outputLimitBytes,
     );
-    if (result.exitCode !== 0)
+    if (result.exitCode !== 0 || result.stdoutTruncated)
       throw new Error("Could not inspect changed files");
-    return result.output
+    return result.stdout
       .trim()
-      .split("\n")
+      .split(/\r?\n/)
       .filter(Boolean)
       .map((line) => {
         const [code, ...pathParts] = line.split("\t");
@@ -286,7 +286,9 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
       15_000,
       this.outputLimitBytes,
     );
-    return redactSecrets(result.output);
+    if (result.exitCode !== 0 || result.stdoutTruncated)
+      throw new Error("Could not inspect workspace diff");
+    return redactSecrets(result.stdout);
   }
 
   async gitStatus(workspace: WorkspaceHandle): Promise<string> {
@@ -296,7 +298,9 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
       15_000,
       this.outputLimitBytes,
     );
-    return redactSecrets(result.output);
+    if (result.exitCode !== 0 || result.stdoutTruncated)
+      throw new Error("Could not inspect workspace status");
+    return redactSecrets(result.stdout);
   }
 
   async runValidation(
@@ -409,9 +413,11 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
     homeDirectory = cwd,
   ): Promise<{
     output: string;
+    stdout: string;
     exitCode: number | null;
     timedOut: boolean;
     truncated: boolean;
+    stdoutTruncated: boolean;
   }> {
     return new Promise((resolve, reject) => {
       const [commandName, ...args] = command;
@@ -434,10 +440,13 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
         detached: process.platform !== "win32",
       });
       let output = "";
+      let stdout = "";
       let bytes = 0;
+      let stdoutBytes = 0;
       let truncated = false;
+      let stdoutTruncated = false;
       let timedOut = false;
-      const capture = (chunk: Buffer): void => {
+      const captureOutput = (chunk: Buffer): void => {
         if (bytes >= outputLimit) {
           truncated = true;
           return;
@@ -448,8 +457,20 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
         bytes += slice.length;
         if (slice.length < chunk.length) truncated = true;
       };
-      child.stdout?.on("data", capture);
-      child.stderr?.on("data", capture);
+      const captureStdout = (chunk: Buffer): void => {
+        captureOutput(chunk);
+        if (stdoutBytes >= outputLimit) {
+          stdoutTruncated = true;
+          return;
+        }
+        const remaining = outputLimit - stdoutBytes;
+        const slice = chunk.subarray(0, remaining);
+        stdout += slice.toString("utf8");
+        stdoutBytes += slice.length;
+        if (slice.length < chunk.length) stdoutTruncated = true;
+      };
+      child.stdout?.on("data", captureStdout);
+      child.stderr?.on("data", captureOutput);
       child.on("error", reject);
       const timer = setTimeout(() => {
         timedOut = true;
@@ -465,9 +486,11 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
         clearTimeout(timer);
         resolve({
           output: `${output}${truncated ? "\n[output truncated by Valmont Agent]" : ""}`,
+          stdout,
           exitCode,
           timedOut,
           truncated,
+          stdoutTruncated,
         });
       });
     });

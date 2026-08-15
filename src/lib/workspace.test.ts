@@ -1,6 +1,8 @@
+import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   commandRequiresShell,
@@ -8,6 +10,8 @@ import {
   RestrictedLocalWorkspaceProvider,
   type WorkspaceHandle,
 } from "@/lib/workspace";
+
+const execFileAsync = promisify(execFile);
 
 let temporary: string[] = [];
 afterEach(async () =>
@@ -49,6 +53,49 @@ describe("restricted local workspace", () => {
     expect(commandRequiresShell("git", "win32")).toBe(false);
     expect(resolveCommandExecutable("npm", "linux")).toBe("npm");
     expect(commandRequiresShell("npm", "linux")).toBe(false);
+  });
+
+  it("parses changed files from stdout when Git warns on stderr", async () => {
+    const { provider, handle, root } = await setup();
+    const git = (...args: string[]) =>
+      execFileAsync("git", args, { cwd: root });
+
+    await git("init", "-q");
+    await git("config", "user.name", "Valmont Test");
+    await git("config", "user.email", "test@localhost");
+    await git("config", "core.autocrlf", "true");
+    await git("config", "core.safecrlf", "warn");
+    await writeFile(path.join(root, "README.md"), "one\r\ntwo\r\n");
+    await git("add", "-A");
+    await git("commit", "-qm", "baseline");
+    await writeFile(path.join(root, "README.md"), "one\ntwo\nthree\n");
+
+    const raw = await git("diff", "--name-status", "HEAD", "--", ".");
+    expect(raw.stdout).toContain("M\tREADME.md");
+    expect(raw.stderr).toContain(
+      "LF will be replaced by CRLF the next time Git touches it",
+    );
+    await expect(provider.listChangedFiles(handle)).resolves.toEqual([
+      { path: "README.md", status: "modified" },
+    ]);
+    await expect(provider.gitDiff(handle)).resolves.not.toContain("warning:");
+  });
+
+  it("continues to reject sensitive paths reported by Git", async () => {
+    const { provider, handle, root } = await setup();
+    const git = (...args: string[]) =>
+      execFileAsync("git", args, { cwd: root });
+
+    await git("init", "-q");
+    await git("config", "user.name", "Valmont Test");
+    await git("config", "user.email", "test@localhost");
+    await git("add", "-A");
+    await git("commit", "-qm", "baseline");
+    await writeFile(path.join(root, "private-key.txt"), "not-a-real-key\n");
+
+    await expect(provider.listChangedFiles(handle)).rejects.toThrow(
+      "Git reported an unsafe changed path",
+    );
   });
 
   it("blocks path traversal and sensitive writes", async () => {
