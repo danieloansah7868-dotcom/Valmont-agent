@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+} from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import type {
@@ -290,6 +296,17 @@ export class SqliteChatStore implements ChatStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       if (existsSync(legacyPath)) {
+        // Preserve an immutable migration source before touching the new store.
+        // copyFile is completed before the transaction marks migration complete.
+        const backupPath = `${legacyPath}.pre-sqlite-backup`;
+        if (!existsSync(backupPath)) {
+          copyFileSync(legacyPath, backupPath);
+          try {
+            chmodSync(backupPath, 0o600);
+          } catch {
+            /* best effort */
+          }
+        }
         const legacy = JSON.parse(
           readFileSyncCompat(legacyPath),
         ) as ChatStoreDocument;
@@ -550,7 +567,7 @@ export class SqliteChatStore implements ChatStore {
     if (!terms) return [];
     const rows = this.db
       .prepare(
-        `SELECT m.* FROM chat_messages_fts f JOIN chat_messages m ON m.id = f.message_id JOIN chat_sessions s ON s.id = m.session_id WHERE f.user_id = ? AND chat_messages_fts MATCH ? ${repositoryId ? "AND json_extract(s.repository_json, '$.id') = ?" : ""} ORDER BY bm25(chat_messages_fts) LIMIT 8`,
+        `SELECT m.* FROM chat_messages_fts f JOIN chat_messages m ON m.id = f.message_id JOIN chat_sessions s ON s.id = m.session_id WHERE f.user_id = ? AND chat_messages_fts MATCH ? ${repositoryId ? "AND json_extract(s.repository_json, '$.id') = ?" : "AND s.repository_json IS NULL"} ORDER BY bm25(chat_messages_fts) LIMIT 8`,
       )
       .all(
         ...(repositoryId ? [userId, terms, repositoryId] : [userId, terms]),
@@ -636,6 +653,109 @@ export class SqliteChatStore implements ChatStore {
       memories: await this.memories(userId),
       memoryEnabled: await this.memoryEnabled(userId),
     };
+  }
+
+  async importUser(
+    userId: string,
+    backup: {
+      sessions: ChatSession[];
+      memories: ChatMemory[];
+      memoryEnabled?: boolean;
+    },
+  ): Promise<void> {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const imported of backup.sessions) {
+        const existing = this.db
+          .prepare("SELECT 1 FROM chat_sessions WHERE id = ?")
+          .get(imported.id);
+        const sessionId = existing ? randomUUID() : imported.id;
+        const session: ChatSession = {
+          ...imported,
+          id: sessionId,
+          userId,
+          title: redactSecrets(imported.title).slice(0, 120),
+          messages: [],
+        };
+        this.db
+          .prepare(
+            "INSERT INTO chat_sessions(id,user_id,title,repository_json,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+          )
+          .run(
+            session.id,
+            userId,
+            session.title || "New conversation",
+            session.repository ? JSON.stringify(session.repository) : null,
+            session.createdAt,
+            session.updatedAt,
+          );
+        for (const importedMessage of imported.messages) {
+          const messageId = this.db
+            .prepare("SELECT 1 FROM chat_messages WHERE id = ?")
+            .get(importedMessage.id)
+            ? randomUUID()
+            : importedMessage.id;
+          const content = redactSecrets(importedMessage.content).slice(0, 8000);
+          this.db
+            .prepare(
+              "INSERT INTO chat_messages(id,session_id,user_id,role,content,created_at,model,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?,?)",
+            )
+            .run(
+              messageId,
+              session.id,
+              userId,
+              importedMessage.role,
+              content,
+              importedMessage.createdAt,
+              importedMessage.model ?? null,
+              importedMessage.inputTokens ?? null,
+              importedMessage.outputTokens ?? null,
+            );
+          this.db
+            .prepare(
+              "INSERT INTO chat_messages_fts(content,message_id,user_id,session_id) VALUES (?,?,?,?)",
+            )
+            .run(content, messageId, userId, session.id);
+        }
+        this.db
+          .prepare(
+            "UPDATE chat_sessions SET summary = ? WHERE id = ? AND user_id = ?",
+          )
+          .run(this.summaryFor(session.id, userId), session.id, userId);
+      }
+      for (const memory of backup.memories) {
+        const id = this.db
+          .prepare("SELECT 1 FROM chat_memories WHERE id = ?")
+          .get(memory.id)
+          ? randomUUID()
+          : memory.id;
+        const content = redactSecrets(memory.content).slice(0, 1000);
+        if (/\[REDACTED/.test(content)) continue;
+        this.db
+          .prepare(
+            "INSERT INTO chat_memories(id,user_id,scope,repository_id,category,content,source_session_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+          )
+          .run(
+            id,
+            userId,
+            memory.scope,
+            memory.scope === "repository"
+              ? (memory.repositoryId ?? null)
+              : null,
+            memory.category,
+            content,
+            null,
+            memory.createdAt,
+            memory.updatedAt,
+          );
+      }
+      if (typeof backup.memoryEnabled === "boolean")
+        await this.setMemoryEnabled(userId, backup.memoryEnabled);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   private hydrate(row: SessionRow): ChatSession {

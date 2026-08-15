@@ -52,7 +52,7 @@ The included local workspace adapter makes the complete flow usable on a trusted
 
 ## Quick start
 
-Requirements: Node.js 22.5+ and npm. Chat memory uses the built-in local SQLite driver; no hosted database or paid vector service is required.
+Requirements: Node.js 22.13+ and npm. Chat memory uses the built-in local SQLite driver; no hosted database or paid vector service is required.
 
 ```bash
 npm install
