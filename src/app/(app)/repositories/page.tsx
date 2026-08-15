@@ -7,6 +7,7 @@ import {
   Search,
   Unlock,
 } from "lucide-react";
+import { CreateRepositoryForm } from "@/components/create-repository-form";
 import {
   ConnectPrompt,
   EmptyState,
@@ -41,7 +42,7 @@ export default async function RepositoriesPage() {
       <PageHeading
         eyebrow="Source control"
         title="Connected repositories"
-        description="Only repositories authorized through your GitHub account are available to the agent."
+        description="Create a repository or choose one already authorized through your GitHub account."
         actions={
           <Link href="/api/auth/github" className="btn-secondary">
             <Github className="size-4" aria-hidden="true" /> Refresh
@@ -72,7 +73,9 @@ export default async function RepositoriesPage() {
         </div>
       ) : (
         <>
-          <div className="mt-6 flex flex-col gap-3 sm:flex-row">
+          <CreateRepositoryForm />
+
+          <div className="mt-7 flex flex-col gap-3 sm:flex-row">
             <label className="relative flex-1">
               <span className="sr-only">Search repositories</span>
               <Search
@@ -171,12 +174,13 @@ export default async function RepositoriesPage() {
           />
           <p className="text-[11px] leading-5 text-slate">
             <strong className="text-navy">Permission boundary.</strong> Valmont
-            reads authorized repositories and creates only{" "}
+            creates a repository only when you submit the form above. Within
+            authorized repositories, it creates only{" "}
             <code className="rounded bg-ivory-100 px-1 py-0.5 text-navy">
               valmont/*
             </code>{" "}
-            branches after final approval. It cannot change repository settings,
-            merge pull requests, or deploy.
+            branches after final approval. It cannot delete repositories, change
+            repository settings, merge pull requests, or deploy.
           </p>
         </div>
       </div>

@@ -111,3 +111,31 @@ export interface RepositorySummary {
   language: string;
   updatedAt: string;
 }
+
+export interface ChatRepositoryContext {
+  id: string;
+  owner: string;
+  name: string;
+  fullName: string;
+  baseBranch: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+export interface ChatSession {
+  id: string;
+  userId: string;
+  title: string;
+  repository?: ChatRepositoryContext;
+  messages: ChatMessage[];
+  createdAt: string;
+  updatedAt: string;
+}

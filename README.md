@@ -1,16 +1,18 @@
 # Valmont Agent
 
-Valmont Agent is a private, web-based AI coding agent with explicit human approval before implementation and again before a pull request. It can inspect an authorized GitHub repository, generate a context-grounded plan, apply model-generated file changes in a restricted workspace, run approved validations, and create a reviewed `valmont/*` pull request.
+Valmont Agent is a private, web-based software assistant with reopenable conversations and explicit human approval before coding and again before a pull request. It can discuss general questions or read-only repository context, hand a reviewed conversation into a coding task, generate a context-grounded plan, apply model-generated file changes in a restricted workspace, run approved validations, and create a reviewed `valmont/*` pull request.
 
 > **Safety boundary:** Valmont never merges, deploys, force-pushes, changes repository settings, or writes to protected/base branches. A pull request requires an explicit final approval.
 
 ## What works
 
 - GitHub OAuth with encrypted, short-lived, `HttpOnly`, `SameSite=Lax` session data
-- Authorized repository listing, bounded source-tree retrieval, archive download, branch/commit, and pull-request operations
+- Authorized repository listing plus explicit GitHub repository creation with user-selected name and private/public visibility
+- Bounded source-tree retrieval, archive download, branch/commit, and pull-request operations
 - Actual model-generated file creation, modification, and deletion inside a generated task workspace
 - Approved dependency/test/lint/type-check/build command execution with real output and diffs
 - Persisted approval-first task state machine and visible audit timeline
+- **Chat with Valmont** for normal, reopenable conversations, with optional read-only repository/branch context and an explicit conversation-to-task handoff
 - Repository retrieval with sensitive/generated/binary path exclusions, bounded files, lexical/symbol search, and secret redaction
 - Provider-neutral `ModelProvider` supporting chat, structured output, tools, streaming, usage, and normalized errors
 - OpenAI-compatible server adapter configured only through server environment variables
@@ -58,23 +60,24 @@ cp .env.example .env.local # set GitHub, model, and session values
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Configure `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `MODEL_API_KEY` first — without them Valmont reports what is missing rather than showing sample data. Then connect GitHub, submit a task against a selected branch, approve the grounded plan, inspect the actual validation output and diff, and give final approval to create the real pull request.
+Open [http://localhost:3000](http://localhost:3000). Configure `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `MODEL_API_KEY` first — without them Valmont reports what is missing rather than showing sample data. Then connect GitHub, create or choose a repository, submit a task against a selected branch, approve the grounded plan, inspect the actual validation output and diff, and give final approval to create the real pull request.
 
 ## Environment configuration
 
 Valmont requires `SESSION_SECRET`, the GitHub OAuth pair, and `MODEL_API_KEY`. Never prefix model or GitHub secrets with `NEXT_PUBLIC_`.
 
-| Variable                     | Purpose                                               |
-| ---------------------------- | ----------------------------------------------------- |
-| `DATABASE_URL`               | PostgreSQL connection URL                             |
-| `SESSION_SECRET`             | 32+ random bytes for AES-GCM OAuth session encryption |
-| `APP_URL`                    | Public origin, e.g. `http://localhost:3000`           |
-| `GITHUB_CLIENT_ID`           | GitHub OAuth App client ID                            |
-| `GITHUB_CLIENT_SECRET`       | GitHub OAuth App secret                               |
-| `MODEL_BASE_URL`             | OpenAI-compatible `/v1` base URL                      |
-| `MODEL_API_KEY`              | Server-only model API key                             |
-| `MODEL_NAME`                 | Provider model identifier                             |
-| `VALMONT_COMMAND_TIMEOUT_MS` | Per-command validation timeout (default 180000)       |
+| Variable                     | Purpose                                                         |
+| ---------------------------- | --------------------------------------------------------------- |
+| `DATABASE_URL`               | PostgreSQL connection URL                                       |
+| `CHAT_STORE_PATH`            | Optional local chat JSON path (default `.data/chat-store.json`) |
+| `SESSION_SECRET`             | 32+ random bytes for AES-GCM OAuth session encryption           |
+| `APP_URL`                    | Public origin, e.g. `http://localhost:3000`                     |
+| `GITHUB_CLIENT_ID`           | GitHub OAuth App client ID                                      |
+| `GITHUB_CLIENT_SECRET`       | GitHub OAuth App secret                                         |
+| `MODEL_BASE_URL`             | OpenAI-compatible `/v1` base URL                                |
+| `MODEL_API_KEY`              | Server-only model API key                                       |
+| `MODEL_NAME`                 | Provider model identifier                                       |
+| `VALMONT_COMMAND_TIMEOUT_MS` | Per-command validation timeout (default 180000)                 |
 
 See `.env.example` for placeholders.
 
@@ -85,7 +88,13 @@ See `.env.example` for placeholders.
 3. Set `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and a strong `SESSION_SECRET`.
 4. Restart the app and choose **Connect GitHub**.
 
-The MVP requests `read:user user:email repo`. GitHub's OAuth `repo` scope is needed to read and create branches/PRs in private repositories; GitHub OAuth does not expose a narrower private-repository write scope. For a multi-tenant production deployment, prefer a GitHub App with repository selection and Contents/Pull requests permissions only. Valmont's adapter additionally allows writes only to `valmont/*` branches and has no merge method.
+The MVP requests `read:user user:email repo`. GitHub's OAuth `repo` scope is needed to create repositories and to read or create branches/PRs in private repositories; GitHub OAuth does not expose a narrower private-repository write scope. For a multi-tenant production deployment, prefer a GitHub App with carefully reviewed repository administration/creation behavior and repository-selected Contents/Pull requests permissions. Valmont's adapter additionally allows content writes only to `valmont/*` branches and has no merge method.
+
+### GitHub repository creation
+
+The protected **Repositories** page has an explicit creation form for a user-selected name, optional description, and `private` or `public` visibility. **Private is the client and server default.** Submitting the form calls GitHub's authenticated-user repository endpoint and initializes a README so a default branch exists immediately. The resulting repository can then be selected for a chat or approval-gated coding task.
+
+Creation is a direct user action, not a model tool: it requires an authenticated session, same-origin CSRF token, validated bounded input, and a stricter per-IP rate limit. Valmont exposes no repository deletion or settings-editing operation. A public selection is visually explicit and is never inferred from a prompt.
 
 ### Model provider
 
@@ -98,6 +107,12 @@ MODEL_NAME=gpt-4.1-mini
 ```
 
 Credentials are read only in server modules. Add another provider by implementing `ModelProvider` in `src/lib/models`; the workflow does not need to change.
+
+### Chat with Valmont
+
+Chat sessions are separate from coding tasks. A session can be general, or it can use bounded, redacted, read-only context from one authorized GitHub repository and branch. The chat model receives no workspace or GitHub write tools and cannot modify files. When a conversation is ready for implementation, **Create coding task** copies a redacted, editable transcript into the existing task form; the normal plan and final approval gates still apply.
+
+Reopenable sessions and messages are stored locally in ignored `.data/chat-store.json` by default. Set `CHAT_STORE_PATH` only if a different server-local path is needed. High-confidence secret patterns are redacted before messages are sent or persisted, but chat history is still sensitive local data: do not paste credentials, restrict filesystem access, and include the store in an intentional backup/deletion policy. Retrieved repository files are not persisted in the chat store.
 
 ### PostgreSQL
 

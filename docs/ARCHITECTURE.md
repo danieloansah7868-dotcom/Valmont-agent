@@ -4,7 +4,24 @@
 
 Valmont is an approval-first orchestration layer between an authorized GitHub repository, a model provider, and an isolated workspace. Its design keeps provider-specific code at the edges and makes unsafe capabilities absent rather than merely discouraged in prompts.
 
-## Request flow
+## Chat flow
+
+1. GitHub OAuth establishes a short-lived encrypted server session.
+2. The user creates a general chat or selects one authorized repository and branch for that session.
+3. Each message is validated, rate-limited, and redacted. Repository-aware chats recheck authorization and retrieve only bounded, filtered, redacted text from the selected branch.
+4. The ordinary `ModelProvider.chat()` interface receives conversation history and optional read-only context. No workspace or GitHub write capability is present in the chat route.
+5. Redacted user and assistant turns are persisted in the user-owned local chat store so several sessions can be reopened independently. Retrieved repository files are never persisted with the chat.
+6. **Create coding task** produces an editable transcript draft in the separate task form. It does not mutate the conversation or authorize any code operation.
+
+## Repository creation flow
+
+1. The authenticated user opens the protected repositories page and explicitly enters a repository name, optional description, and private/public visibility. Private is the client and server default.
+2. The mutation passes same-origin and double-submit CSRF checks, a creation-specific rate limit, and bounded Zod validation.
+3. `GitHubApiProvider.createRepository()` calls the fixed GitHub `/user/repos` endpoint with `auto_init: true`; the user input cannot select a host, owner, or arbitrary API path.
+4. The created repository summary is returned to the UI and the authorized list is refreshed. No model participates, and no chat or task approval state is changed.
+5. The provider exposes no repository deletion or settings-editing method. Subsequent file changes still require a separate coding task and both approvals.
+
+## Coding task request flow
 
 1. GitHub OAuth establishes a short-lived encrypted server session.
 2. The user selects an authorized repository/base branch and submits a bounded task description.
@@ -45,8 +62,9 @@ Planning/execution/PR creation can fail; pending states can be cancelled. Termin
 
 ### GitHub providers
 
-`GitHubProvider` defines repository tree/file reads, bounded archive download, and branch/commit/PR writes. Planning retrieves ranked source directly through GitHub APIs. After plan approval, the authorized base-branch archive is filtered and copied into the generated workspace. `GitHubApiProvider`:
+`GitHubProvider` defines explicit authenticated-user repository creation, repository tree/file reads, bounded archive download, and branch/commit/PR writes. Planning retrieves ranked source directly through GitHub APIs. After plan approval, the authorized base-branch archive is filtered and copied into the generated workspace. `GitHubApiProvider`:
 
+- creates an initialized repository only from a bounded name, description, and private/public choice supplied by the protected form;
 - validates owners, repositories, refs, and file paths;
 - refuses non-`valmont/*` write branches;
 - updates refs with `force: false`;
@@ -84,7 +102,9 @@ Drizzle/PostgreSQL entities:
 - model/tool executions
 - pull request records
 
-`PostgresTaskStore` is selected automatically when `DATABASE_URL` is configured and enforces session ownership in every task query. It hydrates normalized event, approval, tool, and pull-request records. Raw repository content and prompts are not stored in these tables. Account token ciphertext is explicitly server-only. The JSON fallback store uses `.data/task-store.json`, atomic rename writes, and a process-local serialization queue; it starts empty and is never seeded with fixtures.
+`PostgresTaskStore` is selected automatically when `DATABASE_URL` is configured and enforces session ownership in every task query. It hydrates normalized event, approval, tool, and pull-request records. Raw repository content and assembled model prompts are not stored in these tables. Account token ciphertext is explicitly server-only. The task JSON fallback uses `.data/task-store.json`, atomic rename writes, and a process-local serialization queue; it starts empty and is never seeded with fixtures.
+
+`JsonChatStore` persists user-owned session metadata and redacted message history in ignored `.data/chat-store.json` (or `CHAT_STORE_PATH`). Every get/list/delete operation includes the authenticated GitHub user ID, returned objects are cloned, and writes use a process-local queue plus atomic replacement. Repository context is deliberately absent from persisted messages; it is retrieved again after authorization checks for each repository-aware turn. This local-first store is intended for the trusted self-hosted runtime. A multi-instance production deployment must replace it with a transactional, encrypted, user-scoped store and retention/deletion controls.
 
 ### Web security
 

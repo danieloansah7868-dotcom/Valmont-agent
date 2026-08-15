@@ -26,7 +26,7 @@ export function safeApiError(error: unknown) {
   const status =
     error instanceof NotConnectedError
       ? 401
-      : message === "Task not found"
+      : message === "Task not found" || message === "Chat not found"
         ? 404
         : message.includes("CSRF") || message.includes("Cross-origin")
           ? 403

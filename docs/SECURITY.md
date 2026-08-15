@@ -4,30 +4,35 @@ This document describes the MVP's boundaries and the additional controls require
 
 ## Assets
 
-- GitHub OAuth tokens and repository authorization
+- GitHub OAuth tokens, repository authorization, and repository visibility
 - model provider credentials
 - private source code and documentation
 - workspace files and command output
 - approval records and audit history
 - user/session identity
+- locally persisted Chat with Valmont conversation history
 
-Valmont must not read or transmit `.env` files, credentials, private keys, payment data, or customer-record exports. Raw source content is not stored in the application database.
+Valmont must not read or transmit `.env` files, credentials, private keys, payment data, or customer-record exports. Raw source and retrieved repository context are not stored in the application database or chat store. Reopenable chat messages are intentionally persisted after redaction in the ignored local chat JSON file and must be treated as sensitive user data.
 
 ## Trust boundaries
 
 1. **Browser ↔ Next.js:** browser input is untrusted. Mutations require same origin, a double-submit CSRF token, Zod validation, and rate checks.
 2. **Next.js ↔ GitHub/model:** credentials are server-only. OAuth session payloads are AES-256-GCM encrypted and placed in short-lived HttpOnly cookies. Production should store token ciphertext in PostgreSQL/KMS-backed storage and keep only an opaque hashed session ID in the cookie.
-3. **Repository ↔ retrieval/model:** repository content is adversarial, including prompt injection. Path exclusion, content bounds, lexical selection, redaction, structured output, tool validation, and capability gates apply independently of model instructions.
-4. **Agent ↔ workspace:** generated paths and commands are adversarial. Only explicit provider methods are exposed. There is no arbitrary shell tool.
-5. **Workspace ↔ host/network:** the included local adapter is not a secure isolation boundary. Production must replace it.
+3. **Repository creation ↔ GitHub:** creation is an explicit authenticated form mutation, not a model capability. The server fixes the GitHub host, endpoint, authenticated owner, and README initialization; the user controls only validated metadata and private/public visibility.
+4. **Repository ↔ retrieval/model:** repository content is adversarial, including prompt injection. Path exclusion, content bounds, lexical selection, redaction, structured output, tool validation, and capability gates apply independently of model instructions. Chat marks repository excerpts as untrusted and exposes no write tools.
+5. **Chat ↔ coding workflow:** a chat has no workspace or GitHub mutation capability. Its only handoff is an editable task-form draft; task creation and both approval gates remain separate server-side operations.
+6. **Agent ↔ workspace:** generated paths and commands are adversarial. Only explicit provider methods are exposed. There is no arbitrary shell tool.
+7. **Workspace ↔ host/network:** the included local adapter is not a secure isolation boundary. Production must replace it.
 
 ## Threats and MVP controls
 
 | Threat                                  | Controls                                                                                                                                                |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Credential leakage to browser/model/log | server-only env variables; sensitive path exclusion; redaction; no raw prompts/source in DB                                                             |
+| Credential leakage to browser/model/log | server-only env variables; sensitive path exclusion; redaction; no raw repository context in persistence; local chat-history access controls            |
 | OAuth CSRF/session tampering            | random OAuth state; AES-GCM authenticated encryption; HttpOnly, SameSite, Secure-in-production cookies; expiry                                          |
 | Cross-site mutation                     | same-origin check; double-submit CSRF token; JSON APIs                                                                                                  |
+| Unauthorized repository creation        | authenticated session; fixed GitHub endpoint/owner; Zod validation; creation-specific rate limit; no model tool or deletion/settings method             |
+| Accidental public repository            | private client/server default; explicit private/public selection; visibility echoed after creation                                                      |
 | Path traversal/symlink escape           | absolute-path and NUL rejection; resolved-root prefix check; `realpath` verification; symlink component rejection; workspace roots under generated base |
 | Arbitrary command execution             | exact command-to-argv map; `shell: false`; no command interpolation; timeout; process-group kill; output cap; deployment/migration denylist             |
 | Malicious repository script             | npm lifecycle hooks disabled where possible; **not fully mitigated locally**—requires container sandbox and egress policy                               |
@@ -41,11 +46,17 @@ Valmont must not read or transmit `.env` files, credentials, private keys, payme
 
 ## Approval semantics
 
+Repository creation is separate from model-driven coding: submitting the repository form is the direct user authorization for that immediate GitHub operation. It does not authorize later file changes, and it does not bypass task approvals.
+
 - **Plan approval** authorizes only the plan's workspace edits and allowlisted validation commands.
 - **Final approval** separately authorizes branch, commit, and pull-request creation.
 - A rejection cancels the task. Reopening requires a new/revised task.
 - Approvals are checked in domain code, not only hidden/disabled UI.
 - Pull requests remain open for human review. Valmont does not merge or deploy.
+
+## Local chat data
+
+`JsonChatStore` writes redacted conversation turns to `.data/chat-store.json` with owner-only file mode where the platform supports it. `.data/` is ignored by Git. Secret redaction is defense in depth, not a guarantee that arbitrary confidential prose can be recognized, so users must not paste credentials or regulated/customer data. Operators should restrict host access and define backup, retention, and secure deletion practices. Repository excerpts used to answer a turn are not written into chat history.
 
 ## Local workspace warning
 
