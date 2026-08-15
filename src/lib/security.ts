@@ -14,18 +14,24 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
     /(-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)[\s\S]*?(-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/g,
     "[REDACTED_PRIVATE_KEY]",
   ],
-  [
-    /((?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*)[^\s,;]+/gi,
-    "$1[REDACTED]",
-  ],
   [/(postgres(?:ql)?:\/\/[^:\s/]+:)[^@\s]+@/gi, "$1[REDACTED]@"],
 ];
 
+const NAMED_SECRET_PATTERN =
+  /((?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*)([^\s,;]+)/gi;
+const DOCUMENTATION_SECRET_PLACEHOLDERS = new Set(["replace-me"]);
+
 export function redactSecrets(value: string): string {
-  return SECRET_PATTERNS.reduce(
-    (redacted, [pattern, replacement]) =>
-      redacted.replace(pattern, replacement),
+  const redacted = SECRET_PATTERNS.reduce(
+    (current, [pattern, replacement]) => current.replace(pattern, replacement),
     value,
+  );
+  return redacted.replace(
+    NAMED_SECRET_PATTERN,
+    (match, prefix: string, candidate: string) =>
+      DOCUMENTATION_SECRET_PLACEHOLDERS.has(candidate.toLowerCase())
+        ? match
+        : `${prefix}[REDACTED]`,
   );
 }
 
@@ -41,7 +47,7 @@ export function containsLikelySecret(value: string): boolean {
 }
 
 function sessionKey(secret = process.env.SESSION_SECRET): Buffer {
-  if (!secret) throw new Error("SESSION_SECRET is required outside demo mode");
+  if (!secret) throw new Error("SESSION_SECRET is required");
   return createHash("sha256").update(secret).digest();
 }
 

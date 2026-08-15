@@ -1,8 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
-import { getGitHubProvider, getSessionUser } from "@/lib/auth";
-import { DemoGitHubProvider } from "@/lib/github/demo";
+import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { assertCsrf } from "@/lib/security";
 import { getTaskStore } from "@/lib/task-store";
 import { TaskWorkflowService } from "@/lib/workflow";
@@ -23,18 +22,11 @@ export async function POST(
     assertApiRateLimit(request, "task-action", 20);
     const { id } = await context.params;
     const input = actionInput.parse(await request.json());
-    const user = await getSessionUser();
+    const user = await requireApiSessionUser();
     const store = getTaskStore(user);
     const existing = await store.get(id);
     if (!existing) throw new Error("Task not found");
-    const github = existing.demo
-      ? new DemoGitHubProvider()
-      : await getGitHubProvider();
-    if (!existing.demo && github.demo) {
-      throw new Error(
-        "Your GitHub session expired. Reconnect GitHub before continuing.",
-      );
-    }
+    const github = await getGitHubProvider();
     const workflow = new TaskWorkflowService(store, github);
     const task =
       input.action === "approve_plan"

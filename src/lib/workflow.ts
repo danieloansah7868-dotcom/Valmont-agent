@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
-import { DemoGitHubProvider } from "@/lib/github/demo";
 import {
   retrieveGitHubContext,
   selectWorkspaceContextPaths,
@@ -126,21 +125,33 @@ interface CreateTaskInput {
   repositoryId: string;
   repositoryName: string;
   baseBranch: string;
-  demo: boolean;
 }
 
 export class TaskWorkflowService {
+  private modelProvider?: ModelProvider;
+  private readonly workspace: WorkspaceProvider;
+  private readonly sourceBaseDirectory: string;
+
   constructor(
     private readonly store: TaskStore,
-    private readonly github: GitHubProvider = new DemoGitHubProvider(),
-    private readonly model: ModelProvider = createModelProvider(),
-    private readonly workspace: WorkspaceProvider = createWorkspaceProvider(),
-    private readonly sourceBaseDirectory = path.join(
-      process.cwd(),
-      ".data",
-      "sources",
-    ),
-  ) {}
+    private readonly github: GitHubProvider,
+    model?: ModelProvider,
+    workspace?: WorkspaceProvider,
+    sourceBaseDirectory = path.join(process.cwd(), ".data", "sources"),
+  ) {
+    this.modelProvider = model;
+    this.workspace = workspace ?? createWorkspaceProvider();
+    this.sourceBaseDirectory = sourceBaseDirectory;
+  }
+
+  /**
+   * Resolved lazily so approval actions that never need the model (rejections)
+   * do not fail when only GitHub is configured.
+   */
+  private get model(): ModelProvider {
+    this.modelProvider ??= createModelProvider();
+    return this.modelProvider;
+  }
 
   async create(input: CreateTaskInput): Promise<CodingTask> {
     const timestamp = now();
@@ -155,7 +166,6 @@ export class TaskWorkflowService {
       state: "draft",
       createdAt: timestamp,
       updatedAt: timestamp,
-      demo: input.demo,
       validations: [],
       events: [],
       approvals: [],
@@ -177,94 +187,63 @@ export class TaskWorkflowService {
     );
 
     let context: GitHubContextFile[] = [];
-    if (task.demo) {
+    try {
+      const [owner, repository] = repositoryParts(task.repositoryName);
+      const started = Date.now();
+      const retrieval = await retrieveGitHubContext(
+        this.github,
+        owner,
+        repository,
+        task.baseBranch,
+        `${task.title}\n${task.description}`,
+      );
+      context = retrieval.files;
       this.tool(
         task,
         "list_files",
-        "Repository root with sensitive-path filters",
-        "Found 148 source and documentation files (demo repository data)",
-        73,
+        `${task.repositoryName}@${task.baseBranch}`,
+        `Inspected ${retrieval.totalFiles} allowed repository paths`,
+        Date.now() - started,
       );
       this.tool(
         task,
         "search_code",
         `Task terms: ${input.title.slice(0, 100)}`,
-        "Ranked 7 source files by filename, symbol, and exact-text relevance (demo data)",
-        126,
+        `Ranked ${context.length} files by filename, symbols, and relevant source content`,
+        Date.now() - started,
       );
       this.tool(
         task,
         "read_file",
-        "Top-ranked source and test files only",
-        "Retrieved a bounded, redacted context window from 4 files (demo data)",
-        102,
+        context
+          .map((file) => file.path)
+          .join(", ")
+          .slice(0, 1_000),
+        `Retrieved ${context.length} bounded text files; sensitive paths and secret patterns were excluded`,
+        Date.now() - started,
       );
       this.event(
         task,
         "tool",
         "Repository context retrieved",
-        "Demo repository context was used. No GitHub request was made.",
+        "Authorized GitHub source was filtered, minimized, and redacted before model use.",
         "agent",
       );
-    } else {
-      try {
-        const [owner, repository] = repositoryParts(task.repositoryName);
-        const started = Date.now();
-        const retrieval = await retrieveGitHubContext(
-          this.github,
-          owner,
-          repository,
-          task.baseBranch,
-          `${task.title}\n${task.description}`,
-        );
-        context = retrieval.files;
-        this.tool(
-          task,
-          "list_files",
-          `${task.repositoryName}@${task.baseBranch}`,
-          `Inspected ${retrieval.totalFiles} allowed repository paths`,
-          Date.now() - started,
-        );
-        this.tool(
-          task,
-          "search_code",
-          `Task terms: ${input.title.slice(0, 100)}`,
-          `Ranked ${context.length} files by filename, symbols, and relevant source content`,
-          Date.now() - started,
-        );
-        this.tool(
-          task,
-          "read_file",
-          context
-            .map((file) => file.path)
-            .join(", ")
-            .slice(0, 1_000),
-          `Retrieved ${context.length} bounded text files; sensitive paths and secret patterns were excluded`,
-          Date.now() - started,
-        );
-        this.event(
-          task,
-          "tool",
-          "Repository context retrieved",
-          "Authorized GitHub source was filtered, minimized, and redacted before model use.",
-          "agent",
-        );
-      } catch (error) {
-        this.event(
-          task,
-          "error",
-          "Repository inspection failed",
-          safeError(error),
-          "system",
-        );
-        await this.transition(
-          task,
-          "failed",
-          "Planning failed",
-          "No repository files were changed.",
-        );
-        return task;
-      }
+    } catch (error) {
+      this.event(
+        task,
+        "error",
+        "Repository inspection failed",
+        safeError(error),
+        "system",
+      );
+      await this.transition(
+        task,
+        "failed",
+        "Planning failed",
+        "No repository files were changed.",
+      );
+      return task;
     }
 
     try {
@@ -273,9 +252,7 @@ export class TaskWorkflowService {
         task,
         "model",
         "Implementation plan prepared",
-        task.plan.generatedBy === "demo"
-          ? "Deterministic demo planner produced this plan; no external model was called."
-          : `The server-side ${this.model.id} model produced a structured plan from retrieved repository context.`,
+        `The server-side ${this.model.id} model produced a structured plan from retrieved repository context.`,
         "agent",
       );
       await this.transition(
@@ -302,10 +279,7 @@ export class TaskWorkflowService {
     return task;
   }
 
-  async approvePlan(
-    taskId: string,
-    actorId = "demo-user",
-  ): Promise<CodingTask> {
+  async approvePlan(taskId: string, actorId: string): Promise<CodingTask> {
     const task = await this.required(taskId);
     if (task.state !== "awaiting_plan_approval") {
       throw new Error(
@@ -325,14 +299,11 @@ export class TaskWorkflowService {
       task,
       "executing",
       "Isolated execution started",
-      task.demo
-        ? "A deterministic demo patch is being applied in the labelled demo workspace."
-        : "Authorized source is being changed only inside the generated task workspace.",
+      "Authorized source is being changed only inside the generated task workspace.",
     );
 
     try {
-      if (task.demo) await this.executeDemo(task);
-      else await this.executeReal(task);
+      await this.execute(task);
     } catch (error) {
       this.event(task, "error", "Execution failed", safeError(error), "system");
       if (canTransition(task.state, "failed")) {
@@ -352,7 +323,7 @@ export class TaskWorkflowService {
   async reject(
     taskId: string,
     stage: "plan" | "final",
-    actorId = "demo-user",
+    actorId: string,
   ): Promise<CodingTask> {
     const task = await this.required(taskId);
     const expected =
@@ -376,10 +347,7 @@ export class TaskWorkflowService {
     return task;
   }
 
-  async approveFinal(
-    taskId: string,
-    actorId = "demo-user",
-  ): Promise<CodingTask> {
+  async approveFinal(taskId: string, actorId: string): Promise<CodingTask> {
     const task = await this.required(taskId);
     if (task.state !== "awaiting_final_approval") {
       throw new Error(
@@ -418,46 +386,37 @@ export class TaskWorkflowService {
         task,
         "github.create_branch",
         `${task.baseBranch} → ${branch}`,
-        this.github.demo
-          ? "Demo branch recorded"
-          : "Working branch created with force updates disabled",
+        "Working branch created with force updates disabled",
         0,
       );
 
-      if (this.github.demo) {
-        await this.github.commitFiles(owner, repository, branch, task.title, [
-          { path: "demo-change.tsx", content: "// demo" },
-        ]);
-        this.tool(task, "github.commit", branch, "Demo commit recorded", 0);
-      } else {
-        const handle = await this.workspace.open(task.id);
-        const changed = await this.workspace.listChangedFiles(handle);
-        if (changed.length === 0)
-          throw new Error("Workspace has no approved changes to commit");
-        const files: FileChange[] = await Promise.all(
-          changed.map(async (file) => ({
-            path: file.path,
-            content:
-              file.status === "deleted"
-                ? null
-                : await this.workspace.readFileForCommit(handle, file.path),
-          })),
-        );
-        const commitSha = await this.github.commitFiles(
-          owner,
-          repository,
-          branch,
-          task.title,
-          files,
-        );
-        this.tool(
-          task,
-          "github.commit",
-          `${files.length} approved files`,
-          `Created commit ${commitSha.slice(0, 12)} on ${branch}`,
-          0,
-        );
-      }
+      const handle = await this.workspace.open(task.id);
+      const changed = await this.workspace.listChangedFiles(handle);
+      if (changed.length === 0)
+        throw new Error("Workspace has no approved changes to commit");
+      const files: FileChange[] = await Promise.all(
+        changed.map(async (file) => ({
+          path: file.path,
+          content:
+            file.status === "deleted"
+              ? null
+              : await this.workspace.readFileForCommit(handle, file.path),
+        })),
+      );
+      const commitSha = await this.github.commitFiles(
+        owner,
+        repository,
+        branch,
+        task.title,
+        files,
+      );
+      this.tool(
+        task,
+        "github.commit",
+        `${files.length} approved files`,
+        `Created commit ${commitSha.slice(0, 12)} on ${branch}`,
+        0,
+      );
 
       const created = await this.github.createPullRequest(
         owner,
@@ -477,23 +436,20 @@ export class TaskWorkflowService {
         branch: created.branch,
         baseBranch: created.baseBranch,
         status: "open",
-        demo: this.github.demo,
         createdAt: now(),
       };
       this.tool(
         task,
         "github.create_pull_request",
         `${branch} → ${task.baseBranch}`,
-        `Pull request #${created.number} opened${this.github.demo ? " (demo data)" : ""}`,
+        `Pull request #${created.number} opened`,
         0,
       );
       this.event(
         task,
         "system",
         `Pull request #${created.number} created`,
-        this.github.demo
-          ? "Demo PR result recorded; no GitHub write occurred."
-          : "The pull request is open for human review. It was not merged or deployed.",
+        "The pull request is open for human review. It was not merged or deployed.",
         "agent",
       );
       await this.transition(
@@ -531,52 +487,7 @@ export class TaskWorkflowService {
     throw new Error("Unreachable");
   }
 
-  private async executeDemo(task: CodingTask): Promise<void> {
-    this.tool(
-      task,
-      "apply_patch",
-      "2 approved source/test files",
-      "Applied 31 additions and 4 deletions in demo workspace data",
-      184,
-    );
-    this.tool(
-      task,
-      "git_status",
-      "Workspace only",
-      "2 modified files; no untracked secrets",
-      31,
-    );
-    task.diff = demoDiff(task);
-    this.tool(
-      task,
-      "git_diff",
-      "No external diff tools; color disabled",
-      "35 changed lines captured and redacted for review",
-      42,
-    );
-    await this.transition(
-      task,
-      "testing",
-      "Approved validation started",
-      "Only allowlisted commands from the approved plan may run.",
-    );
-    task.validations = demoValidations();
-    for (const validation of task.validations)
-      this.recordValidation(task, validation);
-    await this.transition(
-      task,
-      "awaiting_final_approval",
-      "Final approval required",
-      "Review the complete diff and validation output. No branch or pull request exists yet.",
-    );
-  }
-
-  private async executeReal(task: CodingTask): Promise<void> {
-    if (this.github.demo || this.model.demo) {
-      throw new Error(
-        "Real execution requires both GitHub and model credentials",
-      );
-    }
+  private async execute(task: CodingTask): Promise<void> {
     const [owner, repository] = repositoryParts(task.repositoryName);
     const sourceStarted = Date.now();
     const sourceRoot = await prepareRepositorySource(
@@ -734,7 +645,7 @@ export class TaskWorkflowService {
                   additionalProperties: false,
                   required: ["operation", "path", "content", "rationale"],
                   properties: {
-                    operation: { const: "write" },
+                    operation: { type: "string", enum: ["write"] },
                     path: { type: "string" },
                     content: { type: "string" },
                     rationale: { type: "string" },
@@ -745,7 +656,7 @@ export class TaskWorkflowService {
                   additionalProperties: false,
                   required: ["operation", "path", "rationale"],
                   properties: {
-                    operation: { const: "delete" },
+                    operation: { type: "string", enum: ["delete"] },
                     path: { type: "string" },
                     rationale: { type: "string" },
                   },
@@ -783,7 +694,6 @@ export class TaskWorkflowService {
     task: CodingTask,
     context: GitHubContextFile[],
   ): Promise<TaskPlan> {
-    if (this.model.demo || task.demo) return demoPlan(task);
     const sourceContext = context
       .map((file) => `\n--- FILE: ${file.path} ---\n${file.content}`)
       .join("\n")
@@ -1026,107 +936,6 @@ function slug(value: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 48);
-}
-
-function demoPlan(task: CodingTask): TaskPlan {
-  return {
-    summary: `Implement “${task.title}” with a focused source change and regression coverage, while preserving existing behavior outside the requested path.`,
-    risk: "low",
-    generatedBy: "demo",
-    validationCommands: ["npm test", "npm run typecheck", "npm run lint"],
-    steps: [
-      {
-        title: "Update the focused feature path",
-        description:
-          "Make the smallest implementation change needed for the requested behavior, reusing existing project conventions.",
-        files: ["src/features/projects/project-grid.tsx"],
-      },
-      {
-        title: "Add regression coverage",
-        description:
-          "Cover the new behavior and retain a test for the existing populated state.",
-        files: ["src/features/projects/project-grid.test.tsx"],
-      },
-      {
-        title: "Validate the patch",
-        description:
-          "Run the approved test, type-check, and lint commands in the restricted workspace.",
-        files: [],
-      },
-    ],
-  };
-}
-
-function demoValidations(): ValidationResult[] {
-  return [
-    {
-      command: "npm test",
-      status: "passed",
-      output:
-        "✓ src/features/projects/project-grid.test.tsx (4 tests) 182ms\nTest Files  1 passed (1)\nTests       4 passed (4)",
-      durationMs: 1_284,
-    },
-    {
-      command: "npm run typecheck",
-      status: "passed",
-      output:
-        "> atlas-web@2.4.0 typecheck\n> tsc --noEmit\nType check completed with 0 errors.",
-      durationMs: 2_146,
-    },
-    {
-      command: "npm run lint",
-      status: "passed",
-      output:
-        "> atlas-web@2.4.0 lint\n> eslint .\nLint completed with 0 warnings.",
-      durationMs: 1_732,
-    },
-  ];
-}
-
-function demoDiff(task: CodingTask): string {
-  return `diff --git a/src/features/projects/project-grid.tsx b/src/features/projects/project-grid.tsx
-index 8a22b1c..f13da49 100644
---- a/src/features/projects/project-grid.tsx
-+++ b/src/features/projects/project-grid.tsx
-@@ -2,10 +2,21 @@ import { ProjectCard } from "./project-card";
-+import { EmptyState } from "@/components/empty-state";
-+import { FolderPlus } from "lucide-react";
- 
- export function ProjectGrid({ projects }: ProjectGridProps) {
-+  if (projects.length === 0) {
-+    return (
-+      <EmptyState
-+        icon={FolderPlus}
-+        title="No projects yet"
-+        description="Create your first project to start organizing this workspace."
-+        action={{ label: "Create project", href: "/projects/new" }}
-+      />
-+    );
-+  }
-+
-   return <div className="project-grid">{projects.map(renderProject)}</div>;
- }
-diff --git a/src/features/projects/project-grid.test.tsx b/src/features/projects/project-grid.test.tsx
-index c981cc0..8336de1 100644
---- a/src/features/projects/project-grid.test.tsx
-+++ b/src/features/projects/project-grid.test.tsx
-@@ -8,6 +8,16 @@ describe("ProjectGrid", () => {
-+  it("offers a create action when no projects exist", () => {
-+    render(<ProjectGrid projects={[]} />);
-+
-+    expect(screen.getByRole("heading", { name: "No projects yet" })).toBeVisible();
-+    expect(screen.getByRole("link", { name: "Create project" })).toHaveAttribute(
-+      "href",
-+      "/projects/new",
-+    );
-+  });
-+
-   it("renders available projects", () => {
-     render(<ProjectGrid projects={[project]} />);
-     expect(screen.getByText(project.name)).toBeVisible();
-   });
- });
-# Demo patch generated for task: ${task.title}`;
 }
 
 function pullRequestBody(task: CodingTask): string {

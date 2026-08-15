@@ -1,19 +1,66 @@
 @import "tailwindcss";
 
+/*
+ * Valmont brand system.
+ * Palette extracted from valmontweb.com:
+ *   navy blue #0A1F44 · orange #E8822B · warm ivory #ECE9DE
+ *   valmont blue #14446C · slate #606678
+ * Copper drives primary actions, navy drives strong surfaces and headings,
+ * ivory warms page backgrounds, blue carries secondary navigation, and slate
+ * supports body copy. Green/red remain reserved for passed/failed status only.
+ */
+@theme {
+  --color-navy: #0a1f44;
+  --color-navy-900: #06152f;
+  --color-navy-800: #0d2953;
+  --color-navy-700: #143467;
+  --color-navy-600: #1d447f;
+
+  --color-copper: #e8822b;
+  --color-copper-700: #9e4e11;
+  --color-copper-600: #d26e1c;
+  --color-copper-300: #f3b77c;
+  --color-copper-100: #fbe6d1;
+  --color-copper-50: #fef6ee;
+
+  --color-ivory: #ece9de;
+  --color-ivory-200: #e3dfd1;
+  --color-ivory-100: #f2efe6;
+  --color-ivory-50: #f8f6f0;
+
+  --color-brandblue: #14446c;
+  --color-brandblue-700: #0f3455;
+  --color-brandblue-600: #1b5688;
+  --color-brandblue-200: #bcd2e3;
+  --color-brandblue-100: #dbe7f0;
+  --color-brandblue-50: #eef4f9;
+
+  --color-slate: #606678;
+  --color-slate-700: #464b5b;
+  --color-slate-500: #767c8d;
+  --color-slate-400: #8b90a0;
+  --color-slate-200: #c9ccd5;
+  --color-slate-100: #e5e7ec;
+
+  --color-line: #dcd8cb;
+  --color-line-strong: #c5bfae;
+  --color-line-cool: #dfe2e8;
+  --color-paper: #ffffff;
+
+  --color-pass: #1f7a54;
+  --color-pass-strong: #17603f;
+  --color-pass-soft: #e6f2ec;
+  --color-fail: #b3392f;
+  --color-fail-strong: #8f2b23;
+  --color-fail-soft: #fbeceb;
+
+  --color-attention: #a2661a;
+  --color-attention-soft: #fbf1e0;
+}
+
 :root {
-  --ink: #14211d;
-  --muted: #66736e;
-  --line: #dce4df;
-  --paper: #ffffff;
-  --wash: #f5f7f5;
-  --green: #1f6b4f;
-  --green-dark: #174f3c;
-  --green-soft: #e8f4ee;
-  --amber: #a15c12;
-  --amber-soft: #fff6df;
-  --red: #b33939;
-  --red-soft: #fdf0ef;
-  --navy: #213b4b;
+  color-scheme: light;
+  --shadow-brand: 0 18px 48px rgb(9 21 52 / 0.12);
 }
 
 * {
@@ -21,14 +68,16 @@
 }
 
 html {
-  background: var(--wash);
-  color: var(--ink);
+  background: var(--color-ivory-50);
+  color: var(--color-navy);
   scroll-behavior: smooth;
 }
 
 body {
   min-height: 100vh;
   margin: 0;
+  background: var(--color-ivory-50);
+  color: var(--color-navy);
   font-family:
     "Inter", "Avenir Next", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   font-feature-settings:
@@ -37,13 +86,11 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-button,
-a,
-input,
-textarea,
-select {
-  outline-color: var(--green);
-  outline-offset: 2px;
+h1,
+h2,
+h3,
+h4 {
+  color: var(--color-navy);
 }
 
 button,
@@ -51,19 +98,29 @@ a {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* Visible, consistent copper focus ring everywhere. */
+:focus-visible {
+  outline: 2px solid var(--color-copper);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
 ::selection {
-  background: #c8e6d7;
+  background: var(--color-copper-100);
+  color: var(--color-navy);
 }
 
 .text-balance {
   text-wrap: balance;
 }
 
+/* ---------- surfaces ---------- */
+
 .card {
-  border: 1px solid var(--line);
+  border: 1px solid var(--color-line);
   border-radius: 14px;
-  background: var(--paper);
-  box-shadow: 0 1px 2px rgb(20 33 29 / 0.03);
+  background: var(--color-paper);
+  box-shadow: 0 1px 2px rgb(9 21 52 / 0.04);
 }
 
 .card-hover {
@@ -74,15 +131,28 @@ a {
 }
 
 .card-hover:hover {
-  border-color: #bbc9c0;
-  box-shadow: 0 8px 24px rgb(20 33 29 / 0.07);
+  border-color: var(--color-copper-300);
+  box-shadow: 0 10px 28px rgb(9 21 52 / 0.09);
   transform: translateY(-1px);
 }
+
+.panel-navy {
+  border-radius: 14px;
+  background: linear-gradient(
+    155deg,
+    var(--color-navy) 0%,
+    var(--color-navy-700) 100%
+  );
+  color: var(--color-ivory);
+}
+
+/* ---------- buttons ---------- */
 
 .btn-primary,
 .btn-secondary,
 .btn-danger,
-.btn-quiet {
+.btn-quiet,
+.btn-inverse {
   display: inline-flex;
   min-height: 40px;
   align-items: center;
@@ -93,66 +163,101 @@ a {
   font-size: 14px;
   font-weight: 650;
   line-height: 1;
-  transition: all 150ms ease;
+  text-align: center;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    box-shadow 150ms ease;
   cursor: pointer;
 }
 
+/* Navy on orange reads 5.93:1; white on this orange is only 3.51:1 and fails AA. */
 .btn-primary {
-  border: 1px solid var(--green);
-  background: var(--green);
-  color: white;
-  box-shadow: inset 0 1px rgb(255 255 255 / 0.12);
+  border: 1px solid var(--color-copper);
+  background: var(--color-copper);
+  color: var(--color-navy);
+  font-weight: 650;
+  box-shadow: inset 0 1px rgb(255 255 255 / 0.22);
 }
 
 .btn-primary:hover {
-  border-color: var(--green-dark);
-  background: var(--green-dark);
+  border-color: var(--color-copper-600);
+  background: var(--color-copper-600);
 }
 
 .btn-secondary {
-  border: 1px solid #cdd7d1;
-  background: white;
-  color: var(--ink);
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-paper);
+  color: var(--color-navy);
 }
 
 .btn-secondary:hover {
-  border-color: #aebeb4;
-  background: #f8faf8;
+  border-color: var(--color-copper);
+  background: var(--color-copper-50);
+  color: var(--color-copper-700);
+}
+
+.btn-inverse {
+  border: 1px solid rgb(236 233 222 / 0.34);
+  background: rgb(236 233 222 / 0.08);
+  color: var(--color-ivory);
+}
+
+.btn-inverse:hover {
+  border-color: var(--color-copper);
+  background: rgb(194 110 46 / 0.18);
+  color: #ffffff;
 }
 
 .btn-danger {
-  border: 1px solid #e4b9b6;
-  background: white;
-  color: #9e3030;
+  border: 1px solid #e0b7b3;
+  background: var(--color-paper);
+  color: var(--color-fail-strong);
 }
 
 .btn-danger:hover {
-  background: var(--red-soft);
+  border-color: var(--color-fail);
+  background: var(--color-fail-soft);
 }
 
 .btn-quiet {
   border: 1px solid transparent;
   background: transparent;
-  color: var(--muted);
+  color: var(--color-slate);
 }
 
 .btn-quiet:hover {
-  background: #edf1ee;
-  color: var(--ink);
+  background: var(--color-ivory-100);
+  color: var(--color-navy);
 }
 
 .btn-primary:disabled,
 .btn-secondary:disabled,
 .btn-danger:disabled,
-.btn-quiet:disabled {
+.btn-quiet:disabled,
+.btn-inverse:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
 
+.link-brand {
+  color: var(--color-brandblue);
+  font-weight: 650;
+  text-underline-offset: 3px;
+}
+
+.link-brand:hover {
+  color: var(--color-copper-700);
+  text-decoration: underline;
+}
+
+/* ---------- forms ---------- */
+
 .label {
   display: block;
   margin-bottom: 7px;
-  color: #34443e;
+  color: var(--color-navy);
   font-size: 13px;
   font-weight: 650;
 }
@@ -161,10 +266,10 @@ a {
 .textarea,
 .select {
   width: 100%;
-  border: 1px solid #cbd6cf;
+  border: 1px solid var(--color-line-strong);
   border-radius: 9px;
-  background: white;
-  color: var(--ink);
+  background: var(--color-paper);
+  color: var(--color-navy);
   font-size: 14px;
   transition:
     border-color 120ms ease,
@@ -187,47 +292,78 @@ a {
 .input:focus,
 .textarea:focus,
 .select:focus {
-  border-color: var(--green);
-  box-shadow: 0 0 0 3px rgb(31 107 79 / 0.1);
+  border-color: var(--color-copper);
+  box-shadow: 0 0 0 3px rgb(194 110 46 / 0.18);
   outline: none;
 }
 
 .input::placeholder,
 .textarea::placeholder {
-  color: #95a19c;
+  color: var(--color-slate-400);
+}
+
+/* ---------- code, diff, timeline ---------- */
+
+.code-surface {
+  background: var(--color-navy-900);
+  color: #d9dde6;
 }
 
 .code-scroll {
-  scrollbar-color: #61726a #15241f;
+  scrollbar-color: #3a4666 var(--color-navy-900);
   scrollbar-width: thin;
 }
 
 .diff-line-add {
-  background: rgb(50 142 88 / 0.16);
-  color: #c5f1d3;
+  background: rgb(31 122 84 / 0.24);
+  color: #b9ebd0;
 }
 
 .diff-line-remove {
-  background: rgb(190 70 70 / 0.15);
-  color: #ffd1cf;
+  background: rgb(179 57 47 / 0.24);
+  color: #f7c5c0;
 }
 
 .diff-line-meta {
-  color: #8dbda8;
+  color: var(--color-copper-300);
 }
+
+/* ---------- loading ---------- */
 
 .skeleton {
-  animation: pulse 1.6s ease-in-out infinite;
-  background: #e8ede9;
+  border-radius: 8px;
+  animation: valmont-pulse 1.6s ease-in-out infinite;
+  background: var(--color-ivory-200);
 }
 
-@keyframes pulse {
+@keyframes valmont-pulse {
   0%,
   100% {
-    opacity: 0.55;
+    opacity: 0.5;
   }
   50% {
     opacity: 1;
+  }
+}
+
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgb(255 255 255 / 0.4);
+  border-top-color: #ffffff;
+  border-radius: 9999px;
+  animation: valmont-spin 700ms linear infinite;
+}
+
+.spinner-brand {
+  border-color: var(--color-copper-100);
+  border-top-color: var(--color-copper);
+}
+
+@keyframes valmont-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 

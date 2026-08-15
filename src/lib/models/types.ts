@@ -67,7 +67,6 @@ export interface ModelProvider {
   readonly id: string;
   readonly model: string;
   readonly supportsStreaming: boolean;
-  readonly demo: boolean;
   chat(request: ChatRequest): Promise<ModelResponse>;
   structured<T>(
     request: StructuredRequest<T>,

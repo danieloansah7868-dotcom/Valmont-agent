@@ -24,7 +24,7 @@ export interface TaskPlan {
   steps: PlanStep[];
   validationCommands: string[];
   risk: "low" | "medium" | "high";
-  generatedBy: "demo" | "model";
+  generatedBy: "model";
 }
 
 export interface TaskEvent {
@@ -76,13 +76,12 @@ export interface PullRequestRecord {
   branch: string;
   baseBranch: string;
   status: "open";
-  demo: boolean;
   createdAt: string;
 }
 
 export interface CodingTask {
   id: string;
-  /** Session owner; required by the PostgreSQL store and omitted only by legacy demo fixtures. */
+  /** Session owner; required by the PostgreSQL store. */
   userId?: string;
   title: string;
   description: string;
@@ -99,7 +98,6 @@ export interface CodingTask {
   approvals: Approval[];
   toolExecutions: ToolExecution[];
   pullRequest?: PullRequestRecord;
-  demo: boolean;
 }
 
 export interface RepositorySummary {
@@ -112,5 +110,4 @@ export interface RepositorySummary {
   private: boolean;
   language: string;
   updatedAt: string;
-  demo: boolean;
 }

@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { NotConnectedError } from "@/lib/auth";
 import { checkRateLimit } from "@/lib/security";
 
 export function clientKey(request: NextRequest): string {
@@ -23,12 +24,14 @@ export function safeApiError(error: unknown) {
   const message =
     error instanceof Error ? error.message : "Unexpected request failure";
   const status =
-    message === "Task not found"
-      ? 404
-      : message.includes("CSRF") || message.includes("Cross-origin")
-        ? 403
-        : message.includes("Rate limit")
-          ? 429
-          : 400;
+    error instanceof NotConnectedError
+      ? 401
+      : message === "Task not found"
+        ? 404
+        : message.includes("CSRF") || message.includes("Cross-origin")
+          ? 403
+          : message.includes("Rate limit")
+            ? 429
+            : 400;
   return NextResponse.json({ error: message }, { status });
 }

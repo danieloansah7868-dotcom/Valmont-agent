@@ -6,24 +6,32 @@ export default function SecurityPage() {
     <div className="mx-auto max-w-[800px] px-4 py-8 sm:px-7">
       <Link
         href="/settings"
-        className="inline-flex items-center gap-1.5 text-xs font-bold text-[#27674f]"
+        className="inline-flex items-center gap-1.5 text-xs font-bold text-slate transition-colors hover:text-copper-700"
       >
-        <ArrowLeft className="size-3.5" /> Settings
+        <ArrowLeft className="size-3.5" aria-hidden="true" /> Settings
       </Link>
-      <div className="card mt-6 p-6 sm:p-8">
-        <div className="flex items-center gap-2">
-          <ShieldCheck className="size-5 text-[#2b7154]" />
-          <h1 className="text-2xl font-bold tracking-[-0.03em]">
-            Security model
-          </h1>
+
+      <div className="card mt-6 overflow-hidden">
+        <div className="bg-navy px-6 py-7 sm:px-8">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="size-5 text-copper" aria-hidden="true" />
+            <h1 className="text-2xl font-bold tracking-[-0.03em] text-ivory">
+              Security model
+            </h1>
+          </div>
+          <p className="mt-3 max-w-2xl text-sm leading-6 text-ivory/70">
+            Valmont is designed around explicit approval, bounded retrieval,
+            restricted tools, and an immutable audit trail. It never merges or
+            deploys.
+          </p>
         </div>
-        <p className="mt-4 text-sm leading-6 text-[#66756d]">
-          Valmont is designed around explicit approval, bounded retrieval,
-          restricted tools, and an immutable audit trail. It never merges or
-          deploys.
-        </p>
-        <div className="mt-7 space-y-6">
+
+        <div className="space-y-6 p-6 sm:p-8">
           {[
+            [
+              "Live-only runtime",
+              "Valmont has no demo or sample-data mode. It never substitutes fictional repository data, plans, patches, validations, or pull-request results: when a credential is missing it names the unset variable and asks you to connect GitHub or configure a model provider.",
+            ],
             [
               "Trust boundaries",
               "The browser never receives model or GitHub credentials. OAuth session data is encrypted with AES-256-GCM and stored in a short-lived, HttpOnly, SameSite cookie.",
@@ -45,18 +53,23 @@ export default function SecurityPage() {
               "Use ephemeral containers or an external sandbox with network egress controls, PostgreSQL, a distributed rate limiter, managed encryption keys, centralized audit logs, and regular credential rotation.",
             ],
           ].map(([title, copy]) => (
-            <section key={title}>
-              <h2 className="text-sm font-bold">{title}</h2>
-              <p className="mt-2 text-[12px] leading-6 text-[#6d7973]">
-                {copy}
-              </p>
+            <section
+              key={title}
+              className="border-l-2 border-copper-300 pl-4 sm:pl-5"
+            >
+              <h2 className="text-sm font-bold text-navy">{title}</h2>
+              <p className="mt-2 text-[12px] leading-6 text-slate">{copy}</p>
             </section>
           ))}
+
+          <p className="border-t border-line pt-6 text-[11px] text-slate">
+            For the detailed threat model and assumptions, see{" "}
+            <code className="rounded bg-ivory-100 px-1 py-0.5 text-navy">
+              docs/SECURITY.md
+            </code>{" "}
+            in the repository.
+          </p>
         </div>
-        <p className="mt-8 text-[11px] text-[#849089]">
-          For the detailed threat model and assumptions, see{" "}
-          <code>docs/SECURITY.md</code> in the repository.
-        </p>
       </div>
     </div>
   );

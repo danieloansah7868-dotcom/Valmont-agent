@@ -37,6 +37,84 @@ interface OpenAIResponse {
   error?: { code?: string; message?: string };
 }
 
+interface ProviderErrorDetails {
+  code?: string;
+  message?: string;
+}
+
+function jsonTypeOf(value: unknown): string | undefined {
+  if (value === null) return "null";
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? "integer" : "number";
+  }
+  if (typeof value === "string" || typeof value === "boolean") {
+    return typeof value;
+  }
+  return undefined;
+}
+
+/**
+ * OpenAI-compatible providers implement different JSON Schema subsets.
+ * Gemini rejects `const`, but accepts an enum containing one value. Normalize
+ * recursively while callers continue to enforce the original runtime contract.
+ */
+function compatibleJsonSchema(
+  schema: Record<string, unknown>,
+): Record<string, unknown> {
+  const normalized = Object.fromEntries(
+    Object.entries(schema).map(([key, value]) => [
+      key,
+      Array.isArray(value)
+        ? value.map((item) =>
+            item && typeof item === "object" && !Array.isArray(item)
+              ? compatibleJsonSchema(item as Record<string, unknown>)
+              : item,
+          )
+        : value && typeof value === "object"
+          ? compatibleJsonSchema(value as Record<string, unknown>)
+          : value,
+    ]),
+  );
+
+  if (Object.prototype.hasOwnProperty.call(normalized, "const")) {
+    const literal = normalized.const;
+    delete normalized.const;
+    if (!Object.prototype.hasOwnProperty.call(normalized, "enum")) {
+      normalized.enum = [literal];
+    }
+    if (!Object.prototype.hasOwnProperty.call(normalized, "type")) {
+      const type = jsonTypeOf(literal);
+      if (type) normalized.type = type;
+    }
+  }
+
+  return normalized;
+}
+
+function extractProviderError(payload: unknown): ProviderErrorDetails {
+  const candidates = Array.isArray(payload) ? payload : [payload];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const error = (candidate as { error?: unknown }).error;
+    if (!error || typeof error !== "object") continue;
+
+    const { code, message } = error as {
+      code?: unknown;
+      message?: unknown;
+    };
+    return {
+      code:
+        typeof code === "string" || typeof code === "number"
+          ? String(code)
+          : undefined,
+      message: typeof message === "string" ? message : undefined,
+    };
+  }
+
+  return {};
+}
+
 export class ModelProviderError extends Error implements ModelError {
   provider: string;
   code: string;
@@ -57,7 +135,6 @@ export class OpenAICompatibleProvider implements ModelProvider {
   readonly id: string;
   readonly model: string;
   readonly supportsStreaming = true;
-  readonly demo = false;
   private readonly apiKey: string;
   private readonly baseUrl: string;
   private readonly fetcher: typeof fetch;
@@ -87,7 +164,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         json_schema: {
           name: request.schemaName,
           strict: true,
-          schema: request.jsonSchema,
+          schema: compatibleJsonSchema(request.jsonSchema),
         },
       },
     };
@@ -169,7 +246,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
               function: {
                 name: tool.name,
                 description: tool.description,
-                parameters: tool.inputSchema,
+                parameters: compatibleJsonSchema(tool.inputSchema),
               },
             })),
           }
@@ -203,9 +280,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
     let message = `Model provider request failed (${response.status})`;
     let code = "provider_error";
     try {
-      const payload = (await response.json()) as OpenAIResponse;
-      message = payload.error?.message ?? message;
-      code = payload.error?.code ?? code;
+      const providerError = extractProviderError(await response.json());
+      message = providerError.message ?? message;
+      code = providerError.code ?? code;
     } catch {
       // Provider did not return JSON; use the safe status-only message.
     }

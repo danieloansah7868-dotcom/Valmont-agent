@@ -1,8 +1,28 @@
 import type { NextConfig } from "next";
 
+const isDev = process.env.NODE_ENV !== "production";
+
+/**
+ * Dev-only Content-Security-Policy.
+ *
+ * React's development build uses eval() to rebuild callstacks across
+ * environments, and Turbopack serves HMR chunks that the browser may request
+ * from 127.0.0.1 even when the server is bound to 0.0.0.0. Production keeps the
+ * strict policy below with no 'unsafe-eval' and no websocket origins.
+ */
+const scriptSrc = isDev
+  ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
+  : "script-src 'self' 'unsafe-inline'";
+const connectSrc = isDev
+  ? "connect-src 'self' ws: wss: http://localhost:3000 http://127.0.0.1:3000"
+  : "connect-src 'self'";
+
 const nextConfig: NextConfig = {
   output: "standalone",
   poweredByHeader: false,
+  // Browsers reach the 0.0.0.0 dev server as localhost/127.0.0.1; both must be
+  // allowed or Next.js blocks the HMR and chunk requests as cross-origin.
+  allowedDevOrigins: ["localhost", "127.0.0.1"],
   experimental: {
     typedEnv: false,
   },
@@ -20,8 +40,16 @@ const nextConfig: NextConfig = {
           },
           {
             key: "Content-Security-Policy",
-            value:
-              "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self' https://github.com;",
+            value: [
+              "default-src 'self'",
+              scriptSrc,
+              "style-src 'self' 'unsafe-inline'",
+              "img-src 'self' data: https://avatars.githubusercontent.com",
+              connectSrc,
+              "frame-ancestors 'self'",
+              "base-uri 'self'",
+              "form-action 'self' https://github.com",
+            ].join("; "),
           },
         ],
       },

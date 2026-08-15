@@ -19,11 +19,34 @@ Valmont Agent is a private, web-based AI coding agent with explicit human approv
 - Typed Drizzle ORM schema, migration, and session-scoped PostgreSQL task store for every required workflow entity
 - CSRF double-submit protection, same-origin checks, basic rate limiting, security headers, input validation, and audit events
 
-### Demo mode
+## Brand
 
-With no credentials, the app starts in a clearly labelled demo mode. Repository data, plans, patches, validation output, branches, and PR results are deterministic sample data. The interface never claims these came from GitHub or a real model. Demo tasks persist to `.data/demo-store.json`, which is ignored by Git.
+The interface uses the Valmont Web visual identity from [valmontweb.com](https://valmontweb.com):
 
-When GitHub, model, session, and database settings are configured, new non-demo tasks use actual authorized repository content and produce real pull requests after both approvals. The included local workspace adapter makes the complete flow usable on a trusted self-hosted machine. Before allowing untrusted repositories or users, replace it with an ephemeral container or external sandbox `WorkspaceProvider` as described below.
+| Token        | Hex       | Usage                                     |
+| ------------ | --------- | ----------------------------------------- |
+| Navy blue    | `#0A1F44` | Strong backgrounds, sidebar, headings     |
+| Orange       | `#E8822B` | Primary actions and approval boundaries   |
+| Warm ivory   | `#ECE9DE` | Page backgrounds and inverse text         |
+| Valmont blue | `#14446C` | Secondary navigation and informational UI |
+| Slate        | `#606678` | Supporting body text                      |
+
+Palette tokens live in the `@theme` block of `src/app/globals.css` and are consumed as Tailwind utilities (`bg-navy`, `text-copper`, `bg-ivory-50`, `text-brandblue`, `text-slate`). The `copper` token carries the orange ramp. Green and red are reserved exclusively for passed/failed validation status. Focus rings are orange and visible on every interactive element.
+
+Primary buttons use navy text on orange (5.93:1) because white on this orange measures only 3.51:1 and fails WCAG AA. Orange on navy is 5.93:1, ivory on navy is 13.37:1.
+
+### Live only
+
+Valmont has a single runtime. It always runs against real GitHub repositories, your configured model provider, and real workspace execution. There is no demo mode, no sample-data flag, and no fixture fallback anywhere in the product, so the application can never invent repository data, plans, patches, validation output, diffs, branches, or pull-request results:
+
+- unauthenticated visitors are redirected to connect GitHub instead of being given a fictional workspace;
+- `createModelProvider()` throws when `MODEL_API_KEY` is missing rather than substituting a deterministic planner;
+- the API returns `401` with a clear "connect GitHub" message, and the UI renders a connect prompt listing the exact server variables still required;
+- `/api/health` reports `degraded` with a `missingConfiguration` list until every required variable is set.
+
+Missing credentials fail loudly and name the unset variable. Nothing is fabricated to fill the gap.
+
+The included local workspace adapter makes the complete flow usable on a trusted self-hosted machine. Before allowing untrusted repositories or users, replace it with an ephemeral container or external sandbox `WorkspaceProvider` as described below.
 
 ## Quick start
 
@@ -31,15 +54,15 @@ Requirements: Node.js 20.9+ (Node 22 recommended) and npm.
 
 ```bash
 npm install
-cp .env.example .env.local # optional; leave integrations blank for demo mode
+cp .env.example .env.local # set GitHub, model, and session values
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). With no credentials, try the seeded demo task. With all integrations configured, connect GitHub, submit a task against a selected branch, approve the grounded plan, inspect the actual validation output and diff, and give final approval to create the real pull request.
+Open [http://localhost:3000](http://localhost:3000). Configure `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `MODEL_API_KEY` first — without them Valmont reports what is missing rather than showing sample data. Then connect GitHub, submit a task against a selected branch, approve the grounded plan, inspect the actual validation output and diff, and give final approval to create the real pull request.
 
 ## Environment configuration
 
-All values are optional in local demo mode. Never prefix model or GitHub secrets with `NEXT_PUBLIC_`.
+Valmont requires `SESSION_SECRET`, the GitHub OAuth pair, and `MODEL_API_KEY`. Never prefix model or GitHub secrets with `NEXT_PUBLIC_`.
 
 | Variable                     | Purpose                                               |
 | ---------------------------- | ----------------------------------------------------- |
@@ -81,10 +104,9 @@ Credentials are read only in server modules. Add another provider by implementin
 ```bash
 createdb valmont
 npm run db:migrate
-npm run db:seed # optional sample row
 ```
 
-The migration is in `src/db/migrations`. When `DATABASE_URL` is set, Valmont automatically selects the session-scoped PostgreSQL task store and persists tasks, events, approvals, tool executions, validations, diffs, and pull-request records. Without it, demo mode uses an ignored local JSON store so the application remains immediately runnable.
+Migrations are in `src/db/migrations`. When `DATABASE_URL` is set, Valmont automatically selects the session-scoped PostgreSQL task store and persists tasks, events, approvals, tool executions, validations, diffs, and pull-request records. Without it, tasks fall back to an ignored local JSON store so the application remains runnable during setup.
 
 ## Scripts
 
@@ -106,7 +128,7 @@ npm run db:migrate     # apply PostgreSQL migrations
 - `src/components` — application UI and approval controls
 - `src/lib/workflow.ts` — persisted workflow orchestration and approval gates
 - `src/lib/models` — provider-neutral model contract and adapters
-- `src/lib/github` — GitHub contract, API adapter, and labelled demo adapter
+- `src/lib/github` — GitHub contract and API adapter
 - `src/lib/retrieval.ts` — repository filtering and lexical retrieval
 - `src/lib/workspace.ts` — sandbox contract and restricted development adapter
 - `src/db` — Drizzle schema and SQL migrations

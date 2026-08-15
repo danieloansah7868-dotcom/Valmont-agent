@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { DemoModelProvider } from "@/lib/models/demo";
-import { createModelProvider } from "@/lib/models";
+import { createModelProvider, tryCreateModelProvider } from "@/lib/models";
 import { OpenAICompatibleProvider } from "@/lib/models/openai-compatible";
 import type { ModelProvider } from "@/lib/models/types";
 
@@ -12,16 +11,22 @@ function acceptsProvider(provider: ModelProvider): string {
 }
 
 describe("model provider abstraction", () => {
-  it("selects clearly labelled demo mode without credentials", async () => {
-    const provider = createModelProvider({});
-    expect(provider).toBeInstanceOf(DemoModelProvider);
-    expect(provider.demo).toBe(true);
-    expect(acceptsProvider(provider)).toBe("demo-provider");
-    const response = await provider.chat({
-      messages: [{ role: "user", content: "hello" }],
-    });
-    expect(response.content).toMatch(/Demo mode/);
-    expect(response.usage.totalTokens).toBe(0);
+  it("refuses to fabricate output when no credentials are set", () => {
+    expect(() => createModelProvider({})).toThrow(/MODEL_API_KEY/);
+    expect(tryCreateModelProvider({})).toBeNull();
+  });
+
+  it("ignores a legacy ENABLE_DEMO_MODE variable", () => {
+    expect(() => createModelProvider({ ENABLE_DEMO_MODE: "true" })).toThrow(
+      /MODEL_API_KEY/,
+    );
+    expect(tryCreateModelProvider({ ENABLE_DEMO_MODE: "true" })).toBeNull();
+  });
+
+  it("builds an OpenAI-compatible provider from real credentials", () => {
+    const provider = createModelProvider({ MODEL_API_KEY: "server-only-key" });
+    expect(provider).toBeInstanceOf(OpenAICompatibleProvider);
+    expect(acceptsProvider(provider)).toBe("openai-compatible");
   });
 
   it("normalizes chat, usage, and tool calls from OpenAI-compatible APIs", async () => {
@@ -109,7 +114,10 @@ describe("model provider abstraction", () => {
     });
     const result = await provider.structured({
       schemaName: "answer",
-      jsonSchema: { type: "object" },
+      jsonSchema: {
+        type: "object",
+        properties: { operation: { const: "write" } },
+      },
       messages: [],
       validate(value) {
         const data = value as { answer?: number };
@@ -118,8 +126,59 @@ describe("model provider abstraction", () => {
       },
     });
     expect(result.data).toEqual({ answer: 42 });
+    const requestBody = JSON.parse(String(fetcher.mock.calls[0]![1]!.body)) as {
+      response_format: {
+        type: string;
+        json_schema: {
+          schema: {
+            properties: {
+              operation: Record<string, unknown>;
+            };
+          };
+        };
+      };
+    };
+    expect(requestBody.response_format.type).toBe("json_schema");
     expect(
-      JSON.parse(String(fetcher.mock.calls[0]![1]!.body)).response_format.type,
-    ).toBe("json_schema");
+      requestBody.response_format.json_schema.schema.properties.operation,
+    ).toEqual({ enum: ["write"], type: "string" });
+    expect(JSON.stringify(requestBody)).not.toContain('"const"');
+  });
+
+  it("surfaces messages from Gemini array-wrapped provider errors", async () => {
+    const fetcher = vi.fn(async (input: FetchInput, init?: FetchInit) => {
+      void input;
+      void init;
+      return new Response(
+        JSON.stringify([
+          {
+            error: {
+              code: 400,
+              message: 'Unknown name "const" at schema.properties[0]',
+              status: "INVALID_ARGUMENT",
+            },
+          },
+        ]),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    });
+    const provider = new OpenAICompatibleProvider({
+      apiKey: "key",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+      model: "gemini-test",
+      fetcher,
+    });
+
+    await expect(
+      provider.structured({
+        schemaName: "answer",
+        jsonSchema: { type: "object" },
+        messages: [],
+        validate: (value) => value,
+      }),
+    ).rejects.toMatchObject({
+      message: 'Unknown name "const" at schema.properties[0]',
+      code: "400",
+    });
   });
 });

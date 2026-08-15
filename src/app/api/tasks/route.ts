@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
-import { getGitHubProvider, getSessionUser } from "@/lib/auth";
+import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { createModelProvider } from "@/lib/models";
 import { assertCsrf } from "@/lib/security";
 import { getTaskStore } from "@/lib/task-store";
@@ -15,8 +15,12 @@ const taskInput = z.object({
 });
 
 export async function GET() {
-  const user = await getSessionUser();
-  return NextResponse.json({ tasks: await getTaskStore(user).list() });
+  try {
+    const user = await requireApiSessionUser();
+    return NextResponse.json({ tasks: await getTaskStore(user).list() });
+  } catch (error) {
+    return safeApiError(error);
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -24,6 +28,7 @@ export async function POST(request: NextRequest) {
     assertCsrf(request);
     assertApiRateLimit(request, "create-task", 10);
     const input = taskInput.parse(await request.json());
+    const user = await requireApiSessionUser();
     const github = await getGitHubProvider();
     const repositories = await github.listRepositories();
     const repository = repositories.find(
@@ -37,13 +42,11 @@ export async function POST(request: NextRequest) {
     if (!branches.includes(input.baseBranch))
       throw new Error("Select a valid base branch");
     const model = createModelProvider();
-    const user = await getSessionUser();
     const workflow = new TaskWorkflowService(getTaskStore(user), github, model);
     const task = await workflow.create({
       ...input,
       userId: user.id,
       repositoryName: repository.fullName,
-      demo: github.demo || model.demo || user.demo,
     });
     return NextResponse.json({ task }, { status: 201 });
   } catch (error) {

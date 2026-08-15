@@ -1,8 +1,43 @@
 import { describe, expect, it } from "vitest";
-import { DemoGitHubProvider } from "@/lib/github/demo";
+import type {
+  CreatedPullRequest,
+  GitHubProvider,
+  RepositoryFile,
+} from "@/lib/github/types";
 import type { TaskStore } from "@/lib/task-store";
 import type { CodingTask } from "@/lib/types";
 import { TaskWorkflowService } from "@/lib/workflow";
+
+/** A GitHub provider that fails loudly: the guards under test must run first. */
+class UnusedGitHub implements GitHubProvider {
+  private fail(): never {
+    throw new Error("GitHub must not be contacted before final approval");
+  }
+  async listRepositories(): Promise<never> {
+    this.fail();
+  }
+  async listBranches(): Promise<never> {
+    this.fail();
+  }
+  async listFiles(): Promise<never> {
+    this.fail();
+  }
+  async downloadArchive(): Promise<never> {
+    this.fail();
+  }
+  async readFile(): Promise<RepositoryFile> {
+    this.fail();
+  }
+  async createBranch(): Promise<never> {
+    this.fail();
+  }
+  async commitFiles(): Promise<string> {
+    this.fail();
+  }
+  async createPullRequest(): Promise<CreatedPullRequest> {
+    this.fail();
+  }
+}
 
 class MemoryStore implements TaskStore {
   constructor(private task: CodingTask) {}
@@ -43,7 +78,6 @@ function finalTask(approved: boolean): CodingTask {
           },
         ]
       : [],
-    demo: true,
   };
 }
 
@@ -51,7 +85,7 @@ describe("pull request workflow guard", () => {
   it("prevents PR creation without a final approval", async () => {
     const service = new TaskWorkflowService(
       new MemoryStore(finalTask(false)),
-      new DemoGitHubProvider(),
+      new UnusedGitHub(),
     );
     await expect(
       service.createPullRequestWithoutApproval("task-test"),
@@ -70,7 +104,7 @@ describe("pull request workflow guard", () => {
     });
     const service = new TaskWorkflowService(
       new MemoryStore(task),
-      new DemoGitHubProvider(),
+      new UnusedGitHub(),
     );
     await expect(
       service.createPullRequestWithoutApproval(task.id),

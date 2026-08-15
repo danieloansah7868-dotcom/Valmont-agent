@@ -16,8 +16,6 @@ export async function prepareRepositorySource(
   ref: string,
   baseDirectory = path.join(process.cwd(), ".data", "sources"),
 ): Promise<string> {
-  if (github.demo)
-    throw new Error("Demo repositories do not expose real source archives");
   if (!/^[a-zA-Z0-9_-]{3,80}$/.test(taskId))
     throw new Error("Invalid task identifier");
   const taskRoot = path.join(path.resolve(baseDirectory), taskId);

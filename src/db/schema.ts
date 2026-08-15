@@ -138,7 +138,6 @@ export const codingTasks = pgTable(
       .$type<ValidationResult[]>()
       .notNull()
       .default([]),
-    isDemo: boolean("is_demo").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -260,7 +259,6 @@ export const pullRequests = pgTable("pull_requests", {
   branch: text("branch").notNull(),
   baseBranch: text("base_branch").notNull(),
   status: text("status").notNull().default("open"),
-  isDemo: boolean("is_demo").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

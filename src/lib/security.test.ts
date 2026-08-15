@@ -24,6 +24,15 @@ describe("secret security", () => {
     expect(output).toContain("[REDACTED");
   });
 
+  it("preserves explicit documentation placeholders", () => {
+    expect(redactSecrets("MODEL_API_KEY=replace-me")).toBe(
+      "MODEL_API_KEY=replace-me",
+    );
+    expect(redactSecrets("MODEL_API_KEY=actual-secret-value")).toBe(
+      "MODEL_API_KEY=[REDACTED]",
+    );
+  });
+
   it("blocks high-confidence generated secrets before commit", () => {
     expect(
       containsLikelySecret("const key = 'sk-proj-abcdefghijklmnopqrstuv';"),

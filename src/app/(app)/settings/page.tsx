@@ -6,67 +6,111 @@ import {
   Github,
   KeyRound,
   LockKeyhole,
+  Radio,
   Server,
   ShieldCheck,
 } from "lucide-react";
-import { DemoBadge } from "@/components/demo-badge";
-import { getSessionUser, githubConfigured } from "@/lib/auth";
-import { createModelProvider } from "@/lib/models";
+import { PageHeading } from "@/components/states";
+import { githubConfigured, requireSessionUser } from "@/lib/auth";
+import { missingLiveRequirements } from "@/lib/config";
+import { tryCreateModelProvider } from "@/lib/models";
 
 export const dynamic = "force-dynamic";
 
 export default async function SettingsPage() {
-  const user = await getSessionUser();
-  const model = createModelProvider();
+  const user = await requireSessionUser();
+  const model = tryCreateModelProvider();
+  const modelReady = Boolean(model);
   const githubReady = githubConfigured();
   const databaseReady = Boolean(process.env.DATABASE_URL);
+  const missing = missingLiveRequirements();
+  const liveReady = missing.length === 0;
+
   return (
     <div className="mx-auto max-w-[940px] px-4 py-7 sm:px-7 sm:py-9">
-      <div>
-        <div className="flex items-center gap-2">
-          <p className="text-[12px] font-bold tracking-[0.08em] text-[#6c7b74] uppercase">
-            Workspace configuration
-          </p>
-          {user.demo && <DemoBadge compact />}
-        </div>
-        <h1 className="mt-1.5 text-[29px] font-bold tracking-[-0.035em]">
-          Settings & integrations
-        </h1>
-        <p className="mt-2 text-sm text-[#6b7872]">
-          Provider credentials are read from server environment variables and
-          never sent to the browser.
-        </p>
-      </div>
+      <PageHeading
+        eyebrow="Workspace configuration"
+        title="Settings & integrations"
+        description="Provider credentials are read from server environment variables and never sent to the browser."
+      />
 
-      <section className="card mt-7 overflow-hidden">
-        <div className="border-b border-[#e2e8e4] px-5 py-4 sm:px-6">
-          <h2 className="text-sm font-bold">Integration status</h2>
-          <p className="mt-1 text-[11px] text-[#7b8781]">
+      {/* Valmont has a single runtime: live. There is no demo fallback. */}
+      <section className="mt-7 overflow-hidden rounded-xl border border-line bg-white">
+        <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
+          <div className="flex gap-3">
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-navy text-copper-300">
+              <Radio className="size-[17px]" aria-hidden="true" />
+            </span>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-sm font-bold text-navy">Runtime</h2>
+                <span className="rounded-full bg-pass-soft px-2 py-0.5 text-[9px] font-bold text-pass-strong ring-1 ring-inset ring-pass/30">
+                  LIVE
+                </span>
+              </div>
+              <p className="mt-1.5 max-w-xl text-[11px] leading-5 text-slate">
+                Valmont only runs against real GitHub repositories, your
+                configured model provider, and real workspace execution. There
+                is no demo or sample-data mode: when a credential is missing the
+                affected action fails and names the variable to set.
+              </p>
+            </div>
+          </div>
+          <code className="shrink-0 rounded-md bg-ivory-100 px-2.5 py-1.5 text-[10px] font-bold text-navy ring-1 ring-inset ring-line">
+            {liveReady ? "all systems configured" : "configuration incomplete"}
+          </code>
+        </div>
+      </section>
+
+      {missing.length > 0 && (
+        <div className="mt-4 rounded-xl border border-copper-300 bg-copper-50 p-4">
+          <div className="flex gap-3">
+            <CircleAlert
+              className="mt-0.5 size-4 shrink-0 text-copper-700"
+              aria-hidden="true"
+            />
+            <div>
+              <p className="text-[11px] font-bold text-copper-700">
+                Valmont is missing required configuration
+              </p>
+              <ul className="mt-2 flex flex-wrap gap-2">
+                {missing.map((name) => (
+                  <li
+                    key={name}
+                    className="rounded-md bg-white px-2 py-1 text-[10px] font-bold text-slate-700 ring-1 ring-inset ring-copper-300"
+                  >
+                    {name}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <section className="card mt-6 overflow-hidden">
+        <div className="border-b border-line px-5 py-4 sm:px-6">
+          <h2 className="text-sm font-bold text-navy">Integration status</h2>
+          <p className="mt-1 text-[11px] text-slate">
             Restart the server after changing environment configuration.
           </p>
         </div>
-        <div className="divide-y divide-[#e6ebe8]">
+        <div className="divide-y divide-line">
           <Integration
             icon={Github}
             title="GitHub OAuth"
             description={
               githubReady
-                ? user.demo
-                  ? "OAuth app configured; sign in to authorize repositories."
-                  : `Connected as @${user.login}`
-                : "Not configured. Demo repository data is active."
+                ? `Connected as @${user.login}`
+                : "Not configured. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and SESSION_SECRET."
             }
-            ready={githubReady && !user.demo}
+            ready={githubReady}
             action={
               <Link
                 href="/api/auth/github"
                 className="btn-secondary min-h-8 text-[11px]"
               >
-                {githubReady
-                  ? user.demo
-                    ? "Connect GitHub"
-                    : "Reconnect"
-                  : "Setup guide"}
+                {githubReady ? "Reconnect" : "Setup guide"}
               </Link>
             }
           />
@@ -74,11 +118,11 @@ export default async function SettingsPage() {
             icon={KeyRound}
             title="Model provider"
             description={
-              model.demo
-                ? "No API key configured. Deterministic demo planner is active."
-                : `${model.id} · ${model.model} · credentials loaded server-side`
+              modelReady && model
+                ? `${model.id} · ${model.model} · credentials loaded server-side`
+                : "MODEL_API_KEY is not set. Tasks cannot generate plans or patches."
             }
-            ready={!model.demo}
+            ready={modelReady}
           />
           <Integration
             icon={Database}
@@ -86,7 +130,7 @@ export default async function SettingsPage() {
             description={
               databaseReady
                 ? "DATABASE_URL is configured. Run migrations before production use."
-                : "Not configured. Demo tasks persist to a local ignored data file."
+                : "Not configured. Tasks persist to a local ignored data file instead."
             }
             ready={databaseReady}
           />
@@ -103,8 +147,10 @@ export default async function SettingsPage() {
       <section className="mt-6 grid gap-5 sm:grid-cols-2">
         <div className="card p-5">
           <div className="flex items-center gap-2">
-            <LockKeyhole className="size-4 text-[#376c56]" />
-            <h2 className="text-[13px] font-bold">Required server variables</h2>
+            <LockKeyhole className="size-4 text-copper" aria-hidden="true" />
+            <h2 className="text-[13px] font-bold text-navy">
+              Required server variables
+            </h2>
           </div>
           <div className="mt-4 space-y-2">
             {[
@@ -119,30 +165,33 @@ export default async function SettingsPage() {
             ].map(([name, set]) => (
               <div
                 key={String(name)}
-                className="flex items-center justify-between rounded-lg bg-[#f5f7f5] px-3 py-2"
+                className="flex items-center justify-between rounded-lg bg-ivory-50 px-3 py-2"
               >
-                <code className="text-[10px] font-semibold text-[#4d5f56]">
+                <code className="text-[10px] font-semibold text-navy">
                   {String(name)}
                 </code>
                 <span
-                  className={`text-[9px] font-bold ${set ? "text-[#2b7655]" : "text-[#8b9691]"}`}
+                  className={`text-[9px] font-bold ${set ? "text-pass" : "text-slate-400"}`}
                 >
                   {set ? "SET" : "NOT SET"}
                 </span>
               </div>
             ))}
           </div>
-          <p className="mt-4 text-[10px] leading-4 text-[#838e88]">
+          <p className="mt-4 text-[10px] leading-4 text-slate">
             Values are never displayed. Configure them in{" "}
             <code>.env.local</code> using <code>.env.example</code>.
           </p>
         </div>
+
         <div className="card p-5">
           <div className="flex items-center gap-2">
-            <ShieldCheck className="size-4 text-[#376c56]" />
-            <h2 className="text-[13px] font-bold">Enforced boundaries</h2>
+            <ShieldCheck className="size-4 text-copper" aria-hidden="true" />
+            <h2 className="text-[13px] font-bold text-navy">
+              Enforced boundaries
+            </h2>
           </div>
-          <ul className="mt-4 space-y-3 text-[11px] text-[#627168]">
+          <ul className="mt-4 space-y-3 text-[11px] text-slate">
             {[
               "Plan approval before any code change",
               "Final approval before branch or pull request",
@@ -151,21 +200,23 @@ export default async function SettingsPage() {
               "Secret redaction in logs and model context",
             ].map((item) => (
               <li key={item} className="flex items-start gap-2">
-                <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-[#347557]" />
+                <CheckCircle2
+                  className="mt-0.5 size-3.5 shrink-0 text-copper"
+                  aria-hidden="true"
+                />
                 {item}
               </li>
             ))}
           </ul>
-          <div className="mt-5 flex gap-3 text-[10px] font-bold">
-            <Link
-              href="/docs/security"
-              className="text-[#27684f] hover:underline"
-            >
+          <div className="mt-5 flex gap-4 text-[10px]">
+            <Link href="/docs/security" className="link-brand">
               Threat model
             </Link>
             <a
-              href="https://github.com"
-              className="text-[#27684f] hover:underline"
+              href="https://github.com/settings/developers"
+              target="_blank"
+              rel="noreferrer"
+              className="link-brand"
             >
               GitHub permissions
             </a>
@@ -173,14 +224,17 @@ export default async function SettingsPage() {
         </div>
       </section>
 
-      <div className="mt-6 rounded-xl border border-[#e5d1a4] bg-[#fff9eb] p-4">
+      <div className="mt-6 rounded-xl border border-copper-300 bg-copper-50 p-4">
         <div className="flex gap-3">
-          <CircleAlert className="mt-0.5 size-4 shrink-0 text-[#9b661f]" />
+          <CircleAlert
+            className="mt-0.5 size-4 shrink-0 text-copper-700"
+            aria-hidden="true"
+          />
           <div>
-            <p className="text-[11px] font-bold text-[#74501c]">
+            <p className="text-[11px] font-bold text-copper-700">
               Local execution is not a production sandbox
             </p>
-            <p className="mt-1 text-[10px] leading-5 text-[#806b4c]">
+            <p className="mt-1 text-[10px] leading-5 text-slate-700">
               The included adapter validates paths, blocks symlink escapes, and
               allowlists commands, but a host process is not a complete security
               boundary. Production installations must use short-lived containers
@@ -210,21 +264,25 @@ function Integration({
 }) {
   return (
     <div className="flex items-center gap-4 px-5 py-4 sm:px-6">
-      <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-[#edf2ef] text-[#4d685b]">
-        <Icon className="size-[17px]" />
+      <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-brandblue-50 text-brandblue">
+        <Icon className="size-[17px]" aria-hidden="true" />
       </span>
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <h3 className="text-[12px] font-bold">{title}</h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="text-[12px] font-bold text-navy">{title}</h3>
           <span
-            className={`rounded-full px-2 py-0.5 text-[8px] font-bold ${ready ? "bg-[#e5f4eb] text-[#297052]" : warning ? "bg-[#fff1d6] text-[#92611f]" : "bg-[#eef1ef] text-[#77827d]"}`}
+            className={`rounded-full px-2 py-0.5 text-[8px] font-bold ring-1 ring-inset ${
+              ready
+                ? "bg-pass-soft text-pass-strong ring-pass/30"
+                : warning
+                  ? "bg-copper-50 text-copper-700 ring-copper-300"
+                  : "bg-ivory-100 text-slate-700 ring-line"
+            }`}
           >
-            {ready ? "CONNECTED" : warning ? "DEV ONLY" : "DEMO"}
+            {ready ? "CONNECTED" : warning ? "DEV ONLY" : "NOT CONFIGURED"}
           </span>
         </div>
-        <p className="mt-1 text-[10px] leading-4 text-[#7d8983]">
-          {description}
-        </p>
+        <p className="mt-1 text-[10px] leading-4 text-slate">{description}</p>
       </div>
       {action}
     </div>
