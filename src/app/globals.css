@@ -73,6 +73,14 @@ html {
   scroll-behavior: smooth;
 }
 
+/* Chat is a viewport workspace: its transcript owns vertical scrolling. */
+html.chat-page,
+html.chat-page body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 body {
   min-height: 100vh;
   margin: 0;
