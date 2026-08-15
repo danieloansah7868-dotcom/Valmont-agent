@@ -8,7 +8,6 @@ import { retrieveGitHubContext } from "@/lib/github-retrieval";
 import { createModelProvider } from "@/lib/models";
 import { assertCsrf } from "@/lib/security";
 
-const MAX_MESSAGES_PER_SESSION = 500;
 const messageInput = z.object({
   content: z.string().trim().min(1).max(8_000),
 });
@@ -26,11 +25,6 @@ export async function POST(
     const store = getChatStore();
     const session = await store.get(id, user.id);
     if (!session) throw new Error("Chat not found");
-    if (session.messages.length >= MAX_MESSAGES_PER_SESSION) {
-      throw new Error(
-        "This chat is full. Start a new conversation to continue",
-      );
-    }
 
     let repositoryContext;
     if (session.repository) {
@@ -67,11 +61,41 @@ export async function POST(
       };
     }
 
+    const memoryStore = store as typeof store & {
+      summary?: typeof store.summary;
+      search?: typeof store.search;
+      memories?: typeof store.memories;
+      memoryEnabled?: typeof store.memoryEnabled;
+    };
+    const [summary, olderMessages, memories, memoryEnabled] = await Promise.all(
+      [
+        memoryStore.summary?.(session.id, user.id) ?? "",
+        memoryStore.search?.(user.id, input.content, session.repository?.id) ??
+          [],
+        memoryStore.memories?.(user.id, session.repository?.id) ?? [],
+        memoryStore.memoryEnabled?.(user.id) ?? false,
+      ],
+    );
+    const longTermContext = memoryEnabled
+      ? [
+          summary ? `Conversation summary (user-authored):\n${summary}` : "",
+          memories.length
+            ? `Saved memories:\n${memories.map((memory) => `- ${memory.category}: ${memory.content}`).join("\n")}`
+            : "",
+          olderMessages.length
+            ? `Relevant older messages:\n${olderMessages.map((message) => `${message.role}: ${message.content}`).join("\n")}`
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n")
+      : summary;
+
     const reply = await generateChatReply({
       model: createModelProvider(),
       session,
       userContent: input.content,
       repositoryContext,
+      longTermContext,
     });
     const titleIfNew =
       session.title === "New conversation"

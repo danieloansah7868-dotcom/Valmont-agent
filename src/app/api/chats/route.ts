@@ -5,7 +5,6 @@ import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { getChatStore } from "@/lib/chat-store";
 import { assertCsrf } from "@/lib/security";
 
-const MAX_CHAT_SESSIONS_PER_USER = 100;
 const branchPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const chatInput = z
   .object({
@@ -38,9 +37,6 @@ export async function POST(request: NextRequest) {
     const input = chatInput.parse(await request.json());
     const user = await requireApiSessionUser();
     const store = getChatStore();
-    if ((await store.list(user.id)).length >= MAX_CHAT_SESSIONS_PER_USER) {
-      throw new Error("Delete an older chat before creating another one");
-    }
     let repository;
 
     if (input.repositoryId && input.baseBranch) {
