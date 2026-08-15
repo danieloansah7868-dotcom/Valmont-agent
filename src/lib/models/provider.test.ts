@@ -114,7 +114,10 @@ describe("model provider abstraction", () => {
     });
     const result = await provider.structured({
       schemaName: "answer",
-      jsonSchema: { type: "object" },
+      jsonSchema: {
+        type: "object",
+        properties: { operation: { const: "write" } },
+      },
       messages: [],
       validate(value) {
         const data = value as { answer?: number };
@@ -123,8 +126,59 @@ describe("model provider abstraction", () => {
       },
     });
     expect(result.data).toEqual({ answer: 42 });
+    const requestBody = JSON.parse(String(fetcher.mock.calls[0]![1]!.body)) as {
+      response_format: {
+        type: string;
+        json_schema: {
+          schema: {
+            properties: {
+              operation: Record<string, unknown>;
+            };
+          };
+        };
+      };
+    };
+    expect(requestBody.response_format.type).toBe("json_schema");
     expect(
-      JSON.parse(String(fetcher.mock.calls[0]![1]!.body)).response_format.type,
-    ).toBe("json_schema");
+      requestBody.response_format.json_schema.schema.properties.operation,
+    ).toEqual({ enum: ["write"], type: "string" });
+    expect(JSON.stringify(requestBody)).not.toContain('"const"');
+  });
+
+  it("surfaces messages from Gemini array-wrapped provider errors", async () => {
+    const fetcher = vi.fn(async (input: FetchInput, init?: FetchInit) => {
+      void input;
+      void init;
+      return new Response(
+        JSON.stringify([
+          {
+            error: {
+              code: 400,
+              message: 'Unknown name "const" at schema.properties[0]',
+              status: "INVALID_ARGUMENT",
+            },
+          },
+        ]),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    });
+    const provider = new OpenAICompatibleProvider({
+      apiKey: "key",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+      model: "gemini-test",
+      fetcher,
+    });
+
+    await expect(
+      provider.structured({
+        schemaName: "answer",
+        jsonSchema: { type: "object" },
+        messages: [],
+        validate: (value) => value,
+      }),
+    ).rejects.toMatchObject({
+      message: 'Unknown name "const" at schema.properties[0]',
+      code: "400",
+    });
   });
 });

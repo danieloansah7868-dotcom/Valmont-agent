@@ -645,7 +645,7 @@ export class TaskWorkflowService {
                   additionalProperties: false,
                   required: ["operation", "path", "content", "rationale"],
                   properties: {
-                    operation: { const: "write" },
+                    operation: { type: "string", enum: ["write"] },
                     path: { type: "string" },
                     content: { type: "string" },
                     rationale: { type: "string" },
@@ -656,7 +656,7 @@ export class TaskWorkflowService {
                   additionalProperties: false,
                   required: ["operation", "path", "rationale"],
                   properties: {
-                    operation: { const: "delete" },
+                    operation: { type: "string", enum: ["delete"] },
                     path: { type: "string" },
                     rationale: { type: "string" },
                   },
