@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowRight,
@@ -50,11 +50,70 @@ export function NewTaskForm({
   const [baseBranch, setBaseBranch] = useState(
     initial?.defaultBranch ?? "main",
   );
+  const [branches, setBranches] = useState<string[]>(
+    initial ? [initial.defaultBranch] : [],
+  );
+  const [branchesLoading, setBranchesLoading] = useState(Boolean(initial));
+  const [branchError, setBranchError] = useState("");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const repository = repositories.find((repo) => repo.id === repositoryId);
+
+  useEffect(() => {
+    const selected = repositories.find((item) => item.id === repositoryId);
+    if (!selected) return;
+
+    const controller = new AbortController();
+    void fetch(
+      `/api/repositories/${encodeURIComponent(selected.id)}/branches`,
+      { cache: "no-store", signal: controller.signal },
+    )
+      .then(async (response) => {
+        const data = (await response.json()) as {
+          branches?: unknown;
+          defaultBranch?: unknown;
+          error?: string;
+        };
+        if (!response.ok) {
+          throw new Error(data.error ?? "Branches could not be loaded");
+        }
+        if (
+          !Array.isArray(data.branches) ||
+          !data.branches.every((branch) => typeof branch === "string") ||
+          typeof data.defaultBranch !== "string"
+        ) {
+          throw new Error("GitHub returned an invalid branch list");
+        }
+        return {
+          branches: data.branches,
+          defaultBranch: data.defaultBranch,
+        };
+      })
+      .then((data) => {
+        const ordered = [
+          data.defaultBranch,
+          ...data.branches.filter((branch) => branch !== data.defaultBranch),
+        ];
+        setBranches([...new Set(ordered)]);
+        setBaseBranch(data.defaultBranch);
+      })
+      .catch((caught: unknown) => {
+        if (caught instanceof DOMException && caught.name === "AbortError") {
+          return;
+        }
+        setBranchError(
+          caught instanceof Error
+            ? caught.message
+            : "Branches could not be loaded",
+        );
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setBranchesLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [repositories, repositoryId]);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -138,11 +197,15 @@ export function NewTaskForm({
               value={repositoryId}
               onChange={(event) => {
                 const id = event.target.value;
-                setRepositoryId(id);
-                setBaseBranch(
-                  repositories.find((item) => item.id === id)?.defaultBranch ??
-                    "main",
+                const nextRepository = repositories.find(
+                  (item) => item.id === id,
                 );
+                const nextDefault = nextRepository?.defaultBranch ?? "main";
+                setRepositoryId(id);
+                setBaseBranch(nextDefault);
+                setBranches([nextDefault]);
+                setBranchesLoading(true);
+                setBranchError("");
               }}
               required
             >
@@ -159,12 +222,26 @@ export function NewTaskForm({
               className="select"
               value={baseBranch}
               onChange={(event) => setBaseBranch(event.target.value)}
+              aria-describedby="base-branch-status"
+              disabled={branchesLoading}
               required
             >
-              <option value={repository?.defaultBranch ?? "main"}>
-                {repository?.defaultBranch ?? "main"}
-              </option>
+              {branches.map((branch) => (
+                <option key={branch} value={branch}>
+                  {branch}
+                </option>
+              ))}
             </select>
+            <span
+              id="base-branch-status"
+              className={`mt-1.5 block text-[10px] ${branchError ? "text-fail" : "text-slate"}`}
+              role={branchError ? "alert" : undefined}
+            >
+              {branchesLoading
+                ? "Loading authorized GitHub branches…"
+                : branchError ||
+                  `${branches.length} authorized branch${branches.length === 1 ? "" : "es"} available`}
+            </span>
           </label>
         </div>
 
@@ -209,7 +286,7 @@ export function NewTaskForm({
           <button
             type="submit"
             className="btn-primary"
-            disabled={submitting || !repositoryId}
+            disabled={submitting || branchesLoading || !repositoryId}
           >
             {submitting ? (
               <>
