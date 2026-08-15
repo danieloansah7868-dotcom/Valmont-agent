@@ -14,7 +14,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { apiDelete, apiMutation } from "@/lib/client-api";
-import type { ChatSession, RepositorySummary } from "@/lib/types";
+import type { ChatMessage, ChatSession, RepositorySummary } from "@/lib/types";
 
 interface ChatWorkspaceProps {
   activeSession?: ChatSession;
@@ -32,6 +32,35 @@ interface MessageResponse {
   session: ChatSession;
 }
 
+const GENERAL_HEADLINES = [
+  "What's on your mind?",
+  "Where should we start?",
+  "Good to see you. What are we into today?",
+  "I'm all ears.",
+];
+
+const GENERAL_STARTERS = [
+  "Help me think through a decision I'm weighing",
+  "Explain a concept to me in plain language",
+  "Brainstorm ideas with me for a project",
+  "Poke holes in a rough plan I have",
+];
+
+const REPOSITORY_STARTERS = [
+  "Give me a quick tour of how this repository is organized",
+  "Where would I start to understand the main flow?",
+  "What parts of this codebase look the most complex?",
+  "Walk me through the tests and how they are organized",
+];
+
+function stablePick<T>(items: T[], seed: string): T {
+  let hash = 0;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) | 0;
+  }
+  return items[Math.abs(hash) % items.length] as T;
+}
+
 export function ChatWorkspace({
   activeSession,
   repositories,
@@ -42,14 +71,23 @@ export function ChatWorkspace({
   const [sessionList, setSessionList] = useState(sessions);
   const [session, setSession] = useState(activeSession);
   const [content, setContent] = useState("");
+  const [pendingMessage, setPendingMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [session?.messages.length, sending]);
+  }, [session?.messages.length, pendingMessage, sending]);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 176)}px`;
+  }, [content]);
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -57,6 +95,8 @@ export function ChatWorkspace({
     if (!session || !value || sending) return;
     setSending(true);
     setError("");
+    setPendingMessage(value);
+    setContent("");
     try {
       const response = await apiMutation<MessageResponse>(
         `/api/chats/${session.id}/messages`,
@@ -67,7 +107,6 @@ export function ChatWorkspace({
         response.session,
         ...current.filter((item) => item.id !== response.session.id),
       ]);
-      setContent("");
       router.refresh();
     } catch (requestError) {
       setError(
@@ -75,9 +114,16 @@ export function ChatWorkspace({
           ? requestError.message
           : "Valmont could not send the message.",
       );
+      setContent(value);
     } finally {
+      setPendingMessage("");
       setSending(false);
     }
+  }
+
+  function useStarter(prompt: string) {
+    setContent(prompt);
+    textareaRef.current?.focus();
   }
 
   async function deleteSession() {
@@ -106,9 +152,9 @@ export function ChatWorkspace({
   }
 
   return (
-    <div className="mx-auto grid min-h-[calc(100vh-4rem)] max-w-[1440px] lg:grid-cols-[280px_minmax(0,1fr)]">
-      <aside className="border-b border-line bg-white lg:border-r lg:border-b-0">
-        <div className="flex items-center justify-between border-b border-line px-4 py-4">
+    <div className="mx-auto flex h-[calc(100dvh-8rem)] max-w-[1440px] flex-col overflow-hidden md:h-[calc(100dvh-4rem)] lg:flex-row">
+      <aside className="flex shrink-0 flex-col border-b border-line bg-white lg:h-full lg:w-[280px] lg:border-r lg:border-b-0">
+        <div className="flex items-center justify-between border-b border-line px-4 py-3 lg:py-4">
           <div>
             <p className="text-[10px] font-bold tracking-[0.16em] text-copper uppercase">
               Conversations
@@ -127,11 +173,11 @@ export function ChatWorkspace({
           </Link>
         </div>
         <nav
-          className="flex gap-2 overflow-x-auto p-3 lg:block lg:max-h-[calc(100vh-8.5rem)] lg:space-y-1 lg:overflow-y-auto"
+          className="flex min-h-0 gap-2 overflow-x-auto p-2.5 lg:block lg:flex-1 lg:space-y-1 lg:overflow-x-hidden lg:overflow-y-auto lg:p-3"
           aria-label="Chat sessions"
         >
           {sessionList.length === 0 ? (
-            <div className="min-w-56 rounded-xl border border-dashed border-line px-4 py-5 text-center lg:min-w-0">
+            <div className="min-w-56 rounded-xl border border-dashed border-line px-4 py-4 text-center lg:min-w-0">
               <MessageSquareText
                 className="mx-auto size-5 text-slate-300"
                 aria-hidden="true"
@@ -147,7 +193,7 @@ export function ChatWorkspace({
                 <Link
                   key={item.id}
                   href={`/chat/${item.id}`}
-                  className={`block min-w-56 rounded-xl border px-3 py-3 transition-colors lg:min-w-0 ${
+                  className={`block min-w-56 rounded-xl border px-3 py-2.5 transition-colors lg:min-w-0 ${
                     active
                       ? "border-brandblue-200 bg-brandblue-50"
                       : "border-transparent hover:border-line hover:bg-ivory-50"
@@ -184,9 +230,9 @@ export function ChatWorkspace({
       </aside>
 
       {session ? (
-        <section className="flex min-h-[620px] min-w-0 flex-col bg-ivory-50 lg:h-[calc(100vh-4rem)]">
-          <header className="border-b border-line bg-white px-4 py-3.5 sm:px-6">
-            <div className="mx-auto flex max-w-4xl items-center gap-3">
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-ivory-50">
+          <header className="shrink-0 border-b border-line bg-white px-4 py-3 sm:px-6">
+            <div className="mx-auto flex max-w-3xl items-center gap-3">
               <div className="min-w-0 flex-1">
                 <h2 className="truncate text-sm font-bold text-navy">
                   {session.title}
@@ -218,7 +264,7 @@ export function ChatWorkspace({
                 type="button"
                 onClick={deleteSession}
                 disabled={deleting}
-                className="btn-quiet size-9 min-h-9 px-0 text-slate hover:text-danger disabled:opacity-50"
+                className="btn-quiet size-9 min-h-9 px-0 text-slate hover:text-fail disabled:opacity-50"
                 aria-label="Delete chat"
                 title="Delete chat"
               >
@@ -227,76 +273,38 @@ export function ChatWorkspace({
             </div>
           </header>
 
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6">
-            <div className="mx-auto max-w-4xl space-y-5">
-              {session.messages.length === 0 ? (
-                <ChatWelcome session={session} />
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
+            <div className="mx-auto max-w-3xl">
+              {session.messages.length === 0 && !pendingMessage && !sending ? (
+                <ChatWelcome session={session} onStarter={useStarter} />
               ) : (
-                session.messages.map((message) => (
-                  <article
-                    key={message.id}
-                    className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}
-                  >
-                    {message.role === "assistant" ? (
-                      <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-navy text-ivory">
-                        <Bot className="size-4" aria-hidden="true" />
-                      </span>
-                    ) : null}
-                    <div
-                      className={`max-w-[min(90%,46rem)] rounded-2xl px-4 py-3 text-[13px] leading-6 shadow-sm ${
-                        message.role === "user"
-                          ? "rounded-br-md bg-brandblue text-white"
-                          : "rounded-bl-md border border-line bg-white text-navy"
-                      }`}
-                    >
-                      <p className="whitespace-pre-wrap break-words">
-                        {message.content}
-                      </p>
-                      <time
-                        className={`mt-2 block text-[9px] ${
-                          message.role === "user"
-                            ? "text-white/60"
-                            : "text-slate-400"
-                        }`}
-                        dateTime={message.createdAt}
-                        suppressHydrationWarning
-                      >
-                        {formatMessageTime(message.createdAt)}
-                      </time>
-                    </div>
-                  </article>
-                ))
+                <MessageList
+                  messages={session.messages}
+                  pendingMessage={pendingMessage}
+                  sending={sending}
+                />
               )}
-              {sending ? (
-                <div className="flex gap-3" role="status">
-                  <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-navy text-ivory">
-                    <Bot className="size-4" aria-hidden="true" />
-                  </span>
-                  <div className="rounded-2xl rounded-bl-md border border-line bg-white px-4 py-3 text-[12px] text-slate shadow-sm">
-                    Valmont is thinking<span className="animate-pulse">…</span>
-                  </div>
-                </div>
-              ) : null}
               <div ref={messagesEndRef} />
             </div>
           </div>
 
-          <div className="border-t border-line bg-white px-4 py-4 sm:px-6">
-            <form onSubmit={sendMessage} className="mx-auto max-w-4xl">
+          <div className="shrink-0 border-t border-line bg-white px-4 pt-3 pb-3 sm:px-6">
+            <form onSubmit={sendMessage} className="mx-auto max-w-3xl">
               {error ? (
                 <p
-                  className="mb-2 rounded-lg border border-danger/20 bg-danger/5 px-3 py-2 text-[11px] text-danger"
+                  className="mb-2 rounded-lg border border-fail/25 bg-fail-soft px-3 py-2 text-[11px] text-fail-strong"
                   role="alert"
                 >
                   {error}
                 </p>
               ) : null}
-              <div className="relative rounded-2xl border border-line bg-white shadow-sm transition focus-within:border-brandblue-200 focus-within:ring-2 focus-within:ring-brandblue-100">
+              <div className="flex items-end gap-2 rounded-2xl border border-line bg-white p-2 shadow-sm transition focus-within:border-brandblue-200 focus-within:ring-2 focus-within:ring-brandblue-100">
                 <label htmlFor="chat-message" className="sr-only">
                   Message Valmont
                 </label>
                 <textarea
                   id="chat-message"
+                  ref={textareaRef}
                   value={content}
                   onChange={(event) => setContent(event.target.value)}
                   onKeyDown={(event) => {
@@ -306,28 +314,36 @@ export function ChatWorkspace({
                     }
                   }}
                   maxLength={8_000}
-                  rows={2}
+                  rows={1}
                   disabled={sending}
                   autoFocus
-                  className="block min-h-20 w-full resize-none bg-transparent px-4 pt-3 pr-14 pb-7 text-[13px] leading-5 text-navy outline-none placeholder:text-slate-400 disabled:opacity-60"
+                  aria-describedby="chat-composer-hint"
+                  className="block max-h-44 min-h-10 w-full flex-1 resize-none self-center bg-transparent px-2 py-2.5 text-[13px] leading-5 text-navy outline-none placeholder:text-slate-400 disabled:opacity-60"
                   placeholder="Message Valmont…"
                 />
                 <button
                   type="submit"
                   disabled={sending || !content.trim()}
-                  className="absolute right-3 bottom-3 flex size-8 items-center justify-center rounded-lg bg-copper-600 text-white transition hover:bg-copper-700 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-copper-600 text-white transition hover:bg-copper-700 disabled:cursor-not-allowed disabled:opacity-40"
                   aria-label="Send message"
                 >
                   <ArrowUp className="size-4" aria-hidden="true" />
                 </button>
-                <span className="absolute bottom-2.5 left-4 text-[9px] text-slate-400">
-                  Enter to send · Shift+Enter for a new line
-                </span>
               </div>
-              <p className="mt-2 flex items-center justify-center gap-1 text-center text-[9px] text-slate-400">
-                <ShieldCheck className="size-3" aria-hidden="true" />
-                Chat is read-only. Repository changes require a separate coding
-                task and approval.
+              <p
+                id="chat-composer-hint"
+                className="mt-1.5 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-center text-[9px] text-slate-400"
+              >
+                <span>Enter to send · Shift+Enter for a new line</span>
+                <span
+                  className="hidden size-0.5 rounded-full bg-slate-300 sm:inline-block"
+                  aria-hidden="true"
+                />
+                <span className="inline-flex items-center gap-1">
+                  <ShieldCheck className="size-3" aria-hidden="true" />
+                  Chat is read-only. Repository changes require a separate
+                  coding task and approval.
+                </span>
               </p>
             </form>
           </div>
@@ -342,25 +358,170 @@ export function ChatWorkspace({
   );
 }
 
-function ChatWelcome({ session }: { session: ChatSession }) {
+function MessageList({
+  messages,
+  pendingMessage,
+  sending,
+}: {
+  messages: ChatMessage[];
+  pendingMessage: string;
+  sending: boolean;
+}) {
   return (
-    <div className="mx-auto flex max-w-xl flex-col items-center px-4 py-16 text-center">
-      <span className="flex size-12 items-center justify-center rounded-2xl bg-navy text-ivory shadow-sm">
-        <Bot className="size-6" aria-hidden="true" />
-      </span>
-      <h2 className="mt-5 text-xl font-bold tracking-tight text-navy">
-        What would you like to explore?
-      </h2>
-      <p className="mt-2 text-[12px] leading-5 text-slate">
-        {session.repository
-          ? `I can discuss ${session.repository.fullName} using read-only context from ${session.repository.baseBranch}.`
-          : "Ask about code, architecture, debugging, product ideas, or anything else. This conversation is not attached to a repository."}
-      </p>
-      <div className="mt-5 rounded-xl border border-line bg-white px-4 py-3 text-left text-[10px] leading-4 text-slate">
-        <strong className="text-navy">Safe by design:</strong> chatting never
-        changes files. When you are ready, use Create coding task to review the
-        handoff before Valmont starts an approval-gated workflow.
+    <div className="space-y-1.5">
+      {messages.map((message, index) => {
+        const previous = messages[index - 1];
+        const firstOfGroup = !previous || previous.role !== message.role;
+        const next = messages[index + 1];
+        const lastOfGroup = !next || next.role !== message.role;
+        return (
+          <MessageBubble
+            key={message.id}
+            content={message.content}
+            createdAt={message.createdAt}
+            firstOfGroup={firstOfGroup}
+            lastOfGroup={lastOfGroup}
+            role={message.role}
+          />
+        );
+      })}
+      {pendingMessage ? (
+        <MessageBubble
+          content={pendingMessage}
+          firstOfGroup
+          lastOfGroup
+          role="user"
+        />
+      ) : null}
+      {sending ? <TypingIndicator /> : null}
+    </div>
+  );
+}
+
+function MessageBubble({
+  content,
+  createdAt,
+  firstOfGroup,
+  lastOfGroup,
+  role,
+}: {
+  content: string;
+  createdAt?: string;
+  firstOfGroup: boolean;
+  lastOfGroup: boolean;
+  role: "user" | "assistant";
+}) {
+  const isUser = role === "user";
+  return (
+    <article
+      className={`flex gap-2.5 ${isUser ? "justify-end" : "justify-start"} ${
+        firstOfGroup ? "pt-3 first:pt-0" : ""
+      }`}
+    >
+      {!isUser ? (
+        firstOfGroup ? (
+          <span className="flex size-7 shrink-0 items-center justify-center self-start rounded-full bg-navy text-ivory">
+            <Bot className="size-3.5" aria-hidden="true" />
+          </span>
+        ) : (
+          <span className="size-7 shrink-0" aria-hidden="true" />
+        )
+      ) : null}
+      <div
+        className={`max-w-[min(88%,42rem)] rounded-2xl px-3.5 py-2.5 text-[13px] leading-6 shadow-sm ${
+          isUser
+            ? `bg-brandblue text-white ${lastOfGroup ? "rounded-br-md" : ""}`
+            : `border border-line bg-white text-navy ${lastOfGroup ? "rounded-bl-md" : ""}`
+        }`}
+      >
+        <p className="break-words whitespace-pre-wrap">{content}</p>
+        {lastOfGroup && createdAt ? (
+          <time
+            className={`mt-1 block text-[9px] ${
+              isUser ? "text-white/60" : "text-slate-400"
+            }`}
+            dateTime={createdAt}
+            suppressHydrationWarning
+          >
+            {formatMessageTime(createdAt)}
+          </time>
+        ) : null}
       </div>
+    </article>
+  );
+}
+
+function TypingIndicator() {
+  return (
+    <div className="flex gap-2.5 pt-3" role="status" aria-live="polite">
+      <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-navy text-ivory">
+        <Bot className="size-3.5" aria-hidden="true" />
+      </span>
+      <div className="flex items-center gap-1 rounded-2xl rounded-bl-md border border-line bg-white px-3.5 py-3 shadow-sm">
+        <span className="sr-only">Valmont is typing</span>
+        {[0, 1, 2].map((dot) => (
+          <span
+            key={dot}
+            className="size-1.5 animate-bounce rounded-full bg-slate-400"
+            style={{ animationDelay: `${dot * 150}ms` }}
+            aria-hidden="true"
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ChatWelcome({
+  onStarter,
+  session,
+}: {
+  onStarter: (prompt: string) => void;
+  session: ChatSession;
+}) {
+  const headline = session.repository
+    ? `Let's talk about ${session.repository.name}.`
+    : stablePick(GENERAL_HEADLINES, session.id);
+  const starters = session.repository ? REPOSITORY_STARTERS : GENERAL_STARTERS;
+
+  return (
+    <div className="mx-auto max-w-xl px-2 py-6 sm:py-10">
+      <div className="flex items-center gap-3">
+        <span className="flex size-10 shrink-0 items-center justify-center rounded-2xl bg-navy text-ivory shadow-sm">
+          <Bot className="size-5" aria-hidden="true" />
+        </span>
+        <div className="min-w-0">
+          <h2 className="text-lg font-bold tracking-tight text-navy">
+            {headline}
+          </h2>
+          <p className="mt-0.5 text-[12px] leading-5 text-slate">
+            {session.repository
+              ? `Read-only context from ${session.repository.fullName} on ${session.repository.baseBranch}. Ask away.`
+              : "Anything goes — ideas, plans, tricky decisions, or code when you want it."}
+          </p>
+        </div>
+      </div>
+      <ul className="mt-5 grid gap-2 sm:grid-cols-2" aria-label="Suggestions">
+        {starters.map((starter) => (
+          <li key={starter}>
+            <button
+              type="button"
+              onClick={() => onStarter(starter)}
+              className="w-full rounded-xl border border-line bg-white px-3.5 py-2.5 text-left text-[12px] leading-5 text-navy shadow-sm transition hover:border-copper-300 hover:bg-copper-50"
+            >
+              {starter}
+            </button>
+          </li>
+        ))}
+      </ul>
+      <p className="mt-4 flex items-start gap-1.5 text-[10px] leading-4 text-slate">
+        <ShieldCheck
+          className="mt-0.5 size-3 shrink-0 text-slate-400"
+          aria-hidden="true"
+        />
+        Chatting never changes files. When you want something built, Create
+        coding task hands this conversation to an approval-gated workflow.
+      </p>
     </div>
   );
 }
@@ -445,25 +606,27 @@ function NewChatPanel({
   }
 
   return (
-    <section className="flex min-h-[620px] items-center justify-center bg-ivory-50 px-4 py-10 sm:px-7">
+    <section className="flex min-h-0 min-w-0 flex-1 items-start justify-center overflow-y-auto bg-ivory-50 px-4 py-8 sm:items-center sm:px-7">
       <div className="w-full max-w-xl">
-        <div className="text-center">
-          <span className="mx-auto flex size-12 items-center justify-center rounded-2xl bg-navy text-ivory shadow-sm">
-            <MessageSquareText className="size-6" aria-hidden="true" />
+        <div className="flex items-center gap-3">
+          <span className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-navy text-ivory shadow-sm">
+            <MessageSquareText className="size-5" aria-hidden="true" />
           </span>
-          <p className="mt-5 text-[10px] font-bold tracking-[0.16em] text-copper uppercase">
-            New conversation
-          </p>
-          <h2 className="mt-1 text-2xl font-bold tracking-tight text-navy">
-            Chat with Valmont
-          </h2>
-          <p className="mx-auto mt-2 max-w-md text-[12px] leading-5 text-slate">
-            Start a general conversation, or attach one authorized repository
-            and branch for read-only context.
-          </p>
+          <div className="min-w-0">
+            <p className="text-[10px] font-bold tracking-[0.16em] text-copper uppercase">
+              New conversation
+            </p>
+            <h2 className="mt-0.5 text-xl font-bold tracking-tight text-navy">
+              Chat with Valmont
+            </h2>
+            <p className="mt-1 text-[12px] leading-5 text-slate">
+              Talk about anything, or attach a repository and branch for
+              read-only context.
+            </p>
+          </div>
         </div>
 
-        <form onSubmit={createChat} className="card mt-7 space-y-5 p-5 sm:p-6">
+        <form onSubmit={createChat} className="card mt-5 space-y-5 p-5 sm:p-6">
           <label className="block">
             <span className="label">Conversation title</span>
             <input
@@ -530,7 +693,7 @@ function NewChatPanel({
 
           {error ? (
             <p
-              className="rounded-lg border border-danger/20 bg-danger/5 px-3 py-2 text-[11px] text-danger"
+              className="rounded-lg border border-fail/25 bg-fail-soft px-3 py-2 text-[11px] text-fail-strong"
               role="alert"
             >
               {error}

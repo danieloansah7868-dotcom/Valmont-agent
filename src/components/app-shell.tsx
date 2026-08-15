@@ -86,7 +86,10 @@ export function AppShell({
         </div>
       </aside>
 
-      <main id="main-content" className="min-h-screen pt-16 md:ml-[228px]">
+      <main
+        id="main-content"
+        className="min-h-[calc(100dvh-4rem)] pt-16 md:ml-[228px] md:min-h-dvh"
+      >
         {children}
       </main>
     </div>
