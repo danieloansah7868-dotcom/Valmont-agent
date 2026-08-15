@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  commandRequiresShell,
   resolveCommandExecutable,
   RestrictedLocalWorkspaceProvider,
   type WorkspaceHandle,
@@ -39,11 +40,15 @@ async function setup(options: { timeoutMs?: number } = {}) {
 }
 
 describe("restricted local workspace", () => {
-  it("uses Windows command shims without enabling a shell", () => {
+  it("uses a shell only for Windows package-manager shims", () => {
     expect(resolveCommandExecutable("npm", "win32")).toBe("npm.cmd");
     expect(resolveCommandExecutable("pnpm", "win32")).toBe("pnpm.cmd");
+    expect(commandRequiresShell("npm", "win32")).toBe(true);
+    expect(commandRequiresShell("pnpm", "win32")).toBe(true);
     expect(resolveCommandExecutable("git", "win32")).toBe("git");
+    expect(commandRequiresShell("git", "win32")).toBe(false);
     expect(resolveCommandExecutable("npm", "linux")).toBe("npm");
+    expect(commandRequiresShell("npm", "linux")).toBe(false);
   });
 
   it("blocks path traversal and sensitive writes", async () => {

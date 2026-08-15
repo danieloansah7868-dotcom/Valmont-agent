@@ -75,6 +75,13 @@ export function resolveCommandExecutable(
     : executable;
 }
 
+export function commandRequiresShell(
+  executable: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === "win32" && WINDOWS_COMMAND_SHIMS.has(executable);
+}
+
 const DEFAULT_ALLOWED_COMMANDS: Record<string, readonly [string, ...string[]]> =
   {
     "npm ci": ["npm", "ci", "--ignore-scripts", "--no-audit", "--fund=false"],
@@ -411,7 +418,9 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
       const executable = resolveCommandExecutable(commandName!);
       const child = spawn(executable, args, {
         cwd,
-        shell: false,
+        // Windows cannot execute .cmd shims directly. This remains bounded:
+        // every executable and argument came from an exact server allowlist.
+        shell: commandRequiresShell(commandName!),
         env: {
           PATH: process.env.PATH,
           HOME: homeDirectory,
