@@ -75,11 +75,32 @@ export function resolveCommandExecutable(
     : executable;
 }
 
-export function commandRequiresShell(
+interface CommandInvocation {
+  executable: string;
+  args: string[];
+}
+
+const SAFE_WINDOWS_SHELL_TOKEN = /^[a-zA-Z0-9._=/-]+$/;
+
+export function resolveCommandInvocation(
   executable: string,
+  args: string[],
   platform: NodeJS.Platform = process.platform,
-): boolean {
-  return platform === "win32" && WINDOWS_COMMAND_SHIMS.has(executable);
+  commandShell = process.env.ComSpec || "cmd.exe",
+): CommandInvocation {
+  const resolvedExecutable = resolveCommandExecutable(executable, platform);
+  if (platform !== "win32" || !WINDOWS_COMMAND_SHIMS.has(executable)) {
+    return { executable: resolvedExecutable, args };
+  }
+
+  const commandTokens = [resolvedExecutable, ...args];
+  if (commandTokens.some((token) => !SAFE_WINDOWS_SHELL_TOKEN.test(token))) {
+    throw new Error("Unsafe Windows package-manager command token");
+  }
+  return {
+    executable: commandShell,
+    args: ["/d", "/s", "/c", commandTokens.join(" ")],
+  };
 }
 
 const DEFAULT_ALLOWED_COMMANDS: Record<string, readonly [string, ...string[]]> =
@@ -421,12 +442,12 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
   }> {
     return new Promise((resolve, reject) => {
       const [commandName, ...args] = command;
-      const executable = resolveCommandExecutable(commandName!);
-      const child = spawn(executable, args, {
+      const invocation = resolveCommandInvocation(commandName!, args);
+      const child = spawn(invocation.executable, invocation.args, {
         cwd,
-        // Windows cannot execute .cmd shims directly. This remains bounded:
-        // every executable and argument came from an exact server allowlist.
-        shell: commandRequiresShell(commandName!),
+        // Windows .cmd shims require cmd.exe; invoking it directly avoids shell:true.
+        // Its command text is bounded by restricted tokens and exact allowlists.
+        shell: false,
         env: {
           PATH: process.env.PATH,
           HOME: homeDirectory,

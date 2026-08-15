@@ -5,8 +5,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  commandRequiresShell,
   resolveCommandExecutable,
+  resolveCommandInvocation,
   RestrictedLocalWorkspaceProvider,
   type WorkspaceHandle,
 } from "@/lib/workspace";
@@ -44,15 +44,31 @@ async function setup(options: { timeoutMs?: number } = {}) {
 }
 
 describe("restricted local workspace", () => {
-  it("uses a shell only for Windows package-manager shims", () => {
+  it("uses an explicit command processor for Windows package shims", () => {
+    const commandShell = "C:\\Windows\\System32\\cmd.exe";
     expect(resolveCommandExecutable("npm", "win32")).toBe("npm.cmd");
     expect(resolveCommandExecutable("pnpm", "win32")).toBe("pnpm.cmd");
-    expect(commandRequiresShell("npm", "win32")).toBe(true);
-    expect(commandRequiresShell("pnpm", "win32")).toBe(true);
-    expect(resolveCommandExecutable("git", "win32")).toBe("git");
-    expect(commandRequiresShell("git", "win32")).toBe(false);
-    expect(resolveCommandExecutable("npm", "linux")).toBe("npm");
-    expect(commandRequiresShell("npm", "linux")).toBe(false);
+    expect(
+      resolveCommandInvocation("npm", ["run", "lint"], "win32", commandShell),
+    ).toEqual({
+      executable: commandShell,
+      args: ["/d", "/s", "/c", "npm.cmd run lint"],
+    });
+    expect(
+      resolveCommandInvocation("git", ["status"], "win32", commandShell),
+    ).toEqual({ executable: "git", args: ["status"] });
+    expect(resolveCommandInvocation("npm", ["test"], "linux")).toEqual({
+      executable: "npm",
+      args: ["test"],
+    });
+    expect(() =>
+      resolveCommandInvocation(
+        "npm",
+        ["run", "lint & whoami"],
+        "win32",
+        commandShell,
+      ),
+    ).toThrow("Unsafe Windows package-manager command token");
   });
 
   it("parses changed files from stdout when Git warns on stderr", async () => {
