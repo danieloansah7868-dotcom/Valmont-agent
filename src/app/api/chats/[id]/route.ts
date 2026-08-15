@@ -35,3 +35,22 @@ export async function DELETE(
     return safeApiError(error);
   }
 }
+
+export async function PATCH(
+  request: NextRequest,
+  context: { params: Promise<{ id: string }> },
+) {
+  try {
+    assertCsrf(request);
+    assertApiRateLimit(request, "archive-chat", 20);
+    const { action } = (await request.json()) as { action?: string };
+    if (action !== "archive") throw new Error("Unsupported chat action");
+    const { id } = await context.params;
+    const user = await requireApiSessionUser();
+    if (!(await getChatStore().archive(id, user.id)))
+      throw new Error("Chat not found");
+    return new NextResponse(null, { status: 204 });
+  } catch (error) {
+    return safeApiError(error);
+  }
+}
