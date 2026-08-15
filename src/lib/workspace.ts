@@ -64,6 +64,17 @@ interface LocalWorkspaceOptions {
   allowedCommands?: Record<string, readonly [string, ...string[]]>;
 }
 
+const WINDOWS_COMMAND_SHIMS = new Set(["npm", "pnpm"]);
+
+export function resolveCommandExecutable(
+  executable: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === "win32" && WINDOWS_COMMAND_SHIMS.has(executable)
+    ? `${executable}.cmd`
+    : executable;
+}
+
 const DEFAULT_ALLOWED_COMMANDS: Record<string, readonly [string, ...string[]]> =
   {
     "npm ci": ["npm", "ci", "--ignore-scripts", "--no-audit", "--fund=false"],
@@ -396,8 +407,9 @@ export class RestrictedLocalWorkspaceProvider implements WorkspaceProvider {
     truncated: boolean;
   }> {
     return new Promise((resolve, reject) => {
-      const [executable, ...args] = command;
-      const child = spawn(executable!, args, {
+      const [commandName, ...args] = command;
+      const executable = resolveCommandExecutable(commandName!);
+      const child = spawn(executable, args, {
         cwd,
         shell: false,
         env: {

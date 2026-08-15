@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  resolveCommandExecutable,
   RestrictedLocalWorkspaceProvider,
   type WorkspaceHandle,
 } from "@/lib/workspace";
@@ -38,6 +39,13 @@ async function setup(options: { timeoutMs?: number } = {}) {
 }
 
 describe("restricted local workspace", () => {
+  it("uses Windows command shims without enabling a shell", () => {
+    expect(resolveCommandExecutable("npm", "win32")).toBe("npm.cmd");
+    expect(resolveCommandExecutable("pnpm", "win32")).toBe("pnpm.cmd");
+    expect(resolveCommandExecutable("git", "win32")).toBe("git");
+    expect(resolveCommandExecutable("npm", "linux")).toBe("npm");
+  });
+
   it("blocks path traversal and sensitive writes", async () => {
     const { provider, handle } = await setup();
     await expect(provider.readFile(handle, "../safe.txt")).rejects.toThrow(
