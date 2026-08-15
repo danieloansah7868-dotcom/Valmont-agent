@@ -8,6 +8,7 @@ import {
   FileSearch,
   FolderGit2,
   LockKeyhole,
+  MessageSquareText,
   Sparkles,
 } from "lucide-react";
 import { EmptyState, InlineError } from "@/components/states";
@@ -38,25 +39,35 @@ const QUICK_STARTS = [
 export function NewTaskForm({
   repositories,
   initialRepositoryId,
+  initialBaseBranch,
+  initialTitle = "",
+  initialDescription = "",
+  sourceChatTitle,
 }: {
   repositories: RepositorySummary[];
   initialRepositoryId?: string;
+  initialBaseBranch?: string;
+  initialTitle?: string;
+  initialDescription?: string;
+  sourceChatTitle?: string;
 }) {
   const router = useRouter();
   const initial =
     repositories.find((repo) => repo.id === initialRepositoryId) ??
     repositories[0];
   const [repositoryId, setRepositoryId] = useState(initial?.id ?? "");
+  const preferredInitialBranch =
+    initial?.id === initialRepositoryId ? initialBaseBranch : undefined;
   const [baseBranch, setBaseBranch] = useState(
-    initial?.defaultBranch ?? "main",
+    preferredInitialBranch ?? initial?.defaultBranch ?? "main",
   );
   const [branches, setBranches] = useState<string[]>(
-    initial ? [initial.defaultBranch] : [],
+    initial ? [preferredInitialBranch ?? initial.defaultBranch] : [],
   );
   const [branchesLoading, setBranchesLoading] = useState(Boolean(initial));
   const [branchError, setBranchError] = useState("");
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
+  const [title, setTitle] = useState(initialTitle);
+  const [description, setDescription] = useState(initialDescription);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -96,7 +107,13 @@ export function NewTaskForm({
           ...data.branches.filter((branch) => branch !== data.defaultBranch),
         ];
         setBranches([...new Set(ordered)]);
-        setBaseBranch(data.defaultBranch);
+        const preferred =
+          selected.id === initialRepositoryId &&
+          initialBaseBranch &&
+          data.branches.includes(initialBaseBranch)
+            ? initialBaseBranch
+            : data.defaultBranch;
+        setBaseBranch(preferred);
       })
       .catch((caught: unknown) => {
         if (caught instanceof DOMException && caught.name === "AbortError") {
@@ -113,7 +130,7 @@ export function NewTaskForm({
       });
 
     return () => controller.abort();
-  }, [repositories, repositoryId]);
+  }, [initialBaseBranch, initialRepositoryId, repositories, repositoryId]);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -156,6 +173,24 @@ export function NewTaskForm({
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_315px]">
       <form onSubmit={submit} className="card p-5 sm:p-7">
+        {sourceChatTitle ? (
+          <div className="mb-5 flex gap-3 rounded-xl border border-brandblue-200 bg-brandblue-50 p-4">
+            <MessageSquareText
+              className="mt-0.5 size-4 shrink-0 text-brandblue"
+              aria-hidden="true"
+            />
+            <div>
+              <p className="text-[11px] font-bold text-navy">
+                Conversation copied for review
+              </p>
+              <p className="mt-1 text-[10px] leading-4 text-slate">
+                “{sourceChatTitle}” supplied this editable draft. The original
+                chat remains separate, and creating this task does not authorize
+                code changes.
+              </p>
+            </div>
+          </div>
+        ) : null}
         <div className="border-b border-line pb-5">
           <h2 className="text-sm font-bold text-navy">Task details</h2>
           <p className="mt-1 text-[12px] text-slate">

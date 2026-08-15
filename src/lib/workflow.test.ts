@@ -13,6 +13,9 @@ class UnusedGitHub implements GitHubProvider {
   private fail(): never {
     throw new Error("GitHub must not be contacted before final approval");
   }
+  async createRepository(): Promise<never> {
+    this.fail();
+  }
   async listRepositories(): Promise<never> {
     this.fail();
   }

@@ -1,6 +1,9 @@
+import { notFound } from "next/navigation";
 import { NewTaskForm } from "@/components/new-task-form";
 import { ConnectPrompt, ErrorState } from "@/components/states";
 import { requireSessionUser, tryGetGitHubProvider } from "@/lib/auth";
+import { chatToTaskDraft } from "@/lib/chat";
+import { getChatStore } from "@/lib/chat-store";
 import { missingLiveRequirements } from "@/lib/config";
 import type { RepositorySummary } from "@/lib/types";
 
@@ -9,13 +12,18 @@ export const dynamic = "force-dynamic";
 export default async function NewTaskPage({
   searchParams,
 }: {
-  searchParams: Promise<{ repository?: string }>;
+  searchParams: Promise<{ chat?: string; repository?: string }>;
 }) {
-  await requireSessionUser();
+  const user = await requireSessionUser();
   const [params, provider] = await Promise.all([
     searchParams,
     tryGetGitHubProvider(),
   ]);
+  const sourceChat = params.chat
+    ? await getChatStore().get(params.chat, user.id)
+    : null;
+  if (params.chat && !sourceChat) notFound();
+  const chatDraft = sourceChat ? chatToTaskDraft(sourceChat) : null;
 
   let repositories: RepositorySummary[] = [];
   let loadError = "";
@@ -54,7 +62,11 @@ export default async function NewTaskPage({
       ) : (
         <NewTaskForm
           repositories={repositories}
-          initialRepositoryId={params.repository}
+          initialRepositoryId={sourceChat?.repository?.id ?? params.repository}
+          initialBaseBranch={sourceChat?.repository?.baseBranch}
+          initialTitle={chatDraft?.title}
+          initialDescription={chatDraft?.description}
+          sourceChatTitle={sourceChat?.title}
         />
       )}
     </div>

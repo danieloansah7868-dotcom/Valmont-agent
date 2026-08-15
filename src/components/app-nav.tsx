@@ -6,16 +6,22 @@ import {
   FolderGit2,
   LayoutDashboard,
   ListChecks,
+  MessageSquareText,
   Plus,
   Settings,
 } from "lucide-react";
 
 const links = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
+  { href: "/chat", label: "Chat with Valmont", icon: MessageSquareText },
   { href: "/repositories", label: "Repositories", icon: FolderGit2 },
   { href: "/tasks", label: "Tasks", icon: ListChecks },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
+
+const mobileLinks = links.filter(({ href }) =>
+  ["/dashboard", "/chat", "/tasks"].includes(href),
+);
 
 function useIsActive(pathname: string) {
   return (href: string) =>
@@ -65,7 +71,7 @@ export function AppNav() {
         className="fixed inset-x-0 bottom-0 z-40 flex h-16 items-center justify-around border-t border-navy-700 bg-navy px-2 md:hidden"
         aria-label="Mobile navigation"
       >
-        {links.slice(0, 3).map(({ href, label, icon: Icon }) => {
+        {mobileLinks.map(({ href, label, icon: Icon }) => {
           const active = isActive(href);
           return (
             <Link
@@ -77,7 +83,7 @@ export function AppNav() {
               aria-current={active ? "page" : undefined}
             >
               <Icon className="size-5" aria-hidden="true" />
-              {label}
+              {href === "/chat" ? "Chat" : label}
             </Link>
           );
         })}

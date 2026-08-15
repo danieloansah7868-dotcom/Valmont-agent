@@ -102,6 +102,9 @@ class RealTestGitHub implements GitHubProvider {
   committedFiles: FileChange[] = [];
 
   constructor(private readonly archive: Uint8Array) {}
+  async createRepository(): Promise<RepositorySummary> {
+    throw new Error("Repository creation is outside this workflow test");
+  }
   async listRepositories(): Promise<RepositorySummary[]> {
     return [];
   }

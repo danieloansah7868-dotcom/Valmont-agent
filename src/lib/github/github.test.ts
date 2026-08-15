@@ -48,6 +48,65 @@ describe("GitHub API adapter", () => {
     );
   });
 
+  it("creates and initializes a repository with the selected visibility", async () => {
+    const fetcher = vi.fn(async (input: FetchInput, init?: FetchInit) => {
+      expect(String(input)).toBe("https://api.github.com/user/repos");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        name: "private-project",
+        description: "A new project",
+        private: true,
+        auto_init: true,
+      });
+      return json(
+        {
+          id: 21,
+          name: "private-project",
+          full_name: "octocat/private-project",
+          private: true,
+          description: "A new project",
+          default_branch: "main",
+          language: null,
+          updated_at: "2026-08-15T00:00:00Z",
+          owner: { login: "octocat" },
+        },
+        201,
+      );
+    });
+    const provider = new GitHubApiProvider({ accessToken: "token", fetcher });
+
+    await expect(
+      provider.createRepository({
+        name: "private-project",
+        description: "A new project",
+        visibility: "private",
+      }),
+    ).resolves.toMatchObject({
+      id: "21",
+      fullName: "octocat/private-project",
+      private: true,
+      defaultBranch: "main",
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("rejects invalid repository creation input before GitHub is contacted", async () => {
+    const fetcher = vi.fn();
+    const provider = new GitHubApiProvider({ accessToken: "token", fetcher });
+
+    await expect(
+      provider.createRepository({ name: "../unsafe", visibility: "public" }),
+    ).rejects.toThrow(/repository name/i);
+    await expect(
+      provider.createRepository({
+        name: "valid",
+        visibility: "private",
+        description: "x".repeat(351),
+      }),
+    ).rejects.toThrow(/too long/);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("creates only valmont branches from the requested base SHA", async () => {
     const fetcher = vi.fn(async (url: FetchInput, init?: FetchInit) => {
       void url;

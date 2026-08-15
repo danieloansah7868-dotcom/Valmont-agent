@@ -1,6 +1,7 @@
 import { isSensitivePath } from "@/lib/retrieval";
 import type {
   CreatedPullRequest,
+  CreateRepositoryInput,
   FileChange,
   GitHubProvider,
   RepositoryFile,
@@ -44,21 +45,36 @@ export class GitHubApiProvider implements GitHubProvider {
     this.fetcher = config.fetcher ?? fetch;
   }
 
+  async createRepository(
+    input: CreateRepositoryInput,
+  ): Promise<RepositorySummary> {
+    validateSlug(input.name, "repository name");
+    if (input.name.length > 100 || input.name === "." || input.name === "..") {
+      throw new Error("Invalid repository name");
+    }
+    if (input.description && input.description.length > 350) {
+      throw new Error("Repository description is too long");
+    }
+    if (input.visibility !== "private" && input.visibility !== "public") {
+      throw new Error("Invalid repository visibility");
+    }
+    const repository = await this.request<GitHubRepository>("/user/repos", {
+      method: "POST",
+      body: JSON.stringify({
+        name: input.name,
+        description: input.description || undefined,
+        private: input.visibility === "private",
+        auto_init: true,
+      }),
+    });
+    return repositorySummary(repository);
+  }
+
   async listRepositories(): Promise<RepositorySummary[]> {
     const repositories = await this.request<GitHubRepository[]>(
       "/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member",
     );
-    return repositories.map((repository) => ({
-      id: String(repository.id),
-      owner: repository.owner.login,
-      name: repository.name,
-      fullName: repository.full_name,
-      description: repository.description ?? "No description",
-      defaultBranch: repository.default_branch,
-      private: repository.private,
-      language: repository.language ?? "Unknown",
-      updatedAt: repository.updated_at,
-    }));
+    return repositories.map(repositorySummary);
   }
 
   async listBranches(owner: string, repository: string): Promise<string[]> {
@@ -321,6 +337,20 @@ export class GitHubApiProvider implements GitHubProvider {
     }
     throw new GitHubApiError(message, response.status);
   }
+}
+
+function repositorySummary(repository: GitHubRepository): RepositorySummary {
+  return {
+    id: String(repository.id),
+    owner: repository.owner.login,
+    name: repository.name,
+    fullName: repository.full_name,
+    description: repository.description ?? "No description",
+    defaultBranch: repository.default_branch,
+    private: repository.private,
+    language: repository.language ?? "Unknown",
+    updatedAt: repository.updated_at,
+  };
 }
 
 function validateSlug(value: string, label: string): void {

@@ -21,7 +21,14 @@ export interface CreatedPullRequest {
   baseBranch: string;
 }
 
+export interface CreateRepositoryInput {
+  name: string;
+  description?: string;
+  visibility: "private" | "public";
+}
+
 export interface GitHubProvider {
+  createRepository(input: CreateRepositoryInput): Promise<RepositorySummary>;
   listRepositories(): Promise<RepositorySummary[]>;
   listBranches(owner: string, repository: string): Promise<string[]>;
   listFiles(owner: string, repository: string, ref: string): Promise<string[]>;
