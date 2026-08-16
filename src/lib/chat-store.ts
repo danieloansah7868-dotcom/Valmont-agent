@@ -484,6 +484,17 @@ export class SqliteChatStore implements ChatStore {
     return rows.map((row) => this.hydrate(row));
   }
 
+  private async listForExport(userId: string): Promise<ChatSession[]> {
+    // Archived sessions are intentionally hidden from the ordinary list, but
+    // they remain user-owned, recoverable backup data until permanently deleted.
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM chat_sessions WHERE user_id = ? ORDER BY updated_at DESC",
+      )
+      .all(userId) as SessionRow[];
+    return rows.map((row) => this.hydrate(row));
+  }
+
   async appendMessages(
     id: string,
     userId: string,
@@ -726,12 +737,12 @@ export class SqliteChatStore implements ChatStore {
       .run(userId, enabled ? 1 : 0);
   }
   async exportUser(userId: string) {
-    return {
-      version: 1,
-      sessions: await this.list(userId),
-      memories: await this.memories(userId),
-      memoryEnabled: await this.memoryEnabled(userId),
-    };
+    const [sessions, memories, memoryEnabled] = await Promise.all([
+      this.listForExport(userId),
+      this.memories(userId),
+      this.memoryEnabled(userId),
+    ]);
+    return { version: 1, sessions, memories, memoryEnabled };
   }
 
   async importUser(
@@ -745,6 +756,10 @@ export class SqliteChatStore implements ChatStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const imported of backup.sessions) {
+        // API validation rejects malformed timestamps before this call. Keep the
+        // store check inside the transaction as a defense for direct callers so
+        // an invalid archive state rolls back every prior imported row.
+        const archivedAt = archiveTimestampForImport(imported.archivedAt);
         const existing = this.db
           .prepare("SELECT 1 FROM chat_sessions WHERE id = ?")
           .get(imported.id);
@@ -758,13 +773,14 @@ export class SqliteChatStore implements ChatStore {
         };
         this.db
           .prepare(
-            "INSERT INTO chat_sessions(id,user_id,title,repository_json,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO chat_sessions(id,user_id,title,repository_json,archived_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
           )
           .run(
             session.id,
             userId,
             session.title || "New conversation",
             session.repository ? JSON.stringify(session.repository) : null,
+            archivedAt,
             session.createdAt,
             session.updatedAt,
           );
@@ -851,6 +867,7 @@ export class SqliteChatStore implements ChatStore {
         ? JSON.parse(row.repository_json)
         : undefined,
       messages: messages.map(messageFromRow),
+      ...(row.archived_at === null ? {} : { archivedAt: row.archived_at }),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -884,6 +901,33 @@ function memoryFromRow(row: Record<string, unknown>): ChatMemory {
     updatedAt: String(row.updated_at),
   };
 }
+function archiveTimestampForImport(value: unknown): string | null {
+  if (value === undefined) return null;
+  const match =
+    typeof value === "string"
+      ? /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(
+          value,
+        )
+      : null;
+  if (!match || typeof value !== "string") {
+    throw new Error("Invalid archivedAt in backup");
+  }
+
+  const parsed = new Date(value);
+  if (
+    Number.isNaN(parsed.getTime()) ||
+    parsed.getUTCFullYear() !== Number(match[1]) ||
+    parsed.getUTCMonth() + 1 !== Number(match[2]) ||
+    parsed.getUTCDate() !== Number(match[3]) ||
+    parsed.getUTCHours() !== Number(match[4]) ||
+    parsed.getUTCMinutes() !== Number(match[5]) ||
+    parsed.getUTCSeconds() !== Number(match[6])
+  ) {
+    throw new Error("Invalid archivedAt in backup");
+  }
+  return value;
+}
+
 function parseLegacyChatStore(content: string): ChatStoreDocument {
   let value: unknown;
   try {

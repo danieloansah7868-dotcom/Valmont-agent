@@ -31,6 +31,8 @@ const backup = z.object({
           })
           .optional(),
         messages: z.array(message).max(100000),
+        // Optional for v1 backups produced before archive metadata existed.
+        archivedAt: z.string().datetime().optional(),
         createdAt: z.string().datetime(),
         updatedAt: z.string().datetime(),
       }),

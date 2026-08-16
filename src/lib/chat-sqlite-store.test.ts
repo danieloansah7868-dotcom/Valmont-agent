@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { deriveSqliteChatStorePath, SqliteChatStore } from "@/lib/chat-store";
+import type { ChatSession } from "@/lib/types";
 
 const dirs: string[] = [];
 const migratedAt = "2026-01-01T00:00:00.000Z";
@@ -278,7 +279,175 @@ describe("SQLite chat store", () => {
     await store.delete(a.id, "a");
     expect(await store.search("a", "architecture")).toEqual([]);
     expect(await store.memories("a")).toEqual([]);
+    expect((await store.exportUser("a")).sessions).toEqual([]);
     expect(await store.get(b.id, "a")).toBeNull();
+  });
+
+  it("exports archived conversations and restores them only for the receiving user", async () => {
+    const { db, legacy } = await fixture();
+    const store = new SqliteChatStore(db, legacy);
+    const owner = "owner";
+    const active = await store.create({
+      userId: owner,
+      title: "Active conversation",
+    });
+    const archived = await store.create({
+      userId: owner,
+      title: "Archived conversation",
+    });
+    const other = await store.create({ userId: "other", title: "Other user" });
+    const now = "2026-08-16T00:00:00.000Z";
+
+    await store.appendMessages(active.id, owner, [
+      {
+        id: "active-message",
+        role: "user",
+        content: "active transcript",
+        createdAt: now,
+      },
+    ]);
+    await store.appendMessages(archived.id, owner, [
+      {
+        id: "archived-user-message",
+        role: "user",
+        content: "archived transcript first message",
+        createdAt: now,
+      },
+      {
+        id: "archived-assistant-message",
+        role: "assistant",
+        content: "archived transcript second message",
+        createdAt: now,
+      },
+    ]);
+    await store.appendMessages(other.id, "other", [
+      {
+        id: "other-message",
+        role: "user",
+        content: "other user private transcript",
+        createdAt: now,
+      },
+    ]);
+    expect(await store.archive(archived.id, owner)).toBe(true);
+
+    expect((await store.list(owner)).map((session) => session.id)).toEqual([
+      active.id,
+    ]);
+    const backup = await store.exportUser(owner);
+    expect(backup.sessions).toHaveLength(2);
+    expect(backup.sessions.map((session) => session.id)).not.toContain(
+      other.id,
+    );
+    expect(
+      backup.sessions
+        .flatMap((session) => session.messages)
+        .map((message) => message.content),
+    ).not.toContain("other user private transcript");
+
+    const archivedBackup = backup.sessions.find(
+      (session) => session.id === archived.id,
+    );
+    expect(archivedBackup).toMatchObject({ archivedAt: expect.any(String) });
+    expect(archivedBackup?.messages).toHaveLength(2);
+    expect(archivedBackup?.messages.map((message) => message.content)).toEqual(
+      expect.arrayContaining([
+        "archived transcript first message",
+        "archived transcript second message",
+      ]),
+    );
+
+    await store.importUser("receiver", backup);
+    expect(
+      (await store.list("receiver")).map((session) => session.title),
+    ).toEqual(["Active conversation"]);
+
+    const receiverBackup = await store.exportUser("receiver");
+    expect(receiverBackup.sessions).toHaveLength(2);
+    expect(
+      receiverBackup.sessions.every((session) => session.userId === "receiver"),
+    ).toBe(true);
+    const restoredArchived = receiverBackup.sessions.find(
+      (session) => session.title === "Archived conversation",
+    );
+    expect(restoredArchived).toMatchObject({
+      archivedAt: archivedBackup?.archivedAt,
+    });
+    expect(restoredArchived?.messages).toHaveLength(2);
+    expect(
+      restoredArchived?.messages.map((message) => message.content),
+    ).toEqual(
+      expect.arrayContaining([
+        "archived transcript first message",
+        "archived transcript second message",
+      ]),
+    );
+  });
+
+  it("imports older backups as active and rolls back malformed archive metadata", async () => {
+    const { db, legacy } = await fixture();
+    const store = new SqliteChatStore(db, legacy);
+    const now = "2026-08-16T00:00:00.000Z";
+    const olderActive: ChatSession = {
+      id: "00000000-0000-4000-8000-000000000101",
+      userId: "source-user",
+      title: "Older active backup",
+      messages: [
+        {
+          id: "00000000-0000-4000-8000-000000000102",
+          role: "user",
+          content: "older active transcript",
+          createdAt: now,
+        },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    };
+    await store.importUser("receiver", {
+      sessions: [olderActive],
+      memories: [],
+    });
+    expect(
+      (await store.list("receiver")).map((session) => session.title),
+    ).toEqual(["Older active backup"]);
+    expect((await store.exportUser("receiver")).sessions[0]).not.toHaveProperty(
+      "archivedAt",
+    );
+
+    const validThenRolledBack: ChatSession = {
+      id: "00000000-0000-4000-8000-000000000103",
+      userId: "source-user",
+      title: "Must roll back",
+      messages: [
+        {
+          id: "00000000-0000-4000-8000-000000000104",
+          role: "user",
+          content: "this import must roll back",
+          createdAt: now,
+        },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    };
+    const malformedArchiveState: ChatSession = {
+      id: "00000000-0000-4000-8000-000000000105",
+      userId: "source-user",
+      title: "Invalid archive state",
+      messages: [],
+      archivedAt: "not-a-timestamp",
+      createdAt: now,
+      updatedAt: now,
+    };
+    await expect(
+      store.importUser("receiver", {
+        sessions: [validThenRolledBack, malformedArchiveState],
+        memories: [],
+      }),
+    ).rejects.toThrow("Invalid archivedAt in backup");
+
+    const afterFailure = await store.exportUser("receiver");
+    expect(afterFailure.sessions.map((session) => session.title)).toEqual([
+      "Older active backup",
+    ]);
   });
 
   it("imports transactionally under the receiving user and rolls back invalid data", async () => {
