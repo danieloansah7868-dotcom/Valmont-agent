@@ -1,10 +1,13 @@
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SqliteChatStore } from "@/lib/chat-store";
+import { deriveSqliteChatStorePath, SqliteChatStore } from "@/lib/chat-store";
 
 const dirs: string[] = [];
+const migratedAt = "2026-01-01T00:00:00.000Z";
+
 async function fixture() {
   const dir = await mkdtemp(path.join(os.tmpdir(), "valmont-sqlite-"));
   dirs.push(dir);
@@ -14,6 +17,52 @@ async function fixture() {
     legacy: path.join(dir, "legacy.json"),
   };
 }
+
+function legacyDocument(overrides: Record<string, unknown> = {}) {
+  return {
+    sessions: [
+      {
+        id: "legacy-session",
+        userId: "legacy-user",
+        title: "Legacy chat",
+        messages: [
+          {
+            id: "legacy-message",
+            role: "user",
+            content: "legacy searchable architecture detail",
+            createdAt: migratedAt,
+          },
+        ],
+        createdAt: migratedAt,
+        updatedAt: migratedAt,
+        ...overrides,
+      },
+    ],
+  };
+}
+
+function restoreEnvironment(name: string, value: string | undefined) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+async function withConfiguredChatStorePaths<T>(
+  legacyPath: string | undefined,
+  sqlitePath: string | undefined,
+  run: () => Promise<T> | T,
+): Promise<T> {
+  const previousLegacyPath = process.env.CHAT_STORE_PATH;
+  const previousSqlitePath = process.env.CHAT_SQLITE_PATH;
+  try {
+    restoreEnvironment("CHAT_STORE_PATH", legacyPath);
+    restoreEnvironment("CHAT_SQLITE_PATH", sqlitePath);
+    return await run();
+  } finally {
+    restoreEnvironment("CHAT_STORE_PATH", previousLegacyPath);
+    restoreEnvironment("CHAT_SQLITE_PATH", previousSqlitePath);
+  }
+}
+
 afterEach(async () => {
   await Promise.all(
     dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
@@ -36,11 +85,11 @@ describe("SQLite chat store", () => {
                 id: "m",
                 role: "user",
                 content: "remember that I prefer concise answers",
-                createdAt: "2026-01-01T00:00:00.000Z",
+                createdAt: migratedAt,
               },
             ],
-            createdAt: "2026-01-01T00:00:00.000Z",
-            updatedAt: "2026-01-01T00:00:00.000Z",
+            createdAt: migratedAt,
+            updatedAt: migratedAt,
           },
         ],
       }),
@@ -49,9 +98,9 @@ describe("SQLite chat store", () => {
     expect(await first.get("s", "u")).toMatchObject({
       id: "s",
       userId: "u",
-      createdAt: "2026-01-01T00:00:00.000Z",
-      updatedAt: "2026-01-01T00:00:00.000Z",
-      messages: [{ id: "m", createdAt: "2026-01-01T00:00:00.000Z" }],
+      createdAt: migratedAt,
+      updatedAt: migratedAt,
+      messages: [{ id: "m", createdAt: migratedAt }],
     });
     expect(await readFile(`${legacy}.pre-sqlite-backup`, "utf8")).toBe(
       await readFile(legacy, "utf8"),
@@ -59,6 +108,137 @@ describe("SQLite chat store", () => {
     const second = new SqliteChatStore(db, legacy);
     expect((await second.get("s", "u"))?.messages).toHaveLength(1);
   });
+
+  it("uses a non-default CHAT_STORE_PATH and derives an adjacent SQLite destination", async () => {
+    const { dir } = await fixture();
+    const legacy = path.join(dir, "persistent", "chat-history.json");
+    const sqlite = path.join(dir, "persistent", "chat-history.sqlite");
+    const original = JSON.stringify(legacyDocument());
+    await mkdir(path.dirname(legacy), { recursive: true });
+    await writeFile(legacy, original);
+
+    await withConfiguredChatStorePaths(legacy, undefined, async () => {
+      const store = new SqliteChatStore();
+      expect(deriveSqliteChatStorePath(legacy)).toBe(sqlite);
+      expect(
+        deriveSqliteChatStorePath(
+          path.join(dir, "persistent", "legacy.sqlite"),
+        ),
+      ).toBe(path.join(dir, "persistent", "legacy.sqlite.sqlite"));
+      expect(existsSync(sqlite)).toBe(true);
+      expect(await store.get("legacy-session", "legacy-user")).toMatchObject({
+        id: "legacy-session",
+        messages: [{ id: "legacy-message" }],
+      });
+    });
+
+    expect(await readFile(legacy, "utf8")).toBe(original);
+    expect(await readFile(`${legacy}.pre-sqlite-backup`, "utf8")).toBe(
+      original,
+    );
+  });
+
+  it("honors CHAT_SQLITE_PATH without touching the configured legacy source", async () => {
+    const { dir } = await fixture();
+    const legacy = path.join(dir, "legacy", "chats.json");
+    const sqlite = path.join(dir, "sqlite", "history.sqlite");
+    const automaticDestination = deriveSqliteChatStorePath(legacy);
+    const original = JSON.stringify(legacyDocument({ id: "explicit-session" }));
+    await mkdir(path.dirname(legacy), { recursive: true });
+    await writeFile(legacy, original);
+
+    await withConfiguredChatStorePaths(legacy, sqlite, async () => {
+      const store = new SqliteChatStore();
+      expect(await store.get("explicit-session", "legacy-user")).not.toBeNull();
+    });
+
+    expect(existsSync(sqlite)).toBe(true);
+    expect(existsSync(automaticDestination)).toBe(false);
+    expect(await readFile(legacy, "utf8")).toBe(original);
+    expect(await readFile(`${legacy}.pre-sqlite-backup`, "utf8")).toBe(
+      original,
+    );
+  });
+
+  it("keeps migration idempotent across sessions, messages, FTS, summaries, and memories", async () => {
+    const { db, legacy } = await fixture();
+    await writeFile(legacy, JSON.stringify(legacyDocument()));
+    const first = new SqliteChatStore(db, legacy);
+    await first.appendMessages("legacy-session", "legacy-user", [
+      {
+        id: "post-migration-memory",
+        role: "user",
+        content: "remember that I prefer idempotent migration tests",
+        createdAt: "2026-01-02T00:00:00.000Z",
+      },
+    ]);
+    const summary = await first.summary("legacy-session", "legacy-user");
+    expect(await first.search("legacy-user", "legacy searchable")).toHaveLength(
+      1,
+    );
+    expect(await first.memories("legacy-user")).toHaveLength(1);
+
+    const second = new SqliteChatStore(db, legacy);
+    const migrated = await second.get("legacy-session", "legacy-user");
+    expect(migrated?.messages).toHaveLength(2);
+    expect(
+      await second.search("legacy-user", "legacy searchable"),
+    ).toHaveLength(1);
+    expect(await second.summary("legacy-session", "legacy-user")).toBe(summary);
+    expect(await second.memories("legacy-user")).toHaveLength(1);
+  });
+
+  it("fails safely for malformed legacy JSON and leaves the migration retryable", async () => {
+    const { db, legacy } = await fixture();
+    const malformed = '{"sessions": [';
+    await writeFile(legacy, malformed);
+
+    expect(() => new SqliteChatStore(db, legacy)).toThrow(
+      "Legacy chat JSON is malformed",
+    );
+    expect(await readFile(legacy, "utf8")).toBe(malformed);
+    expect(await readFile(`${legacy}.pre-sqlite-backup`, "utf8")).toBe(
+      malformed,
+    );
+
+    await writeFile(
+      legacy,
+      JSON.stringify(legacyDocument({ id: "recovered" })),
+    );
+    const recovered = new SqliteChatStore(db, legacy);
+    expect(await recovered.get("recovered", "legacy-user")).not.toBeNull();
+  });
+
+  it("rejects identical legacy and SQLite paths before opening the JSON source", async () => {
+    const { legacy } = await fixture();
+    const original = JSON.stringify(legacyDocument());
+    await writeFile(legacy, original);
+
+    await withConfiguredChatStorePaths(legacy, legacy, () => {
+      expect(() => new SqliteChatStore()).toThrow(
+        "CHAT_STORE_PATH (legacy JSON) and CHAT_SQLITE_PATH (SQLite destination) must be distinct",
+      );
+    });
+
+    expect(await readFile(legacy, "utf8")).toBe(original);
+    expect(existsSync(`${legacy}.pre-sqlite-backup`)).toBe(false);
+  });
+
+  it("starts without a legacy source and can migrate one that appears later", async () => {
+    const { db, legacy } = await fixture();
+    const first = new SqliteChatStore(db, legacy);
+    expect(await first.list("legacy-user")).toEqual([]);
+    expect(existsSync(db)).toBe(true);
+    expect(existsSync(`${legacy}.pre-sqlite-backup`)).toBe(false);
+
+    await writeFile(
+      legacy,
+      JSON.stringify(legacyDocument({ id: "late-source" })),
+    );
+    const second = new SqliteChatStore(db, legacy);
+    expect(await second.get("late-source", "legacy-user")).not.toBeNull();
+  });
+
   it("isolates FTS, serializes writes, and permanently removes derived memory", async () => {
     const { db, legacy } = await fixture();
     const store = new SqliteChatStore(db, legacy);
@@ -100,10 +280,11 @@ describe("SQLite chat store", () => {
     expect(await store.memories("a")).toEqual([]);
     expect(await store.get(b.id, "a")).toBeNull();
   });
+
   it("imports transactionally under the receiving user and rolls back invalid data", async () => {
     const { db, legacy } = await fixture();
     const store = new SqliteChatStore(db, legacy);
-    const now = "2026-01-01T00:00:00.000Z";
+    const now = migratedAt;
     await store.importUser("receiver", {
       sessions: [
         {

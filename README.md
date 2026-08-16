@@ -66,18 +66,19 @@ Open [http://localhost:3000](http://localhost:3000). Configure `SESSION_SECRET`,
 
 Valmont requires `SESSION_SECRET`, the GitHub OAuth pair, and `MODEL_API_KEY`. Never prefix model or GitHub secrets with `NEXT_PUBLIC_`.
 
-| Variable                     | Purpose                                                         |
-| ---------------------------- | --------------------------------------------------------------- |
-| `DATABASE_URL`               | PostgreSQL connection URL                                       |
-| `CHAT_STORE_PATH`            | Optional local chat JSON path (default `.data/chat-store.json`) |
-| `SESSION_SECRET`             | 32+ random bytes for AES-GCM OAuth session encryption           |
-| `APP_URL`                    | Public origin, e.g. `http://localhost:3000`                     |
-| `GITHUB_CLIENT_ID`           | GitHub OAuth App client ID                                      |
-| `GITHUB_CLIENT_SECRET`       | GitHub OAuth App secret                                         |
-| `MODEL_BASE_URL`             | OpenAI-compatible `/v1` base URL                                |
-| `MODEL_API_KEY`              | Server-only model API key                                       |
-| `MODEL_NAME`                 | Provider model identifier                                       |
-| `VALMONT_COMMAND_TIMEOUT_MS` | Per-command validation timeout (default 180000)                 |
+| Variable                     | Purpose                                                                                       |
+| ---------------------------- | --------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`               | PostgreSQL connection URL                                                                     |
+| `CHAT_STORE_PATH`            | Legacy JSON chat-store input for migration (default `.data/chat-store.json`)                  |
+| `CHAT_SQLITE_PATH`           | SQLite chat-store destination; defaults to a sibling `.sqlite` path next to `CHAT_STORE_PATH` |
+| `SESSION_SECRET`             | 32+ random bytes for AES-GCM OAuth session encryption                                         |
+| `APP_URL`                    | Public origin, e.g. `http://localhost:3000`                                                   |
+| `GITHUB_CLIENT_ID`           | GitHub OAuth App client ID                                                                    |
+| `GITHUB_CLIENT_SECRET`       | GitHub OAuth App secret                                                                       |
+| `MODEL_BASE_URL`             | OpenAI-compatible `/v1` base URL                                                              |
+| `MODEL_API_KEY`              | Server-only model API key                                                                     |
+| `MODEL_NAME`                 | Provider model identifier                                                                     |
+| `VALMONT_COMMAND_TIMEOUT_MS` | Per-command validation timeout (default 180000)                                               |
 
 See `.env.example` for placeholders.
 
@@ -112,7 +113,7 @@ Credentials are read only in server modules. Add another provider by implementin
 
 Chat sessions are separate from coding tasks. A session can be general, or it can use bounded, redacted, read-only context from one authorized GitHub repository and branch. The chat model receives no workspace or GitHub write tools and cannot modify files. When a conversation is ready for implementation, **Create coding task** copies a redacted, editable transcript into the existing task form; the normal plan and final approval gates still apply.
 
-Reopenable sessions and messages are stored locally in ignored `.data/chat-store.json` by default. Set `CHAT_STORE_PATH` only if a different server-local path is needed. High-confidence secret patterns are redacted before messages are sent or persisted, but chat history is still sensitive local data: do not paste credentials, restrict filesystem access, and include the store in an intentional backup/deletion policy. Retrieved repository files are not persisted in the chat store.
+Reopenable sessions, messages, FTS retrieval data, and long-term memories are stored locally in SQLite. `CHAT_STORE_PATH` remains the backward-compatible legacy JSON input (default `.data/chat-store.json`), while `CHAT_SQLITE_PATH` selects the SQLite destination. When `CHAT_SQLITE_PATH` is omitted, Valmont derives a distinct sibling destination by replacing the legacy path extension with `.sqlite` (for example `.data/chat-store.json` becomes `.data/chat-store.sqlite`), so a configured persistent legacy directory remains in use. Before migration, Valmont creates `<legacy path>.pre-sqlite-backup`, migrates transactionally, and records completion only with the migrated rows. Never point both variables at the same file; the legacy JSON source is never opened as SQLite or overwritten. High-confidence secret patterns are redacted before messages are sent or persisted, but chat history is still sensitive local data: do not paste credentials, restrict filesystem access, and include the store in an intentional backup/deletion policy. Retrieved repository files are not persisted in the chat store.
 
 ### PostgreSQL
 

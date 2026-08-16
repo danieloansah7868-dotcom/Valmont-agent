@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import {
   chmodSync,
+  constants,
   copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
 } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
@@ -206,11 +208,68 @@ export function setChatStoreForTests(store: ChatStore | null) {
 // SQLite is the active chat store. The JSON class above is deliberately retained
 // only as a read-compatible migration source for installations created before
 // SQLite-backed chat history.
-const DEFAULT_SQLITE_CHAT_STORE_PATH = path.join(
-  process.cwd(),
-  ".data",
-  "chat-store.sqlite",
-);
+/**
+ * `CHAT_STORE_PATH` remains the legacy JSON input for backwards-compatible
+ * upgrades. SQLite always writes to a distinct path, either explicitly via
+ * `CHAT_SQLITE_PATH` or next to the legacy source.
+ */
+export function deriveSqliteChatStorePath(legacyPath: string): string {
+  const extension = path.extname(legacyPath);
+  const stem = extension ? legacyPath.slice(0, -extension.length) : legacyPath;
+  const destination = `${stem}.sqlite`;
+  // A legacy JSON file can have any extension, including `.sqlite`. Preserve
+  // the safety invariant even for that unusual historical configuration.
+  return path.resolve(destination) === path.resolve(legacyPath)
+    ? `${legacyPath}.sqlite`
+    : destination;
+}
+
+function configuredLegacyChatStorePath(): string {
+  return process.env.CHAT_STORE_PATH || DEFAULT_CHAT_STORE_PATH;
+}
+
+function configuredSqliteChatStorePath(legacyPath: string): string {
+  return process.env.CHAT_SQLITE_PATH || deriveSqliteChatStorePath(legacyPath);
+}
+
+function legacyBackupPath(legacyPath: string): string {
+  return `${legacyPath}.pre-sqlite-backup`;
+}
+
+function assertDistinctStorePaths(
+  legacyPath: string,
+  sqlitePath: string,
+): void {
+  const source = path.resolve(legacyPath);
+  const destination = path.resolve(sqlitePath);
+  if (source === destination) {
+    throw new Error(
+      "CHAT_STORE_PATH (legacy JSON) and CHAT_SQLITE_PATH (SQLite destination) must be distinct",
+    );
+  }
+
+  // Different spellings can still address the same existing file through a
+  // symlink or hard link. Detect that before DatabaseSync gets a chance to
+  // write a SQLite header over the legacy JSON source.
+  if (existsSync(legacyPath) && existsSync(sqlitePath)) {
+    const sourceStat = statSync(legacyPath);
+    const destinationStat = statSync(sqlitePath);
+    if (
+      sourceStat.dev === destinationStat.dev &&
+      sourceStat.ino === destinationStat.ino
+    ) {
+      throw new Error(
+        "CHAT_STORE_PATH (legacy JSON) and CHAT_SQLITE_PATH (SQLite destination) must be distinct",
+      );
+    }
+  }
+
+  if (destination === path.resolve(legacyBackupPath(legacyPath))) {
+    throw new Error(
+      "CHAT_SQLITE_PATH must not use the legacy .pre-sqlite-backup path",
+    );
+  }
+}
 
 export interface ChatMemory {
   id: string;
@@ -238,15 +297,13 @@ type SessionRow = {
 export class SqliteChatStore implements ChatStore {
   private readonly db: DatabaseSync;
 
-  constructor(
-    private readonly filePath = process.env.CHAT_STORE_PATH ||
-      DEFAULT_SQLITE_CHAT_STORE_PATH,
-    legacyPath = path.join(process.cwd(), ".data", "chat-store.json"),
-  ) {
-    mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(filePath);
+  constructor(filePath?: string, legacyPath = configuredLegacyChatStorePath()) {
+    const sqlitePath = filePath ?? configuredSqliteChatStorePath(legacyPath);
+    assertDistinctStorePaths(legacyPath, sqlitePath);
+    mkdirSync(path.dirname(sqlitePath), { recursive: true, mode: 0o700 });
+    this.db = new DatabaseSync(sqlitePath);
     try {
-      chmodSync(filePath, 0o600);
+      chmodSync(sqlitePath, 0o600);
     } catch {
       // The database was still opened with the process umask; this is best effort
       // on filesystems that do not support POSIX permissions.
@@ -287,32 +344,24 @@ export class SqliteChatStore implements ChatStore {
   }
 
   private migrateLegacyJson(legacyPath: string) {
-    if (
-      this.db
-        .prepare("SELECT 1 FROM chat_meta WHERE key = ?")
-        .get("legacy-json-migrated")
-    )
-      return;
+    if (this.hasLegacyMigrationMarker() || !existsSync(legacyPath)) return;
+
+    // Copy before beginning the SQLite migration. The source is never opened as
+    // a database, and an existing backup is left untouched on every retry.
+    this.backupLegacyJson(legacyPath);
+
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      if (existsSync(legacyPath)) {
-        // Preserve an immutable migration source before touching the new store.
-        // copyFile is completed before the transaction marks migration complete.
-        const backupPath = `${legacyPath}.pre-sqlite-backup`;
-        if (!existsSync(backupPath)) {
-          copyFileSync(legacyPath, backupPath);
-          try {
-            chmodSync(backupPath, 0o600);
-          } catch {
-            /* best effort */
-          }
-        }
-        const legacy = JSON.parse(
-          readFileSyncCompat(legacyPath),
-        ) as ChatStoreDocument;
-        for (const session of normalizeDocument(legacy).sessions)
-          this.insertSession(session);
+      // Another process can complete the migration while this process waits for
+      // the immediate transaction lock. Recheck so a restart is idempotent.
+      if (this.hasLegacyMigrationMarker()) {
+        this.db.exec("COMMIT");
+        return;
       }
+      const legacy = parseLegacyChatStore(readFileSyncCompat(legacyPath));
+      for (const session of legacy.sessions) this.insertSession(session);
+      // The marker is committed in the same transaction as the migrated rows,
+      // so a failed parse/insert/commit never records a completed migration.
       this.db
         .prepare("INSERT INTO chat_meta(key, value) VALUES (?, ?)")
         .run("legacy-json-migrated", new Date().toISOString());
@@ -323,8 +372,35 @@ export class SqliteChatStore implements ChatStore {
     }
   }
 
+  private hasLegacyMigrationMarker(): boolean {
+    return Boolean(
+      this.db
+        .prepare("SELECT 1 FROM chat_meta WHERE key = ?")
+        .get("legacy-json-migrated"),
+    );
+  }
+
+  private backupLegacyJson(legacyPath: string) {
+    const backupPath = legacyBackupPath(legacyPath);
+    if (existsSync(backupPath)) return;
+    try {
+      copyFileSync(legacyPath, backupPath, constants.COPYFILE_EXCL);
+    } catch (error) {
+      // A concurrent startup may have produced the backup after our existence
+      // check. It is safe to reuse that immutable copy; all other failures must
+      // stop before migration begins.
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    try {
+      chmodSync(backupPath, 0o600);
+    } catch {
+      // The directory's owner-only mode still protects new default paths; this
+      // is best effort for filesystems without POSIX permissions.
+    }
+  }
+
   private insertSession(session: ChatSession) {
-    this.db
+    const inserted = this.db
       .prepare(
         "INSERT OR IGNORE INTO chat_sessions(id,user_id,title,repository_json,created_at,updated_at) VALUES (?,?,?,?,?,?)",
       )
@@ -336,6 +412,9 @@ export class SqliteChatStore implements ChatStore {
         session.createdAt,
         session.updatedAt,
       );
+    // A pre-existing session ID must not receive messages from another legacy
+    // document. It also ensures retries cannot duplicate FTS entries.
+    if (Number(inserted.changes) === 0) return;
     const message = this.db.prepare(
       "INSERT OR IGNORE INTO chat_messages(id,session_id,user_id,role,content,created_at,model,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?,?)",
     );
@@ -805,6 +884,76 @@ function memoryFromRow(row: Record<string, unknown>): ChatMemory {
     updatedAt: String(row.updated_at),
   };
 }
+function parseLegacyChatStore(content: string): ChatStoreDocument {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch (error) {
+    throw new Error("Legacy chat JSON is malformed", { cause: error });
+  }
+  if (!value || typeof value !== "object") {
+    throw new Error("Legacy chat JSON is malformed");
+  }
+  const sessions = (value as { sessions?: unknown }).sessions;
+  if (!Array.isArray(sessions)) {
+    throw new Error("Legacy chat JSON is malformed");
+  }
+  if (!sessions.every(isLegacyChatSession)) {
+    throw new Error("Legacy chat JSON contains an invalid session");
+  }
+  return { sessions };
+}
+
+function isLegacyChatSession(value: unknown): value is ChatSession {
+  if (!value || typeof value !== "object") return false;
+  const session = value as Partial<ChatSession>;
+  return (
+    typeof session.id === "string" &&
+    typeof session.userId === "string" &&
+    typeof session.title === "string" &&
+    typeof session.createdAt === "string" &&
+    typeof session.updatedAt === "string" &&
+    (session.repository === undefined ||
+      isLegacyRepositoryContext(session.repository)) &&
+    Array.isArray(session.messages) &&
+    session.messages.every(isLegacyChatMessage)
+  );
+}
+
+function isLegacyRepositoryContext(
+  value: unknown,
+): value is ChatRepositoryContext {
+  if (!value || typeof value !== "object") return false;
+  const repository = value as Partial<ChatRepositoryContext>;
+  return (
+    typeof repository.id === "string" &&
+    typeof repository.owner === "string" &&
+    typeof repository.name === "string" &&
+    typeof repository.fullName === "string" &&
+    typeof repository.baseBranch === "string"
+  );
+}
+
+function isLegacyChatMessage(value: unknown): value is ChatMessage {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<ChatMessage>;
+  return (
+    typeof message.id === "string" &&
+    (message.role === "user" || message.role === "assistant") &&
+    typeof message.content === "string" &&
+    typeof message.createdAt === "string" &&
+    (message.model === undefined || typeof message.model === "string") &&
+    (message.inputTokens === undefined ||
+      (typeof message.inputTokens === "number" &&
+        Number.isInteger(message.inputTokens) &&
+        message.inputTokens >= 0)) &&
+    (message.outputTokens === undefined ||
+      (typeof message.outputTokens === "number" &&
+        Number.isInteger(message.outputTokens) &&
+        message.outputTokens >= 0))
+  );
+}
+
 function readFileSyncCompat(file: string) {
   return readFileSync(file, "utf8");
 }
