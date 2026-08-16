@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   Bot,
@@ -75,12 +75,46 @@ export function ChatWorkspace({
   const [sending, setSending] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const activeSessionIdRef = useRef<string | undefined>(undefined);
+  const shouldFollowMessagesRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // Chat occupies the application viewport, rather than extending the document.
+  // This is kept here (instead of globally) so the rest of the authenticated app
+  // retains its normal document scrolling behavior.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [session?.messages.length, pendingMessage, sending]);
+    document.documentElement.classList.add("chat-page");
+    return () => document.documentElement.classList.remove("chat-page");
+  }, []);
+
+  // Scroll only the transcript. In particular, do not use scrollIntoView here:
+  // it may select a document scroll ancestor and push the composer off screen.
+  useLayoutEffect(() => {
+    const transcript = transcriptRef.current;
+    if (!transcript) return;
+
+    const isNewSession = activeSessionIdRef.current !== session?.id;
+    if (isNewSession || shouldFollowMessagesRef.current) {
+      transcript.scrollTo({ top: transcript.scrollHeight, behavior: "auto" });
+    }
+    if (isNewSession) {
+      activeSessionIdRef.current = session?.id;
+      shouldFollowMessagesRef.current = true;
+    }
+  }, [session?.id, session?.messages.length, pendingMessage, sending]);
+
+  function trackTranscriptPosition() {
+    const transcript = transcriptRef.current;
+    if (!transcript) return;
+    // A small threshold accommodates fractional layout values and lets someone
+    // reading the newest message continue to receive responses naturally.
+    shouldFollowMessagesRef.current =
+      transcript.scrollHeight -
+        transcript.scrollTop -
+        transcript.clientHeight <=
+      96;
+  }
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -152,7 +186,7 @@ export function ChatWorkspace({
   }
 
   return (
-    <div className="mx-auto flex h-[calc(100dvh-8rem)] max-w-[1440px] flex-col overflow-hidden md:h-[calc(100dvh-4rem)] lg:flex-row">
+    <div className="fixed inset-x-0 top-16 bottom-16 mx-auto flex max-w-[1440px] flex-col overflow-hidden bg-ivory-50 md:left-[228px] md:bottom-0 lg:flex-row">
       <aside className="flex shrink-0 flex-col border-b border-line bg-white lg:h-full lg:w-[280px] lg:border-r lg:border-b-0">
         <div className="flex items-center justify-between border-b border-line px-4 py-3 lg:py-4">
           <div>
@@ -273,7 +307,12 @@ export function ChatWorkspace({
             </div>
           </header>
 
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
+          <div
+            ref={transcriptRef}
+            onScroll={trackTranscriptPosition}
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6"
+            aria-label="Message transcript"
+          >
             <div className="mx-auto max-w-3xl">
               {session.messages.length === 0 && !pendingMessage && !sending ? (
                 <ChatWelcome session={session} onStarter={useStarter} />
@@ -284,7 +323,6 @@ export function ChatWorkspace({
                   sending={sending}
                 />
               )}
-              <div ref={messagesEndRef} />
             </div>
           </div>
 

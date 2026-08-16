@@ -13,7 +13,7 @@ docker compose up --build -d
 curl https://your-domain.example/api/health
 ```
 
-The compose migration mount initializes a new PostgreSQL volume. For an existing database, review and apply migrations manually with `npm run db:migrate` from a controlled release job. Valmont never runs production migrations from an agent task.
+The compose migration mount initializes a new PostgreSQL volume. For an existing database, review and apply migrations manually with `npm run db:migrate` from a controlled release job. Valmont never runs production migrations from an agent task. The default persistent `/app/.data` volume also retains chat SQLite data. If `CHAT_STORE_PATH` or `CHAT_SQLITE_PATH` points outside that directory, mount the custom parent directory into the app container; leaving `CHAT_SQLITE_PATH` unset derives a sibling SQLite file next to the legacy JSON input.
 
 The compose port binds only to `127.0.0.1`. Put Caddy on the host in front of it:
 

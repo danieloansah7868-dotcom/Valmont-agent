@@ -7,7 +7,7 @@ export function csrfToken(): string {
 
 async function apiRequest<T>(
   url: string,
-  method: "POST" | "DELETE",
+  method: "POST" | "PATCH" | "DELETE",
   body?: unknown,
 ): Promise<T> {
   const response = await fetch(url, {
@@ -26,6 +26,10 @@ async function apiRequest<T>(
 
 export function apiMutation<T>(url: string, body: unknown): Promise<T> {
   return apiRequest<T>(url, "POST", body);
+}
+
+export function apiPatch<T>(url: string, body: unknown): Promise<T> {
+  return apiRequest<T>(url, "PATCH", body);
 }
 
 export function apiDelete(url: string): Promise<void> {

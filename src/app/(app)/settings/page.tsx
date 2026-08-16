@@ -209,6 +209,9 @@ export default async function SettingsPage() {
             ))}
           </ul>
           <div className="mt-5 flex gap-4 text-[10px]">
+            <Link href="/settings/memory" className="link-brand">
+              Chat memory
+            </Link>
             <Link href="/docs/security" className="link-brand">
               Threat model
             </Link>

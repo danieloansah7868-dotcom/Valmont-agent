@@ -136,6 +136,8 @@ export interface ChatSession {
   title: string;
   repository?: ChatRepositoryContext;
   messages: ChatMessage[];
+  /** Present for archived sessions in backups and direct session reads. */
+  archivedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

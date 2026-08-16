@@ -33,6 +33,10 @@ services:
       MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.openai.com/v1}
       MODEL_API_KEY: ${MODEL_API_KEY:-}
       MODEL_NAME: ${MODEL_NAME:-gpt-4.1-mini}
+      # CHAT_STORE_PATH remains a legacy JSON input; CHAT_SQLITE_PATH can select
+      # a distinct destination. Mount any custom parent directory as well.
+      CHAT_STORE_PATH: ${CHAT_STORE_PATH:-}
+      CHAT_SQLITE_PATH: ${CHAT_SQLITE_PATH:-}
       VALMONT_COMMAND_TIMEOUT_MS: ${VALMONT_COMMAND_TIMEOUT_MS:-180000}
     volumes:
       - valmont-workspaces:/app/.data
