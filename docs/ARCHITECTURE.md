@@ -138,3 +138,7 @@ Missing credentials fail loudly at every boundary rather than being papered over
 - `JsonTaskStore` starts empty; the PostgreSQL schema carries no demo columns.
 
 `missingLiveRequirements()` drives the connect prompts, settings page, and `/api/health` `missingConfiguration` array so operators see exactly which variables remain unset.
+
+## Website Studio Phase 1
+
+Phase 1 provides category/package/theme/template registries, SiteBrief v1 with Ghana defaults (country Ghana, currency GHS, timezone Africa/Accra, +233, regions, plannedPaymentMethods typed future-only), shared SQLite file (same as Chat, derived via deriveSqliteChatStorePath, assertDistinctStorePaths safety), PostgreSQL studio_drafts table via Drizzle migration 0002, atomic revision concurrency (WHERE revision RETURNING), Brief completeness derived, bounded body 1MB/25MB via stream, backup v2 {backupVersion:2, chat, studio} accepting legacy v1, one-handle transaction for Chat+Studio, wizard 4 steps with autosave and 409 handling. Deferred: Phases 2-6 (uploads, payments, repo generation, deploys). Tests: vitest + Playwright e2e with encrypted test session cookies, temp DBs, never .data.

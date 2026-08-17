@@ -61,3 +61,7 @@ Before exposing Valmont to customers, organizations you do not control, or publi
 8. Keep branch protection and mandatory GitHub reviews enabled.
 
 Valmont intentionally has no merge or deployment method. Your existing reviewed CI/CD process should deploy only after a human merges the pull request in GitHub.
+
+## Website Studio Storage
+
+SQLite Phase 1 uses the same SQLite file as Chat (CHAT_STORE_PATH/CHAT_SQLITE_PATH via shared resolver). studio_meta holds studio_schema_version, explicit version check on startup. PostgreSQL uses studio_drafts table; backup v2 export is one consistent read transaction, import is one DB transaction. Backup v1 legacy still accepted.

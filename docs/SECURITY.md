@@ -91,3 +91,7 @@ Use TLS, backups, point-in-time recovery, row ownership checks, and migration re
 - [ ] immutable audit export and alerts for failed gates
 - [ ] dependency/image scanning and regular rotation
 - [ ] penetration test focused on repo prompt injection and sandbox escape
+
+## Website Studio Phase 1 Security
+
+Studio mutations require requireApiSessionUser (401), assertCsrf + assertSameOrigin (403), rate limit 30/min (429), readBoundedJson stream limits 1MB/25MB (413), Zod validation (no javascript: / data: / credential URLs, strict #RRGGBB, E.164), generic 404 for missing vs foreign draft, no server-side fetch of user URLs, no dangerouslySetInnerHTML, canonical deterministicUuid for owner, no asset URLs in v1, no payment execution (plannedPaymentMethods future-only).
