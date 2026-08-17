@@ -186,7 +186,7 @@ export function ChatWorkspace({
   }
 
   return (
-    <div className="fixed inset-x-0 top-16 bottom-16 mx-auto flex max-w-[1440px] flex-col overflow-hidden bg-ivory-50 md:left-[228px] md:bottom-0 lg:flex-row">
+    <div className="fixed inset-x-0 top-16 bottom-16 mx-auto flex max-w-[1440px] flex-col overflow-hidden bg-ivory-50 md:bottom-0 lg:flex-row">
       <aside className="flex shrink-0 flex-col border-b border-line bg-white lg:h-full lg:w-[280px] lg:border-r lg:border-b-0">
         <div className="flex items-center justify-between border-b border-line px-4 py-3 lg:py-4">
           <div>

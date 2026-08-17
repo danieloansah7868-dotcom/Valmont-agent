@@ -11,8 +11,9 @@ export function SignOutButton() {
   return (
     <button
       type="button"
-      className="btn-quiet size-9 min-h-9 px-0"
+      className="btn-header"
       aria-label="Sign out"
+      title="Sign out"
       disabled={pending}
       onClick={async () => {
         setPending(true);

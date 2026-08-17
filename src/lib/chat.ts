@@ -73,19 +73,39 @@ export async function generateChatReply(input: {
   longTermContext?: string;
 }): Promise<ChatReplyResult> {
   const userContent = redactSecrets(input.userContent.trim());
-  const response = await input.model.chat({
+  const request = {
+    temperature: 0.4,
+    maxTokens: 4_096,
+  };
+  let response = await input.model.chat({
+    ...request,
     messages: buildChatCompletionMessages({
       session: input.session,
       userContent,
       repositoryContext: input.repositoryContext,
       longTermContext: input.longTermContext,
     }),
-    temperature: 0.4,
   });
-  const assistantContent = redactSecrets(response.content.trim());
+  let assistantContent = redactSecrets(response.content.trim());
+
+  // Huge repository dumps make some providers (Gemini, newer OpenAI models)
+  // return 200 with an empty string. Retry once without that context so the
+  // user still gets an answer.
+  if (!assistantContent && input.repositoryContext) {
+    response = await input.model.chat({
+      ...request,
+      messages: buildChatCompletionMessages({
+        session: input.session,
+        userContent,
+        longTermContext: input.longTermContext,
+      }),
+    });
+    assistantContent = redactSecrets(response.content.trim());
+  }
+
   if (!assistantContent) {
     throw new Error(
-      "The model returned an empty chat response. Please try again.",
+      "The model returned an empty chat response. Check MODEL_NAME / MODEL_BASE_URL, then try a shorter question.",
     );
   }
   const now = new Date().toISOString();

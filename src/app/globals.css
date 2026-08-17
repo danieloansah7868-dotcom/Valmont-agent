@@ -240,6 +240,34 @@ a {
   background: var(--color-fail-soft);
 }
 
+.btn-header {
+  display: inline-flex;
+  min-height: 36px;
+  min-width: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 9px;
+  background: var(--color-paper);
+  padding: 0 10px;
+  color: var(--color-navy);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+.btn-header:hover {
+  border-color: var(--color-copper);
+  background: var(--color-copper-50);
+  color: var(--color-navy);
+}
+
 .btn-quiet {
   border: 1px solid transparent;
   background: transparent;

@@ -93,6 +93,7 @@ describe("Chat with Valmont", () => {
     });
 
     expect(chat).toHaveBeenCalledOnce();
+    expect(chat.mock.calls[0]?.[0]).toMatchObject({ maxTokens: 4_096 });
     expect(result.assistantMessage).toMatchObject({
       role: "assistant",
       model: "gemini-test",
@@ -141,5 +142,45 @@ describe("Chat with Valmont", () => {
     expect(chatTitleFromMessage("  Discuss   command menus  ")).toBe(
       "Discuss command menus",
     );
+  });
+
+  it("retries without repository context when the first reply is empty", async () => {
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({
+        content: "   ",
+        model: "gemini-test",
+        provider: "openai-compatible",
+        finishReason: "stop",
+        toolCalls: [],
+        usage: { inputTokens: 80, outputTokens: 0, totalTokens: 80 },
+      })
+      .mockResolvedValueOnce({
+        content: "The ads app lives under ads/.",
+        model: "gemini-test",
+        provider: "openai-compatible",
+        finishReason: "stop",
+        toolCalls: [],
+        usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
+      });
+
+    const result = await generateChatReply({
+      model: { chat } as unknown as ModelProvider,
+      session: session(),
+      userContent: "How is this repo organized?",
+      repositoryContext: {
+        repository: {
+          id: "42",
+          owner: "acme",
+          name: "ads",
+          fullName: "acme/ads",
+          baseBranch: "main",
+        },
+        files: [{ path: "README.md", content: "# Ads", score: 10 }],
+      },
+    });
+
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(result.assistantMessage.content).toBe("The ads app lives under ads/.");
   });
 });

@@ -53,7 +53,7 @@ export async function POST(
         authorized.name,
         session.repository.baseBranch,
         input.content,
-        8,
+        4,
       );
       repositoryContext = {
         repository: session.repository,
