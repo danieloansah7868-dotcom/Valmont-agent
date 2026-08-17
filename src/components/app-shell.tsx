@@ -2,31 +2,11 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import type { LinkProps } from "next/link";
 import { CircleHelp, Menu, ShieldCheck, X } from "lucide-react";
 import { AppNav } from "@/components/app-nav";
 import { Logo } from "@/components/logo";
 import { SignOutButton } from "@/components/sign-out-button";
 import type { SessionUser } from "@/lib/auth";
-
-function CloseOnNavLink({
-  onNavigate,
-  ...props
-}: LinkProps & {
-  children: React.ReactNode;
-  className?: string;
-  onNavigate: () => void;
-}) {
-  return (
-    <Link
-      {...props}
-      onClick={(event) => {
-        props.onClick?.(event);
-        if (!event.defaultPrevented) onNavigate();
-      }}
-    />
-  );
-}
 
 export function AppShell({
   children,
@@ -141,13 +121,11 @@ export function AppShell({
         aria-hidden={!navOpen}
       >
         <div className="flex h-16 shrink-0 items-center justify-between border-b border-navy-700 px-4">
-          <CloseOnNavLink
+          <Logo
+            inverse
             href="/dashboard"
-            onNavigate={() => setNavOpen(false)}
-            aria-label="Valmont Agent dashboard"
-          >
-            <Logo inverse />
-          </CloseOnNavLink>
+            onClick={() => setNavOpen(false)}
+          />
           <button
             type="button"
             onClick={() => setNavOpen(false)}
