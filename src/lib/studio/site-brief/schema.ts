@@ -75,6 +75,12 @@ export const siteBriefSchemaV1 = z.object({
   preferredLanguage: z.string().max(20).optional(),
   existingWebsite: httpsUrl.optional(),
   assetStatus: z.literal("not_provided").default("not_provided"),
+  products: z.array(z.object({ name: z.string().max(80), category: z.string().max(40).optional() })).max(50).default([]),
+  country: z.string().max(60).default("Ghana"),
+  currency: z.string().max(10).default("GHS"),
+  timezone: z.string().max(40).default("Africa/Accra"),
+  ghanaRegion: z.string().max(40).optional(),
+  paymentNotes: z.string().max(500).optional(),
 });
 
 export type SiteBriefV1 = z.infer<typeof siteBriefSchemaV1>;
