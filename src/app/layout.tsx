@@ -2,10 +2,10 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: { default: "Valmont Agent", template: "%s · Valmont Agent" },
+  title: { default: "Valmont — Portfolio", template: "%s · Valmont" },
   description:
-    "A private, approval-first AI coding agent for your GitHub repositories.",
-  applicationName: "Valmont Agent",
+    "The Valmont portfolio — a connected ecosystem of ventures spanning payments, banking, data, web, AI, gadgets, electrical services, and advertising.",
+  applicationName: "Valmont",
 };
 
 export const viewport: Viewport = {

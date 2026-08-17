@@ -6,14 +6,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, apiDelete, apiMutation, apiPatch } from "./client-api";
 
-type FetchArgs = [input: string, init: RequestInit];
-
 function mockFetch(
   status: number,
   body: unknown,
   { json = true }: { json?: boolean } = {},
 ) {
-  const fn = vi.fn(async (..._args: FetchArgs) => ({
+  const fn = vi.fn(async (input: string, init: RequestInit) => ({
+    input,
+    init,
     status,
     ok: status >= 200 && status < 300,
     json: async () => {
