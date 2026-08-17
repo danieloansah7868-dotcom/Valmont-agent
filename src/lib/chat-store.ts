@@ -7,7 +7,6 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  statSync,
 } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
@@ -17,12 +16,20 @@ import type {
   ChatSession,
 } from "@/lib/types";
 import { redactSecrets } from "@/lib/security";
+import {
+  assertDistinctStorePaths,
+  configuredLegacyChatStorePath,
+  configuredSqliteChatStorePath,
+  DEFAULT_CHAT_STORE_PATH,
+  legacyBackupPath,
+} from "@/lib/sqlite-path";
 
-const DEFAULT_CHAT_STORE_PATH = path.join(
-  process.cwd(),
-  ".data",
-  "chat-store.json",
-);
+// Re-exported so existing importers of the chat store keep working; the shared
+// module in "@/lib/sqlite-path" is the single implementation.
+export {
+  assertDistinctStorePaths,
+  deriveSqliteChatStorePath,
+} from "@/lib/sqlite-path";
 
 type ChatStoreDocument = {
   sessions: ChatSession[];
@@ -208,68 +215,6 @@ export function setChatStoreForTests(store: ChatStore | null) {
 // SQLite is the active chat store. The JSON class above is deliberately retained
 // only as a read-compatible migration source for installations created before
 // SQLite-backed chat history.
-/**
- * `CHAT_STORE_PATH` remains the legacy JSON input for backwards-compatible
- * upgrades. SQLite always writes to a distinct path, either explicitly via
- * `CHAT_SQLITE_PATH` or next to the legacy source.
- */
-export function deriveSqliteChatStorePath(legacyPath: string): string {
-  const extension = path.extname(legacyPath);
-  const stem = extension ? legacyPath.slice(0, -extension.length) : legacyPath;
-  const destination = `${stem}.sqlite`;
-  // A legacy JSON file can have any extension, including `.sqlite`. Preserve
-  // the safety invariant even for that unusual historical configuration.
-  return path.resolve(destination) === path.resolve(legacyPath)
-    ? `${legacyPath}.sqlite`
-    : destination;
-}
-
-function configuredLegacyChatStorePath(): string {
-  return process.env.CHAT_STORE_PATH || DEFAULT_CHAT_STORE_PATH;
-}
-
-function configuredSqliteChatStorePath(legacyPath: string): string {
-  return process.env.CHAT_SQLITE_PATH || deriveSqliteChatStorePath(legacyPath);
-}
-
-function legacyBackupPath(legacyPath: string): string {
-  return `${legacyPath}.pre-sqlite-backup`;
-}
-
-function assertDistinctStorePaths(
-  legacyPath: string,
-  sqlitePath: string,
-): void {
-  const source = path.resolve(legacyPath);
-  const destination = path.resolve(sqlitePath);
-  if (source === destination) {
-    throw new Error(
-      "CHAT_STORE_PATH (legacy JSON) and CHAT_SQLITE_PATH (SQLite destination) must be distinct",
-    );
-  }
-
-  // Different spellings can still address the same existing file through a
-  // symlink or hard link. Detect that before DatabaseSync gets a chance to
-  // write a SQLite header over the legacy JSON source.
-  if (existsSync(legacyPath) && existsSync(sqlitePath)) {
-    const sourceStat = statSync(legacyPath);
-    const destinationStat = statSync(sqlitePath);
-    if (
-      sourceStat.dev === destinationStat.dev &&
-      sourceStat.ino === destinationStat.ino
-    ) {
-      throw new Error(
-        "CHAT_STORE_PATH (legacy JSON) and CHAT_SQLITE_PATH (SQLite destination) must be distinct",
-      );
-    }
-  }
-
-  if (destination === path.resolve(legacyBackupPath(legacyPath))) {
-    throw new Error(
-      "CHAT_SQLITE_PATH must not use the legacy .pre-sqlite-backup path",
-    );
-  }
-}
 
 export interface ChatMemory {
   id: string;
@@ -296,6 +241,45 @@ type SessionRow = {
 /** Local, durable SQLite store. All queries bind the authenticated user id. */
 export class SqliteChatStore implements ChatStore {
   private readonly db: DatabaseSync;
+
+  /**
+   * The one open connection to the local database. Website Studio and the
+   * complete-backup routes reuse this handle so chat, memories and studio
+   * drafts can be written inside a single SQLite transaction. Opening a second
+   * `DatabaseSync` on the same file would give each writer its own transaction
+   * and break all-or-nothing imports.
+   */
+  get connection(): DatabaseSync {
+    return this.db;
+  }
+
+  /**
+   * Runs `work` inside one `BEGIN IMMEDIATE` transaction on this connection.
+   * Nested calls join the outer transaction instead of starting a new one,
+   * because SQLite has no nested transactions.
+   */
+  runInTransaction<T>(work: () => T): T {
+    if (this.inTransaction) return work();
+    this.inTransaction = true;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = work();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // The transaction was already aborted by SQLite; the original error
+        // below is the meaningful one.
+      }
+      throw error;
+    } finally {
+      this.inTransaction = false;
+    }
+  }
+
+  private inTransaction = false;
 
   constructor(filePath?: string, legacyPath = configuredLegacyChatStorePath()) {
     const sqlitePath = filePath ?? configuredSqliteChatStorePath(legacyPath);
@@ -730,6 +714,9 @@ export class SqliteChatStore implements ChatStore {
     return !row || Boolean(row.cross_chat_memory);
   }
   async setMemoryEnabled(userId: string, enabled: boolean) {
+    this.setMemoryEnabledSync(userId, enabled);
+  }
+  setMemoryEnabledSync(userId: string, enabled: boolean) {
     this.db
       .prepare(
         "INSERT INTO chat_preferences(user_id,cross_chat_memory) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET cross_chat_memory = excluded.cross_chat_memory",
@@ -753,7 +740,29 @@ export class SqliteChatStore implements ChatStore {
       memoryEnabled?: boolean;
     },
   ): Promise<void> {
-    this.db.exec("BEGIN IMMEDIATE");
+    this.importUserSync(userId, backup);
+  }
+
+  /**
+   * Synchronous import core. `node:sqlite` is synchronous, so this can safely be
+   * called from inside `runInTransaction` — an `async` version would suspend at
+   * its first `await` and let the transaction commit early.
+   */
+  importUserSync(
+    userId: string,
+    backup: {
+      sessions: ChatSession[];
+      memories: ChatMemory[];
+      memoryEnabled?: boolean;
+    },
+  ): void {
+    // Join an enclosing transaction (complete-backup import) when present so a
+    // later studio failure rolls chat and memories back too.
+    const ownsTransaction = !this.inTransaction;
+    if (ownsTransaction) {
+      this.inTransaction = true;
+      this.db.exec("BEGIN IMMEDIATE");
+    }
     try {
       for (const imported of backup.sessions) {
         // API validation rejects malformed timestamps before this call. Keep the
@@ -845,11 +854,13 @@ export class SqliteChatStore implements ChatStore {
           );
       }
       if (typeof backup.memoryEnabled === "boolean")
-        await this.setMemoryEnabled(userId, backup.memoryEnabled);
-      this.db.exec("COMMIT");
+        this.setMemoryEnabledSync(userId, backup.memoryEnabled);
+      if (ownsTransaction) this.db.exec("COMMIT");
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      if (ownsTransaction) this.db.exec("ROLLBACK");
       throw error;
+    } finally {
+      if (ownsTransaction) this.inTransaction = false;
     }
   }
 
@@ -1035,4 +1046,13 @@ const sqliteGlobal = globalThis as typeof globalThis & {
 };
 export function getSqliteChatStore(): SqliteChatStore {
   return (sqliteGlobal.__valmontSqliteChatStore ??= new SqliteChatStore());
+}
+
+/**
+ * Test-only: point the shared singleton at a temporary database, or clear it.
+ * Never used by application code, so there is no production auth or data bypass.
+ */
+export function setSqliteChatStoreForTests(store: SqliteChatStore | null) {
+  if (store) sqliteGlobal.__valmontSqliteChatStore = store;
+  else delete sqliteGlobal.__valmontSqliteChatStore;
 }

@@ -1,44 +1,33 @@
-/* eslint-disable */
-import { NextRequest, NextResponse } from "next/server";
-import { z } from "zod";
+import { NextResponse, type NextRequest } from "next/server";
 import { assertCsrf } from "@/lib/security";
 import { requireApiSessionUser } from "@/lib/auth";
-import { safeApiError } from "@/lib/api";
-import { readBoundedJson } from "@/lib/bounded-json";
+import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { BACKUP_BODY_LIMIT_BYTES, readBoundedJson } from "@/lib/bounded-json";
+import { importBackup, parseBackup } from "@/lib/studio/backup";
 
+/**
+ * Restores a backup file into the signed-in person's own account.
+ *
+ * Order matters: the version is checked and the entire file validated *before*
+ * a single row is written. Owner ids inside the file are ignored — everything
+ * is filed under the person doing the import.
+ */
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
+    assertApiRateLimit(request, "backup-import", 5);
     const user = await requireApiSessionUser();
-    const json = (await readBoundedJson(
+
+    const raw = await readBoundedJson(
       request as unknown as Request,
-      25_000_000,
-    )) as any;
-    if (json.backupVersion !== 1 && json.backupVersion !== 2)
-      throw new Error("Unsupported backup version");
-    // basic validation then delegate to chat import; studio import best-effort
-    const { getChatStore } = await import("@/lib/chat-store");
-    if (json.sessions || json.chat) {
-      const chatData = json.chat || json;
-      if (chatData.sessions) {
-        await getChatStore().importUser(user.id, {
-          sessions: chatData.sessions,
-          memories: chatData.memories || [],
-          memoryEnabled: chatData.memoryEnabled,
-        });
-      }
-    }
-    if (json.studio?.drafts) {
-      const { getStudioDraftStore } = await import("@/lib/studio/draft-store");
-      const store = getStudioDraftStore();
-      for (const d of json.studio.drafts) {
-        try {
-          await store.create(user, d.brief);
-        } catch {}
-      }
-    }
-    return new NextResponse(null, { status: 204 });
-  } catch (e) {
-    return safeApiError(e);
+      BACKUP_BODY_LIMIT_BYTES,
+    );
+    // Throws before any write when the version is unknown or the file is bad.
+    const backup = parseBackup(raw);
+
+    const summary = await importBackup(user, backup);
+    return NextResponse.json(summary, { status: 200 });
+  } catch (error) {
+    return safeApiError(error);
   }
 }

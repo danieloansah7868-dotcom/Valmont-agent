@@ -4,6 +4,7 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
 import { getChatStore } from "@/lib/chat-store";
 import { assertCsrf } from "@/lib/security";
+import { BACKUP_BODY_LIMIT_BYTES, readBoundedJson } from "@/lib/bounded-json";
 const message = z.object({
   id: z.string().uuid(),
   role: z.enum(["user", "assistant"]),
@@ -58,10 +59,15 @@ export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
     assertApiRateLimit(request, "memory-import", 5);
-    const size = Number(request.headers.get("content-length") ?? 0);
-    if (size > 25_000_000) throw new Error("Backup is too large");
     const user = await requireApiSessionUser();
-    const input = backup.parse(await request.json());
+    // Counts the bytes that actually arrive rather than trusting the
+    // content-length header, which may be missing, wrong or chunked away.
+    const input = backup.parse(
+      await readBoundedJson(
+        request as unknown as Request,
+        BACKUP_BODY_LIMIT_BYTES,
+      ),
+    );
     await getChatStore().importUser(user.id, input);
     return new NextResponse(null, { status: 204 });
   } catch (error) {

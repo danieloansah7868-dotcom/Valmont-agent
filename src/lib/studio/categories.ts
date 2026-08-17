@@ -159,6 +159,16 @@ export const categories: CategoryManifest[] = [
 export function isCategoryId(v: string): v is CategoryId {
   return (CATEGORY_IDS as readonly string[]).includes(v);
 }
+/** Human wording for a shop subtype, e.g. "bags-shoes" -> "Bags & shoes". */
+export function ecomSubcategoryLabel(id: EcomSubcategoryId): string {
+  const words = id.replace(/-/g, " & ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 export function isEcomSubcategoryId(v: string): v is EcomSubcategoryId {
   return (ECOM_SUBCATEGORIES as readonly string[]).includes(v);
+}
+
+export function getCategory(id: string): CategoryManifest | undefined {
+  return categories.find((category) => category.id === id);
 }

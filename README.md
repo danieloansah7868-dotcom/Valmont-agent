@@ -158,4 +158,136 @@ The local workspace adapter is **not** represented as a secure production sandbo
 
 ## Website Studio Phase 1
 
-Phase 1 can: pick category/package/theme/template, save owner-isolated drafts in shared SQLite (same as Chat) or PostgreSQL, show Brief completeness (not launch readiness), preview safely, handle 409 concurrency, download/import backup v2 (accepts legacy v1). Cannot: uploads, payments/checkout (plannedPaymentMethods are future-only Ghana tips), repo generation, deploys (Phases 2-6 deferred). Body limits 1MB drafts / 25MB import via bounded stream. Tested via vitest + Playwright (Chromium).
+The Website Studio collects everything needed to plan a website. It does **not**
+build, deploy, or run one. Everything below describes what Phase 1 actually
+does today.
+
+### What Phase 1 can do
+
+- **A four-step wizard** — website type (with an online-shop sub-type), package,
+  look and layout, then business details. Steps can be revisited in any order.
+- **Drafts you own** — create, edit, reopen, and delete. A draft is tied to your
+  GitHub identity; nobody else can read or change it.
+- **Autosave** — changes save automatically a moment after you stop typing.
+  Saves are queued one after another, never overlapping, so a fast typist cannot
+  race their own edits. The header always shows the current state ("All changes
+  saved", "Saving…", "Not saved yet", or the reason a save failed).
+- **Nothing is lost when you change your mind** — switching website type,
+  package, theme, or layout keeps every business detail you have already
+  entered. If a chosen layout does not suit a new website type, the closest
+  suitable layout is selected instead.
+- **Brief completeness** — a percentage plus a plain-language list of what is
+  still needed. This measures how complete the _plan_ is, not whether a website
+  is ready to launch.
+- **A safe preview** — shows only what you typed. Missing details appear as
+  "Not provided yet". Text is never treated as HTML, and only `https` links that
+  pass a safety check become clickable.
+- **Two people editing at once is handled honestly** — if the draft changed
+  elsewhere while you were typing, Valmont refetches, reapplies your pending
+  edit when the two changes do not overlap, and otherwise shows both options and
+  asks which to keep. Neither person's work is silently discarded.
+- **Products as well as services** — simple names and optional categories only.
+- **Ghana-friendly defaults** — Ghana, GHS/GH₵, `Africa/Accra`, automatic +233
+  phone formatting, the sixteen Ghana regions, WhatsApp, and service or delivery
+  areas.
+- **Backups** — download everything (chats, memories, and website drafts) as one
+  JSON file, and restore it later.
+
+### What Phase 1 cannot do
+
+- No file or logo uploads. `assetStatus` is only a marker; there is no upload
+  control and no arbitrary asset URL is ever stored.
+- **No payments of any kind.** Payment preferences recorded in a draft are
+  labelled future-planning information. Mobile money, Paystack, Valmont Pay,
+  cards, checkout, and delivery calculation are **not connected and do not
+  work.**
+- No product catalogue, prices, stock, cart, or orders.
+- No repository generation, no sandboxed build, and no deployment.
+- No admin roles or team sharing.
+
+Phases 2–6 (uploads and object storage, repository generation, sandboxed
+builds, preview deployments, roles, e-commerce and payments) are deliberately
+**not implemented.**
+
+### Where drafts are stored
+
+- **Without `DATABASE_URL`** — SQLite, in **exactly the same file as Chat**. One
+  shared path resolver (`src/lib/sqlite-path.ts`) is used by both, so there is
+  never a second database file and a legacy JSON store is never opened as
+  SQLite.
+- **With `DATABASE_URL`** — PostgreSQL, in the `studio_drafts` table.
+
+### Not losing an edit (optimistic concurrency)
+
+Every draft carries a `revision` number. A save sends the revision it was based
+on, and the server applies it as a single atomic statement:
+
+```sql
+UPDATE studio_drafts
+   SET brief = $1, revision = revision + 1, updated_at = now()
+ WHERE id = $2 AND owner_id = $3 AND revision = $4
+RETURNING ...
+```
+
+If no row comes back the save is rejected with `409 Conflict` — never a
+misleading `200`. With two people saving the same revision at the same moment,
+exactly one succeeds. A draft that does not exist and a draft belonging to
+somebody else both return the same generic `404`, so the API never reveals
+whether an ID exists.
+
+### Backups
+
+- `GET /api/backup/export` downloads a version 2 backup:
+  `{ backupVersion: 2, exportedAt, chat: {...}, studio: {...} }`.
+- `POST /api/backup/import` accepts a version 2 backup **and** a legacy
+  version 1 chat-only file. An unknown version is rejected _before anything is
+  written_.
+- Owner IDs inside the file are never trusted. Everything is reassigned to the
+  signed-in account.
+- A draft ID that already exists is imported as a separate copy under a new ID
+  rather than overwriting your work.
+- The whole import is one transaction. If any part fails, chats, memories, and
+  drafts all roll back together — SQLite uses a single database handle so this
+  is a real rollback, not a best-effort one.
+- The older `/api/memories/export` and `/api/memories/import` endpoints keep
+  their version 1 behaviour unchanged.
+
+### Request size limits
+
+Request bodies are read as a stream and counted byte by byte, stopping as soon
+as the limit is passed and parsing only afterwards. This holds even when
+`Content-Length` is missing, wrong, or the body is chunked.
+
+| Endpoint                | Limit |
+| ----------------------- | ----- |
+| Draft create and update | 1 MB  |
+| Backup import           | 25 MB |
+
+Errors never echo back what you submitted, so business details and private
+values stay out of messages and logs.
+
+### Testing
+
+```bash
+npm test                # unit and integration tests (Vitest)
+npm run test:e2e        # browser tests (Playwright, Chromium)
+```
+
+The browser tests need a session secret and a browser:
+
+```bash
+npx playwright install --with-deps chromium
+SESSION_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))") npm run test:e2e
+```
+
+They build and start a real production server on port 3200 (override with
+`E2E_PORT`) against a throwaway SQLite database under `.e2e-data`. Your real
+`.data` files are never touched. Sign-in uses a genuine encrypted session
+cookie created with the same `SESSION_SECRET` the server was started with —
+**there is no test-only authentication bypass in application code.**
+
+The PostgreSQL draft tests only run when `STUDIO_TEST_DATABASE_URL` points at a
+throwaway database; otherwise they are reported as skipped, never as passed. CI
+provides a real PostgreSQL 16 service so they always run there.
+
+The production Docker image does **not** install browser binaries.

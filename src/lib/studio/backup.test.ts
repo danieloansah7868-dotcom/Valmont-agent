@@ -1,95 +1,380 @@
-/* eslint-disable @typescript-eslint/ban-ts-comment */
-// @ts-nocheck
-import { describe, it, expect } from "vitest";
-import { readBoundedJson } from "@/lib/bounded-json";
-import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
+import type { SessionUser } from "@/lib/auth";
+import { canonicalUserId } from "@/lib/user-identity";
+import {
+  BACKUP_VERSION,
+  BackupValidationError,
+  buildBackup,
+  importBackup,
+  parseBackup,
+} from "./backup";
+import { SqliteStudioDraftStore } from "./draft-store";
+import { createDefaultBrief } from "./site-brief/defaults";
 
-// backup v2 round-trip, legacy v1, collision, owner reassignment, rollback
-describe("backup v2", () => {
-  it("v2 structure valid", () => {
-    const b = {
+const userA: SessionUser = { id: "9001", login: "ama", name: "Ama" };
+const userB: SessionUser = { id: "9002", login: "kofi", name: "Kofi" };
+
+const dirs: string[] = [];
+let chatStore: SqliteChatStore;
+let drafts: SqliteStudioDraftStore;
+
+function freshDatabase() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "valmont-backup-"));
+  dirs.push(dir);
+  chatStore = new SqliteChatStore(
+    path.join(dir, "chat-store.sqlite"),
+    path.join(dir, "chat-store.json"),
+  );
+  setSqliteChatStoreForTests(chatStore);
+  drafts = new SqliteStudioDraftStore();
+}
+
+beforeEach(freshDatabase);
+
+afterEach(() => {
+  setSqliteChatStoreForTests(null);
+  delete process.env.DATABASE_URL;
+  for (const dir of dirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
+});
+
+async function seedUserA() {
+  const session = await chatStore.create({
+    userId: userA.id,
+    title: "Planning",
+  });
+  await chatStore.appendMessages(session.id, userA.id, [
+    {
+      id: "m1",
+      role: "user",
+      content: "Please help me plan my shop website.",
+      createdAt: new Date().toISOString(),
+    },
+  ]);
+  await chatStore.addMemory({
+    id: "mem1",
+    userId: userA.id,
+    scope: "personal",
+    category: "preference",
+    content: "Prefers WhatsApp contact.",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+  const draft = await drafts.create(
+    userA,
+    createDefaultBrief({
+      businessName: "Adom Fashion House",
+      phone: "+233201234567",
+      adminEmail: "owner@adom.example",
+    }),
+  );
+  return { session, draft };
+}
+
+describe("parseBackup version handling", () => {
+  it("accepts a v2 file", () => {
+    const parsed = parseBackup({
       backupVersion: 2,
       exportedAt: new Date().toISOString(),
-      chat: { version: 1, sessions: [], memories: [] },
+      chat: { version: 1, sessions: [], memories: [], memoryEnabled: true },
       studio: { version: 1, schemaVersion: 1, drafts: [] },
+    });
+    expect(parsed.sourceVersion).toBe(2);
+  });
+
+  it("accepts a legacy v1 chat-only file and treats studio as empty", () => {
+    const parsed = parseBackup({ version: 1, sessions: [], memories: [] });
+    expect(parsed.sourceVersion).toBe(1);
+    expect(parsed.studio.drafts).toEqual([]);
+  });
+
+  it("rejects an unknown version before anything is written", () => {
+    expect(() => parseBackup({ backupVersion: 3 })).toThrow(
+      BackupValidationError,
+    );
+    expect(() => parseBackup({ backupVersion: 3 })).toThrow(
+      /Unsupported backup version/,
+    );
+  });
+
+  it("rejects a file with no version at all", () => {
+    expect(() => parseBackup({ sessions: [] })).toThrow(BackupValidationError);
+  });
+
+  it("rejects non-object input", () => {
+    expect(() => parseBackup("nonsense")).toThrow(BackupValidationError);
+    expect(() => parseBackup([1, 2, 3])).toThrow(BackupValidationError);
+    expect(() => parseBackup(null)).toThrow(BackupValidationError);
+  });
+
+  it("validates the whole file, not just the version", () => {
+    expect(() =>
+      parseBackup({
+        backupVersion: 2,
+        exportedAt: new Date().toISOString(),
+        chat: { version: 1, sessions: "not-an-array", memories: [] },
+        studio: { version: 1, schemaVersion: 1, drafts: [] },
+      }),
+    ).toThrow(BackupValidationError);
+  });
+
+  it("names the bad field without echoing the value in it", () => {
+    const secret = "0244000111 private client number";
+    let message = "";
+    try {
+      parseBackup({
+        backupVersion: 2,
+        exportedAt: new Date().toISOString(),
+        chat: {
+          version: 1,
+          sessions: [],
+          memories: [],
+          memoryEnabled: secret,
+        },
+        studio: { version: 1, schemaVersion: 1, drafts: [] },
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("chat.memoryEnabled");
+    expect(message).not.toContain(secret);
+    expect(message).not.toContain("0244000111");
+  });
+
+  it("rejects a draft whose brief is invalid", () => {
+    expect(() =>
+      parseBackup({
+        backupVersion: 2,
+        exportedAt: new Date().toISOString(),
+        chat: { version: 1, sessions: [], memories: [] },
+        studio: {
+          version: 1,
+          schemaVersion: 1,
+          drafts: [
+            {
+              id: "d1",
+              schemaVersion: 1,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              brief: { schemaVersion: 1, category: "not-a-category" },
+            },
+          ],
+        },
+      }),
+    ).toThrow(BackupValidationError);
+  });
+});
+
+describe("export", () => {
+  it("produces a v2 file containing chat, memories and drafts", async () => {
+    await seedUserA();
+    const backup = await buildBackup(userA);
+
+    expect(backup.backupVersion).toBe(BACKUP_VERSION);
+    expect(backup.chat.version).toBe(1);
+    expect(backup.chat.sessions).toHaveLength(1);
+    expect(backup.chat.memories).toHaveLength(1);
+    expect(backup.studio.version).toBe(1);
+    expect(backup.studio.drafts).toHaveLength(1);
+    expect(backup.studio.drafts[0]!.brief.businessName).toBe(
+      "Adom Fashion House",
+    );
+  });
+
+  it("exports only the caller's own data", async () => {
+    await seedUserA();
+    await drafts.create(
+      userB,
+      createDefaultBrief({ businessName: "Kofi Motors" }),
+    );
+
+    const backup = await buildBackup(userB);
+    expect(backup.studio.drafts).toHaveLength(1);
+    expect(backup.studio.drafts[0]!.brief.businessName).toBe("Kofi Motors");
+  });
+
+  it("re-validates cleanly through parseBackup (round-trippable shape)", async () => {
+    await seedUserA();
+    const backup = await buildBackup(userA);
+    const reparsed = parseBackup(JSON.parse(JSON.stringify(backup)));
+    expect(reparsed.sourceVersion).toBe(2);
+    expect(reparsed.studio.drafts).toHaveLength(1);
+  });
+});
+
+describe("import round trip", () => {
+  it("restores chat, memories and drafts into an empty database", async () => {
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+
+    expect(summary.sourceVersion).toBe(2);
+    expect(summary.chatSessions).toBe(1);
+    expect(summary.memories).toBe(1);
+    expect(summary.studioDrafts).toBe(1);
+    expect(summary.remappedDraftIds).toBe(0);
+
+    const restoredDrafts = await drafts.list(userA);
+    expect(restoredDrafts).toHaveLength(1);
+    expect(restoredDrafts[0]!.brief.businessName).toBe("Adom Fashion House");
+    expect(restoredDrafts[0]!.brief.phone).toBe("+233201234567");
+
+    const sessions = await chatStore.list(userA.id);
+    expect(sessions).toHaveLength(1);
+    expect(await chatStore.memories(userA.id)).toHaveLength(1);
+  });
+
+  it("imports a legacy v1 chat-only file without touching studio", async () => {
+    await seedUserA();
+    const legacy = {
+      version: 1,
+      sessions: JSON.parse(
+        JSON.stringify((await buildBackup(userA)).chat.sessions),
+      ),
+      memories: [],
+      memoryEnabled: true,
     };
-    expect(b.backupVersion).toBe(2);
-  });
-  it("legacy v1 accepted", () => {
-    const v1 = { version: 1, sessions: [], memories: [] };
-    // import should accept version 1 or backupVersion 1
-    expect(v1.version).toBe(1);
-  });
-  it("rejects unknown version", () => {
-    const bad = { backupVersion: 99 };
-    expect([1, 2].includes(bad.backupVersion)).toBe(false);
-  });
-  it("collision remapping deterministic", () => {
-    const id = "11111111-1111-4111-8111-111111111111";
-    // remapping uses randomUUID on collision - deterministic test that collision generates new id
-    expect(id).toMatch(/^[0-9a-f-]+$/);
-  });
-  it("owner reassignment overwrites file owner", () => {
-    const fileOwner = "aaaa";
-    const canonical = createHash("sha256")
-      .update("github:9001")
-      .digest("hex")
-      .slice(0, 8);
-    expect(canonical).not.toBe(fileOwner);
+
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(legacy));
+
+    expect(summary.sourceVersion).toBe(1);
+    expect(summary.chatSessions).toBe(1);
+    expect(summary.studioDrafts).toBe(0);
+    expect(await drafts.list(userA)).toHaveLength(0);
+    expect(await chatStore.list(userA.id)).toHaveLength(1);
   });
 });
 
-describe("route-level streamed oversized", () => {
-  it("1MB draft limit enforced via stream", async () => {
-    const big = "x".repeat(1_100_000);
-    const req = new Request("http://a", {
-      method: "POST",
-      body: JSON.stringify({ x: big }),
-    });
-    await expect(readBoundedJson(req, 1_000_000)).rejects.toThrow(/too large/);
+describe("ownership is never taken from the file", () => {
+  it("assigns imported drafts to the authenticated user, not the file's owner", async () => {
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    expect(backup.studio.drafts[0].ownerId).toBe(canonicalUserId(userA));
+
+    freshDatabase();
+    // User B imports user A's file.
+    await importBackup(userB, parseBackup(backup));
+
+    const forB = await drafts.list(userB);
+    expect(forB).toHaveLength(1);
+    expect(forB[0]!.ownerId).toBe(canonicalUserId(userB));
+    expect(await drafts.list(userA)).toHaveLength(0);
   });
-  it("25MB import allows larger", async () => {
-    const big = "x".repeat(1_100_000);
-    const req = new Request("http://a", {
-      method: "POST",
-      body: JSON.stringify({ x: big }),
-    });
-    await expect(readBoundedJson(req, 25_000_000)).resolves.toBeDefined();
+
+  it("ignores a forged owner id inside the file", async () => {
+    const now = new Date().toISOString();
+    const forged = {
+      backupVersion: 2,
+      exportedAt: now,
+      chat: { version: 1, sessions: [], memories: [] },
+      studio: {
+        version: 1,
+        schemaVersion: 1,
+        drafts: [
+          {
+            id: "11111111-2222-3333-4444-555555555555",
+            ownerId: "somebody-else-entirely",
+            schemaVersion: 1,
+            createdAt: now,
+            updatedAt: now,
+            brief: createDefaultBrief({ businessName: "Forged" }),
+          },
+        ],
+      },
+    };
+
+    await importBackup(userA, parseBackup(forged));
+
+    const mine = await drafts.list(userA);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.ownerId).toBe(canonicalUserId(userA));
   });
 });
 
-describe("studio API security", () => {
-  it("generic 404 same for missing vs foreign", () => {
-    const msgMissing = "Draft not found";
-    const msgForeign = "Draft not found";
-    expect(msgMissing).toBe(msgForeign);
+describe("id collisions", () => {
+  it("gives a fresh id to a draft whose id already exists, keeping both", async () => {
+    const { draft } = await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+
+    // Import into the same database that still holds the original.
+    const summary = await importBackup(userA, parseBackup(backup));
+
+    expect(summary.remappedDraftIds).toBe(1);
+    const all = await drafts.list(userA);
+    expect(all).toHaveLength(2);
+    expect(all.filter((item) => item.id === draft.id)).toHaveLength(1);
+    expect(new Set(all.map((item) => item.id)).size).toBe(2);
   });
-  it("sanitized validation errors do not echo raw input", () => {
-    const raw = "<script>alert(1)</script>";
-    // safeApiError should not include raw in message for generic cases
-    expect(raw).not.toBe("");
+
+  it("remaps deterministically: every colliding draft is counted", async () => {
+    await drafts.create(userA, createDefaultBrief({ businessName: "One" }));
+    await drafts.create(userA, createDefaultBrief({ businessName: "Two" }));
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+
+    const summary = await importBackup(userA, parseBackup(backup));
+
+    expect(summary.remappedDraftIds).toBe(2);
+    expect(await drafts.list(userA)).toHaveLength(4);
+  });
+
+  it("does not remap when the ids are free", async () => {
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+    expect(summary.remappedDraftIds).toBe(0);
   });
 });
 
-describe("studio_meta versioning", () => {
-  it("fresh DB creates version 1", async () => {
-    expect(1).toBe(1); // explicit meta INSERT OR IGNORE verified in draft-store
-  });
-  it("repeated startup idempotent", async () => {
-    expect(true).toBe(true);
-  });
-  it("custom CHAT_STORE_PATH derived correctly", async () => {
-    // covered in studio.test.ts
-    expect(true).toBe(true);
-  });
-});
+describe("rollback", () => {
+  it("rolls chat, memories and drafts back together when a write fails midway", async () => {
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
 
-describe("postgres integration skeleton", () => {
-  it.skipIf(!process.env.DATABASE_URL)(
-    "two same-revision writers one 409",
-    async () => {
-      // real test requires DATABASE_URL; skipped locally, runs in CI with postgres service
-      expect(true).toBe(true);
-    },
-  );
+    freshDatabase();
+    const before = {
+      sessions: (await chatStore.list(userA.id)).length,
+      drafts: (await drafts.list(userA)).length,
+    };
+    expect(before).toEqual({ sessions: 0, drafts: 0 });
+
+    await expect(
+      importBackup(userA, parseBackup(backup), {
+        failAfterInsertForTests: () => {
+          throw new Error("simulated failure after inserts");
+        },
+      }),
+    ).rejects.toThrow(/simulated failure/);
+
+    // Nothing at all survived the failed import.
+    expect(await chatStore.list(userA.id)).toHaveLength(0);
+    expect(await chatStore.memories(userA.id)).toHaveLength(0);
+    expect(await drafts.list(userA)).toHaveLength(0);
+  });
+
+  it("leaves pre-existing data untouched after a failed import", async () => {
+    const { draft } = await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+
+    await expect(
+      importBackup(userA, parseBackup(backup), {
+        failAfterInsertForTests: () => {
+          throw new Error("simulated failure after inserts");
+        },
+      }),
+    ).rejects.toThrow(/simulated failure/);
+
+    const after = await drafts.list(userA);
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe(draft.id);
+    expect(after[0]!.brief.businessName).toBe("Adom Fashion House");
+    expect(await chatStore.list(userA.id)).toHaveLength(1);
+  });
 });

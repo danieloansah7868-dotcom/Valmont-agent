@@ -1,26 +1,26 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { requireApiSessionUser } from "@/lib/auth";
-import { getChatStore } from "@/lib/chat-store";
-import { safeApiError } from "@/lib/api";
+import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { buildBackup } from "@/lib/studio/backup";
 
-export async function GET() {
+/**
+ * Downloads everything this signed-in person has: chat history, memories and
+ * website drafts, in one version 2 file. Failures are reported, never quietly
+ * turned into an empty export.
+ */
+export async function GET(request: NextRequest) {
   try {
+    assertApiRateLimit(request, "backup-export", 10);
     const user = await requireApiSessionUser();
-    const chat = await getChatStore().exportUser(user.id);
-    // studio draft export attempt - best effort
-    let studio: unknown = { version: 1, schemaVersion: 1, drafts: [] };
-    try {
-      const { getStudioDraftStore } = await import("@/lib/studio/draft-store");
-      const drafts = await getStudioDraftStore().list(user);
-      studio = { version: 1, schemaVersion: 1, drafts };
-    } catch {}
-    return NextResponse.json({
-      backupVersion: 2,
-      exportedAt: new Date().toISOString(),
-      chat,
-      studio,
+    const backup = await buildBackup(user);
+    const stamp = backup.exportedAt.slice(0, 10);
+    return NextResponse.json(backup, {
+      headers: {
+        "content-disposition": `attachment; filename="valmont-backup-${stamp}.json"`,
+        "cache-control": "no-store",
+      },
     });
-  } catch (e) {
-    return safeApiError(e);
+  } catch (error) {
+    return safeApiError(error);
   }
 }

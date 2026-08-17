@@ -64,4 +64,66 @@ Valmont intentionally has no merge or deployment method. Your existing reviewed 
 
 ## Website Studio Storage
 
-SQLite Phase 1 uses the same SQLite file as Chat (CHAT_STORE_PATH/CHAT_SQLITE_PATH via shared resolver). studio_meta holds studio_schema_version, explicit version check on startup. PostgreSQL uses studio_drafts table; backup v2 export is one consistent read transaction, import is one DB transaction. Backup v1 legacy still accepted.
+### Choosing a backend
+
+Studio follows the same rule as the rest of Valmont:
+
+- **`DATABASE_URL` set** — drafts go to PostgreSQL, in the `studio_drafts` table
+  created by migration `0002_uneven_the_anarchist.sql`. Run `npm run db:migrate`
+  before first use. This is the recommended production setup: it survives
+  container replacement and supports more than one application instance.
+- **`DATABASE_URL` unset** — drafts go to SQLite, in **exactly the same file as
+  Chat**. Suitable for a single instance with a persistent volume only.
+
+There is no Studio-specific environment variable. `CHAT_STORE_PATH` and
+`CHAT_SQLITE_PATH` control both Chat and Studio through the shared resolver in
+`src/lib/sqlite-path.ts`. Never point the two variables at the same file; the
+resolver asserts they differ and will refuse to open a legacy `.json` store as
+SQLite.
+
+If you run SQLite in Docker, mount the directory holding the store as a named
+volume. Without a volume every container restart starts from an empty database.
+
+### Schema versions
+
+The SQLite store records `studio-schema-version` in `chat_meta`, and PostgreSQL
+rows carry `schema_version`. Both are `1`. Startup is idempotent: the tables are
+created only if missing, and repeated restarts neither duplicate nor migrate
+anything twice. The legacy-JSON migration writes
+`<legacy path>.pre-sqlite-backup` first, using `COPYFILE_EXCL` so an existing
+backup is never overwritten, and records a `legacy-json-migrated` marker only
+after the migrated rows are committed.
+
+### Backups
+
+- `GET /api/backup/export` — one consistent read; a version 2 file containing
+  chat sessions, memories, and Studio drafts.
+- `POST /api/backup/import` — one transaction. SQLite uses the single shared
+  database handle, so a mid-import failure rolls chat, memories, and drafts back
+  together. Legacy version 1 chat-only files are still accepted; unknown
+  versions are rejected before anything is written.
+
+Backups contain the owner's business details. Treat a downloaded file as
+sensitive: store it encrypted, and delete copies you no longer need. Regular
+exports are the recommended backup mechanism for SQLite deployments; for
+PostgreSQL use your normal database backups as well.
+
+### Request limits
+
+Draft mutations accept at most 1 MB and backup imports at most 25 MB, enforced
+by counting real bytes while streaming. If a reverse proxy sits in front of
+Valmont, set its own body limit to at least 25 MB or large restores will be
+rejected before they reach the application.
+
+### Browsers are not installed in production
+
+The production image (`node:22.13-bookworm-slim`, Next.js standalone output,
+running as `USER node`) installs **no Playwright browser binaries**. Browser
+tests belong in CI, where `npx playwright install --with-deps chromium` runs as
+an explicit step. Do not add that step to the Dockerfile.
+
+### What Phase 1 does not do in production
+
+No file uploads, no payment processing, no repository generation, and no
+deployments. Nothing in the Studio can take an order or move money. Do not
+describe a generated Brief to a customer as a working website.

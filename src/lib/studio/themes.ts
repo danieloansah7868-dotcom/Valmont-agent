@@ -152,3 +152,7 @@ export function isThemeId(v: string): v is ThemeId {
   return (THEME_IDS as readonly string[]).includes(v);
 }
 export const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
+
+export function getTheme(id: string): ThemeManifest | undefined {
+  return themes.find((theme) => theme.id === id);
+}

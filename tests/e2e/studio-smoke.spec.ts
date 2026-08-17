@@ -1,133 +1,380 @@
-/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars */
-import { test, expect } from "@playwright/test";
+import { randomBytes } from "node:crypto";
+import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 import { encryptSessionValue } from "../../src/lib/security";
 
-function makeSessionCookie(
-  user: { id: string; login: string; name: string },
-  secret: string,
-) {
-  const payload = JSON.stringify({
-    accessToken: "test-token",
-    id: user.id,
-    login: user.login,
-    name: user.name,
-    avatarUrl: "",
-    expiresAt: Date.now() + 3600_000,
-  });
-  return encryptSessionValue(payload, secret);
+/**
+ * These tests sign in the way the real app does: an encrypted `valmont_session`
+ * cookie produced with the server's own `SESSION_SECRET`. There is no test-only
+ * bypass in application code.
+ */
+const SECRET = process.env.SESSION_SECRET;
+if (!SECRET) throw new Error("SESSION_SECRET must be set for the e2e tests.");
+
+const ownerA = { id: "e2e-9001", login: "owner-a", name: "Owner A" };
+const ownerB = { id: "e2e-9002", login: "owner-b", name: "Owner B" };
+
+function sessionCookieValue(user: typeof ownerA): string {
+  return encryptSessionValue(
+    JSON.stringify({
+      accessToken: "e2e-access-token",
+      id: user.id,
+      login: user.login,
+      name: user.name,
+      avatarUrl: "",
+      expiresAt: Date.now() + 3_600_000,
+    }),
+    SECRET,
+  );
 }
 
-const SECRET =
-  process.env.SESSION_SECRET ||
-  "ci-test-session-secret-32-bytes-long-value-for-playwright";
-const ownerA = { id: "9001", login: "owner-a", name: "Owner A" };
-const ownerB = { id: "9002", login: "owner-b", name: "Owner B" };
-
-async function authContext(page: any, user: typeof ownerA) {
-  const val = makeSessionCookie(user, SECRET);
-  await page
-    .context()
-    .addCookies([
-      { name: "valmont_session", value: val, domain: "localhost", path: "/" },
-    ]);
-  // CSRF cookie for mutations
-  const csrf = "test-csrf-token-1234567890";
-  await page
-    .context()
-    .addCookies([
-      { name: "valmont_csrf", value: csrf, domain: "localhost", path: "/" },
-    ]);
+async function signIn(
+  context: BrowserContext,
+  user: typeof ownerA,
+  baseURL: string,
+): Promise<string> {
+  // A freshly generated CSRF token per run, never a fixed string.
+  const csrf = randomBytes(16).toString("hex");
+  const url = new URL(baseURL);
+  await context.addCookies([
+    {
+      name: "valmont_session",
+      value: sessionCookieValue(user),
+      domain: url.hostname,
+      path: "/",
+    },
+    { name: "valmont_csrf", value: csrf, domain: url.hostname, path: "/" },
+  ]);
+  return csrf;
 }
 
-test.describe("Website Studio authenticated workflow", () => {
-  test("owners A/B, wizard steps, autosave, theme retain, preview, conflict, keyboard, mobile, 404 parity", async ({
+async function createDraft(page: Page, businessName: string): Promise<string> {
+  await page.goto("/studio");
+  await page.getByTestId("start-new-website").click();
+  await page.getByLabel(/Business name/i).fill(businessName);
+  await page.getByTestId("create-draft").click();
+  await page.waitForURL(/\/studio\/drafts\/[0-9a-f-]{36}$/);
+  return page.url().split("/").pop()!;
+}
+
+test.describe("Website Studio", () => {
+  test("create a draft, complete every step, and autosave business details", async ({
     page,
     context,
-    isMobile,
+    baseURL,
   }) => {
-    // 1. Auth as A
-    await authContext(page, ownerA);
+    await signIn(context, ownerA, baseURL!);
+
     await page.goto("/studio");
     await expect(
       page.getByRole("heading", { name: /Website Studio/i }),
     ).toBeVisible();
 
-    // 2. Create draft via UI - use API fallback if wizard not fully wired
-    await page.getByRole("link", { name: /Start new website/i }).click();
-    await expect(page).toHaveURL(/\/studio\/drafts\/.+/);
-    const draftUrl = page.url();
-    const draftId = draftUrl.split("/").pop() || "";
+    const draftId = await createDraft(page, "Adom Fashion House");
 
-    // 3. Complete all four wizard steps
-    // Step 1: category
+    // Step 1 — website type, including the shop sub-type.
+    await page.getByRole("button", { name: /1\. Website type/i }).click();
+    await page.getByLabel(/Website type/i).selectOption("online-shop");
+    await expect(page.getByLabel(/What does the shop sell/i)).toBeVisible();
+    await page.getByLabel(/What does the shop sell/i).selectOption("fashion");
+    await page.getByLabel(/Website type/i).selectOption("business-profile");
+
+    // Step 2 — package.
+    await page.getByRole("button", { name: /2\. Package/i }).click();
     await page
-      .getByLabel(/Category/i)
+      .getByRole("radio", { name: /Business/i })
       .first()
-      .waitFor();
-    // Step 2: package - select business
-    // Step 3: theme
-    // Step 4: business info
-    const nameInput = page.getByLabel(/Business name/i);
-    if (await nameInput.count()) {
-      await nameInput.fill("Acme Ghana Test");
-      await page.getByLabel(/Admin email/i).fill("owner@example.com");
-      // Autosave debounce - wait for Saved indicator
-      await expect(page.getByText(/Saved|Saving/i)).toBeVisible({
-        timeout: 5000,
-      });
-    }
+      .check();
 
-    // 4. Reopen and verify persistence
-    await page.goto(`/studio/drafts/${draftId}`);
-    if (await nameInput.count())
-      await expect(nameInput).toHaveValue("Acme Ghana Test");
+    // Step 3 — theme and layout.
+    await page.getByRole("button", { name: /3\. Look and layout/i }).click();
+    await page.getByRole("radio", { name: /Luxury/i }).check();
+    await expect(page.getByRole("radio", { name: /Luxury/i })).toBeChecked();
 
-    // 5. Change theme without losing data
-    const themeRadio = page.getByLabel(/Luxury/i);
-    if (await themeRadio.count()) {
-      await themeRadio.check();
-      await expect(page.getByLabel(/Business name/i)).toHaveValue(
-        "Acme Ghana Test",
-      );
-    }
+    // Step 4 — business information, then wait for the autosave to land.
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await page.getByLabel(/Admin email/i).fill("owner@adom.example");
+    await page.getByLabel(/Phone number/i).fill("0201234567");
+    await page.getByLabel(/^Tagline$/i).fill("Style that fits");
 
-    // 6. Brief completeness and preview
-    await expect(page.getByText(/Brief completeness/i)).toBeVisible();
-    await expect(page.getByText(/Acme Ghana Test/i)).toBeVisible();
-
-    // 7. Keyboard navigation - tab through
-    await page.keyboard.press("Tab");
-    await expect(page.locator(":focus")).toBeVisible();
-
-    // 8. iPhone viewport no horizontal overflow
-    await page.setViewportSize({ width: 390, height: 844 });
-    const overflow = await page.evaluate(
-      () => document.documentElement.scrollWidth <= window.innerWidth + 1,
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      { timeout: 15_000 },
     );
-    expect(overflow).toBeTruthy();
 
-    // 9. Owner B gets same 404 for A's draft as random ID
-    const csrf = "test-csrf-token-1234567890";
-    const bCookie = makeSessionCookie(ownerB, SECRET);
-    const apiA = await page.request.get(`/api/studio/drafts/${draftId}`, {
-      headers: {
-        Cookie: `valmont_session=${bCookie}; valmont_csrf=${csrf}`,
-        "x-valmont-csrf": csrf,
-      },
-    });
-    expect(apiA.status()).toBe(404);
-    const apiRand = await page.request.get(
-      `/api/studio/drafts/00000000-0000-4000-a000-000000000000`,
+    // Ghana defaults are applied to the phone number.
+    await expect(page.getByLabel(/Phone number/i)).toHaveValue("+233201234567");
+
+    // Reopen the draft in a brand-new page: the details must still be there.
+    const reopened = await context.newPage();
+    await reopened.goto(`/studio/drafts/${draftId}`);
+    await reopened
+      .getByRole("button", { name: /4\. Business details/i })
+      .click();
+    await expect(reopened.getByLabel(/Business name/i)).toHaveValue(
+      "Adom Fashion House",
+    );
+    await expect(reopened.getByLabel(/Admin email/i)).toHaveValue(
+      "owner@adom.example",
+    );
+    await expect(reopened.getByLabel(/^Tagline$/i)).toHaveValue(
+      "Style that fits",
+    );
+    await reopened.close();
+  });
+
+  test("changing the theme keeps every business detail", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, ownerA, baseURL!);
+    const draftId = await createDraft(page, "Kofi Motors");
+
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await page.getByLabel(/Admin email/i).fill("kofi@motors.example");
+    await page.getByLabel(/Address/i).fill("12 Oxford Street, Osu");
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
       {
-        headers: {
-          Cookie: `valmont_session=${bCookie}; valmont_csrf=${csrf}`,
-          "x-valmont-csrf": csrf,
-        },
+        timeout: 15_000,
       },
     );
-    expect(apiRand.status()).toBe(404);
-    const bodyA = await apiA.json().catch(() => ({}));
-    const bodyRand = await apiRand.json().catch(() => ({}));
-    expect(bodyA.error).toBe(bodyRand.error);
+
+    // Switch the theme, then the package, then the website type.
+    await page.getByRole("button", { name: /3\. Look and layout/i }).click();
+    await page.getByRole("radio", { name: /Luxury/i }).check();
+    await page.getByRole("button", { name: /2\. Package/i }).click();
+    await page.getByRole("radio", { name: /Empire/i }).check();
+    await page.getByRole("button", { name: /1\. Website type/i }).click();
+    await page.getByLabel(/Website type/i).selectOption("online-shop");
+
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      {
+        timeout: 15_000,
+      },
+    );
+
+    // Reload from the server and confirm nothing was lost.
+    await page.goto(`/studio/drafts/${draftId}`);
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await expect(page.getByLabel(/Business name/i)).toHaveValue("Kofi Motors");
+    await expect(page.getByLabel(/Admin email/i)).toHaveValue(
+      "kofi@motors.example",
+    );
+    await expect(page.getByLabel(/Address/i)).toHaveValue(
+      "12 Oxford Street, Osu",
+    );
+  });
+
+  test("shows brief completeness and a preview of the real details", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, ownerA, baseURL!);
+    await createDraft(page, "Adom Fashion House");
+
+    await expect(page.getByTestId("completeness-score")).toBeVisible();
+    await expect(page.getByTestId("completeness-score")).toHaveText(/\d+%/);
+    await expect(page.getByRole("progressbar")).toBeVisible();
+
+    // Missing required information is named before anything is complete.
+    await expect(page.getByTestId("missing-required")).toBeVisible();
+
+    const preview = page.getByTestId("business-preview");
+    await expect(preview).toBeVisible();
+    await expect(preview).toContainText("Adom Fashion House");
+
+    // Filling a required field raises the score.
+    const before = await page.getByTestId("completeness-score").textContent();
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await page.getByLabel(/Admin email/i).fill("owner@adom.example");
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      {
+        timeout: 15_000,
+      },
+    );
+    await expect(page.getByTestId("completeness-score")).not.toHaveText(
+      before ?? "",
+    );
+  });
+
+  test("the preview shows text as typed, without running it", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, ownerA, baseURL!);
+    await createDraft(page, "Safe Preview Test");
+
+    let dialogAppeared = false;
+    page.on("dialog", async (dialog) => {
+      dialogAppeared = true;
+      await dialog.dismiss();
+    });
+
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await page
+      .getByLabel(/What does the business do/i)
+      .fill('<img src=x onerror="alert(1)">');
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      {
+        timeout: 15_000,
+      },
+    );
+
+    const preview = page.getByTestId("business-preview");
+    await expect(preview).toContainText("<img src=x");
+    await expect(preview.locator("img")).toHaveCount(0);
+    expect(dialogAppeared).toBe(false);
+  });
+
+  test("can be used with the keyboard and has labelled controls", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, ownerA, baseURL!);
+    await createDraft(page, "Keyboard Test");
+
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+
+    const nameField = page.getByLabel(/Business name/i);
+    await nameField.focus();
+    await expect(nameField).toBeFocused();
+
+    // Tab moves to the next control and it is a real, reachable element.
+    await page.keyboard.press("Tab");
+    const focused = page.locator(":focus");
+    await expect(focused).toBeVisible();
+
+    // Typing with the keyboard alone edits and saves the draft.
+    await nameField.focus();
+    await nameField.press("Control+a");
+    await page.keyboard.type("Typed With Keyboard");
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      {
+        timeout: 15_000,
+      },
+    );
+
+    // Every form control on this step has an accessible name.
+    const controls = await page
+      .locator("main input, main select, main textarea")
+      .all();
+    expect(controls.length).toBeGreaterThan(0);
+    for (const control of controls) {
+      const [id, ariaLabel, ariaLabelledBy] = await Promise.all([
+        control.getAttribute("id"),
+        control.getAttribute("aria-label"),
+        control.getAttribute("aria-labelledby"),
+      ]);
+      const hasLabelElement = id
+        ? (await page.locator(`label[for="${id}"]`).count()) > 0
+        : false;
+      const wrappedInLabel =
+        (await control.locator("xpath=ancestor::label").count()) > 0;
+      expect(
+        hasLabelElement || wrappedInLabel || !!ariaLabel || !!ariaLabelledBy,
+      ).toBe(true);
+    }
+
+    // The live save state is announced to screen readers.
+    await expect(page.getByTestId("save-state")).toHaveAttribute(
+      "aria-live",
+      "polite",
+    );
+  });
+
+  test("fits an iPhone screen with no sideways scrolling", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    test.skip(
+      test.info().project.name !== "iphone",
+      "Runs in the iPhone project only.",
+    );
+    await signIn(context, ownerA, baseURL!);
+    const draftId = await createDraft(page, "Mobile Test");
+
+    for (const path of ["/studio", `/studio/drafts/${draftId}`]) {
+      await page.goto(path);
+      const overflow = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+      }));
+      expect(
+        overflow.scrollWidth,
+        `${path} scrolls sideways at ${overflow.innerWidth}px`,
+      ).toBeLessThanOrEqual(overflow.innerWidth + 1);
+    }
+  });
+
+  test("owner B gets the same not-found for owner A's draft as for a random id", async ({
+    page,
+    context,
+    browser,
+    baseURL,
+  }) => {
+    await signIn(context, ownerA, baseURL!);
+    const draftId = await createDraft(page, "Private To Owner A");
+
+    // A completely separate browser context signed in as owner B.
+    const contextB = await browser.newContext({ baseURL });
+    const csrfB = await signIn(contextB, ownerB, baseURL!);
+    const pageB = await contextB.newPage();
+
+    const foreign = await pageB.request.get(`/api/studio/drafts/${draftId}`, {
+      headers: { "x-valmont-csrf": csrfB },
+    });
+    const random = await pageB.request.get(
+      "/api/studio/drafts/00000000-0000-4000-a000-000000000000",
+      { headers: { "x-valmont-csrf": csrfB } },
+    );
+
+    expect(foreign.status()).toBe(404);
+    expect(random.status()).toBe(404);
+    expect(await foreign.json()).toEqual(await random.json());
+
+    // The page owner B sees is the same generic panel in both cases.
+    await pageB.goto(`/studio/drafts/${draftId}`);
+    await expect(pageB.getByText(/Draft not found/i)).toBeVisible();
+    await pageB.goto("/studio/drafts/00000000-0000-4000-a000-000000000000");
+    await expect(pageB.getByText(/Draft not found/i)).toBeVisible();
+
+    // Owner B's own studio does not list it.
+    await pageB.goto("/studio");
+    await expect(pageB.getByText("Private To Owner A")).toHaveCount(0);
+
+    // Owner A's draft is untouched.
+    await page.goto(`/studio/drafts/${draftId}`);
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await expect(page.getByLabel(/Business name/i)).toHaveValue(
+      "Private To Owner A",
+    );
+
+    await contextB.close();
+  });
+
+  test("a draft can be deleted and then no longer opens", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, ownerA, baseURL!);
+    const draftId = await createDraft(page, "Temporary Draft");
+
+    page.on("dialog", (dialog) => dialog.accept());
+    await page.getByTestId("delete-draft").click();
+    await page.waitForURL(/\/studio$/);
+    await expect(page.getByText("Temporary Draft")).toHaveCount(0);
+
+    await page.goto(`/studio/drafts/${draftId}`);
+    await expect(page.getByText(/Draft not found/i)).toBeVisible();
   });
 });

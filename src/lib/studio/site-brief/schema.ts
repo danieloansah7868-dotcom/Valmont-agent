@@ -1,33 +1,45 @@
 import { z } from "zod";
 import { isCategoryId, isEcomSubcategoryId } from "../categories";
 import { isPackageId } from "../packages";
-import { isTemplateId } from "../templates";
+import { isTemplateId, isTemplateCompatible } from "../templates";
 import { isThemeId, HEX_COLOR_RE } from "../themes";
+import { isGhanaRegion } from "./defaults";
 
 export const SITE_BRIEF_VERSION = 1 as const;
+
+/**
+ * True for a plain https link to a public host. Blocks other protocols, links
+ * carrying a username/password, and addresses that point back inside the
+ * network (localhost, private ranges, the cloud metadata address). Exported so
+ * the preview can apply exactly the same rule before rendering a link.
+ */
+export function isHttpsSafeUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") return false;
+    if (url.username || url.password) return false;
+    const host = url.hostname.toLowerCase();
+    if (
+      host === "localhost" ||
+      host.startsWith("127.") ||
+      host.startsWith("10.") ||
+      host.startsWith("192.168.") ||
+      host === "169.254.169.254"
+    )
+      return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const httpsUrl = z
   .string()
   .max(500)
-  .refine((v) => {
-    try {
-      const u = new URL(v);
-      if (u.protocol !== "https:") return false;
-      if (u.username || u.password) return false;
-      const host = u.hostname.toLowerCase();
-      if (
-        host === "localhost" ||
-        host.startsWith("127.") ||
-        host.startsWith("10.") ||
-        host.startsWith("192.168.") ||
-        host === "169.254.169.254"
-      )
-        return false;
-      return true;
-    } catch {
-      return false;
-    }
-  }, "Must be a valid https URL without credentials or private host");
+  .refine(
+    isHttpsSafeUrl,
+    "Must be a valid https URL without credentials or private host",
+  );
 
 const domainName = z
   .string()
@@ -44,7 +56,7 @@ const e164 = z
 
 const socialLink = z.object({ platform: z.string().max(40), url: httpsUrl });
 
-export const siteBriefSchemaV1 = z.object({
+const baseSiteBriefV1 = z.object({
   schemaVersion: z.literal(1),
   businessName: z.string().trim().min(2).max(120),
   category: z.string().refine(isCategoryId, "Invalid category"),
@@ -91,7 +103,11 @@ export const siteBriefSchemaV1 = z.object({
   country: z.string().max(60).default("Ghana"),
   currency: z.string().max(10).default("GHS"),
   timezone: z.string().max(40).default("Africa/Accra"),
-  ghanaRegion: z.string().max(40).optional(),
+  ghanaRegion: z
+    .string()
+    .max(40)
+    .optional()
+    .refine((v) => !v || isGhanaRegion(v), "Unknown Ghana region"),
   paymentNotes: z.string().max(500).optional(),
   plannedPaymentMethods: z
     .array(z.enum(["momo", "paystack", "valmont_pay", "card", "bank", "cod"]))
@@ -100,7 +116,32 @@ export const siteBriefSchemaV1 = z.object({
     .describe("Future planning only — not operational"),
 });
 
-export type SiteBriefV1 = z.infer<typeof siteBriefSchemaV1>;
+/**
+ * A layout must actually suit the chosen website type. Without this check the
+ * schema would accept `selectedTemplate` values the template registry refuses
+ * to render.
+ */
+export const siteBriefSchemaV1 = baseSiteBriefV1.superRefine((brief, ctx) => {
+  if (
+    brief.selectedTemplate &&
+    !isTemplateCompatible(brief.selectedTemplate, brief.category)
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["selectedTemplate"],
+      message: "This layout is not available for the chosen website type",
+    });
+  }
+  if (brief.ecomSubcategory && brief.category !== "online-shop") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["ecomSubcategory"],
+      message: "A shop subtype only applies to the Online Shop website type",
+    });
+  }
+});
+
+export type SiteBriefV1 = z.infer<typeof baseSiteBriefV1>;
 
 export interface StudioDraft {
   id: string;

@@ -141,4 +141,131 @@ Missing credentials fail loudly at every boundary rather than being papered over
 
 ## Website Studio Phase 1
 
-Phase 1 provides category/package/theme/template registries, SiteBrief v1 with Ghana defaults (country Ghana, currency GHS, timezone Africa/Accra, +233, regions, plannedPaymentMethods typed future-only), shared SQLite file (same as Chat, derived via deriveSqliteChatStorePath, assertDistinctStorePaths safety), PostgreSQL studio_drafts table via Drizzle migration 0002, atomic revision concurrency (WHERE revision RETURNING), Brief completeness derived, bounded body 1MB/25MB via stream, backup v2 {backupVersion:2, chat, studio} accepting legacy v1, one-handle transaction for Chat+Studio, wizard 4 steps with autosave and 409 handling. Deferred: Phases 2-6 (uploads, payments, repo generation, deploys). Tests: vitest + Playwright e2e with encrypted test session cookies, temp DBs, never .data.
+Phase 1 is a **planning surface**. It captures a Site Brief and nothing more: no
+build pipeline, no deployment, no payments. Phases 2–6 are deliberately absent
+from the codebase.
+
+### Modules
+
+| Path                                     | Responsibility                                                                     |
+| ---------------------------------------- | ---------------------------------------------------------------------------------- |
+| `src/lib/studio/categories.ts`           | 15 website types plus 11 online-shop sub-types.                                    |
+| `src/lib/studio/packages.ts`             | Lite / Starter / Business / Empire, each with page and product limits.             |
+| `src/lib/studio/themes.ts`               | 7 themes, exported as design tokens only — never forked layouts.                   |
+| `src/lib/studio/templates.ts`            | Real template registry: manifests, per-category compatibility, and reconciliation. |
+| `src/lib/studio/site-brief/schema.ts`    | `siteBriefSchemaV1` — Zod base object plus cross-field `superRefine`.              |
+| `src/lib/studio/site-brief/defaults.ts`  | Ghana defaults, region list, `formatGhanaPhone`, planned-payment labels.           |
+| `src/lib/studio/site-brief/readiness.ts` | `computeBriefCompleteness` and the preview placeholder helper.                     |
+| `src/lib/studio/draft-store.ts`          | `SqliteStudioDraftStore` and `PostgresStudioDraftStore` behind one interface.      |
+| `src/lib/studio/merge.ts`                | Field-level three-way merge used by the 409 recovery path.                         |
+| `src/lib/studio/backup.ts`               | Backup v2 build, parse, and transactional import.                                  |
+| `src/lib/sqlite-path.ts`                 | The single SQLite path resolver shared by Chat and Studio.                         |
+| `src/lib/bounded-json.ts`                | Streaming, byte-counted request-body reader.                                       |
+
+### Template registry
+
+`SiteBriefV1` accepts `selectedTemplate`, so a registry must genuinely exist —
+otherwise the field would be a lie. `templates.ts` holds a manifest per layout
+(`id`, `label`, `description`, ordered `sections`, `compatibleCategories`).
+`"*"` means the layout suits every website type, which guarantees the "Custom
+Website" category can never have zero choices. The schema's `superRefine`
+rejects a template that does not suit the chosen category, and the wizard calls
+`reconcileTemplate(category, current)` when the category changes so a draft can
+never point at an incompatible layout.
+
+### Persistence
+
+- **SQLite (no `DATABASE_URL`)** — `studio_drafts` lives inside the **same file
+  and the same `DatabaseSync` handle** as Chat. `getStudioSqliteStore()` returns
+  Chat's singleton store, so a complete-backup import can put chat sessions,
+  memories, and drafts inside one real transaction. `ensureStudioSchema()` is
+  idempotent and records `studio-schema-version` in `chat_meta`.
+- **PostgreSQL (`DATABASE_URL` set)** — the `studio_drafts` table from Drizzle
+  migration `0002_uneven_the_anarchist.sql`: uuid primary key, `owner_id`
+  referencing `users` with cascade delete, a `jsonb` brief, and the
+  `studio_drafts_owner_updated_idx` index.
+
+`src/lib/user-identity.ts` maps a GitHub id to a canonical UUID with
+`deterministicUuid("github:" + id)`, and `ensureStudioUser` upserts the row only
+when PostgreSQL is in use.
+
+### Shared SQLite path resolution
+
+`src/lib/sqlite-path.ts` is the one place that answers "which file?". It exports
+`DEFAULT_CHAT_STORE_PATH`, `deriveSqliteChatStorePath`,
+`configuredLegacyChatStorePath`, `configuredSqliteChatStorePath`,
+`legacyBackupPath`, `assertDistinctStorePaths`, and `resolveSqliteStorePaths`.
+Chat and Studio both call it, so they cannot drift onto different files. The
+legacy JSON path and the SQLite path are asserted to differ, and a `.json`
+legacy source is never opened as a SQLite database. Studio adds no environment
+variable of its own.
+
+### Optimistic concurrency
+
+Both stores perform a single atomic conditional update and inspect the returned
+rows:
+
+```sql
+UPDATE studio_drafts
+   SET brief_json = $1, revision = revision + 1, updated_at = $2
+ WHERE id = $3 AND owner_id = $4 AND revision = $5
+RETURNING *
+```
+
+Zero rows means either a stale revision or a draft that is not yours. The store
+distinguishes the two with a follow-up owner-scoped existence check and raises
+`DraftConflictError` (409) or `DraftNotFoundError` (404). A `200` on zero rows is
+impossible. `DraftNotFoundError` carries an identical message for a foreign
+draft and a made-up id, so existence is never disclosed.
+
+Client-side, `wizard.tsx` serializes saves through a single in-flight promise
+and debounces keystrokes. On a 409 it refetches the server copy and calls
+`mergeBriefs(base, mine, theirs)`. When the two sides touched different fields
+the pending edit is reapplied and retried once; when they touched the same field
+with different values, `merged` is `null` and the conflict banner asks the owner
+to keep their version or take the other. No write is ever dropped silently.
+
+### Backups
+
+`buildBackup(user)` produces
+`{ backupVersion: 2, exportedAt, chat: { version: 1, ... }, studio: { version: 1, schemaVersion: 1, drafts: [...] } }`.
+`parseBackup(input)` checks the version **before** validating or writing
+anything, and accepts a legacy v1 chat-only file by lifting it into the v2
+shape. `importBackup` reassigns every record to the authenticated canonical
+owner — `ownerId` values in the file are always ignored — and remaps a colliding
+draft id to a fresh `randomUUID()` rather than overwriting. Validation errors
+report field _paths_ only (at most five), never submitted values.
+
+SQLite runs the whole import inside `store.runInTransaction` on the single
+shared handle, so a failure after any insert rolls chat, memories, and studio
+back together. PostgreSQL uses one database transaction. A
+`failAfterInsertForTests` hook lets the suite prove the rollback rather than
+assume it.
+
+### Request bodies
+
+`readBoundedJson(request, limitBytes)` reads `Request.body` through
+`getReader()`, adds up real chunk sizes, cancels the stream the moment the limit
+is passed, and only parses once the whole body is safely buffered. It therefore
+holds when `Content-Length` is absent, false, or the transfer is chunked.
+Limits: `DRAFT_BODY_LIMIT_BYTES` 1 MB, `BACKUP_BODY_LIMIT_BYTES` 25 MB.
+
+### Testing
+
+Vitest covers the resolver, stores, merge, backup, bounded reader, and the Site
+Brief. The PostgreSQL contract suite runs only when
+`STUDIO_TEST_DATABASE_URL` is set and is otherwise reported as skipped, so
+SQLite results are never presented as PostgreSQL parity; CI supplies a real
+PostgreSQL 16 service.
+
+Playwright (`playwright.config.ts`, `tests/e2e/studio-smoke.spec.ts`) drives a
+real production build on a throwaway SQLite database, in a desktop Chromium
+project and an iPhone 13 project. It signs in with a genuine encrypted session
+cookie minted from the server's own `SESSION_SECRET`; no production code path is
+weakened for tests. The production Dockerfile installs no browser binaries.
+
+### Deferred
+
+Uploads and object storage, repository generation, sandboxed builds, preview
+deployments, admin roles, e-commerce, payments, and template versioning all
+remain unimplemented.

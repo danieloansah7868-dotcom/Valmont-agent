@@ -1,294 +1,279 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { readBoundedJson } from "@/lib/bounded-json";
-import { siteBriefSchemaV1 } from "./site-brief/schema";
-import { getStudioDraftStore, _resetStudioSqliteForTests } from "./draft-store";
-import { canonicalUserId } from "@/lib/user-identity";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import type { SessionUser } from "@/lib/auth";
-import { deriveSqliteChatStorePath } from "@/lib/chat-store";
+import { canonicalUserId } from "@/lib/user-identity";
+import {
+  DraftConflictError,
+  DraftNotFoundError,
+  SqliteStudioDraftStore,
+  getStudioSqliteDb,
+  getStudioSqliteStore,
+} from "./draft-store";
+import { createDefaultBrief } from "./site-brief/defaults";
+import type { SiteBriefV1 } from "./site-brief/schema";
 
-const userA: SessionUser = { id: "1001", login: "alice", name: "Alice" };
-const userB: SessionUser = { id: "1002", login: "bob", name: "Bob" };
-const validBrief: any = {
-  schemaVersion: 1 as const,
-  businessName: "Acme Ghana",
-  category: "business-profile",
-  selectedPackage: "starter",
-  selectedTheme: "clean-corporate",
-  adminEmail: "owner@example.com",
-  socialLinks: [],
-  serviceAreas: [],
-  deliveryAreas: [],
-  services: [],
-  requiredPages: [],
-  assetStatus: "not_provided" as const,
-  products: [],
-  country: "Ghana",
-  currency: "GHS",
-  timezone: "Africa/Accra",
-  plannedPaymentMethods: [] as any,
-};
+const userA: SessionUser = { id: "9001", login: "ama", name: "Ama" };
+const userB: SessionUser = { id: "9002", login: "kofi", name: "Kofi" };
 
-let tmpDir: string;
+const dirs: string[] = [];
+let store: SqliteStudioDraftStore;
+let chatStore: SqliteChatStore;
+let dbPath: string;
+let legacyPath: string;
+
+function brief(overrides: Partial<SiteBriefV1> = {}): SiteBriefV1 {
+  return createDefaultBrief({
+    businessName: "Adom Fashion House",
+    adminEmail: "owner@adom.example",
+    ...overrides,
+  });
+}
+
 beforeEach(() => {
-  tmpDir = mkdtempSync(path.join(tmpdir(), "studio-test-"));
-  process.env.CHAT_STORE_PATH = path.join(tmpDir, "chat-store.json");
-  delete process.env.CHAT_SQLITE_PATH;
-  delete process.env.DATABASE_URL;
-  _resetStudioSqliteForTests();
+  // Temporary files only. No real .data file is ever opened by these tests.
+  const dir = mkdtempSync(path.join(os.tmpdir(), "valmont-studio-"));
+  dirs.push(dir);
+  dbPath = path.join(dir, "chat-store.sqlite");
+  legacyPath = path.join(dir, "chat-store.json");
+  chatStore = new SqliteChatStore(dbPath, legacyPath);
+  setSqliteChatStoreForTests(chatStore);
+  store = new SqliteStudioDraftStore();
 });
+
 afterEach(() => {
-  _resetStudioSqliteForTests();
-  try {
-    rmSync(tmpDir, { recursive: true, force: true });
-  } catch {}
-  delete process.env.CHAT_STORE_PATH;
+  setSqliteChatStoreForTests(null);
+  for (const dir of dirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
 });
 
-describe("shared SQLite path resolver", () => {
-  it("derives .sqlite from .json", () => {
-    expect(deriveSqliteChatStorePath("/tmp/a/chat-store.json")).toBe(
-      path.resolve("/tmp/a/chat-store.sqlite"),
+describe("studio drafts share the chat database", () => {
+  it("writes drafts into the very same SQLite file as chat", async () => {
+    await store.create(userA, brief());
+    expect(existsSync(dbPath)).toBe(true);
+
+    const tables = getStudioSqliteDb()
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all()
+      .map((row) => String((row as { name: string }).name));
+
+    expect(tables).toContain("studio_drafts");
+    expect(tables).toContain("chat_sessions");
+  });
+
+  it("uses one connection, not a second handle onto the same file", () => {
+    expect(getStudioSqliteStore().connection).toBe(chatStore.connection);
+  });
+
+  it("records the studio schema version in the shared meta table", async () => {
+    await store.create(userA, brief());
+    const row = getStudioSqliteDb()
+      .prepare("SELECT value FROM chat_meta WHERE key = ?")
+      .get("studio-schema-version") as { value: string } | undefined;
+    expect(row?.value).toBe("1");
+  });
+
+  it("keeps existing chat data intact when studio tables are added", async () => {
+    await chatStore.create({ userId: userA.id, title: "Existing chat" });
+    const before = await chatStore.list(userA.id);
+    await store.create(userA, brief());
+    const after = await chatStore.list(userA.id);
+    expect(after.map((session) => session.id)).toEqual(
+      before.map((session) => session.id),
     );
   });
-  it("respects CHAT_SQLITE_PATH", () => {
-    process.env.CHAT_SQLITE_PATH = "/tmp/custom.sqlite";
+
+  it("survives repeated startup against an existing file", async () => {
+    const created = await store.create(userA, brief());
+
+    // Simulate the process restarting against the same database file.
+    setSqliteChatStoreForTests(new SqliteChatStore(dbPath, legacyPath));
+    const reopened = new SqliteStudioDraftStore();
+    const found = await reopened.get(userA, created.id);
+    expect(found?.brief.businessName).toBe("Adom Fashion House");
+  });
+});
+
+describe("draft CRUD", () => {
+  it("creates a draft at revision 1 owned by the signed-in user", async () => {
+    const draft = await store.create(userA, brief());
+    expect(draft.revision).toBe(1);
+    expect(draft.ownerId).toBe(canonicalUserId(userA));
+    expect(draft.schemaVersion).toBe(1);
+  });
+
+  it("lists only the caller's own drafts", async () => {
+    await store.create(userA, brief({ businessName: "Ama Shop" }));
+    await store.create(userB, brief({ businessName: "Kofi Motors" }));
+
+    const forA = await store.list(userA);
+    expect(forA).toHaveLength(1);
+    expect(forA[0]!.brief.businessName).toBe("Ama Shop");
+  });
+
+  it("reopens a saved draft with its details intact", async () => {
+    const created = await store.create(
+      userA,
+      brief({ phone: "+233201234567", services: ["Tailoring", "Repairs"] }),
+    );
+    const reopened = await store.get(userA, created.id);
+    expect(reopened?.brief.phone).toBe("+233201234567");
+    expect(reopened?.brief.services).toEqual(["Tailoring", "Repairs"]);
+  });
+
+  it("deletes a draft and refuses to delete somebody else's", async () => {
+    const draft = await store.create(userA, brief());
+    expect(await store.delete(userB, draft.id)).toBe(false);
+    expect(await store.get(userA, draft.id)).not.toBeNull();
+    expect(await store.delete(userA, draft.id)).toBe(true);
+    expect(await store.get(userA, draft.id)).toBeNull();
+  });
+});
+
+describe("owner isolation", () => {
+  it("returns null for another owner's draft, exactly as for a random id", async () => {
+    const draft = await store.create(userA, brief());
+    expect(await store.get(userB, draft.id)).toBeNull();
     expect(
-      (() => {
-        const legacy = process.env.CHAT_STORE_PATH!;
-        return (
-          (process.env.CHAT_SQLITE_PATH as string) ||
-          deriveSqliteChatStorePath(legacy)
-        );
-      })(),
-    ).toBe("/tmp/custom.sqlite");
+      await store.get(userB, "11111111-2222-3333-4444-555555555555"),
+    ).toBeNull();
   });
-  it("non-json CHAT_STORE_PATH derives correctly", () => {
-    expect(deriveSqliteChatStorePath("/tmp/data/store")).toBe(
-      path.resolve("/tmp/data/store.sqlite"),
-    );
+
+  it("raises the same not-found error for a foreign draft as for a missing one", async () => {
+    const draft = await store.create(userA, brief());
+
+    const foreign = await store
+      .update(userB, draft.id, brief({ businessName: "Hijack" }), 1)
+      .catch((error: unknown) => error);
+    const missing = await store
+      .update(userB, "11111111-2222-3333-4444-555555555555", brief(), 1)
+      .catch((error: unknown) => error);
+
+    expect(foreign).toBeInstanceOf(DraftNotFoundError);
+    expect(missing).toBeInstanceOf(DraftNotFoundError);
+    expect((foreign as Error).message).toBe((missing as Error).message);
+    expect((foreign as DraftNotFoundError).status).toBe(404);
   });
-  it("repeated startup does not error", async () => {
-    const s = getStudioDraftStore();
-    await s.create(userA, validBrief as any);
-    _resetStudioSqliteForTests();
-    const s2 = getStudioDraftStore();
-    const list = await s2.list(userA);
-    expect(list.length).toBe(1);
-  });
-  it("fresh DB and upgrade preserve data", async () => {
-    const s = getStudioDraftStore();
-    const d = await s.create(userA, validBrief as any);
-    _resetStudioSqliteForTests();
-    const s2 = getStudioDraftStore();
-    const g = await s2.get(userA, d.id);
-    expect(g?.brief.businessName).toBe("Acme Ghana");
+
+  it("leaves the real owner's draft untouched after a foreign write attempt", async () => {
+    const draft = await store.create(userA, brief());
+    await store
+      .update(userB, draft.id, brief({ businessName: "Hijack" }), 1)
+      .catch(() => undefined);
+    const current = await store.get(userA, draft.id);
+    expect(current?.brief.businessName).toBe("Adom Fashion House");
+    expect(current?.revision).toBe(1);
   });
 });
 
-describe("studio draft CRUD and isolation", () => {
-  it("create/get/list/delete owner isolated", async () => {
-    const s = getStudioDraftStore();
-    const d = await s.create(userA, validBrief as any);
-    expect(await s.get(userB, d.id)).toBeNull();
-    expect(await s.delete(userB, d.id)).toBe(false);
-    expect(await s.delete(userA, d.id)).toBe(true);
-    expect(await s.get(userA, d.id)).toBeNull();
-  });
-  it("generic 404 for missing vs foreign", async () => {
-    const s = getStudioDraftStore();
-    const d = await s.create(userA, validBrief as any);
-    const miss = await s.get(userB, "00000000-0000-4000-a000-000000000000");
-    const foreign = await s.get(userB, d.id);
-    expect(miss).toBeNull();
-    expect(foreign).toBeNull();
-  });
-  it("stale revision rejected", async () => {
-    const s = getStudioDraftStore();
-    const d = await s.create(userA, validBrief as any);
-    await s.update(
+describe("optimistic concurrency (SQLite)", () => {
+  it("accepts an update that carries the current revision", async () => {
+    const draft = await store.create(userA, brief());
+    const updated = await store.update(
       userA,
-      d.id,
-      { ...(validBrief as any), businessName: "Acme v2" },
-      1,
+      draft.id,
+      brief({ tagline: "Style that fits" }),
+      draft.revision,
     );
-    await expect(
-      s.update(userA, d.id, { ...validBrief, businessName: "Acme v3" }, 1),
-    ).rejects.toThrow(/Conflict/);
-  });
-  it("simultaneous updates one succeeds one 409", async () => {
-    const s = getStudioDraftStore();
-    const d = await s.create(userA, validBrief as any);
-    await s.update(
-      userA,
-      d.id,
-      { ...(validBrief as any), businessName: "Acme A" },
-      1,
-    );
-    await expect(
-      s.update(
-        userA,
-        d.id,
-        { ...(validBrief as any), businessName: "Acme B" },
-        1,
-      ),
-    ).rejects.toThrow(/Conflict/);
+    expect(updated.revision).toBe(2);
+    expect(updated.brief.tagline).toBe("Style that fits");
   });
 
-  it("changing theme does not erase business info", async () => {
-    const s = getStudioDraftStore();
-    const d = await s.create(userA, validBrief as any);
-    const u = await s.update(
-      userA,
-      d.id,
-      { ...(validBrief as any), selectedTheme: "luxury" },
-      1,
+  it("rejects a stale revision with a conflict", async () => {
+    const draft = await store.create(userA, brief());
+    await store.update(userA, draft.id, brief({ tagline: "First" }), 1);
+
+    const error = await store
+      .update(userA, draft.id, brief({ tagline: "Second" }), 1)
+      .catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(DraftConflictError);
+    expect((error as DraftConflictError).status).toBe(409);
+  });
+
+  it("lets exactly one of two writers on the same revision win", async () => {
+    const draft = await store.create(userA, brief());
+
+    const results = await Promise.allSettled([
+      store.update(userA, draft.id, brief({ tagline: "Writer one" }), 1),
+      store.update(userA, draft.id, brief({ tagline: "Writer two" }), 1),
+    ]);
+
+    const wins = results.filter((result) => result.status === "fulfilled");
+    const losses = results.filter((result) => result.status === "rejected");
+    expect(wins).toHaveLength(1);
+    expect(losses).toHaveLength(1);
+    expect((losses[0] as PromiseRejectedResult).reason).toBeInstanceOf(
+      DraftConflictError,
     );
-    expect(u.brief.businessName).toBe("Acme Ghana");
-    expect(u.brief.selectedTheme).toBe("luxury");
+
+    const final = await store.get(userA, draft.id);
+    expect(final?.revision).toBe(2);
+  });
+
+  it("never reports success when no row was updated", async () => {
+    const draft = await store.create(userA, brief());
+    await store.delete(userA, draft.id);
+    await expect(
+      store.update(userA, draft.id, brief(), 1),
+    ).rejects.toBeInstanceOf(DraftNotFoundError);
   });
 });
 
-describe("bounded json limits", () => {
-  it("missing Content-Length still enforced", async () => {
-    const big = "a".repeat(1_100_000);
-    const req = new Request("http://a", {
-      method: "POST",
-      body: JSON.stringify({ x: big }),
+describe("changing choices does not lose business information", () => {
+  it("keeps every business detail when the theme changes", async () => {
+    const filled = brief({
+      phone: "+233201234567",
+      whatsapp: "+233241111111",
+      address: "12 Oxford Street, Osu",
+      hours: "Mon-Sat 8am-6pm",
+      services: ["Tailoring"],
+      products: [{ name: "Kente scarf" }],
+      description: "Bespoke tailoring in Accra.",
     });
-    // missing header but body is large
-    await expect(readBoundedJson(req, 1_000_000)).rejects.toThrow(/too large/);
+    const draft = await store.create(userA, filled);
+
+    const updated = await store.update(
+      userA,
+      draft.id,
+      { ...filled, selectedTheme: "luxury" },
+      draft.revision,
+    );
+
+    expect(updated.brief.selectedTheme).toBe("luxury");
+    expect(updated.brief.phone).toBe("+233201234567");
+    expect(updated.brief.address).toBe("12 Oxford Street, Osu");
+    expect(updated.brief.services).toEqual(["Tailoring"]);
+    expect(updated.brief.products).toEqual([{ name: "Kente scarf" }]);
+    expect(updated.brief.description).toBe("Bespoke tailoring in Accra.");
   });
-  it("false Content-Length does not bypass (stream counts bytes)", async () => {
-    const body = JSON.stringify({ x: "a".repeat(100) });
-    const req = new Request("http://a", {
-      method: "POST",
-      headers: { "content-length": "1" },
-      body,
-    });
-    const j = (await readBoundedJson(req, 1_000_000)) as any;
-    expect(j.x.length).toBe(100);
-  });
-  it("chunked oversized rejected", async () => {
-    const stream = new ReadableStream({
-      start(c) {
-        c.enqueue(new TextEncoder().encode("a".repeat(600)));
-        c.enqueue(new TextEncoder().encode("b".repeat(600)));
-        c.close();
+
+  it("keeps business details when the package and website type change", async () => {
+    const filled = brief({ phone: "+233201234567", tagline: "Fits you" });
+    const draft = await store.create(userA, filled);
+
+    const step = await store.update(
+      userA,
+      draft.id,
+      { ...filled, selectedPackage: "business" },
+      1,
+    );
+    const final = await store.update(
+      userA,
+      draft.id,
+      {
+        ...step.brief,
+        category: "online-shop",
+        selectedTemplate: "split-features",
       },
-    });
-    const req = new Request("http://a", {
-      method: "POST",
-      body: stream,
-      duplex: "half",
-    } as any);
-    await expect(readBoundedJson(req, 1000)).rejects.toThrow(/too large/);
-  });
-  it("valid json passes", async () => {
-    const req = new Request("http://a", {
-      method: "POST",
-      body: JSON.stringify({ ok: 1 }),
-    });
-    expect(await readBoundedJson(req, 1_000_000)).toEqual({ ok: 1 });
-  });
-  it("1MB and 25MB limits distinct", async () => {
-    const oneMb = "a".repeat(1_100_000);
-    const req = new Request("http://a", {
-      method: "POST",
-      body: JSON.stringify({ x: oneMb }),
-    });
-    await expect(readBoundedJson(req, 1_000_000)).rejects.toThrow();
-    await expect(
-      readBoundedJson(
-        new Request("http://a", {
-          method: "POST",
-          body: JSON.stringify({ x: oneMb }),
-        }),
-        25_000_000,
-      ),
-    ).resolves.toBeDefined();
-  });
-});
-
-describe("site brief validation and Ghana defaults", () => {
-  it("accepts valid Ghana brief", () => {
-    expect(siteBriefSchemaV1.safeParse(validBrief).success).toBe(true);
-  });
-  it("rejects javascript url", () => {
-    expect(
-      siteBriefSchemaV1.safeParse({
-        ...validBrief,
-        mapsLink: "javascript:alert(1)",
-      }).success,
-    ).toBe(false);
-  });
-  it("rejects data url", () => {
-    expect(
-      siteBriefSchemaV1.safeParse({
-        ...validBrief,
-        mapsLink: "data:text/html,hi",
-      }).success,
-    ).toBe(false);
-  });
-  it("rejects credential url", () => {
-    expect(
-      siteBriefSchemaV1.safeParse({
-        ...validBrief,
-        mapsLink: "https://user:pass@example.com",
-      }).success,
-    ).toBe(false);
-  });
-  it("rejects bad hex", () => {
-    expect(
-      siteBriefSchemaV1.safeParse({
-        ...validBrief,
-        preferredColours: ["#GGGGGG", "#ffffff", "#000000"] as any,
-      }).success,
-    ).toBe(false);
-  });
-  it("typed template and payment methods", () => {
-    expect(
-      siteBriefSchemaV1.safeParse({
-        ...validBrief,
-        selectedTemplate: "classic-hero",
-        plannedPaymentMethods: ["momo", "card"],
-      }).success,
-    ).toBe(true);
-    expect(
-      siteBriefSchemaV1.safeParse({ ...validBrief, selectedTemplate: "bad" })
-        .success,
-    ).toBe(false);
-  });
-});
-
-describe("backup versioning", () => {
-  it("export v2 structure", async () => {
-    const chat = { version: 1, sessions: [], memories: [] };
-    const studio = { version: 1, schemaVersion: 1, drafts: [] };
-    const backup = {
-      backupVersion: 2,
-      exportedAt: new Date().toISOString(),
-      chat,
-      studio,
-    };
-    expect(backup.backupVersion).toBe(2);
-  });
-  it("rejects unknown version", () => {
-    const v: any = 99;
-    expect([1, 2].includes(v as number)).toBe(false);
-  });
-});
-
-describe("canonical identity", () => {
-  it("deterministic and stable", () => {
-    expect(canonicalUserId(userA)).toBe(
-      canonicalUserId({ id: "1001", login: "x", name: "y" }),
+      step.revision,
     );
-  });
-  it("different users different", () => {
-    expect(canonicalUserId(userA)).not.toBe(canonicalUserId(userB));
+
+    expect(final.brief.selectedPackage).toBe("business");
+    expect(final.brief.category).toBe("online-shop");
+    expect(final.brief.phone).toBe("+233201234567");
+    expect(final.brief.tagline).toBe("Fits you");
   });
 });

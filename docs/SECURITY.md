@@ -94,4 +94,81 @@ Use TLS, backups, point-in-time recovery, row ownership checks, and migration re
 
 ## Website Studio Phase 1 Security
 
-Studio mutations require requireApiSessionUser (401), assertCsrf + assertSameOrigin (403), rate limit 30/min (429), readBoundedJson stream limits 1MB/25MB (413), Zod validation (no javascript: / data: / credential URLs, strict #RRGGBB, E.164), generic 404 for missing vs foreign draft, no server-side fetch of user URLs, no dangerouslySetInnerHTML, canonical deterministicUuid for owner, no asset URLs in v1, no payment execution (plannedPaymentMethods future-only).
+### Every Studio route
+
+| Control          | Implementation                                                       | Failure |
+| ---------------- | -------------------------------------------------------------------- | ------- |
+| Authentication   | `requireApiSessionUser()`                                            | 401     |
+| CSRF             | `assertCsrf` — `x-valmont-csrf` must match the `valmont_csrf` cookie | 403     |
+| Origin           | `assertSameOrigin`                                                   | 403     |
+| Rate limiting    | 30/min draft mutations, 10/min backup export, 5/min backup import    | 429     |
+| Body size        | `readBoundedJson` — 1 MB drafts, 25 MB backup import                 | 413     |
+| Input validation | `siteBriefSchemaV1` / `parseBackup`                                  | 400     |
+
+### Owner isolation
+
+Every read, update, and delete is scoped by `owner_id` in the SQL statement
+itself, not filtered afterwards. A draft belonging to somebody else and a draft
+that does not exist produce the **same generic 404 with the same body**, so the
+API cannot be used to discover which ids are real. The end-to-end suite asserts
+this by comparing the two responses byte for byte. Owner identity comes from the
+encrypted session and is mapped through `deterministicUuid("github:" + id)`; it
+is never taken from the request body.
+
+### Concurrency safety
+
+Draft updates are a single conditional `UPDATE ... WHERE id AND owner_id AND
+revision ... RETURNING`. Zero returned rows is always an error (409 or 404),
+never a success. Two writers on the same revision cannot both win, and no
+writer's changes are discarded without the owner being told.
+
+### Untrusted input
+
+- **URLs** — `isHttpsSafeUrl` accepts `https` only, and rejects embedded
+  credentials, `localhost`, `127.*`, `10.*`, `192.168.*`, and `169.254.169.254`.
+  This blocks `javascript:`, `data:`, and SSRF-shaped values. Valmont never
+  fetches a URL a user typed; links are rendered with
+  `rel="noopener noreferrer nofollow"` only after passing the same check the
+  schema applies.
+- **Text** — the preview renders text as text. There is no
+  `dangerouslySetInnerHTML` anywhere in the Studio, so `<img src=x onerror=...>`
+  is displayed literally, never executed. A browser test asserts this.
+- **Colours** — strict `#RRGGBB`. **Phones** — E.164 `/^\+\d{8,15}$/`.
+- **Assets** — `assetStatus` is `z.literal("not_provided")`: a marker, not a
+  URL. There is no upload control and no arbitrary asset URL can be stored.
+
+### Error and log hygiene
+
+`safeApiError` maps known error types to status codes and returns short, generic
+messages. Zod issues are reduced to at most five field **paths**; submitted
+values, business details, and imported file contents are never echoed into a
+response or a log line. Existing secret-redaction patterns still apply to
+everything written to the store.
+
+### Backup imports
+
+An imported file is fully untrusted input. Its version is checked before
+anything is written; unknown versions are rejected outright. `ownerId` fields
+inside the file are ignored and every record is reassigned to the authenticated
+account, so a crafted backup cannot plant records under another user or read
+theirs. A colliding draft id becomes a new copy instead of overwriting existing
+work. The import is one transaction, so a partial write cannot leave chats,
+memories, and drafts inconsistent.
+
+### No payments, no payment data
+
+Phase 1 executes no payment of any kind. `plannedPaymentMethods` is a small
+enum of future-planning preferences, stored alongside `PAYMENT_PLANNING_NOTICE`
+which states plainly that nothing is connected. Card numbers, mobile-money PINs,
+and merchant credentials have no field in the schema, are stripped by Zod if
+submitted, and are never stored or logged. A test asserts their absence from
+parsed output.
+
+### Test credentials
+
+The end-to-end tests mint a real encrypted `valmont_session` cookie using the
+`SESSION_SECRET` the server was started with. **There is no test-only
+authentication bypass in application code.** The session secret is generated per
+CI run; `playwright.config.ts` refuses to run without a 32-character-plus
+secret and provides no fallback. Tests use a throwaway database directory and
+never open the real `.data` files.

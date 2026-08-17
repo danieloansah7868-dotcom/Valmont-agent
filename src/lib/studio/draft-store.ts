@@ -1,8 +1,5 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { randomUUID } from "node:crypto";
-import path from "node:path";
-import { mkdirSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import {
   siteBriefSchemaV1,
   type SiteBriefV1,
@@ -12,8 +9,37 @@ import { canonicalUserId } from "@/lib/user-identity";
 import type { SessionUser } from "@/lib/auth";
 import { getDatabase } from "@/db";
 import { studioDrafts } from "@/db/schema";
-import { and, eq, desc } from "drizzle-orm";
-import { deriveSqliteChatStorePath as sharedDerive } from "@/lib/chat-store";
+import { and, eq, desc, sql } from "drizzle-orm";
+import { getSqliteChatStore, type SqliteChatStore } from "@/lib/chat-store";
+
+export const STUDIO_SCHEMA_VERSION = 1;
+
+/**
+ * Raised when a write loses an optimistic-concurrency race. Callers map this to
+ * HTTP 409 by type, never by matching the message text.
+ */
+export class DraftConflictError extends Error {
+  readonly status = 409;
+  constructor(
+    message = "This draft was changed somewhere else. Reload to see the latest version.",
+  ) {
+    super(message);
+    this.name = "DraftConflictError";
+  }
+}
+
+/**
+ * Raised for a draft that does not exist *or* belongs to somebody else. Both
+ * cases deliberately produce the identical error so a signed-in user cannot
+ * probe for the existence of another owner's drafts.
+ */
+export class DraftNotFoundError extends Error {
+  readonly status = 404;
+  constructor(message = "Draft not found") {
+    super(message);
+    this.name = "DraftNotFoundError";
+  }
+}
 
 export interface StudioDraftStore {
   create(user: SessionUser, brief: Partial<SiteBriefV1>): Promise<StudioDraft>;
@@ -31,26 +57,30 @@ export interface StudioDraftStore {
 function validatedBrief(input: Partial<SiteBriefV1>): SiteBriefV1 {
   return siteBriefSchemaV1.parse(input);
 }
-function nowIso() {
+
+function nowIso(): string {
   return new Date().toISOString();
 }
 
-function sqlitePath(): string {
-  const legacy =
-    process.env.CHAT_STORE_PATH || `${process.cwd()}/.data/chat-store.json`;
-  return (process.env.CHAT_SQLITE_PATH as string) || sharedDerive(legacy);
+interface StudioDraftRow {
+  id: string;
+  owner_id: string;
+  schema_version: number;
+  template_version: number;
+  theme_version: number;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  brief_json: string;
 }
 
-let sqliteDb: DatabaseSync | undefined;
-export function getStudioSqliteDb(): DatabaseSync {
-  if (sqliteDb) return sqliteDb;
-  const p = sqlitePath();
-  mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
-  sqliteDb = new DatabaseSync(p);
-  sqliteDb.exec(
-    "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
-  );
-  sqliteDb.exec(`
+/**
+ * Creates the studio tables on the shared chat database connection. Studio has
+ * no database file of its own: it uses exactly the same SQLite file as Chat,
+ * resolved once by "@/lib/sqlite-path".
+ */
+export function ensureStudioSchema(db: DatabaseSync): void {
+  db.exec(`
     CREATE TABLE IF NOT EXISTS studio_drafts (
       id TEXT PRIMARY KEY,
       owner_id TEXT NOT NULL,
@@ -63,149 +93,148 @@ export function getStudioSqliteDb(): DatabaseSync {
       brief_json TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS studio_drafts_owner_updated ON studio_drafts(owner_id, updated_at DESC);
-    CREATE TABLE IF NOT EXISTS studio_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    INSERT OR IGNORE INTO studio_meta(key,value) VALUES ('studio_schema_version','1');
   `);
-  return sqliteDb;
+  db.prepare("INSERT OR IGNORE INTO chat_meta(key, value) VALUES (?, ?)").run(
+    "studio-schema-version",
+    String(STUDIO_SCHEMA_VERSION),
+  );
 }
 
-class SqliteStudioDraftStore implements StudioDraftStore {
+const migratedConnections = new WeakSet<object>();
+
+/**
+ * Returns the single shared SQLite connection, guaranteeing the studio tables
+ * exist on it. Reusing Chat's handle is what lets a complete-backup import put
+ * chat, memories and studio drafts inside one transaction.
+ */
+export function getStudioSqliteStore(): SqliteChatStore {
+  const store = getSqliteChatStore();
+  if (!migratedConnections.has(store)) {
+    ensureStudioSchema(store.connection);
+    migratedConnections.add(store);
+  }
+  return store;
+}
+
+export function getStudioSqliteDb(): DatabaseSync {
+  return getStudioSqliteStore().connection;
+}
+
+export class SqliteStudioDraftStore implements StudioDraftStore {
+  private get db(): DatabaseSync {
+    return getStudioSqliteDb();
+  }
+
   async create(
     user: SessionUser,
     brief: Partial<SiteBriefV1>,
   ): Promise<StudioDraft> {
-    const vb = validatedBrief(brief);
-    const ownerId = canonicalUserId(user);
-    const id = randomUUID();
-    const ts = nowIso();
-    const draft: StudioDraft = {
-      id,
-      ownerId,
-      schemaVersion: 1,
-      templateRegistryVersion: 1,
-      themeRegistryVersion: 1,
-      revision: 1,
-      createdAt: ts,
-      updatedAt: ts,
-      brief: vb,
-    };
-    getStudioSqliteDb()
-      .prepare(
-        "INSERT INTO studio_drafts(id,owner_id,schema_version,template_version,theme_version,revision,created_at,updated_at,brief_json) VALUES (?,?,?,?,?,?,?,?,?)",
-      )
-      .run(id, ownerId, 1, 1, 1, 1, ts, ts, JSON.stringify(vb));
+    const validated = validatedBrief(brief);
+    const draft = newDraftRecord(canonicalUserId(user), validated);
+    insertDraftRow(this.db, draft);
     return draft;
   }
+
   async get(user: SessionUser, id: string): Promise<StudioDraft | null> {
-    const ownerId = canonicalUserId(user);
-    const row = getStudioSqliteDb()
-      .prepare("SELECT * FROM studio_drafts WHERE id=? AND owner_id=?")
-      .get(id, ownerId) as any;
-    if (!row) return null;
-    return rowToDraft(row);
+    const row = this.db
+      .prepare("SELECT * FROM studio_drafts WHERE id = ? AND owner_id = ?")
+      .get(id, canonicalUserId(user)) as unknown as StudioDraftRow | undefined;
+    return row ? rowToDraft(row) : null;
   }
+
   async list(user: SessionUser): Promise<StudioDraft[]> {
-    const ownerId = canonicalUserId(user);
-    const rows = getStudioSqliteDb()
+    const rows = this.db
       .prepare(
-        "SELECT * FROM studio_drafts WHERE owner_id=? ORDER BY updated_at DESC",
+        "SELECT * FROM studio_drafts WHERE owner_id = ? ORDER BY updated_at DESC",
       )
-      .all(ownerId) as any[];
+      .all(canonicalUserId(user)) as unknown as StudioDraftRow[];
     return rows.map(rowToDraft);
   }
+
   async update(
     user: SessionUser,
     id: string,
     brief: Partial<SiteBriefV1>,
     expectedRevision: number,
   ): Promise<StudioDraft> {
-    const vb = validatedBrief(brief);
+    const validated = validatedBrief(brief);
     const ownerId = canonicalUserId(user);
-    const db = getStudioSqliteDb();
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const row = db
-        .prepare("SELECT revision FROM studio_drafts WHERE id=? AND owner_id=?")
-        .get(id, ownerId) as any;
-      if (!row) {
-        db.exec("ROLLBACK");
-        throw new Error("Draft not found");
-      }
-      if (row.revision !== expectedRevision) {
-        db.exec("ROLLBACK");
-        const e = new Error(
-          "Conflict: draft was modified elsewhere. Reload and retry.",
-        );
-        (e as any).status = 409;
-        throw e;
-      }
-      const ts = nowIso();
-      const newRev = expectedRevision + 1;
-      const changes = db
-        .prepare(
-          "UPDATE studio_drafts SET brief_json=?, revision=?, updated_at=? WHERE id=? AND owner_id=? AND revision=?",
-        )
-        .run(JSON.stringify(vb), newRev, ts, id, ownerId, expectedRevision);
-      if (Number((changes as any).changes) === 0) {
-        db.exec("ROLLBACK");
-        const e = new Error("Conflict");
-        (e as any).status = 409;
-        throw e;
-      }
-      db.exec("COMMIT");
-      return (await this.get(user, id))!;
-    } catch (e) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {}
-      throw e;
+
+    // One atomic conditional update. The revision guard is part of the WHERE
+    // clause, so two writers holding the same revision can never both succeed —
+    // whoever runs second updates zero rows.
+    const updated = this.db
+      .prepare(
+        `UPDATE studio_drafts
+            SET brief_json = ?, revision = revision + 1, updated_at = ?
+          WHERE id = ? AND owner_id = ? AND revision = ?
+      RETURNING *`,
+      )
+      .all(
+        JSON.stringify(validated),
+        nowIso(),
+        id,
+        ownerId,
+        expectedRevision,
+      ) as unknown as StudioDraftRow[];
+
+    if (updated.length === 1) return rowToDraft(updated[0]!);
+    if (updated.length > 1) {
+      // Impossible with a primary-key match, but never return success blindly.
+      throw new Error("Draft update matched more than one row");
     }
+
+    // Zero rows: either the draft is gone/foreign (404) or the revision is
+    // stale (409). Distinguish with an owner-scoped existence check only.
+    const exists = this.db
+      .prepare("SELECT 1 FROM studio_drafts WHERE id = ? AND owner_id = ?")
+      .get(id, ownerId);
+    if (!exists) throw new DraftNotFoundError();
+    throw new DraftConflictError();
   }
+
   async delete(user: SessionUser, id: string): Promise<boolean> {
-    const ownerId = canonicalUserId(user);
-    const r = getStudioSqliteDb()
-      .prepare("DELETE FROM studio_drafts WHERE id=? AND owner_id=?")
-      .run(id, ownerId);
-    return Number((r as any).changes) > 0;
+    const result = this.db
+      .prepare("DELETE FROM studio_drafts WHERE id = ? AND owner_id = ?")
+      .run(id, canonicalUserId(user));
+    return Number(result.changes) > 0;
   }
 }
 
-class PostgresStudioDraftStore implements StudioDraftStore {
+export class PostgresStudioDraftStore implements StudioDraftStore {
   async create(
     user: SessionUser,
     brief: Partial<SiteBriefV1>,
   ): Promise<StudioDraft> {
-    const vb = validatedBrief(brief);
-    const ownerId = canonicalUserId(user);
+    const validated = validatedBrief(brief);
     const { ensureStudioUser } = await import("@/lib/user-identity");
-    await ensureStudioUser(user);
+    const ownerId = await ensureStudioUser(user);
     const id = randomUUID();
-    const ts = new Date();
-    await getDatabase()
-      .insert(studioDrafts)
-      .values({
-        id,
-        ownerId,
-        schemaVersion: 1,
-        templateVersion: 1,
-        themeVersion: 1,
-        revision: 1,
-        createdAt: ts,
-        updatedAt: ts,
-        brief: vb as any,
-      });
+    const timestamp = new Date();
+    await getDatabase().insert(studioDrafts).values({
+      id,
+      ownerId,
+      schemaVersion: STUDIO_SCHEMA_VERSION,
+      templateVersion: 1,
+      themeVersion: 1,
+      revision: 1,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      brief: validated,
+    });
     return {
       id,
       ownerId,
-      schemaVersion: 1,
+      schemaVersion: STUDIO_SCHEMA_VERSION,
       templateRegistryVersion: 1,
       themeRegistryVersion: 1,
       revision: 1,
-      createdAt: ts.toISOString(),
-      updatedAt: ts.toISOString(),
-      brief: vb,
+      createdAt: timestamp.toISOString(),
+      updatedAt: timestamp.toISOString(),
+      brief: validated,
     };
   }
+
   async get(user: SessionUser, id: string): Promise<StudioDraft | null> {
     const ownerId = canonicalUserId(user);
     const [row] = await getDatabase()
@@ -213,9 +242,9 @@ class PostgresStudioDraftStore implements StudioDraftStore {
       .from(studioDrafts)
       .where(and(eq(studioDrafts.id, id), eq(studioDrafts.ownerId, ownerId)))
       .limit(1);
-    if (!row) return null;
-    return pgRowToDraft(row);
+    return row ? pgRowToDraft(row) : null;
   }
+
   async list(user: SessionUser): Promise<StudioDraft[]> {
     const ownerId = canonicalUserId(user);
     const rows = await getDatabase()
@@ -225,20 +254,24 @@ class PostgresStudioDraftStore implements StudioDraftStore {
       .orderBy(desc(studioDrafts.updatedAt));
     return rows.map(pgRowToDraft);
   }
+
   async update(
     user: SessionUser,
     id: string,
     brief: Partial<SiteBriefV1>,
     expectedRevision: number,
   ): Promise<StudioDraft> {
-    const vb = validatedBrief(brief);
+    const validated = validatedBrief(brief);
     const ownerId = canonicalUserId(user);
     const db = getDatabase();
+
+    // Single atomic statement; PostgreSQL takes the row lock, so exactly one of
+    // two simultaneous same-revision writers gets a row back.
     const updated = await db
       .update(studioDrafts)
       .set({
-        brief: vb as any,
-        revision: expectedRevision + 1,
+        brief: validated,
+        revision: sql`${studioDrafts.revision} + 1`,
         updatedAt: new Date(),
       })
       .where(
@@ -249,31 +282,74 @@ class PostgresStudioDraftStore implements StudioDraftStore {
         ),
       )
       .returning();
-    if (!updated[0]) {
-      const [exists] = await db
-        .select()
-        .from(studioDrafts)
-        .where(and(eq(studioDrafts.id, id), eq(studioDrafts.ownerId, ownerId)))
-        .limit(1);
-      if (!exists) throw new Error("Draft not found");
-      const e = new Error(
-        "Conflict: draft was modified elsewhere. Reload and retry.",
-      );
-      (e as any).status = 409;
-      throw e;
+
+    if (updated.length === 1) return pgRowToDraft(updated[0]!);
+    if (updated.length > 1) {
+      throw new Error("Draft update matched more than one row");
     }
-    return pgRowToDraft(updated[0]);
+
+    const [exists] = await db
+      .select({ id: studioDrafts.id })
+      .from(studioDrafts)
+      .where(and(eq(studioDrafts.id, id), eq(studioDrafts.ownerId, ownerId)))
+      .limit(1);
+    if (!exists) throw new DraftNotFoundError();
+    throw new DraftConflictError();
   }
+
   async delete(user: SessionUser, id: string): Promise<boolean> {
     const ownerId = canonicalUserId(user);
-    const r = await getDatabase()
+    const deleted = await getDatabase()
       .delete(studioDrafts)
-      .where(and(eq(studioDrafts.id, id), eq(studioDrafts.ownerId, ownerId)));
-    return (r as any).rowCount > 0;
+      .where(and(eq(studioDrafts.id, id), eq(studioDrafts.ownerId, ownerId)))
+      .returning({ id: studioDrafts.id });
+    return deleted.length > 0;
   }
 }
 
-function rowToDraft(row: any): StudioDraft {
+export function newDraftRecord(
+  ownerId: string,
+  brief: SiteBriefV1,
+  overrides: Partial<Pick<StudioDraft, "id" | "createdAt" | "updatedAt">> = {},
+): StudioDraft {
+  const timestamp = nowIso();
+  return {
+    id: overrides.id ?? randomUUID(),
+    ownerId,
+    schemaVersion: STUDIO_SCHEMA_VERSION,
+    templateRegistryVersion: 1,
+    themeRegistryVersion: 1,
+    revision: 1,
+    createdAt: overrides.createdAt ?? timestamp,
+    updatedAt: overrides.updatedAt ?? timestamp,
+    brief,
+  };
+}
+
+/** Low-level insert used by create() and by complete-backup import. */
+export function insertDraftRow(db: DatabaseSync, draft: StudioDraft): void {
+  db.prepare(
+    "INSERT INTO studio_drafts(id,owner_id,schema_version,template_version,theme_version,revision,created_at,updated_at,brief_json) VALUES (?,?,?,?,?,?,?,?,?)",
+  ).run(
+    draft.id,
+    draft.ownerId,
+    draft.schemaVersion,
+    draft.templateRegistryVersion,
+    draft.themeRegistryVersion,
+    draft.revision,
+    draft.createdAt,
+    draft.updatedAt,
+    JSON.stringify(draft.brief),
+  );
+}
+
+export function draftIdExists(db: DatabaseSync, id: string): boolean {
+  return Boolean(
+    db.prepare("SELECT 1 FROM studio_drafts WHERE id = ?").get(id),
+  );
+}
+
+function rowToDraft(row: StudioDraftRow): StudioDraft {
   return {
     id: row.id,
     ownerId: row.owner_id,
@@ -283,10 +359,11 @@ function rowToDraft(row: any): StudioDraft {
     revision: row.revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    brief: JSON.parse(row.brief_json),
+    brief: JSON.parse(row.brief_json) as SiteBriefV1,
   };
 }
-function pgRowToDraft(row: any): StudioDraft {
+
+function pgRowToDraft(row: typeof studioDrafts.$inferSelect): StudioDraft {
   return {
     id: row.id,
     ownerId: row.ownerId,
@@ -303,12 +380,4 @@ function pgRowToDraft(row: any): StudioDraft {
 export function getStudioDraftStore(): StudioDraftStore {
   if (process.env.DATABASE_URL) return new PostgresStudioDraftStore();
   return new SqliteStudioDraftStore();
-}
-export function _resetStudioSqliteForTests() {
-  if (sqliteDb) {
-    try {
-      sqliteDb.close();
-    } catch {}
-    sqliteDb = undefined;
-  }
 }
