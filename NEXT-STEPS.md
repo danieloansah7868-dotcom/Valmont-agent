@@ -122,6 +122,27 @@ against the corrected `main` and the ticks mean something again.
 
 ---
 
+## Re-type the legacy error fallback in `safeApiError`
+
+**Status:** not done. Deferred deliberately; raised in independent review of PR #9.
+
+`safeApiError` ends in a fallback that infers the HTTP status from the text of
+the error message: `"Task not found"` becomes 404, anything containing `"CSRF"`
+becomes 403, `"Rate limit"` becomes 429, everything else 400. Rewording any of
+those strings silently changes the status code a client sees.
+
+This is the same anti-pattern the Studio work removed when it gave every error a
+numeric `status` field, and no Studio route reaches the fallback. It survives
+because pre-existing chat, task and repository routes still throw bare `Error`s
+that depend on it. Fixing it means giving those routes typed errors, which
+changes behaviour outside Website Studio and belongs in its own PR with its own
+tests.
+
+**Do not delete the fallback before those routes are converted** — every one of
+them would start returning 400.
+
+---
+
 ## Unchanged status
 
 **Website Studio Phase 1 has not been merged or deployed.** PR #9 still requires an

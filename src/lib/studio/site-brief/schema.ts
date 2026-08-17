@@ -97,6 +97,49 @@ function parseIpv6(value: string): number[] | null {
   return groups;
 }
 
+/**
+ * Every IPv4 address an IPv6 literal might be carrying.
+ *
+ * The transition mechanisms all park an IPv4 address somewhere inside a v6
+ * address, and each has its own prefix:
+ *
+ * - `::ffff:a.b.c.d`   IPv4-mapped (RFC 4291)
+ * - `::a.b.c.d`        IPv4-compatible, deprecated but still parsed
+ * - `::ffff:0:a.b.c.d` SIIT translated form (RFC 2765), an extra zero word
+ * - `64:ff9b::a.b.c.d` well-known NAT64 prefix (RFC 6052)
+ * - `64:ff9b:1::/48`   local-use NAT64 (RFC 8215)
+ * - `2002:a.b.c.d::`   6to4, where the address sits in groups 1-2 instead
+ *
+ * A gateway that understands any of these will happily carry the packet to the
+ * embedded destination, so the embedded address is what actually matters. This
+ * returns candidates, not certainties: the caller tests each against the
+ * reserved-IPv4 list, and a public embedded address simply fails that test.
+ */
+function embeddedIpv4Candidates(groups: number[]): number[] {
+  const join = (hi: number, lo: number) => (((hi << 16) | lo) >>> 0) >>> 0;
+  const zeros = (upto: number) => groups.slice(0, upto).every((g) => g === 0);
+  const candidates: number[] = [];
+
+  // Anything whose leading words are all zero is a mapped/compatible/SIIT
+  // form; the address is always in the final two words.
+  if (zeros(5) && (groups[5] === 0xffff || groups[5] === 0)) {
+    candidates.push(join(groups[6], groups[7]));
+  }
+  // SIIT `::ffff:0:a.b.c.d` — zero, then ffff, then a zero filler word.
+  if (zeros(4) && groups[4] === 0xffff && groups[5] === 0) {
+    candidates.push(join(groups[6], groups[7]));
+  }
+  // NAT64 64:ff9b::/96 and 64:ff9b:1::/48 both end with the IPv4 address.
+  if (groups[0] === 0x0064 && groups[1] === 0xff9b) {
+    candidates.push(join(groups[6], groups[7]));
+  }
+  // 6to4 puts the IPv4 address immediately after the 2002 prefix.
+  if (groups[0] === 0x2002) {
+    candidates.push(join(groups[1], groups[2]));
+  }
+  return candidates;
+}
+
 function isReservedIpv6(groups: number[]): boolean {
   const [g0] = groups;
   const isZeroPrefix = groups.slice(0, 7).every((g) => g === 0);
@@ -104,14 +147,13 @@ function isReservedIpv6(groups: number[]): boolean {
   if (isZeroPrefix && groups[7] === 1) return true; // ::1 loopback
   if (groups.every((g) => g === 0)) return true; // :: unspecified
 
-  // ::ffff:0:0/96 IPv4-mapped and ::/96 IPv4-compatible (deprecated) both
-  // embed an IPv4 address in the low 32 bits. `::7f00:1` is loopback written
-  // the compatible way, so both have to be reduced and re-tested.
-  const embedsIpv4 =
-    (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) ||
-    groups.slice(0, 6).every((g) => g === 0);
-  if (embedsIpv4) {
-    const address = ((groups[6] << 16) | groups[7]) >>> 0;
+  // Several IPv6 forms carry an IPv4 address inside them. Judging only the
+  // outer literal lets `[::ffff:0:7f00:1]` or `[64:ff9b::7f00:1]` smuggle
+  // 127.0.0.1 past a check that is looking for loopback. Rather than listing
+  // the encodings one at a time and missing the next one, extract every
+  // candidate IPv4 address any of these forms could be expressing and refuse
+  // the host if *any* of them is reserved.
+  for (const address of embeddedIpv4Candidates(groups)) {
     if (isReservedIpv4(address)) return true;
   }
 

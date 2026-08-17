@@ -4,19 +4,36 @@ import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { csrfToken } from "@/lib/client-api";
 
+/**
+ * Mirrors `ImportSummary` in `@/lib/studio/backup`, plus the `notice` the route
+ * adds. Every field the server reports is rendered somewhere below: a count the
+ * client quietly drops is a count the owner is never told about, which is the
+ * exact failure this restore flow was corrected for.
+ */
 interface ImportSummary {
   sourceVersion: 1 | 2;
   chatSessions: number;
   memories: number;
+  skippedMemories: number;
   studioDrafts: number;
   remappedDraftIds: number;
+  atomicity: "single-transaction" | "staged";
+  notice?: string;
+}
+
+/** The 500 body sent when the chat half committed but the drafts half did not. */
+interface PartialFailure {
+  error: string;
+  partial: true;
+  committed: { chat: boolean; studio: boolean };
 }
 
 type Status =
   | { kind: "idle" }
   | { kind: "working" }
   | { kind: "done"; summary: ImportSummary }
-  | { kind: "failed"; message: string };
+  | { kind: "failed"; message: string }
+  | { kind: "partial"; failure: PartialFailure };
 
 /** Download a complete backup, or restore one into your own account. */
 export function BackupControls() {
@@ -44,9 +61,25 @@ export function BackupControls() {
       // The response is always checked. A failed import is never reported as
       // a success.
       if (!response.ok) {
-        const problem = (await response.json().catch(() => null)) as {
-          error?: string;
-        } | null;
+        const problem = (await response.json().catch(() => null)) as
+          (Partial<PartialFailure> & { error?: string }) | null;
+
+        // A partial import is not a plain failure. Some data really did land,
+        // and telling the owner "import failed" would invite a retry that
+        // duplicates their chats. Surface exactly what committed.
+        if (problem?.partial && problem.committed) {
+          setStatus({
+            kind: "partial",
+            failure: {
+              error: problem.error ?? "The import did not finish.",
+              partial: true,
+              committed: problem.committed,
+            },
+          });
+          router.refresh();
+          return;
+        }
+
         throw new Error(
           problem?.error ?? `Import failed (status ${response.status}).`,
         );
@@ -118,6 +151,42 @@ export function BackupControls() {
           </span>
         )}
       </p>
+
+      {/* Skipped memories are reported next to the success, not hidden by it.
+          The counts above are what was written; this is what was not. */}
+      {status.kind === "done" && status.summary.skippedMemories > 0 && (
+        <p
+          role="status"
+          data-testid="import-skipped"
+          className="text-sm text-amber-800"
+        >
+          {status.summary.notice ??
+            `${status.summary.skippedMemories} memor${
+              status.summary.skippedMemories === 1 ? "y was" : "ies were"
+            } not restored because the text looked like a password or key.`}
+        </p>
+      )}
+
+      {status.kind === "partial" && (
+        <div
+          role="alert"
+          data-testid="import-partial"
+          className="grid gap-1 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900"
+        >
+          <strong>Your restore only partly finished.</strong>
+          <span>{status.failure.error}</span>
+          <span>
+            Chats and memories:{" "}
+            {status.failure.committed.chat ? "restored" : "not restored"}.
+            Website drafts:{" "}
+            {status.failure.committed.studio ? "restored" : "not restored"}.
+          </span>
+          <span>
+            Importing the same file again will add a second copy of anything
+            that already came back, so check what is there before retrying.
+          </span>
+        </div>
+      )}
 
       {status.kind === "failed" && (
         <p

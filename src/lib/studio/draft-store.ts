@@ -245,6 +245,16 @@ export class PostgresStudioDraftStore implements StudioDraftStore {
     return row ? pgRowToDraft(row) : null;
   }
 
+  /**
+   * Unlike every other method here, this deliberately does not call
+   * `ensureStudioUser`. The upsert exists to satisfy the
+   * `studio_drafts.owner_id -> users.id` foreign key before a write; a SELECT
+   * has no such constraint, and someone who has never created a draft should
+   * not have a row written into `users` merely for opening the Studio page.
+   * A missing user row simply yields no drafts, which is the correct answer.
+   *
+   * Do not copy this omission into anything that inserts or updates.
+   */
   async list(user: SessionUser): Promise<StudioDraft[]> {
     const ownerId = canonicalUserId(user);
     const rows = await getDatabase()

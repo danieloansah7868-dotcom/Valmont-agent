@@ -629,6 +629,42 @@ describe("isHttpsSafeUrl private-address blocking", () => {
     expect(isHttpsSafeUrl("https://[2001:db8::1]/")).toBe(false);
   });
 
+  // A second independent review demonstrated that the transition-mechanism
+  // encodings below still reached `accepted: true`. Each one hides an IPv4
+  // address inside an IPv6 literal that a gateway will happily deliver to.
+
+  it("rejects SIIT-translated addresses hiding a private destination", () => {
+    // ::ffff:0:a.b.c.d — the extra zero word defeated the mapped-address regex.
+    expect(isHttpsSafeUrl("https://[::ffff:0:127.0.0.1]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[::ffff:0:7f00:1]/")).toBe(false);
+    expect(
+      isHttpsSafeUrl("https://[::ffff:0:169.254.169.254]/latest/meta-data"),
+    ).toBe(false);
+  });
+
+  it("rejects NAT64-prefixed addresses hiding a private destination", () => {
+    // 64:ff9b::/96 is the well-known prefix; 64:ff9b:1::/48 is local-use.
+    expect(isHttpsSafeUrl("https://[64:ff9b::127.0.0.1]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[64:ff9b::7f00:1]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[64:ff9b::169.254.169.254]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[64:ff9b:1::7f00:1]/")).toBe(false);
+  });
+
+  it("rejects 6to4 addresses hiding a private destination", () => {
+    // 2002:<ipv4>::/48 carries the address in the two words after the prefix.
+    expect(isHttpsSafeUrl("https://[2002:7f00:1::]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[2002:a9fe:a9fe::]/")).toBe(false);
+  });
+
+  it("still allows public addresses in those same encodings", () => {
+    // The rule is "the embedded address is private", not "the encoding is
+    // unusual". A public destination stays reachable however it is written.
+    expect(isHttpsSafeUrl("https://[::ffff:8.8.8.8]/")).toBe(true);
+    expect(isHttpsSafeUrl("https://[64:ff9b::8.8.8.8]/")).toBe(true);
+    expect(isHttpsSafeUrl("https://[2002:0808:0808::]/")).toBe(true);
+    expect(isHttpsSafeUrl("https://[2606:4700:4700::1111]/")).toBe(true);
+  });
+
   it("rejects special-purpose IPv4 ranges beyond the obvious private ones", () => {
     for (const host of [
       "192.0.0.1", // IETF protocol assignments

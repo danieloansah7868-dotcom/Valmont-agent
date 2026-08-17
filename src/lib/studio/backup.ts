@@ -86,10 +86,15 @@ export const chatSectionSchema = z.object({
  * mid-import, leaking the driver's message through the 400. Rejecting the id
  * during validation keeps every malformed file a clean pre-write refusal.
  *
- * The rule matches what PostgreSQL's `uuid` type accepts — 8-4-4-4-12 hex —
- * rather than Zod's `.uuid()`, which additionally demands RFC-4122 version and
- * variant bits. Being stricter than the database would reject ids the database
- * itself stores happily, including ones already written by earlier versions.
+ * The rule matches the 8-4-4-4-12 hex form this codebase produces — every id
+ * comes from `randomUUID()` — rather than Zod's `.uuid()`, which additionally
+ * demands RFC-4122 version and variant bits and would reject ids the database
+ * itself stores happily, including ones written by earlier versions.
+ *
+ * It is not full parity with PostgreSQL's `uuid_in`, which also accepts the
+ * braced form, the 32-hex-digit form with no dashes, and mixed dash placement.
+ * Refusing those is deliberate: no legitimate round-tripped id is written that
+ * way, so the only thing narrower parsing rejects is a hand-crafted file.
  */
 const draftId = z
   .string()

@@ -104,6 +104,13 @@ export function safeApiError(error: unknown) {
     return NextResponse.json({ error: GENERIC_FAILURE }, { status: 500 });
   }
 
+  // Legacy fallback, inherited from before typed errors existed. Matching on
+  // message text is the very pattern the Studio code was corrected away from,
+  // and it is wrong in the same way: reword "Task not found" and the status
+  // silently becomes 400. It survives here only because pre-existing chat and
+  // task routes still throw bare `Error`s that rely on it, and re-typing those
+  // is outside Website Studio's scope. No Studio code path reaches this branch
+  // — every Studio error carries a numeric `status`. Recorded in NEXT-STEPS.md.
   const status =
     error instanceof NotConnectedError
       ? 401

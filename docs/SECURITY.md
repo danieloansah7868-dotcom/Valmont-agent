@@ -146,14 +146,27 @@ writer's changes are discarded without the owner being told.
   credentials, `localhost`, and literal addresses in every private, loopback,
   link-local, CGNAT, multicast or reserved range: `0.0.0.0/8`, `10/8`,
   `100.64/10`, `127/8`, `169.254/16` (including the cloud metadata address),
-  `172.16/12`, `192.168/16`, `224/4`+, IPv6 `::`, `::1`, `fc00::/7`, `fe80::/10`,
-  and IPv4-mapped IPv6 forms such as `::ffff:169.254.169.254`. This blocks
+  `172.16/12`, `192.168/16`, `224/4`+, IPv6 `::`, `::1`, `fc00::/7`,
+  `fe80::/10`, `ff00::/8` and `2001:db8::/32`. Because several IPv6 forms carry
+  an IPv4 address inside them, the embedded address is extracted and tested too
+  — IPv4-mapped (`::ffff:169.254.169.254`), IPv4-compatible (`::7f00:1`), SIIT
+  (`::ffff:0:7f00:1`), NAT64 (`64:ff9b::7f00:1`, `64:ff9b:1::/48`) and 6to4
+  (`2002:7f00:1::`). A public address in any of those encodings is still
+  allowed; it is the destination that is judged, not the notation. This blocks
   `javascript:`, `data:`, and SSRF-shaped values. **Phase 1 never fetches a URL
   a user typed** — these values are only rendered as links, with
   `rel="noopener noreferrer nofollow"`, after passing the same check the schema
-  applies. The blocklist is literal-address only: a public hostname that
-  _resolves_ to a private address is not detected, so any future server-side
-  fetch must additionally validate the resolved IP at connect time.
+  applies.
+
+  **This is a link-safety check, not a complete SSRF defence**, and the
+  difference matters the day something does fetch one of these. It judges the
+  literal string only. It performs no DNS resolution, so a public hostname that
+  _resolves_ to a private address is not detected; it does not follow
+  redirects, so a permitted URL that redirects to `169.254.169.254` is not
+  detected; and it does no punycode or homoglyph analysis. Any future
+  server-side fetch must re-validate the resolved IP at connect time and on
+  every redirect hop, through this same reserved-range list.
+
 - **Text** — the preview renders text as text. There is no
   `dangerouslySetInnerHTML` anywhere in the Studio, so `<img src=x onerror=...>`
   is displayed literally, never executed. A browser test asserts this (not yet
@@ -253,7 +266,7 @@ change:
 
 | Suite                           | Status                                                                                                                                                                                                                                |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit + integration (`npm test`) | **Run.** 292 passing, 0 skipped, including the PostgreSQL draft-store and staged-import tests against a real PostgreSQL 18.4 server. Without `STUDIO_TEST_DATABASE_URL` the 13 PostgreSQL tests skip and the total is 279.            |
+| Unit + integration (`npm test`) | **Run.** 308 passing, 0 skipped, including the PostgreSQL draft-store and staged-import tests against a real PostgreSQL 18.4 server. Without `STUDIO_TEST_DATABASE_URL` the 13 PostgreSQL tests skip and the total is 295.            |
 | End-to-end (`npm run test:e2e`) | **Never executed.** Chromium cannot be downloaded in the environment used so far. The specs exist and are discoverable; treat every browser-level assertion in this document as _intended_, not _verified_, until a green run exists. |
 
 The browser tests only run once a maintainer moves
