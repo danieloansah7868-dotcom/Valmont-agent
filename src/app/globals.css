@@ -154,6 +154,17 @@ a {
   color: var(--color-ivory);
 }
 
+.panel-navy h1,
+.panel-navy h2,
+.panel-navy h3,
+.panel-navy h4,
+.bg-navy h1,
+.bg-navy h2,
+.bg-navy h3,
+.bg-navy h4 {
+  color: var(--color-ivory);
+}
+
 /* ---------- buttons ---------- */
 
 .btn-primary,
