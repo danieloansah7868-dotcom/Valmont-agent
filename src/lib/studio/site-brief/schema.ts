@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { redactPaymentData, redactSecrets } from "@/lib/redact";
 import { isCategoryId, isEcomSubcategoryId } from "../categories";
 import { isPackageId } from "../packages";
 import { isTemplateId, isTemplateCompatible } from "../templates";
@@ -8,60 +9,154 @@ import { isGhanaRegion } from "./defaults";
 export const SITE_BRIEF_VERSION = 1 as const;
 
 /**
- * True when `host` is a literal IP address (or IPv6 form) that belongs to a
- * private, loopback, link-local, or otherwise non-public range.
+ * Every IPv4 block that is not ordinary public unicast, as a
+ * `[firstAddress, prefixLength]` pair. Classifying by prefix rather than by
+ * hand-written octet comparisons is what stops ranges being missed one at a
+ * time: adding a block here is a single line and cannot be half-applied.
+ *
+ * Source: IANA IPv4 Special-Purpose Address Registry.
+ */
+const IPV4_RESERVED: ReadonlyArray<readonly [string, number]> = [
+  ["0.0.0.0", 8], // "this host on this network"
+  ["10.0.0.0", 8], // RFC1918 private
+  ["100.64.0.0", 10], // carrier-grade NAT
+  ["127.0.0.0", 8], // loopback
+  ["169.254.0.0", 16], // link-local, includes cloud metadata 169.254.169.254
+  ["172.16.0.0", 12], // RFC1918 private
+  ["192.0.0.0", 24], // IETF protocol assignments
+  ["192.0.2.0", 24], // TEST-NET-1 documentation
+  ["192.88.99.0", 24], // deprecated 6to4 relay anycast
+  ["192.168.0.0", 16], // RFC1918 private
+  ["198.18.0.0", 15], // benchmarking
+  ["198.51.100.0", 24], // TEST-NET-2 documentation
+  ["203.0.113.0", 24], // TEST-NET-3 documentation
+  ["224.0.0.0", 4], // multicast
+  ["240.0.0.0", 4], // reserved, includes 255.255.255.255 broadcast
+];
+
+/** Parse strict dotted-quad IPv4 into a 32-bit number, or null if it is not one. */
+function parseIpv4(value: string): number | null {
+  const octets = value.split(".");
+  if (octets.length !== 4) return null;
+  let result = 0;
+  for (const octet of octets) {
+    // Reject empty, non-numeric, over-long and leading-zero forms outright.
+    // WHATWG `URL` has already normalised decimal/octal/hex notations before
+    // this point, so anything still irregular here is not a valid address.
+    if (!/^\d{1,3}$/.test(octet)) return null;
+    const n = Number(octet);
+    if (n > 255) return null;
+    result = result * 256 + n;
+  }
+  return result >>> 0;
+}
+
+function isReservedIpv4(address: number): boolean {
+  for (const [base, bits] of IPV4_RESERVED) {
+    const baseAddress = parseIpv4(base);
+    if (baseAddress === null) continue;
+    // A /0 mask would shift by 32, which is undefined for `<<` in JS.
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    if ((address & mask) >>> 0 === (baseAddress & mask) >>> 0) return true;
+  }
+  return false;
+}
+
+/** Expand an IPv6 literal to its eight 16-bit groups, or null if malformed. */
+function parseIpv6(value: string): number[] | null {
+  let text = value.toLowerCase().replace(/%.*$/, ""); // drop any zone id
+
+  // A trailing dotted-quad (::ffff:1.2.3.4, ::1.2.3.4) becomes two groups.
+  const dotted = /:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text);
+  if (dotted) {
+    const embedded = parseIpv4(dotted[1]);
+    if (embedded === null) return null;
+    const hi = (embedded >>> 16).toString(16);
+    const lo = (embedded & 0xffff).toString(16);
+    text = `${text.slice(0, dotted.index)}:${hi}:${lo}`;
+  }
+
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const toGroups = (part: string) =>
+    part === "" ? [] : part.split(":").map((g) => parseInt(g, 16));
+
+  let groups: number[];
+  if (halves.length === 2) {
+    const head = toGroups(halves[0]);
+    const tail = toGroups(halves[1]);
+    const fill = 8 - head.length - tail.length;
+    if (fill < 0) return null;
+    groups = [...head, ...Array<number>(fill).fill(0), ...tail];
+  } else {
+    groups = toGroups(halves[0]);
+  }
+
+  if (groups.length !== 8 || groups.some((g) => !Number.isInteger(g) || g < 0))
+    return null;
+  return groups;
+}
+
+function isReservedIpv6(groups: number[]): boolean {
+  const [g0] = groups;
+  const isZeroPrefix = groups.slice(0, 7).every((g) => g === 0);
+
+  if (isZeroPrefix && groups[7] === 1) return true; // ::1 loopback
+  if (groups.every((g) => g === 0)) return true; // :: unspecified
+
+  // ::ffff:0:0/96 IPv4-mapped and ::/96 IPv4-compatible (deprecated) both
+  // embed an IPv4 address in the low 32 bits. `::7f00:1` is loopback written
+  // the compatible way, so both have to be reduced and re-tested.
+  const embedsIpv4 =
+    (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) ||
+    groups.slice(0, 6).every((g) => g === 0);
+  if (embedsIpv4) {
+    const address = ((groups[6] << 16) | groups[7]) >>> 0;
+    if (isReservedIpv4(address)) return true;
+  }
+
+  if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+  if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((g0 & 0xff00) === 0xff00) return true; // ff00::/8 multicast
+  if (g0 === 0x2001 && (groups[1] & 0xfff0) === 0x0db0) return true; // 2001:db8::/32 docs
+  return false;
+}
+
+/**
+ * True when `host` must not be linked to: a loopback, private, link-local,
+ * multicast, or otherwise non-public destination.
  *
  * Phase 1 never server-fetches a user-supplied URL — these values are only ever
- * rendered as `<a href>`. The check is written to a full SSRF standard anyway so
- * it is already correct on the day something does fetch one. Note it can only
- * judge literal addresses: a public hostname that *resolves* to a private
- * address still needs a connect-time check from whatever does the fetching.
+ * rendered as `<a href>` — so this is a link-safety check, not a complete SSRF
+ * defence. It judges only literal addresses and known-local names. A public
+ * hostname that *resolves* to a private address still gets through, so anything
+ * that later fetches one of these URLs must re-check at connect time, after DNS
+ * resolution and on every redirect hop. Do not treat this function as
+ * sufficient on its own.
  */
 function isPrivateHost(host: string): boolean {
   // IPv6 arrives from URL.hostname wrapped in brackets.
-  const bare =
+  let bare =
     host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
 
+  // A trailing dot is the DNS root label: "localhost." resolves exactly like
+  // "localhost". Strip it so the name checks below cannot be stepped around.
+  bare = bare.replace(/\.+$/, "").toLowerCase();
+
   if (bare === "localhost" || bare.endsWith(".localhost")) return true;
-
-  // IPv4-mapped IPv6 — reduce to the embedded IPv4 and re-test so the mapping
-  // cannot be used to slip a private address past the IPv4 rules. Both the
-  // dotted form (::ffff:169.254.169.254) and the hex form WHATWG normalises it
-  // to (::ffff:a9fe:a9fe) have to be handled.
-  const mappedDotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(bare);
-  if (mappedDotted) return isPrivateHost(mappedDotted[1]);
-
-  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(bare);
-  if (mappedHex) {
-    const hi = parseInt(mappedHex[1], 16);
-    const lo = parseInt(mappedHex[2], 16);
-    return isPrivateHost([hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join("."));
-  }
+  // Reserved for loopback by RFC 6761 and commonly mapped to 127.0.0.1.
+  if (bare === "localhost.localdomain") return true;
 
   if (bare.includes(":")) {
-    const v6 = bare.toLowerCase().replace(/%.*$/, ""); // strip zone id
-    if (v6 === "::" || v6 === "::1") return true;
-    const head = v6.split(":")[0];
-    // fc00::/7 unique-local, fe80::/10 link-local.
-    if (/^f[cd][0-9a-f]{0,2}$/.test(head)) return true;
-    if (/^fe[89ab][0-9a-f]?$/.test(head)) return true;
-    return false;
+    const groups = parseIpv6(bare);
+    // An unparseable IPv6 literal is refused rather than allowed through.
+    return groups === null ? true : isReservedIpv6(groups);
   }
 
-  const octets = bare.split(".");
-  if (octets.length === 4 && octets.every((o) => /^\d{1,3}$/.test(o))) {
-    const [a, b] = octets.map(Number);
-    if (octets.some((o) => Number(o) > 255)) return true; // malformed → refuse
-    if (a === 0) return true; // 0.0.0.0/8 "this host"
-    if (a === 10) return true; // 10.0.0.0/8
-    if (a === 127) return true; // loopback
-    if (a === 169 && b === 254) return true; // link-local incl. cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    if (a === 192 && b === 168) return true; // 192.168.0.0/16
-    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
-    if (a >= 224) return true; // multicast + reserved
-  }
+  const address = parseIpv4(bare);
+  if (address !== null) return isReservedIpv4(address);
 
+  // Not a literal address — an ordinary hostname.
   return false;
 }
 
@@ -99,6 +194,21 @@ const e164 = z
 
 const socialLink = z.object({ platform: z.string().max(40), url: httpsUrl });
 
+/**
+ * Free text the owner types, cleaned on the way in.
+ *
+ * Anything a person can type freely is passed through the same secret
+ * redaction used for chat, plus a payment-detail pass. This keeps the promise
+ * in `docs/SECURITY.md` honest at the point of storage rather than relying on
+ * people never pasting the wrong thing. It is a safety net with real limits:
+ * see the note beside the claim in that document.
+ */
+const freeText = (max: number) =>
+  z
+    .string()
+    .max(max)
+    .transform((value) => redactPaymentData(redactSecrets(value)));
+
 const baseSiteBriefV1 = z.object({
   schemaVersion: z.literal(1),
   businessName: z.string().trim().min(2).max(120),
@@ -107,22 +217,22 @@ const baseSiteBriefV1 = z.object({
     .string()
     .optional()
     .refine((v) => !v || isEcomSubcategoryId(v), "Invalid subcategory"),
-  description: z.string().max(2000).optional(),
-  tagline: z.string().max(120).optional(),
+  description: freeText(2000).optional(),
+  tagline: freeText(120).optional(),
   preferredColours: z.tuple([hexColor, hexColor, hexColor]).optional(),
   phone: e164.optional(),
   whatsapp: e164.optional(),
   email: z.string().email().max(254).optional(),
-  address: z.string().max(500).optional(),
+  address: freeText(500).optional(),
   mapsLink: httpsUrl.optional(),
-  hours: z.string().max(500).optional(),
+  hours: freeText(500).optional(),
   socialLinks: z.array(socialLink).max(12).default([]),
-  serviceAreas: z.array(z.string().max(80)).max(20).default([]),
-  deliveryAreas: z.array(z.string().max(80)).max(20).default([]),
-  primaryCallToAction: z.string().max(40).optional(),
-  services: z.array(z.string().max(80)).max(30).default([]),
-  requiredPages: z.array(z.string().max(40)).max(20).default([]),
-  specialInstructions: z.string().max(2000).optional(),
+  serviceAreas: z.array(freeText(80)).max(20).default([]),
+  deliveryAreas: z.array(freeText(80)).max(20).default([]),
+  primaryCallToAction: freeText(40).optional(),
+  services: z.array(freeText(80)).max(30).default([]),
+  requiredPages: z.array(freeText(40)).max(20).default([]),
+  specialInstructions: freeText(2000).optional(),
   selectedPackage: z.string().refine(isPackageId, "Invalid package"),
   selectedTheme: z.string().refine(isThemeId, "Invalid theme"),
   selectedTemplate: z
@@ -137,8 +247,8 @@ const baseSiteBriefV1 = z.object({
   products: z
     .array(
       z.object({
-        name: z.string().max(80),
-        category: z.string().max(40).optional(),
+        name: freeText(80),
+        category: freeText(40).optional(),
       }),
     )
     .max(50)
@@ -151,7 +261,7 @@ const baseSiteBriefV1 = z.object({
     .max(40)
     .optional()
     .refine((v) => !v || isGhanaRegion(v), "Unknown Ghana region"),
-  paymentNotes: z.string().max(500).optional(),
+  paymentNotes: freeText(500).optional(),
   plannedPaymentMethods: z
     .array(z.enum(["momo", "paystack", "valmont_pay", "card", "bank", "cod"]))
     .max(6)

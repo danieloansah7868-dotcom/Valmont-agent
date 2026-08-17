@@ -336,6 +336,93 @@ describe("site brief: payment preferences are planning only", () => {
   });
 });
 
+describe("site brief: free text is cleaned before storage", () => {
+  // Regression cover for an independent-review finding: SECURITY.md promised
+  // payment details could not be stored, but free-text fields accepted them.
+
+  it("redacts a card number, PIN and API key pasted into payment notes", () => {
+    const parsed = siteBriefSchemaV1.parse({
+      schemaVersion: 1,
+      businessName: "Adom Fabrics",
+      category: "business-profile",
+      selectedPackage: "starter",
+      selectedTheme: "clean-corporate",
+      selectedTemplate: "classic-hero",
+      adminEmail: "ama@adomfabrics.com",
+      paymentNotes:
+        "Card 4111111111111111; MoMo PIN 1234; merchant secret sk-proj-abcdefghijklmnop",
+    });
+    expect(parsed.paymentNotes).not.toContain("4111111111111111");
+    expect(parsed.paymentNotes).not.toContain("sk-proj-abcdefghijklmnop");
+    expect(parsed.paymentNotes).not.toMatch(/PIN 1234/);
+    expect(parsed.paymentNotes).toContain("[REDACTED_CARD_NUMBER]");
+  });
+
+  it("cleans every free-text field, not only payment notes", () => {
+    const card = "4111111111111111";
+    const parsed = siteBriefSchemaV1.parse({
+      schemaVersion: 1,
+      businessName: "Adom Fabrics",
+      category: "business-profile",
+      selectedPackage: "starter",
+      selectedTheme: "clean-corporate",
+      selectedTemplate: "classic-hero",
+      adminEmail: "ama@adomfabrics.com",
+      description: `Pay to ${card}`,
+      specialInstructions: `Use ${card}`,
+      address: `Invoice ${card}`,
+      hours: `Ring ${card}`,
+      tagline: `Card ${card}`,
+    });
+    for (const value of [
+      parsed.description,
+      parsed.specialInstructions,
+      parsed.address,
+      parsed.hours,
+      parsed.tagline,
+    ]) {
+      expect(value).not.toContain(card);
+    }
+  });
+
+  it("cleans list entries too, not only single fields", () => {
+    const card = "4111111111111111";
+    const parsed = siteBriefSchemaV1.parse({
+      schemaVersion: 1,
+      businessName: "Adom Fabrics",
+      category: "business-profile",
+      selectedPackage: "starter",
+      selectedTheme: "clean-corporate",
+      selectedTemplate: "classic-hero",
+      adminEmail: "ama@adomfabrics.com",
+      serviceAreas: [`Accra ${card}`],
+      deliveryAreas: [`Tema ${card}`],
+      services: [`Tailoring ${card}`],
+      requiredPages: [`About ${card}`],
+      products: [{ name: `Dress ${card}`, category: `Wear ${card}` }],
+    });
+    expect(JSON.stringify(parsed)).not.toContain(card);
+  });
+
+  it("leaves ordinary business text untouched", () => {
+    const parsed = siteBriefSchemaV1.parse({
+      schemaVersion: 1,
+      businessName: "Adom Fabrics",
+      category: "business-profile",
+      selectedPackage: "starter",
+      selectedTheme: "clean-corporate",
+      selectedTemplate: "classic-hero",
+      adminEmail: "ama@adomfabrics.com",
+      description: "Order 12345678 ships in 3 to 5 days for GHS 3,500.",
+      hours: "Mon-Fri 8:00 to 17:00",
+    });
+    expect(parsed.description).toBe(
+      "Order 12345678 ships in 3 to 5 days for GHS 3,500.",
+    );
+    expect(parsed.hours).toBe("Mon-Fri 8:00 to 17:00");
+  });
+});
+
 describe("site brief: asset status stays a marker", () => {
   it("only accepts the not_provided marker", () => {
     expect(
@@ -519,5 +606,60 @@ describe("isHttpsSafeUrl private-address blocking", () => {
 
   it("rejects malformed dotted quads rather than guessing", () => {
     expect(isHttpsSafeUrl("https://999.999.999.999/")).toBe(false);
+  });
+
+  // The checks below are regression cover for bypasses found in independent
+  // review of this file's previous hand-written deny list.
+
+  it("rejects a trailing dot, which DNS treats as the same name", () => {
+    expect(isHttpsSafeUrl("https://localhost./")).toBe(false);
+    expect(isHttpsSafeUrl("https://app.localhost./")).toBe(false);
+    expect(isHttpsSafeUrl("https://localhost.localdomain/")).toBe(false);
+  });
+
+  it("rejects deprecated IPv4-compatible IPv6 hiding loopback", () => {
+    // ::7f00:1 is 127.0.0.1 written the IPv4-compatible way.
+    expect(isHttpsSafeUrl("https://[::7f00:1]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[::127.0.0.1]/")).toBe(false);
+  });
+
+  it("rejects IPv6 multicast and documentation ranges", () => {
+    expect(isHttpsSafeUrl("https://[ff00::1]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[ff02::1]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[2001:db8::1]/")).toBe(false);
+  });
+
+  it("rejects special-purpose IPv4 ranges beyond the obvious private ones", () => {
+    for (const host of [
+      "192.0.0.1", // IETF protocol assignments
+      "192.0.2.1", // TEST-NET-1
+      "198.18.0.1", // benchmarking
+      "198.51.100.1", // TEST-NET-2
+      "203.0.113.1", // TEST-NET-3
+      "192.88.99.1", // deprecated 6to4 relay
+      "240.0.0.1", // reserved
+      "255.255.255.255", // broadcast
+    ]) {
+      expect(isHttpsSafeUrl(`https://${host}/x`), host).toBe(false);
+    }
+  });
+
+  it("rejects an IPv6 literal it cannot parse instead of allowing it", () => {
+    expect(isHttpsSafeUrl("https://[1:2:3:4:5:6:7:8:9]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[::ffff:1.2.3]/")).toBe(false);
+  });
+
+  it("still allows ordinary public addresses next to blocked ranges", () => {
+    for (const host of [
+      "valmontweb.com",
+      "8.8.8.8",
+      "192.169.1.1", // one above 192.168/16
+      "100.128.0.1", // one above the CGNAT block
+      "11.0.0.1", // one above 10/8
+      "[2606:4700:4700::1111]",
+      "shop.valmontweb.com.", // trailing dot on a public name is fine
+    ]) {
+      expect(isHttpsSafeUrl(`https://${host}/x`), host).toBe(true);
+    }
   });
 });

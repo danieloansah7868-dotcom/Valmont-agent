@@ -12,7 +12,7 @@ This document describes the MVP's boundaries and the additional controls require
 - user/session identity
 - locally persisted Chat with Valmont conversation history
 
-Valmont must not read or transmit `.env` files, credentials, private keys, payment data, or customer-record exports. Raw source and retrieved repository context are not stored in the application database or chat store. Reopenable chat messages are intentionally persisted after redaction in the ignored local chat JSON file and must be treated as sensitive user data.
+Valmont must not read or transmit `.env` files, credentials, private keys, payment data, or customer-record exports. Raw source and retrieved repository context are not stored in the application database or chat store. Reopenable chat messages are intentionally persisted after redaction in the ignored local chat store — a SQLite database (`chat-store.sqlite`), with the older JSON file retained only for one-way migration — and must be treated as sensitive user data.
 
 ## Trust boundaries
 
@@ -94,16 +94,33 @@ Use TLS, backups, point-in-time recovery, row ownership checks, and migration re
 
 ## Website Studio Phase 1 Security
 
-### Every Studio route
+### Studio route controls
 
-| Control          | Implementation                                                       | Failure |
-| ---------------- | -------------------------------------------------------------------- | ------- |
-| Authentication   | `requireApiSessionUser()`                                            | 401     |
-| CSRF             | `assertCsrf` — `x-valmont-csrf` must match the `valmont_csrf` cookie | 403     |
-| Origin           | `assertSameOrigin`                                                   | 403     |
-| Rate limiting    | 30/min draft mutations, 10/min backup export, 5/min backup import    | 429     |
-| Body size        | `readBoundedJson` — 1 MB drafts, 25 MB backup import                 | 413     |
-| Input validation | `siteBriefSchemaV1` / `parseBackup`                                  | 400     |
+Controls differ by method, so they are listed by what each actually applies.
+Authentication and owner scoping are the only two that are on every route.
+
+| Control          | Implementation                                                       | Applies to                                            | Failure |
+| ---------------- | -------------------------------------------------------------------- | ----------------------------------------------------- | ------- |
+| Authentication   | `requireApiSessionUser()`                                            | every Studio and backup route, reads included         | 401     |
+| Owner scoping    | `owner_id` in the SQL itself                                         | every read, update and delete                         | 404     |
+| CSRF             | `assertCsrf` — `x-valmont-csrf` must match the `valmont_csrf` cookie | mutations only (`POST`, `PATCH`, `DELETE`, import)    | 403     |
+| Origin           | `assertSameOrigin` (called by `assertCsrf`)                          | mutations only                                        | 403     |
+| Rate limiting    | 30/min draft mutations, 10/min backup export, 5/min backup import    | mutations and both backup routes; **not** draft reads | 429     |
+| Body size        | `readBoundedJson` — 1 MB drafts, 25 MB backup import                 | requests with a body                                  | 413     |
+| Input validation | `siteBriefSchemaV1` / `parseBackup`                                  | requests with a body                                  | 400     |
+
+`GET /api/studio/drafts` and `GET /api/studio/drafts/[id]` carry authentication
+and owner scoping only. They take no body and change nothing, so CSRF and body
+limits do not apply; they are also **not** rate limited, which is a gap worth
+closing if these endpoints are ever exposed beyond a signed-in session.
+
+### Internal error detail
+
+`safeApiError` screens every message before it is returned. A database driver
+puts the failing statement, its bound parameter values and the host it dialled
+into `error.message`; any message matching those shapes is replaced with a
+generic sentence and reported as **500**, never as a 400 that would wrongly
+blame the caller's input. This is covered by `src/lib/api.test.ts`.
 
 ### Owner isolation
 
@@ -180,18 +197,42 @@ new copy instead of overwriting existing work.
 On the staged path, if the studio half fails after chat has committed the API
 raises `PartialImportError`, which tells the user that chats and memories were
 imported, drafts were not, and that re-importing will duplicate the chats. A
-partial import is therefore always reported truthfully — it is never presented
-as a clean success or a clean failure. Removing this limitation requires moving
-chat history into the same database, which is out of Phase 1 scope.
+partial import is reported truthfully whenever the process survives to answer:
+it is never presented as a clean success or a clean failure. The limit is that
+this depends on a response being sent. If the process is killed, the container
+is evicted, or the connection drops between the two commits, the browser gets
+no answer at all and the owner is left to check for themselves which half
+landed. Nothing marks the import as incomplete on disk. Removing this
+limitation requires moving chat history into the same database, which is out of
+Phase 1 scope.
 
 ### No payments, no payment data
 
 Phase 1 executes no payment of any kind. `plannedPaymentMethods` is a small
 enum of future-planning preferences, stored alongside `PAYMENT_PLANNING_NOTICE`
-which states plainly that nothing is connected. Card numbers, mobile-money PINs,
-and merchant credentials have no field in the schema, are stripped by Zod if
-submitted, and are never stored or logged. A test asserts their absence from
-parsed output.
+which states plainly that nothing is connected. No field in the schema asks for
+a card number, a mobile-money PIN or a merchant credential.
+
+Free text is a different matter, because a person can paste anything into a
+description or a note. Every free-text field in the Site Brief — including the
+list fields and product names — is passed through `redactSecrets` and
+`redactPaymentData` (`src/lib/redact.ts`) during Zod parsing, so a pasted card
+number is replaced with `[REDACTED_CARD_NUMBER]` before the value is stored.
+
+**This is a safety net, not a guarantee, and its limits are specific:**
+
+- Card numbers are detected only when a 13–19 digit run also passes the Luhn
+  check. A mistyped or deliberately obfuscated number will not match.
+- PINs, CVVs and CVCs are redacted only when the digits are adjacent to a label
+  such as `PIN` or `CVV`. A bare `1234` is indistinguishable from an order
+  number and is deliberately left alone.
+- API keys and passwords are matched by known prefixes and `key=value` shapes.
+  A novel credential format will pass through.
+- Redaction happens at the schema boundary. Anything written through a path
+  that bypasses `siteBriefSchemaV1` is not covered.
+
+Nobody should be encouraged to paste payment details on the strength of this.
+The correct control remains not collecting them, and Phase 1 asks for none.
 
 ### Test credentials
 
@@ -199,8 +240,11 @@ The end-to-end tests mint a real encrypted `valmont_session` cookie using the
 `SESSION_SECRET` the server was started with. **There is no test-only
 authentication bypass in application code.** The session secret is generated per
 CI run; `playwright.config.ts` refuses to run without a 32-character-plus
-secret and provides no fallback. Tests use a throwaway database directory and
-never open the real `.data` files.
+secret and provides no fallback. Tests never open the real `.data` files: they
+use a separate directory, `.e2e-data` by default and overridable with
+`E2E_DATA_DIR`. On CI that directory disappears with the runner, but **locally
+it persists between runs** — it is not deleted afterwards. Delete it by hand if
+you want a clean slate.
 
 ### Test status
 
@@ -209,7 +253,7 @@ change:
 
 | Suite                           | Status                                                                                                                                                                                                                                |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit + integration (`npm test`) | **Run.** 236 passing, 0 skipped, including the 10 PostgreSQL draft-store tests against a real PostgreSQL 18 server.                                                                                                                   |
+| Unit + integration (`npm test`) | **Run.** 292 passing, 0 skipped, including the PostgreSQL draft-store and staged-import tests against a real PostgreSQL 18.4 server. Without `STUDIO_TEST_DATABASE_URL` the 13 PostgreSQL tests skip and the total is 279.            |
 | End-to-end (`npm run test:e2e`) | **Never executed.** Chromium cannot be downloaded in the environment used so far. The specs exist and are discoverable; treat every browser-level assertion in this document as _intended_, not _verified_, until a green run exists. |
 
 The browser tests only run once a maintainer moves

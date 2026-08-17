@@ -35,6 +35,18 @@ type ChatStoreDocument = {
   sessions: ChatSession[];
 };
 
+/**
+ * What an import actually wrote, as opposed to what the file asked for.
+ * `skippedMemories` counts memories dropped because their text matched a
+ * secret-redaction pattern; they are not stored and must not be reported as
+ * restored.
+ */
+export interface ImportCounts {
+  chatSessions: number;
+  memories: number;
+  skippedMemories: number;
+}
+
 export interface ChatStore {
   appendMessages(
     id: string,
@@ -739,14 +751,18 @@ export class SqliteChatStore implements ChatStore {
       memories: ChatMemory[];
       memoryEnabled?: boolean;
     },
-  ): Promise<void> {
-    this.importUserSync(userId, backup);
+  ): Promise<ImportCounts> {
+    return this.importUserSync(userId, backup);
   }
 
   /**
    * Synchronous import core. `node:sqlite` is synchronous, so this can safely be
    * called from inside `runInTransaction` — an `async` version would suspend at
    * its first `await` and let the transaction commit early.
+   *
+   * Returns what was actually written. Memories carrying secret-like text are
+   * deliberately dropped, so the caller must report these counts rather than
+   * the number of records the file claimed to contain.
    */
   importUserSync(
     userId: string,
@@ -755,7 +771,7 @@ export class SqliteChatStore implements ChatStore {
       memories: ChatMemory[];
       memoryEnabled?: boolean;
     },
-  ): void {
+  ): ImportCounts {
     // Join an enclosing transaction (complete-backup import) when present so a
     // later studio failure rolls chat and memories back too.
     const ownsTransaction = !this.inTransaction;
@@ -763,6 +779,9 @@ export class SqliteChatStore implements ChatStore {
       this.inTransaction = true;
       this.db.exec("BEGIN IMMEDIATE");
     }
+    let importedSessions = 0;
+    let importedMemories = 0;
+    let skippedMemories = 0;
     try {
       for (const imported of backup.sessions) {
         // API validation rejects malformed timestamps before this call. Keep the
@@ -826,6 +845,7 @@ export class SqliteChatStore implements ChatStore {
             "UPDATE chat_sessions SET summary = ? WHERE id = ? AND user_id = ?",
           )
           .run(this.summaryFor(session.id, userId), session.id, userId);
+        importedSessions += 1;
       }
       for (const memory of backup.memories) {
         const id = this.db
@@ -834,7 +854,13 @@ export class SqliteChatStore implements ChatStore {
           ? randomUUID()
           : memory.id;
         const content = redactSecrets(memory.content).slice(0, 1000);
-        if (/\[REDACTED/.test(content)) continue;
+        // A memory whose text looks like a credential is not imported at all.
+        // Count it so the caller can tell the owner it was skipped instead of
+        // reporting it as restored.
+        if (/\[REDACTED/.test(content)) {
+          skippedMemories += 1;
+          continue;
+        }
         this.db
           .prepare(
             "INSERT INTO chat_memories(id,user_id,scope,repository_id,category,content,source_session_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -852,10 +878,16 @@ export class SqliteChatStore implements ChatStore {
             memory.createdAt,
             memory.updatedAt,
           );
+        importedMemories += 1;
       }
       if (typeof backup.memoryEnabled === "boolean")
         this.setMemoryEnabledSync(userId, backup.memoryEnabled);
       if (ownsTransaction) this.db.exec("COMMIT");
+      return {
+        chatSessions: importedSessions,
+        memories: importedMemories,
+        skippedMemories,
+      };
     } catch (error) {
       if (ownsTransaction) this.db.exec("ROLLBACK");
       throw error;

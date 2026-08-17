@@ -249,8 +249,16 @@ function assembleBackup(
 
 export interface ImportSummary {
   sourceVersion: 1 | 2;
+  /** Chat sessions actually written, not the number the file contained. */
   chatSessions: number;
+  /** Memories actually written. Excludes any counted in `skippedMemories`. */
   memories: number;
+  /**
+   * Memories present in the file but deliberately not imported because their
+   * text matched a secret-redaction pattern. Reported so the owner is told the
+   * record was dropped rather than silently losing it.
+   */
+  skippedMemories: number;
   studioDrafts: number;
   /** Drafts whose id already existed and were given a fresh id. */
   remappedDraftIds: number;
@@ -309,11 +317,15 @@ export async function importBackup(
   backup: NormalizedBackup,
   options: { failAfterInsertForTests?: () => void } = {},
 ): Promise<ImportSummary> {
+  // Counts start empty and are filled in from what each store reports it wrote.
+  // Trusting the file's own lengths is what previously let a dropped memory be
+  // reported as restored.
   const summary: ImportSummary = {
     sourceVersion: backup.sourceVersion,
-    chatSessions: backup.chat.sessions.length,
-    memories: backup.chat.memories.length,
-    studioDrafts: backup.studio.drafts.length,
+    chatSessions: 0,
+    memories: 0,
+    skippedMemories: 0,
+    studioDrafts: 0,
     remappedDraftIds: 0,
     atomicity: process.env.DATABASE_URL ? "staged" : "single-transaction",
   };
@@ -331,11 +343,14 @@ export async function importBackup(
   // synchronous import core is required here: an awaited call would let the
   // transaction commit before the studio rows are written.
   store.runInTransaction(() => {
-    store.importUserSync(user.id, {
+    const counts = store.importUserSync(user.id, {
       sessions: backup.chat.sessions as ChatSession[],
       memories: backup.chat.memories as ChatMemory[],
       memoryEnabled: backup.chat.memoryEnabled,
     });
+    summary.chatSessions = counts.chatSessions;
+    summary.memories = counts.memories;
+    summary.skippedMemories = counts.skippedMemories;
     importStudioDrafts(db, ownerId, backup.studio, summary);
     // Test hook: proves a failure after inserts rolls the whole import back.
     options.failAfterInsertForTests?.();
@@ -371,6 +386,7 @@ export function importStudioDrafts(
       updatedAt: incoming.updatedAt,
       brief: incoming.brief,
     });
+    summary.studioDrafts += 1;
   }
 }
 
@@ -388,11 +404,14 @@ async function importIntoPostgres(
 
   // Chat history still lives in SQLite even when studio uses PostgreSQL, so it
   // keeps its own transaction; the studio half below is fully transactional.
-  await getSqliteChatStore().importUser(user.id, {
+  const chatCounts = await getSqliteChatStore().importUser(user.id, {
     sessions: backup.chat.sessions as ChatSession[],
     memories: backup.chat.memories as ChatMemory[],
     memoryEnabled: backup.chat.memoryEnabled,
   });
+  summary.chatSessions = chatCounts.chatSessions;
+  summary.memories = chatCounts.memories;
+  summary.skippedMemories = chatCounts.skippedMemories;
 
   // From here the chat half is committed and cannot be rolled back by the
   // PostgreSQL transaction below. Any failure is surfaced as a PartialImport-
@@ -404,6 +423,7 @@ async function importIntoPostgres(
   }
 
   async function runStudioImportTransaction(): Promise<void> {
+    let insertedDrafts = 0;
     await getDatabase().transaction(async (tx) => {
       for (const incoming of backup.studio.drafts) {
         const [existing] = await tx
@@ -423,8 +443,11 @@ async function importIntoPostgres(
           updatedAt: new Date(incoming.updatedAt),
           brief: incoming.brief,
         });
+        insertedDrafts += 1;
       }
       options.failAfterInsertForTests?.();
     });
+    // Only credited once the transaction above has committed.
+    summary.studioDrafts = insertedDrafts;
   }
 }

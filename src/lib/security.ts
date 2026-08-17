@@ -6,34 +6,7 @@ import {
 } from "node:crypto";
 import type { NextRequest } from "next/server";
 
-const SECRET_PATTERNS: Array<[RegExp, string]> = [
-  [/\b(gh[pousr]_[A-Za-z0-9_]{20,})\b/g, "[REDACTED_GITHUB_TOKEN]"],
-  [/\b(sk-(?:proj-)?[A-Za-z0-9_-]{16,})\b/g, "[REDACTED_API_KEY]"],
-  [/\b(AKIA[0-9A-Z]{16})\b/g, "[REDACTED_AWS_KEY]"],
-  [
-    /(-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)[\s\S]*?(-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/g,
-    "[REDACTED_PRIVATE_KEY]",
-  ],
-  [/(postgres(?:ql)?:\/\/[^:\s/]+:)[^@\s]+@/gi, "$1[REDACTED]@"],
-];
-
-const NAMED_SECRET_PATTERN =
-  /((?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*)([^\s,;]+)/gi;
-const DOCUMENTATION_SECRET_PLACEHOLDERS = new Set(["replace-me"]);
-
-export function redactSecrets(value: string): string {
-  const redacted = SECRET_PATTERNS.reduce(
-    (current, [pattern, replacement]) => current.replace(pattern, replacement),
-    value,
-  );
-  return redacted.replace(
-    NAMED_SECRET_PATTERN,
-    (match, prefix: string, candidate: string) =>
-      DOCUMENTATION_SECRET_PLACEHOLDERS.has(candidate.toLowerCase())
-        ? match
-        : `${prefix}[REDACTED]`,
-  );
-}
+export { redactSecrets, redactPaymentData } from "./redact";
 
 /** High-confidence scan used before generated files can be committed. */
 export function containsLikelySecret(value: string): boolean {

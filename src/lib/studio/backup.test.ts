@@ -436,6 +436,49 @@ describe("draft ids must be UUIDs before anything is written", () => {
   });
 });
 
+describe("counts describe what was written, not what the file claimed", () => {
+  // Regression cover for an independent-review finding: a memory whose text
+  // matches a secret pattern is dropped on import, but the summary counted it
+  // as restored, so the owner was told data came back when it had not.
+
+  it("does not count a redacted memory as restored", async () => {
+    // Build a real export, then replace the memory text with something the
+    // secret filter will reject. This is the reviewer's reproduction.
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    expect(backup.chat.memories).toHaveLength(1);
+    backup.chat.memories[0].content = "password=perfectly-legitimate-note";
+
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+
+    // The store really is empty...
+    expect(await chatStore.memories(userA.id)).toHaveLength(0);
+    // ...so the summary must say so rather than claiming one was restored.
+    expect(summary.memories).toBe(0);
+    expect(summary.skippedMemories).toBe(1);
+  });
+
+  it("counts a memory that is genuinely stored", async () => {
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+    expect(summary.memories).toBe(1);
+    expect(summary.skippedMemories).toBe(0);
+    expect(await chatStore.memories(userA.id)).toHaveLength(summary.memories);
+  });
+
+  it("draft and session counts match the rows actually present", async () => {
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+    expect(await drafts.list(userA)).toHaveLength(summary.studioDrafts);
+    expect(await chatStore.list(userA.id)).toHaveLength(summary.chatSessions);
+  });
+});
+
 describe("import atomicity is reported, not assumed", () => {
   it("reports a single transaction on SQLite", async () => {
     await seedUserA();
@@ -447,6 +490,11 @@ describe("import atomicity is reported, not assumed", () => {
     expect(summary.atomicity).toBe("single-transaction");
   });
 
+  // This checks the error object's shape only. It constructs the error
+  // directly and proves nothing about whether the staged path ever raises it.
+  // The real staged rollback, against two live engines, is covered by
+  // `postgres-backup.test.ts`, and the route's 500 response by
+  // `backup-route.test.ts`.
   it("PartialImportError explains exactly what landed", () => {
     const error = new PartialImportError(new Error("connection reset"));
     expect(error.status).toBe(500);

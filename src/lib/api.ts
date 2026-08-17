@@ -56,16 +56,54 @@ export class PayloadTooLargeError extends Error {
   }
 }
 
+/**
+ * Text that must never reach a browser. A database driver puts the failing
+ * statement, its bound parameter values and the host it dialled into
+ * `error.message`; returning that verbatim hands an attacker the schema and
+ * leaks whatever was in those parameters. Anything matching here is replaced
+ * with a generic message and reported as a 500, because a driver failure is a
+ * server fault, not a bad request.
+ */
+const INTERNAL_DETAIL = [
+  /failed query/i,
+  /\bselect\b[\s\S]*\bfrom\b/i,
+  /\binsert into\b/i,
+  /\bupdate\b[\s\S]*\bset\b/i,
+  /\bdelete from\b/i,
+  /\bparams:/i,
+  /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|ECONNRESET/i,
+  /postgres:\/\/|postgresql:\/\//i,
+  /sqlite/i,
+  /\bat [\w.]+ \(.*:\d+:\d+\)/,
+];
+
+function leaksInternals(message: string): boolean {
+  return INTERNAL_DETAIL.some((pattern) => pattern.test(message));
+}
+
+const GENERIC_FAILURE =
+  "Something went wrong handling that request. Please try again.";
+
 export function safeApiError(error: unknown) {
   if (hasStatus(error)) {
+    // A deliberate status still gets its message screened: a wrapped driver
+    // error could otherwise carry statement text out with it.
     return NextResponse.json(
-      { error: error.message },
-      { status: error.status },
+      {
+        error: leaksInternals(error.message) ? GENERIC_FAILURE : error.message,
+      },
+      { status: leaksInternals(error.message) ? 500 : error.status },
     );
   }
 
   const message =
     error instanceof Error ? error.message : "Unexpected request failure";
+
+  // Unrecognised failures that expose internals become an opaque 500.
+  if (leaksInternals(message)) {
+    return NextResponse.json({ error: GENERIC_FAILURE }, { status: 500 });
+  }
+
   const status =
     error instanceof NotConnectedError
       ? 401

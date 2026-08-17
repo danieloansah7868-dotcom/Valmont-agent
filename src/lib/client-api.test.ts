@@ -100,6 +100,23 @@ describe("successful requests", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  // Regression cover for an independent-review finding: a 2xx whose body was
+  // not JSON used to resolve as `undefined`, letting callers show success for a
+  // write that may never have happened.
+  it("rejects a 200 whose body is not JSON instead of returning undefined", async () => {
+    mockFetch(200, null, { json: false });
+    const error = await rejection(apiMutation("/api/studio/drafts", {}));
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(200);
+    expect(error.message).toMatch(/could not read/i);
+  });
+
+  it("rejects an empty 201 body rather than treating it as success", async () => {
+    mockFetch(201, null, { json: false });
+    const error = await rejection(apiMutation("/api/studio/drafts", {}));
+    expect(error).toBeInstanceOf(ApiError);
+  });
+
   it("sends the CSRF header on every mutation", async () => {
     const fetchMock = mockFetch(200, {});
     await apiMutation("/api/studio/drafts", {});

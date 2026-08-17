@@ -23,6 +23,7 @@ import {
   type StudioDraft,
 } from "@/lib/studio/site-brief/schema";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
+import { evaluateSaveGate } from "@/lib/studio/save-gate";
 import {
   GHANA_REGIONS,
   PAYMENT_PLANNING_NOTICE,
@@ -87,10 +88,23 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
   const pendingRef = useRef<SiteBriefV1 | null>(null);
   /** True while a request is in flight: this is what serializes saving. */
   const inFlightRef = useRef(false);
+  /**
+   * True from the moment overlapping edits are detected until the owner picks a
+   * version. While set, no save may leave this component. Without it, typing
+   * anything while the choice is on screen would autosave the whole on-screen
+   * version over the other tab's work — the exact loss the choice exists to
+   * prevent. A ref rather than state because the save loop reads it
+   * synchronously and must never act on a stale render.
+   */
+  const awaitingConflictChoiceRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Lets the save loop re-enter itself without becoming its own dependency. */
   const flushRef = useRef<() => Promise<void>>(async () => {});
   const unmountedRef = useRef(false);
+  /** The confirmation panel, so focus can be moved into and kept inside it. */
+  const deleteDialogRef = useRef<HTMLDivElement | null>(null);
+  /** Where focus was before the dialog opened, so it can be handed back. */
+  const deleteTriggerRef = useRef<HTMLElement | null>(null);
 
   useEffect(
     () => () => {
@@ -99,6 +113,58 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     },
     [],
   );
+
+  /**
+   * Keyboard and screen-reader behaviour for the delete confirmation.
+   *
+   * The trigger button is removed from the page when the dialog opens, so focus
+   * would otherwise fall back to the top of a long form. Focus is moved to the
+   * safe option, held inside the dialog while it is open, and returned to where
+   * it started once the dialog closes. Escape cancels, matching what a dialog
+   * is expected to do.
+   */
+  useEffect(() => {
+    if (!confirmingDelete) return;
+    const dialog = deleteDialogRef.current;
+    if (!dialog) return;
+
+    // Land on "Keep this draft" — the non-destructive choice.
+    const cancelButton = dialog.querySelector<HTMLButtonElement>(
+      '[data-testid="delete-draft-cancel"]',
+    );
+    cancelButton?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setConfirmingDelete(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = dialog.querySelectorAll<HTMLElement>(
+        "button:not([disabled])",
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      // Wrap at both ends so Tab cannot walk out into the page behind.
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      // Hand focus back to whatever opened the dialog, when it still exists.
+      const trigger = deleteTriggerRef.current;
+      if (trigger && document.body.contains(trigger)) trigger.focus();
+    };
+  }, [confirmingDelete]);
 
   const validation = useMemo(() => {
     const result = siteBriefSchemaV1.safeParse(brief);
@@ -153,6 +219,9 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       }
 
       // Overlapping edits: show both options rather than pick for them.
+      // Freeze saving first, so an edit made while the choice is on screen
+      // cannot escape and overwrite the other version.
+      awaitingConflictChoiceRef.current = true;
       setConflictPair({ mine, theirs: latest.brief });
       setSaveState({
         kind: "conflict",
@@ -168,12 +237,19 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
    * requests can never overtake one another and clobber a newer value.
    */
   const flush = useCallback(async (): Promise<void> => {
-    if (inFlightRef.current) return;
     const outgoing = pendingRef.current;
-    if (!outgoing) return;
-
-    // Never send something the server would reject; wait for it to be valid.
-    if (!siteBriefSchemaV1.safeParse(outgoing).success) return;
+    // The rule itself lives in save-gate.ts so it can be unit tested. An
+    // unresolved conflict freezes saving: the edit stays queued and is written
+    // only after the owner chooses which version to keep.
+    const decision = evaluateSaveGate({
+      inFlight: inFlightRef.current,
+      awaitingConflictChoice: awaitingConflictChoiceRef.current,
+      hasPendingEdit: outgoing !== null,
+      // Never send something the server would reject; wait for it to be valid.
+      isValid:
+        outgoing !== null && siteBriefSchemaV1.safeParse(outgoing).success,
+    });
+    if (!decision.send || !outgoing) return;
 
     inFlightRef.current = true;
     pendingRef.current = null;
@@ -254,6 +330,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
 
   const keepMine = useCallback(() => {
     if (!conflictPair) return;
+    awaitingConflictChoiceRef.current = false;
     setConflictPair(null);
     pendingRef.current = conflictPair.mine;
     setSaveState({ kind: "unsaved" });
@@ -262,6 +339,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
 
   const takeTheirs = useCallback(() => {
     if (!conflictPair) return;
+    awaitingConflictChoiceRef.current = false;
     setConflictPair(null);
     setBrief(conflictPair.theirs);
     savedBriefRef.current = conflictPair.theirs;
@@ -771,7 +849,9 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       <div className="mt-8 border-t border-line pt-4">
         {confirmingDelete ? (
           <div
+            ref={deleteDialogRef}
             role="alertdialog"
+            aria-modal="true"
             aria-labelledby="delete-confirm-heading"
             aria-describedby="delete-confirm-body"
             data-testid="delete-confirm"
@@ -812,7 +892,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           <>
             <button
               type="button"
-              onClick={() => setConfirmingDelete(true)}
+              onClick={(event) => {
+                deleteTriggerRef.current = event.currentTarget;
+                setConfirmingDelete(true);
+              }}
               disabled={deleting}
               data-testid="delete-draft"
               className="text-sm text-red-700 underline"

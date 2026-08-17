@@ -21,6 +21,11 @@ import {
  * the two halves commit separately; if the second half fails this returns 500
  * with `committed`, naming exactly what was written, rather than implying
  * nothing happened.
+ *
+ * Every count in the success body is what was actually written. A memory whose
+ * text matches a secret-redaction pattern is not imported; it is counted in
+ * `skippedMemories` and described in `notice` so the owner knows the record did
+ * not come back rather than being told it did.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -36,7 +41,18 @@ export async function POST(request: NextRequest) {
     const backup = parseBackup(raw);
 
     const summary = await importBackup(user, backup);
-    return NextResponse.json(summary, { status: 200 });
+    const notice =
+      summary.skippedMemories > 0
+        ? `${summary.skippedMemories} ${
+            summary.skippedMemories === 1 ? "memory was" : "memories were"
+          } not restored because the text looked like a password or key. ` +
+          `The backup file still contains ${
+            summary.skippedMemories === 1 ? "it" : "them"
+          }.`
+        : undefined;
+    return NextResponse.json(notice ? { ...summary, notice } : summary, {
+      status: 200,
+    });
   } catch (error) {
     if (error instanceof PartialImportError) {
       return NextResponse.json(
