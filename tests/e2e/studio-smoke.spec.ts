@@ -369,8 +369,20 @@ test.describe("Website Studio", () => {
     await signIn(context, ownerA, baseURL!);
     const draftId = await createDraft(page, "Temporary Draft");
 
-    page.on("dialog", (dialog) => dialog.accept());
+    // Deletion must ask first. Assert the confirmation really appears rather
+    // than listening for a browser dialog that the UI never opens.
     await page.getByTestId("delete-draft").click();
+    await expect(page.getByTestId("delete-confirm")).toBeVisible();
+
+    // Backing out must leave the draft completely untouched.
+    await page.getByTestId("delete-draft-cancel").click();
+    await expect(page.getByTestId("delete-confirm")).toHaveCount(0);
+    await page.goto(`/studio/drafts/${draftId}`);
+    await expect(page.getByTestId("delete-draft")).toBeVisible();
+
+    // Confirming deletes it for real.
+    await page.getByTestId("delete-draft").click();
+    await page.getByTestId("delete-draft-confirm").click();
     await page.waitForURL(/\/studio$/);
     await expect(page.getByText("Temporary Draft")).toHaveCount(0);
 

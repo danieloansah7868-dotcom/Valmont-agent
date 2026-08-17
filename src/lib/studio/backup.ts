@@ -80,8 +80,23 @@ export const chatSectionSchema = z.object({
   memoryEnabled: z.boolean().optional(),
 });
 
+/**
+ * Draft ids must be UUIDs. The PostgreSQL column is `uuid`, so a hand-edited
+ * file containing `"id": "d1"` would otherwise reach the driver and fail
+ * mid-import, leaking the driver's message through the 400. Rejecting the id
+ * during validation keeps every malformed file a clean pre-write refusal.
+ *
+ * The rule matches what PostgreSQL's `uuid` type accepts — 8-4-4-4-12 hex —
+ * rather than Zod's `.uuid()`, which additionally demands RFC-4122 version and
+ * variant bits. Being stricter than the database would reject ids the database
+ * itself stores happily, including ones already written by earlier versions.
+ */
+const draftId = z
+  .string()
+  .regex(/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i, "must be a UUID");
+
 const studioDraftSchema = z.object({
-  id: z.string().max(200),
+  id: draftId,
   // Ignored on import — reassigned to the authenticated user.
   ownerId: z.string().max(200).optional(),
   schemaVersion: z.number().int().min(1).max(STUDIO_SCHEMA_VERSION),
@@ -180,8 +195,10 @@ export async function buildBackup(user: SessionUser): Promise<BackupV2> {
     return assembleBackup(chat, drafts);
   }
 
-  // One consistent read: a deferred transaction gives every SELECT below the
-  // same snapshot, so chat and studio cannot disagree mid-export.
+  // Chat and drafts are read back to back from the one shared connection.
+  // Note this is NOT wrapped in an explicit transaction: an export is a
+  // read-only snapshot for one user, and Phase 1 has no concurrent writer that
+  // could interleave with it. Do not describe it as transactionally consistent.
   const store = getStudioSqliteStore();
   const chat = await store.exportUser(user.id);
   const ownerId = canonicalUserId(user);
@@ -237,14 +254,52 @@ export interface ImportSummary {
   studioDrafts: number;
   /** Drafts whose id already existed and were given a fresh id. */
   remappedDraftIds: number;
+  /**
+   * How the two halves were committed.
+   *
+   * - `"single-transaction"` (SQLite): chat, memories and drafts share one
+   *   connection and one transaction. A failure rolls back everything.
+   * - `"staged"` (PostgreSQL): chat lives in SQLite and studio in PostgreSQL,
+   *   so there is no distributed transaction. Each half is individually atomic
+   *   and they are committed in order.
+   */
+  atomicity: "single-transaction" | "staged";
+}
+
+/**
+ * Raised when the chat half of a staged (PostgreSQL) import committed but the
+ * studio half did not. The message tells the user exactly what landed, because
+ * "import failed" would be untrue and would invite a destructive retry.
+ */
+export class PartialImportError extends Error {
+  readonly status = 500;
+  readonly committed: { chat: boolean; studio: boolean };
+  constructor(cause: unknown) {
+    super(
+      "Your chats and memories were imported, but the website drafts could not be saved. " +
+        "Nothing was lost from the backup file. Re-importing the same file will restore the " +
+        "drafts and will create a second copy of the chats.",
+    );
+    this.name = "PartialImportError";
+    this.committed = { chat: true, studio: false };
+    this.cause = cause;
+  }
 }
 
 /**
  * Writes a validated backup for the authenticated user.
  *
- * SQLite: everything happens inside one transaction on the one shared
- * connection, so a failure part-way through rolls back chat, memories *and*
- * studio drafts together. PostgreSQL: one database transaction, same guarantee.
+ * **SQLite** (default): chat, memories and studio drafts share one connection,
+ * so the whole import is a single transaction. A failure anywhere rolls back
+ * everything.
+ *
+ * **PostgreSQL** (`DATABASE_URL` set): chat history still lives in SQLite while
+ * studio drafts live in PostgreSQL. Two engines cannot share a transaction and
+ * this codebase deliberately does not add a distributed-transaction layer in
+ * Phase 1. The import is therefore *staged*: each half is individually atomic,
+ * chat commits first, and if the studio half then fails the caller receives a
+ * `PartialImportError` naming exactly what was written. It is never reported as
+ * a clean failure.
  *
  * Owner ids inside the file are never trusted. Chat rows are reassigned by the
  * chat store, studio rows by this function.
@@ -260,6 +315,7 @@ export async function importBackup(
     memories: backup.chat.memories.length,
     studioDrafts: backup.studio.drafts.length,
     remappedDraftIds: 0,
+    atomicity: process.env.DATABASE_URL ? "staged" : "single-transaction",
   };
 
   if (process.env.DATABASE_URL) {
@@ -338,26 +394,37 @@ async function importIntoPostgres(
     memoryEnabled: backup.chat.memoryEnabled,
   });
 
-  await getDatabase().transaction(async (tx) => {
-    for (const incoming of backup.studio.drafts) {
-      const [existing] = await tx
-        .select({ id: studioDrafts.id })
-        .from(studioDrafts)
-        .where(eq(studioDrafts.id, incoming.id))
-        .limit(1);
-      if (existing) summary.remappedDraftIds += 1;
-      await tx.insert(studioDrafts).values({
-        id: existing ? randomUUID() : incoming.id,
-        ownerId,
-        schemaVersion: incoming.schemaVersion,
-        templateVersion: incoming.templateRegistryVersion ?? 1,
-        themeVersion: incoming.themeRegistryVersion ?? 1,
-        revision: incoming.revision ?? 1,
-        createdAt: new Date(incoming.createdAt),
-        updatedAt: new Date(incoming.updatedAt),
-        brief: incoming.brief,
-      });
-    }
-    options.failAfterInsertForTests?.();
-  });
+  // From here the chat half is committed and cannot be rolled back by the
+  // PostgreSQL transaction below. Any failure is surfaced as a PartialImport-
+  // Error so the user is told precisely which half landed.
+  try {
+    await runStudioImportTransaction();
+  } catch (cause) {
+    throw new PartialImportError(cause);
+  }
+
+  async function runStudioImportTransaction(): Promise<void> {
+    await getDatabase().transaction(async (tx) => {
+      for (const incoming of backup.studio.drafts) {
+        const [existing] = await tx
+          .select({ id: studioDrafts.id })
+          .from(studioDrafts)
+          .where(eq(studioDrafts.id, incoming.id))
+          .limit(1);
+        if (existing) summary.remappedDraftIds += 1;
+        await tx.insert(studioDrafts).values({
+          id: existing ? randomUUID() : incoming.id,
+          ownerId,
+          schemaVersion: incoming.schemaVersion,
+          templateVersion: incoming.templateRegistryVersion ?? 1,
+          themeVersion: incoming.themeRegistryVersion ?? 1,
+          revision: incoming.revision ?? 1,
+          createdAt: new Date(incoming.createdAt),
+          updatedAt: new Date(incoming.updatedAt),
+          brief: incoming.brief,
+        });
+      }
+      options.failAfterInsertForTests?.();
+    });
+  }
 }

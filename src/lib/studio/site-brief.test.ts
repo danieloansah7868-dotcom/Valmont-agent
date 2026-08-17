@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { siteBriefSchemaV1, type SiteBriefV1 } from "./site-brief/schema";
+import {
+  isHttpsSafeUrl,
+  siteBriefSchemaV1,
+  type SiteBriefV1,
+} from "./site-brief/schema";
 import {
   computeBriefCompleteness,
   displayValue,
@@ -438,5 +442,82 @@ describe("preview values", () => {
       text: "Adom Fabrics",
       isPlaceholder: false,
     });
+  });
+});
+
+describe("isHttpsSafeUrl private-address blocking", () => {
+  it("accepts ordinary public https URLs", () => {
+    for (const url of [
+      "https://valmontweb.com",
+      "https://maps.google.com/?q=Accra",
+      "https://sub.domain.example.co.uk/path?a=1#b",
+      "https://8.8.8.8/health",
+      "https://[2001:4860:4860::8888]/",
+    ]) {
+      expect(isHttpsSafeUrl(url), url).toBe(true);
+    }
+  });
+
+  it("rejects non-https schemes and embedded credentials", () => {
+    for (const url of [
+      "javascript:alert(1)",
+      "data:text/html,<script>alert(1)</script>",
+      "http://valmontweb.com",
+      "file:///etc/passwd",
+      "https://user:pass@valmontweb.com",
+      "not a url",
+    ]) {
+      expect(isHttpsSafeUrl(url), url).toBe(false);
+    }
+  });
+
+  it("rejects every private, loopback and link-local IPv4 range", () => {
+    for (const host of [
+      "localhost",
+      "app.localhost",
+      "127.0.0.1",
+      "127.1.2.3",
+      "10.0.0.1",
+      "192.168.1.1",
+      "169.254.169.254", // cloud metadata
+      "169.254.1.1",
+      "0.0.0.0",
+      "172.16.0.1", // the range the old list missed
+      "172.20.10.5",
+      "172.31.255.254",
+      "100.64.0.1", // CGNAT
+      "239.1.1.1", // multicast
+    ]) {
+      expect(isHttpsSafeUrl(`https://${host}/x`), host).toBe(false);
+    }
+  });
+
+  it("still allows 172.x addresses outside the private 172.16/12 block", () => {
+    expect(isHttpsSafeUrl("https://172.15.0.1/")).toBe(true);
+    expect(isHttpsSafeUrl("https://172.32.0.1/")).toBe(true);
+  });
+
+  it("rejects IPv6 loopback, unique-local and link-local", () => {
+    for (const host of [
+      "[::1]",
+      "[::]",
+      "[fc00::1]",
+      "[fd12:3456::1]",
+      "[fe80::1]",
+    ]) {
+      expect(isHttpsSafeUrl(`https://${host}/x`), host).toBe(false);
+    }
+  });
+
+  it("rejects IPv4-mapped IPv6 that hides a private address", () => {
+    expect(
+      isHttpsSafeUrl("https://[::ffff:169.254.169.254]/latest/meta-data"),
+    ).toBe(false);
+    expect(isHttpsSafeUrl("https://[::ffff:127.0.0.1]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[::ffff:10.0.0.1]/")).toBe(false);
+  });
+
+  it("rejects malformed dotted quads rather than guessing", () => {
+    expect(isHttpsSafeUrl("https://999.999.999.999/")).toBe(false);
   });
 });

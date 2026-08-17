@@ -110,8 +110,9 @@ Use TLS, backups, point-in-time recovery, row ownership checks, and migration re
 Every read, update, and delete is scoped by `owner_id` in the SQL statement
 itself, not filtered afterwards. A draft belonging to somebody else and a draft
 that does not exist produce the **same generic 404 with the same body**, so the
-API cannot be used to discover which ids are real. The end-to-end suite asserts
-this by comparing the two responses byte for byte. Owner identity comes from the
+API cannot be used to discover which ids are real. Unit tests assert this
+directly against the route handlers; an end-to-end test also compares the two
+responses byte for byte, but see "Test status" below for what has actually run. Owner identity comes from the
 encrypted session and is mapped through `deterministicUuid("github:" + id)`; it
 is never taken from the request body.
 
@@ -124,26 +125,40 @@ writer's changes are discarded without the owner being told.
 
 ### Untrusted input
 
-- **URLs** — `isHttpsSafeUrl` accepts `https` only, and rejects embedded
-  credentials, `localhost`, `127.*`, `10.*`, `192.168.*`, and `169.254.169.254`.
-  This blocks `javascript:`, `data:`, and SSRF-shaped values. Valmont never
-  fetches a URL a user typed; links are rendered with
-  `rel="noopener noreferrer nofollow"` only after passing the same check the
-  schema applies.
+- **URLs** — `isHttpsSafeUrl` accepts `https` only and rejects embedded
+  credentials, `localhost`, and literal addresses in every private, loopback,
+  link-local, CGNAT, multicast or reserved range: `0.0.0.0/8`, `10/8`,
+  `100.64/10`, `127/8`, `169.254/16` (including the cloud metadata address),
+  `172.16/12`, `192.168/16`, `224/4`+, IPv6 `::`, `::1`, `fc00::/7`, `fe80::/10`,
+  and IPv4-mapped IPv6 forms such as `::ffff:169.254.169.254`. This blocks
+  `javascript:`, `data:`, and SSRF-shaped values. **Phase 1 never fetches a URL
+  a user typed** — these values are only rendered as links, with
+  `rel="noopener noreferrer nofollow"`, after passing the same check the schema
+  applies. The blocklist is literal-address only: a public hostname that
+  _resolves_ to a private address is not detected, so any future server-side
+  fetch must additionally validate the resolved IP at connect time.
 - **Text** — the preview renders text as text. There is no
   `dangerouslySetInnerHTML` anywhere in the Studio, so `<img src=x onerror=...>`
-  is displayed literally, never executed. A browser test asserts this.
+  is displayed literally, never executed. A browser test asserts this (not yet
+  executed — see "Test status").
 - **Colours** — strict `#RRGGBB`. **Phones** — E.164 `/^\+\d{8,15}$/`.
 - **Assets** — `assetStatus` is `z.literal("not_provided")`: a marker, not a
   URL. There is no upload control and no arbitrary asset URL can be stored.
 
 ### Error and log hygiene
 
-`safeApiError` maps known error types to status codes and returns short, generic
-messages. Zod issues are reduced to at most five field **paths**; submitted
-values, business details, and imported file contents are never echoed into a
-response or a log line. Existing secret-redaction patterns still apply to
-everything written to the store.
+`safeApiError` maps known error types to status codes. Backup-import failures
+go through `parseBackup`, which reduces Zod issues to at most five field
+**paths** and never echoes submitted values, business details, or imported file
+contents.
+
+**Known limitation:** `safeApiError` forwards `error.message` for errors it does
+not recognise, so an unanticipated database or library message can still reach
+the client with a 400. Draft `POST`/`PATCH` validate with
+`siteBriefSchemaV1.parse`, whose raw Zod message is returned on failure. That
+message names field paths and constraints rather than the user's own data, but
+it is not the short generic string this section previously claimed. Existing
+secret-redaction patterns still apply to everything written to the store.
 
 ### Backup imports
 
@@ -151,9 +166,23 @@ An imported file is fully untrusted input. Its version is checked before
 anything is written; unknown versions are rejected outright. `ownerId` fields
 inside the file are ignored and every record is reassigned to the authenticated
 account, so a crafted backup cannot plant records under another user or read
-theirs. A colliding draft id becomes a new copy instead of overwriting existing
-work. The import is one transaction, so a partial write cannot leave chats,
-memories, and drafts inconsistent.
+theirs. Draft ids must be UUIDs, so a hand-edited file cannot push an
+illegal identifier as far as the database driver. A colliding draft id becomes a
+new copy instead of overwriting existing work.
+
+**Atomicity depends on the storage backend, and the API reports which applies:**
+
+| Backend                     | `atomicity`          | Guarantee                                                                                                                                     |
+| --------------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| SQLite (default)            | `single-transaction` | Chat, memories and drafts share one connection and one transaction. Any failure rolls all three back.                                         |
+| PostgreSQL (`DATABASE_URL`) | `staged`             | Chat is still SQLite, studio is PostgreSQL. **There is no distributed transaction.** Each half is individually atomic and chat commits first. |
+
+On the staged path, if the studio half fails after chat has committed the API
+raises `PartialImportError`, which tells the user that chats and memories were
+imported, drafts were not, and that re-importing will duplicate the chats. A
+partial import is therefore always reported truthfully — it is never presented
+as a clean success or a clean failure. Removing this limitation requires moving
+chat history into the same database, which is out of Phase 1 scope.
 
 ### No payments, no payment data
 
@@ -172,3 +201,17 @@ authentication bypass in application code.** The session secret is generated per
 CI run; `playwright.config.ts` refuses to run without a 32-character-plus
 secret and provides no fallback. Tests use a throwaway database directory and
 never open the real `.data` files.
+
+### Test status
+
+Security claims are only worth what has actually been executed. As of this
+change:
+
+| Suite                           | Status                                                                                                                                                                                                                                |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit + integration (`npm test`) | **Run.** 236 passing, 0 skipped, including the 10 PostgreSQL draft-store tests against a real PostgreSQL 18 server.                                                                                                                   |
+| End-to-end (`npm run test:e2e`) | **Never executed.** Chromium cannot be downloaded in the environment used so far. The specs exist and are discoverable; treat every browser-level assertion in this document as _intended_, not _verified_, until a green run exists. |
+
+The browser tests only run once a maintainer moves
+`.github/ci-workflow-phase1.yml` to `.github/workflows/ci.yml`; the automation
+token is not permitted to create workflow files.

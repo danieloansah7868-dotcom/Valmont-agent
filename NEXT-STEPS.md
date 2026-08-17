@@ -22,13 +22,13 @@ caused by that merge, plus one pre-existing task.
 **Nothing is broken for users.** Verified on a clean checkout of `df702ff`, with no
 other branch involved:
 
-| Check | Result |
-| --- | --- |
-| `lint` | pass |
-| `typecheck` | pass |
-| `test` | pass (86) |
-| `build` | pass |
-| `format:check` | **fail** |
+| Check          | Result    |
+| -------------- | --------- |
+| `lint`         | pass      |
+| `typecheck`    | pass      |
+| `test`         | pass (86) |
+| `build`        | pass      |
+| `format:check` | **fail**  |
 
 The fix is one command run on `main`:
 
@@ -62,7 +62,7 @@ no changes without explicit permission.
 PR #10 was merged while its `validate` check was failing. That was the owner's
 deliberate decision and is entirely allowed.
 
-Worth deciding whether GitHub should *block* merging when checks fail, as a
+Worth deciding whether GitHub should _block_ merging when checks fail, as a
 guard against merging a genuine failure by accident on some future day. This is a
 branch-protection setting on `main` and is reversible at any time.
 

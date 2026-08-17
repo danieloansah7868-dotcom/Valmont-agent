@@ -11,6 +11,7 @@ import {
   buildBackup,
   importBackup,
   parseBackup,
+  PartialImportError,
 } from "./backup";
 import { SqliteStudioDraftStore } from "./draft-store";
 import { createDefaultBrief } from "./site-brief/defaults";
@@ -376,5 +377,83 @@ describe("rollback", () => {
     expect(after[0]!.id).toBe(draft.id);
     expect(after[0]!.brief.businessName).toBe("Adom Fashion House");
     expect(await chatStore.list(userA.id)).toHaveLength(1);
+  });
+});
+
+describe("draft ids must be UUIDs before anything is written", () => {
+  function fileWithDraftId(id: string) {
+    return {
+      backupVersion: 2,
+      exportedAt: new Date().toISOString(),
+      chat: { version: 1, sessions: [], memories: [] },
+      studio: {
+        version: 1,
+        schemaVersion: 1,
+        drafts: [
+          {
+            id,
+            schemaVersion: 1,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            brief: createDefaultBrief({ businessName: "Adom" }),
+          },
+        ],
+      },
+    };
+  }
+
+  it("rejects ids that are not UUIDs", () => {
+    for (const id of [
+      "d1",
+      "",
+      "not-a-uuid",
+      "../../etc/passwd",
+      "'; DROP TABLE studio_drafts; --",
+      "x".repeat(200),
+    ]) {
+      expect(() => parseBackup(fileWithDraftId(id)), id).toThrow(
+        BackupValidationError,
+      );
+    }
+  });
+
+  it("accepts a real UUID", () => {
+    const parsed = parseBackup(
+      fileWithDraftId("3f4b2c1e-7a9d-4c8b-9f21-5d6e7a8b9c01"),
+    );
+    expect(parsed.studio.drafts).toHaveLength(1);
+  });
+
+  it("names the offending field without echoing the bad id", () => {
+    let message = "";
+    try {
+      parseBackup(fileWithDraftId("secret-looking-value-123"));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("studio.drafts");
+    expect(message).not.toContain("secret-looking-value-123");
+  });
+});
+
+describe("import atomicity is reported, not assumed", () => {
+  it("reports a single transaction on SQLite", async () => {
+    await seedUserA();
+    const backup = await buildBackup(userA);
+    const summary = await importBackup(
+      userB,
+      parseBackup(JSON.parse(JSON.stringify(backup))),
+    );
+    expect(summary.atomicity).toBe("single-transaction");
+  });
+
+  it("PartialImportError explains exactly what landed", () => {
+    const error = new PartialImportError(new Error("connection reset"));
+    expect(error.status).toBe(500);
+    expect(error.committed).toEqual({ chat: true, studio: false });
+    expect(error.message).toMatch(/chat/i);
+    expect(error.message).toMatch(/draft/i);
+    // It must not leak the underlying driver text to the user.
+    expect(error.message).not.toContain("connection reset");
   });
 });

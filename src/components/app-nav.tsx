@@ -22,8 +22,14 @@ const links = [
 ];
 
 const mobileLinks = links.filter(({ href }) =>
-  ["/dashboard", "/chat", "/tasks"].includes(href),
+  ["/dashboard", "/chat", "/studio", "/tasks"].includes(href),
 );
+
+/** Shorter labels so five tabs still fit a narrow phone without wrapping. */
+const mobileLabels: Record<string, string> = {
+  "/chat": "Chat",
+  "/studio": "Studio",
+};
 
 function useIsActive(pathname: string) {
   return (href: string) =>
@@ -85,7 +91,7 @@ export function AppNav() {
               aria-current={active ? "page" : undefined}
             >
               <Icon className="size-5" aria-hidden="true" />
-              {href === "/chat" ? "Chat" : label}
+              {mobileLabels[href] ?? label}
             </Link>
           );
         })}

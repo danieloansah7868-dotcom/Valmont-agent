@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { apiDelete, apiPatch } from "@/lib/client-api";
+import { ApiError, apiDelete, apiPatch } from "@/lib/client-api";
 import { BusinessPreview } from "./business-preview";
 import {
   categories,
@@ -64,6 +64,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     at: initial.updatedAt,
   });
   const [deleting, setDeleting] = useState(false);
+  // Deleting a brief is irreversible, so the button asks first. This is an
+  // in-page confirmation rather than window.confirm(): it is reachable by
+  // screen readers, testable, and cannot be suppressed by the browser.
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   /** Both versions kept side by side while the person decides. */
   const [conflictPair, setConflictPair] = useState<{
     mine: SiteBriefV1;
@@ -189,7 +193,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     } catch (cause) {
       const message =
         cause instanceof Error ? cause.message : "Could not save your changes.";
-      const isConflict = /changed somewhere else|conflict/i.test(message);
+      // Branch on the HTTP status, never on the message text: rewording a
+      // server message must not turn a conflict into a retry loop, and a 500
+      // that happens to contain the word "conflict" must not trigger a merge.
+      const isConflict = cause instanceof ApiError && cause.status === 409;
       if (isConflict) {
         await handleConflict(outgoing);
       } else if (!unmountedRef.current) {
@@ -762,19 +769,62 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       </div>
 
       <div className="mt-8 border-t border-line pt-4">
-        <button
-          type="button"
-          onClick={removeDraft}
-          disabled={deleting}
-          data-testid="delete-draft"
-          className="text-sm text-red-700 underline"
-        >
-          {deleting ? "Deleting…" : "Delete this draft"}
-        </button>
-        <p className="mt-1 text-xs text-slate-500">
-          Deleting removes the draft permanently. Download a backup first if you
-          want to keep a copy.
-        </p>
+        {confirmingDelete ? (
+          <div
+            role="alertdialog"
+            aria-labelledby="delete-confirm-heading"
+            aria-describedby="delete-confirm-body"
+            data-testid="delete-confirm"
+            className="rounded-lg border border-red-300 bg-red-50 p-4"
+          >
+            <h3
+              id="delete-confirm-heading"
+              className="text-sm font-semibold text-red-900"
+            >
+              Delete this draft permanently?
+            </h3>
+            <p id="delete-confirm-body" className="mt-1 text-xs text-red-800">
+              This cannot be undone. Everything you entered for this business
+              will be removed.
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={removeDraft}
+                disabled={deleting}
+                data-testid="delete-draft-confirm"
+                className="min-h-10 rounded-md bg-red-700 px-3 text-sm font-semibold text-white hover:bg-red-800 disabled:opacity-60"
+              >
+                {deleting ? "Deleting…" : "Yes, delete it"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmingDelete(false)}
+                disabled={deleting}
+                data-testid="delete-draft-cancel"
+                className="min-h-10 rounded-md border border-line bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+              >
+                Keep this draft
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <button
+              type="button"
+              onClick={() => setConfirmingDelete(true)}
+              disabled={deleting}
+              data-testid="delete-draft"
+              className="text-sm text-red-700 underline"
+            >
+              Delete this draft
+            </button>
+            <p className="mt-1 text-xs text-slate-500">
+              Deleting removes the draft permanently. Download a backup first if
+              you want to keep a copy.
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

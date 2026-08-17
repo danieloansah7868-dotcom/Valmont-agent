@@ -47,7 +47,16 @@ export default defineConfig({
     },
     {
       name: "iphone",
-      use: { ...devices["iPhone 13"] },
+      use: {
+        ...devices["iPhone 13"],
+        // The iPhone 13 descriptor defaults to WebKit, but CI installs only
+        // Chromium. Pinning the engine keeps the mobile viewport, touch and
+        // user-agent emulation while running on the browser that is actually
+        // present — otherwise every test in this project fails to launch.
+        // Swap to WebKit only alongside `playwright install webkit` in CI.
+        defaultBrowserType: "chromium",
+        browserName: "chromium",
+      },
     },
   ],
   webServer: {
