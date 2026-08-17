@@ -7,6 +7,7 @@ import {
   LayoutDashboard,
   ListChecks,
   MessageSquareText,
+  PanelsTopLeft,
   Plus,
   Settings,
 } from "lucide-react";
@@ -14,6 +15,7 @@ import {
 const links = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
   { href: "/chat", label: "Chat with Valmont", icon: MessageSquareText },
+  { href: "/studio", label: "Website Studio", icon: PanelsTopLeft },
   { href: "/repositories", label: "Repositories", icon: FolderGit2 },
   { href: "/tasks", label: "Tasks", icon: ListChecks },
   { href: "/settings", label: "Settings", icon: Settings },

@@ -246,6 +246,30 @@ export const toolExecutions = pgTable(
   (table) => [index("tool_executions_task_idx").on(table.taskId)],
 );
 
+export const studioDrafts = pgTable(
+  "studio_drafts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    ownerId: uuid("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    schemaVersion: integer("schema_version").notNull().default(1),
+    templateVersion: integer("template_version").notNull().default(1),
+    themeVersion: integer("theme_version").notNull().default(1),
+    revision: integer("revision").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    brief: jsonb("brief").notNull(),
+  },
+  (table) => [
+    index("studio_drafts_owner_updated_idx").on(table.ownerId, table.updatedAt),
+  ],
+);
+
 export const pullRequests = pgTable("pull_requests", {
   id: uuid("id").primaryKey().defaultRandom(),
   taskId: uuid("task_id")
