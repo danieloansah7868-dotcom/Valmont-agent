@@ -14,6 +14,13 @@ export async function GET() {
       const drafts = await getStudioDraftStore().list(user);
       studio = { version: 1, schemaVersion: 1, drafts };
     } catch {}
-    return NextResponse.json({ backupVersion: 2, exportedAt: new Date().toISOString(), chat, studio });
-  } catch (e) { return safeApiError(e); }
+    return NextResponse.json({
+      backupVersion: 2,
+      exportedAt: new Date().toISOString(),
+      chat,
+      studio,
+    });
+  } catch (e) {
+    return safeApiError(e);
+  }
 }

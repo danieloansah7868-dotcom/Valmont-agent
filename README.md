@@ -155,3 +155,6 @@ npm run db:migrate     # apply PostgreSQL migrations
 ## Important production note
 
 The local workspace adapter is **not** represented as a secure production sandbox. Its checks reduce accidental host access, but repository scripts execute as a host process. Use an ephemeral container or external code sandbox with an unprivileged user, read-only base image, CPU/memory/PID limits, network egress controls, short TTL, and no host mounts. See the threat model for details.
+
+## Website Studio Phase 1
+Phase 1 can: pick category/package/theme/template, save owner-isolated drafts in shared SQLite (same as Chat) or PostgreSQL, show Brief completeness (not launch readiness), preview safely, handle 409 concurrency, download/import backup v2 (accepts legacy v1). Cannot: uploads, payments/checkout (plannedPaymentMethods are future-only Ghana tips), repo generation, deploys (Phases 2-6 deferred). Body limits 1MB drafts / 25MB import via bounded stream. Tested via vitest + Playwright (Chromium).

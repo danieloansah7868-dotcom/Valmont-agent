@@ -1,9 +1,14 @@
-export async function readBoundedJson(request: Request, limitBytes: number): Promise<unknown> {
+export async function readBoundedJson(
+  request: Request,
+  limitBytes: number,
+): Promise<unknown> {
   const reader = request.body?.getReader();
   if (!reader) {
     const text = await request.text();
-    if (Buffer.byteLength(text, "utf8") > limitBytes) throw new Error("Request body too large");
-    return JSON.parse(text || "null");
+    if (Buffer.byteLength(text, "utf8") > limitBytes)
+      throw new Error("Request body too large");
+    if (!text) return null;
+    return JSON.parse(text);
   }
   let total = 0;
   const chunks: Uint8Array[] = [];
@@ -15,6 +20,7 @@ export async function readBoundedJson(request: Request, limitBytes: number): Pro
     chunks.push(value);
   }
   const buf = Buffer.concat(chunks);
+  if (buf.length === 0) return null;
   const text = buf.toString("utf8");
-  return JSON.parse(text || "null");
+  return JSON.parse(text);
 }

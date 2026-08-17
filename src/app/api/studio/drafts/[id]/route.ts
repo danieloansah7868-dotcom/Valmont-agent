@@ -5,6 +5,7 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
 import { getStudioDraftStore } from "@/lib/studio/draft-store";
 import { siteBriefSchemaV1 } from "@/lib/studio/site-brief/schema";
+import { readBoundedJson } from "@/lib/bounded-json";
 
 export async function GET(
   _: NextRequest,
@@ -29,11 +30,12 @@ export async function PATCH(
   try {
     assertCsrf(request);
     assertApiRateLimit(request, "studio-mutation", 30);
-    const size = Number(request.headers.get("content-length") ?? 0);
-    if (size > 1_000_000) throw new Error("Request body too large");
     const { id } = await params;
     const user = await requireApiSessionUser();
-    const body = await request.json();
+    const body = (await readBoundedJson(
+      request as unknown as Request,
+      1_000_000,
+    )) as Record<string, unknown>;
     const { expectedRevision, ...briefData } = z
       .object({ expectedRevision: z.number().int().min(1) })
       .passthrough()
@@ -47,6 +49,11 @@ export async function PATCH(
     );
     return NextResponse.json(draft);
   } catch (e) {
+    if (e instanceof Error && e.message === "Request body too large")
+      return NextResponse.json(
+        { error: "Request body too large" },
+        { status: 413 },
+      );
     const msg = e instanceof Error ? e.message : "";
     if (msg.includes("Conflict"))
       return NextResponse.json({ error: msg }, { status: 409 });
