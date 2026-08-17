@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { githubConfigured } from "@/lib/auth";
+import { authOrigin } from "@/lib/auth-redirect";
 import { decryptSessionValue, encryptSessionValue } from "@/lib/security";
 
 interface GitHubUser {
@@ -10,7 +11,17 @@ interface GitHubUser {
 }
 
 export async function GET(request: NextRequest) {
-  const errorRedirect = new URL("/?auth_error=github", request.url);
+  let origin: URL;
+  try {
+    origin = authOrigin(request.url);
+  } catch {
+    return NextResponse.json(
+      { error: "APP_URL must be an absolute HTTP or HTTPS origin" },
+      { status: 500 },
+    );
+  }
+
+  const errorRedirect = new URL("/?auth_error=github", origin);
   if (!githubConfigured()) return NextResponse.redirect(errorRedirect);
   const state = request.nextUrl.searchParams.get("state");
   const code = request.nextUrl.searchParams.get("code");
@@ -63,7 +74,7 @@ export async function GET(request: NextRequest) {
         expiresAt: Date.now() + 8 * 60 * 60 * 1_000,
       }),
     );
-    const response = NextResponse.redirect(new URL("/dashboard", request.url));
+    const response = NextResponse.redirect(new URL("/dashboard", origin));
     response.cookies.delete("valmont_oauth_state");
     response.cookies.set("valmont_session", payload, {
       httpOnly: true,
