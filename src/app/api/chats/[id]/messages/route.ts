@@ -28,37 +28,32 @@ export async function POST(
 
     let repositoryContext;
     if (session.repository) {
-      const github = await getGitHubProvider();
-      const repositories = await github.listRepositories();
-      const authorized = repositories.find(
-        (repository) => repository.id === session.repository?.id,
-      );
-      if (
-        !authorized ||
-        authorized.owner !== session.repository.owner ||
-        authorized.name !== session.repository.name
-      ) {
-        throw new Error("The chat repository is no longer authorized");
+      try {
+        const github = await getGitHubProvider();
+        const retrieved = await Promise.race([
+          retrieveGitHubContext(
+            github,
+            session.repository.owner,
+            session.repository.name,
+            session.repository.baseBranch,
+            input.content,
+            4,
+          ),
+          new Promise<never>((_, reject) => {
+            setTimeout(
+              () => reject(new Error("Repository context timed out")),
+              12_000,
+            );
+          }),
+        ]);
+        repositoryContext = {
+          repository: session.repository,
+          files: retrieved.files,
+        };
+      } catch {
+        // Chat still answers when GitHub is slow or the tree is too large.
+        repositoryContext = undefined;
       }
-      const branches = await github.listBranches(
-        authorized.owner,
-        authorized.name,
-      );
-      if (!branches.includes(session.repository.baseBranch)) {
-        throw new Error("The chat branch is no longer available");
-      }
-      const retrieved = await retrieveGitHubContext(
-        github,
-        authorized.owner,
-        authorized.name,
-        session.repository.baseBranch,
-        input.content,
-        4,
-      );
-      repositoryContext = {
-        repository: session.repository,
-        files: retrieved.files,
-      };
     }
 
     const memoryStore = store as typeof store & {

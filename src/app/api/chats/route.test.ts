@@ -178,7 +178,7 @@ describe("chat APIs", () => {
     );
   });
 
-  it("rechecks repository authorization before retrieving read-only context", async () => {
+  it("retrieves read-only context without listing every repo first", async () => {
     const session = emptySession({
       repository: {
         id: "42",
@@ -189,12 +189,8 @@ describe("chat APIs", () => {
       },
     });
     const github = {
-      listRepositories: vi
-        .fn()
-        .mockResolvedValue([
-          { id: "42", owner: "acme", name: "app", fullName: "acme/app" },
-        ]),
-      listBranches: vi.fn().mockResolvedValue(["main"]),
+      listRepositories: vi.fn(),
+      listBranches: vi.fn(),
     };
     mocks.get.mockResolvedValue(session);
     mocks.getGitHubProvider.mockResolvedValue(github);
@@ -228,14 +224,55 @@ describe("chat APIs", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(github.listBranches).toHaveBeenCalledWith("acme", "app");
+    expect(github.listRepositories).not.toHaveBeenCalled();
+    expect(github.listBranches).not.toHaveBeenCalled();
     expect(mocks.retrieveGitHubContext).toHaveBeenCalledWith(
       github,
       "acme",
       "app",
       "main",
       "What does this project do?",
-      8,
+      4,
     );
+  });
+
+  it("still replies when repository retrieval fails", async () => {
+    const session = emptySession({
+      repository: {
+        id: "42",
+        owner: "acme",
+        name: "app",
+        fullName: "acme/app",
+        baseBranch: "main",
+      },
+    });
+    mocks.get.mockResolvedValue(session);
+    mocks.getGitHubProvider.mockRejectedValue(new Error("GitHub timed out"));
+    const chat = vi.fn().mockResolvedValue({
+      content: "I can still help without the file tree.",
+      model: "gemini-test",
+      provider: "openai-compatible",
+      finishReason: "stop",
+      toolCalls: [],
+      usage: { inputTokens: 8, outputTokens: 6, totalTokens: 14 },
+    });
+    mocks.createModelProvider.mockReturnValue({ chat });
+    mocks.appendMessages.mockImplementation(
+      async (_id, _userId, messages, titleIfNew) => ({
+        ...session,
+        title: titleIfNew ?? session.title,
+        messages,
+      }),
+    );
+
+    const response = await sendMessage(
+      mutationRequest("http://localhost/api/chats/chat-1/messages", {
+        content: "What is still missing?",
+      }),
+      { params: Promise.resolve({ id: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(chat).toHaveBeenCalledOnce();
   });
 });

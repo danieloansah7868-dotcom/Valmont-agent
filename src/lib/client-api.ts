@@ -5,6 +5,22 @@ export function csrfToken(): string {
   return decodeURIComponent(item?.split("=").slice(1).join("=") ?? "");
 }
 
+async function readResponseBody(
+  response: Response,
+): Promise<{ error?: string } & Record<string, unknown>> {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text) as { error?: string } & Record<string, unknown>;
+  } catch {
+    throw new Error(
+      response.ok
+        ? "The server returned a page instead of a chat reply. Refresh and try again."
+        : `Request failed (${response.status}).`,
+    );
+  }
+}
+
 async function apiRequest<T>(
   url: string,
   method: "POST" | "PATCH" | "DELETE",
@@ -19,9 +35,9 @@ async function apiRequest<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (response.status === 204) return undefined as T;
-  const data = (await response.json()) as T & { error?: string };
+  const data = await readResponseBody(response);
   if (!response.ok) throw new Error(data.error ?? "Request failed");
-  return data;
+  return data as T;
 }
 
 export function apiMutation<T>(url: string, body: unknown): Promise<T> {
