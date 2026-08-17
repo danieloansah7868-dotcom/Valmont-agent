@@ -9,6 +9,7 @@ import {
   Layers,
   LockKeyhole,
   Megaphone,
+  MessageSquareText,
   PlugZap,
   ShieldCheck,
   Sparkles,
@@ -28,6 +29,7 @@ type Venture = {
   icon: typeof Wallet;
   category: string;
   href?: string;
+  cta?: string;
   live?: boolean;
 };
 
@@ -112,6 +114,20 @@ const ventures: Venture[] = [
     icon: Bot,
     category: "AI / Developer",
     href: "/agent",
+    cta: "Open Valmont Agent",
+    live: true,
+  },
+  {
+    slug: "valmont-chat",
+    name: "Valmont Chat",
+    shortLabel: "Chat",
+    tagline: "A private conversation you can reopen.",
+    description:
+      "Talk through a problem, attach optional read-only repository context, and hand a reviewed thread into a coding task. Nothing is written until you approve.",
+    icon: MessageSquareText,
+    category: "AI / Developer",
+    href: "/chat",
+    cta: "Open Valmont Chat",
     live: true,
   },
   {
@@ -189,7 +205,7 @@ function VentureCard({ venture }: { venture: Venture }) {
 
       {isLink && (
         <span className="mt-5 inline-flex items-center gap-1.5 text-[13px] font-bold text-brandblue transition-colors group-hover:text-copper-700">
-          Open Valmont Agent
+          {venture.cta ?? "Open"}
           <ArrowRight className="size-3.5" aria-hidden="true" />
         </span>
       )}
@@ -206,7 +222,8 @@ export default function PortfolioPage() {
         <div className="mx-auto flex max-w-[1180px] items-center justify-between gap-4 px-5 py-2 text-[11px] sm:px-8">
           <span className="flex items-center gap-2 font-semibold text-ivory/80">
             <LockKeyhole className="size-3.5 text-copper" aria-hidden="true" />
-            Private Valmont workspace — Valmont Agent requires GitHub sign-in.
+            Private Valmont workspace — Valmont Agent and Valmont Chat require
+            GitHub sign-in.
           </span>
           <Link
             href="/agent"
@@ -272,9 +289,9 @@ export default function PortfolioPage() {
             </h1>
             <p className="mt-6 max-w-[580px] text-[17px] leading-7 text-slate sm:text-lg">
               An internal map of every Valmont product — Valmont Pay, Valmont
-              Bank, Valmont Data, Valmont Web, Valmont Agent, and the rest —
-              built to stay inside this workspace. There is no public contact
-              form and no open inbox.
+              Bank, Valmont Data, Valmont Web, Valmont Agent, Valmont Chat, and
+              the rest — built to stay inside this workspace. There is no public
+              contact form and no open inbox.
             </p>
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
               <a
@@ -327,7 +344,7 @@ export default function PortfolioPage() {
                 </span>
               </div>
 
-              <div className="mt-7 grid grid-cols-3 gap-2.5">
+              <div className="mt-7 grid grid-cols-5 gap-2.5">
                 {ventures.map((v) => {
                   const VIcon = v.icon;
                   return (
@@ -419,12 +436,13 @@ export default function PortfolioPage() {
               Valmont products
             </p>
             <h2 className="text-balance mt-3 max-w-[640px] text-[34px] leading-[1.08] font-[750] tracking-[-0.03em] text-navy sm:text-[44px]">
-              Nine Valmont products. One private family.
+              Ten Valmont products. One private family.
             </h2>
           </div>
           <p className="max-w-[360px] text-[14px] leading-6 text-slate">
-            Each name is written in full. Only Valmont Agent is live in this
-            workspace; the others are listed so the portfolio stays complete.
+            Each name is written in full. Valmont Agent and Valmont Chat are
+            live in this workspace; the others are listed so the portfolio
+            stays complete.
           </p>
         </div>
 
@@ -542,12 +560,12 @@ export default function PortfolioPage() {
               This page is not a public brochure. It is the internal Valmont
               portfolio: Valmont Pay, Valmont Data, Valmont Electrical, Valmont
               Gadgets, Valmont Web, Valmont Ecosystem, Valmont Bank, Valmont
-              Agent, and Valmont Ads.
+              Agent, Valmont Chat, and Valmont Ads.
             </p>
             <p>
-              Only Valmont Agent is connected here. Opening it requires a GitHub
-              account. There is no public email, no partnership form, and no
-              “get in touch” path — on purpose.
+              Valmont Agent and Valmont Chat are connected here. Opening either
+              requires a GitHub account. There is no public email, no
+              partnership form, and no “get in touch” path — on purpose.
             </p>
             <div className="grid grid-cols-3 gap-4 pt-4">
               {[
@@ -616,6 +634,9 @@ export default function PortfolioPage() {
             </a>
             <Link href="/agent" className="hover:text-copper-700">
               Valmont Agent
+            </Link>
+            <Link href="/chat" className="hover:text-copper-700">
+              Valmont Chat
             </Link>
           </div>
         </div>
