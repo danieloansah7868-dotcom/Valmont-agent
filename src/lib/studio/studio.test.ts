@@ -5,11 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { siteBriefSchemaV1 } from "./site-brief/schema";
-import {
-  getStudioDraftStore,
-  _resetStudioSqliteForTests,
-  
-} from "./draft-store";
+import { getStudioDraftStore, _resetStudioSqliteForTests } from "./draft-store";
 import { canonicalUserId } from "@/lib/user-identity";
 import type { SessionUser } from "@/lib/auth";
 import { deriveSqliteChatStorePath } from "@/lib/chat-store";
