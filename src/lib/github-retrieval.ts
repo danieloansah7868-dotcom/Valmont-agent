@@ -1,3 +1,4 @@
+import { isAuditQuestion } from "@/lib/agent-method";
 import type { GitHubProvider } from "@/lib/github/types";
 import { isSensitivePath } from "@/lib/retrieval";
 import { redactSecrets } from "@/lib/security";
@@ -51,16 +52,35 @@ const PINNED_CHAT_PATHS = [
   "ads/src/lib/store.ts",
   "ads/src/lib/types.ts",
   "ads/src/lib/taxonomy.ts",
+  "ads/src/lib/session.ts",
+  "ads/src/app/api/ads/route.ts",
+  "ads/src/app/api/ads/[id]/route.ts",
+  "ads/src/app/api/auth/route.ts",
+  "ads/src/app/api/my-ads/route.ts",
+  "ads/src/app/api/my-ads/[id]/route.ts",
+  "ads/src/components/PostForm.tsx",
+  "ads/src/components/MyAdsClient.tsx",
+  "ads/scripts/test.mjs",
   "docs/README.md",
   "package.json",
   "src/app/page.tsx",
 ];
+
+const AUDIT_PATH = /(^|\/)(store|session|auth|types|taxonomy)\.[cm]?[jt]sx?$/i;
 
 const AGENT_BRIEFING_PATH =
   /(^|\/)(context-for-agent|prompt-for-agent|agents)\.md$/i;
 
 export function isAgentBriefingPath(filePath: string): boolean {
   return AGENT_BRIEFING_PATH.test(filePath);
+}
+
+export function isAuditSourcePath(filePath: string): boolean {
+  return (
+    AUDIT_PATH.test(filePath) ||
+    /\/api\/.+\.(?:[cm]?[jt]sx?|mjs)$/i.test(filePath) ||
+    /(^|\/)(scripts\/)?test\.(mjs|[cm]?[jt]sx?)$/i.test(filePath)
+  );
 }
 
 /**
@@ -134,21 +154,33 @@ export async function retrieveChatRepositoryContext(
   const paths = await withTimeout(listPromise, remaining(), []);
   const byPath = new Map(pinned.map((file) => [file.path, file]));
 
-  const unreadBriefings = paths.filter(
-    (filePath) => isAgentBriefingPath(filePath) && !byPath.has(filePath),
+  const unreadMustReads = paths.filter(
+    (filePath) =>
+      !byPath.has(filePath) &&
+      (isAgentBriefingPath(filePath) ||
+        (isAuditQuestion(question) && isAuditSourcePath(filePath))),
   );
-  if (unreadBriefings.length > 0 && remaining() > 800) {
-    const briefings = await withTimeout(
-      readNamedFiles(github, owner, repository, ref, unreadBriefings, 60),
+  if (unreadMustReads.length > 0 && remaining() > 800) {
+    const mustReads = await withTimeout(
+      readNamedFiles(github, owner, repository, ref, unreadMustReads, 55),
       remaining(),
       [],
     );
-    for (const file of briefings) byPath.set(file.path, file);
+    for (const file of mustReads) byPath.set(file.path, file);
   }
 
+  const extraLimit = isAuditQuestion(question) ? 10 : 6;
   if (paths.length > 0 && remaining() > 1_500) {
     const extra = await withTimeout(
-      readRankedFiles(github, owner, repository, ref, paths, question, 6),
+      readRankedFiles(
+        github,
+        owner,
+        repository,
+        ref,
+        paths,
+        question,
+        extraLimit,
+      ),
       remaining(),
       [],
     );
@@ -158,9 +190,12 @@ export async function retrieveChatRepositoryContext(
     }
   }
 
+  const fileLimit = isAuditQuestion(question) ? 16 : 10;
   return {
     paths,
-    files: [...byPath.values()].sort((a, b) => b.score - a.score).slice(0, 10),
+    files: [...byPath.values()]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, fileLimit),
   };
 }
 
@@ -190,7 +225,7 @@ async function readNamedFiles(
 ): Promise<GitHubContextFile[]> {
   const fetched = await Promise.all(
     filePaths
-      .slice(0, 8)
+      .slice(0, 16)
       .map(async (filePath): Promise<GitHubContextFile | null> => {
         if (isSensitivePath(filePath)) return null;
         try {
@@ -296,15 +331,23 @@ export async function retrieveGitHubContext(
   const allPaths = (await github.listFiles(owner, repository, ref)).filter(
     (filePath) => !isSensitivePath(filePath) && SOURCE_EXTENSION.test(filePath),
   );
-  const files = await readRankedFiles(
-    github,
-    owner,
-    repository,
-    ref,
-    allPaths,
-    taskText,
-    limit,
+  const mustRead = allPaths.filter(
+    (filePath) =>
+      isAgentBriefingPath(filePath) ||
+      (isAuditQuestion(taskText) && isAuditSourcePath(filePath)),
   );
+  const [priority, ranked] = await Promise.all([
+    readNamedFiles(github, owner, repository, ref, mustRead, 55),
+    readRankedFiles(github, owner, repository, ref, allPaths, taskText, limit),
+  ]);
+  const byPath = new Map(priority.map((file) => [file.path, file]));
+  for (const file of ranked) {
+    const existing = byPath.get(file.path);
+    if (!existing || file.score > existing.score) byPath.set(file.path, file);
+  }
+  const files = [...byPath.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(limit, isAuditQuestion(taskText) ? 16 : limit));
   return { totalFiles: allPaths.length, paths: allPaths, files };
 }
 
@@ -319,11 +362,17 @@ export function selectWorkspaceContextPaths(
   const briefings = allPaths.filter(
     (item) => allowed.has(item) && isAgentBriefingPath(item),
   );
+  const audit = isAuditQuestion(taskText)
+    ? allPaths.filter((item) => allowed.has(item) && isAuditSourcePath(item))
+    : [];
   const terms = taskTerms(taskText);
   const ranked = allPaths
     .filter((item) => allowed.has(item) && SOURCE_EXTENSION.test(item))
     .sort((a, b) => pathScore(b, terms) - pathScore(a, terms));
-  return [...new Set([...briefings, ...requested, ...ranked])].slice(0, limit);
+  return [...new Set([...briefings, ...audit, ...requested, ...ranked])].slice(
+    0,
+    limit,
+  );
 }
 
 function taskTerms(value: string): string[] {
@@ -345,6 +394,7 @@ function pathScore(filePath: string, terms: string[]): number {
     0,
   );
   if (isAgentBriefingPath(filePath)) score += 50;
+  if (isAuditSourcePath(filePath)) score += 16;
   if (/(^|\/)readme\.md$/i.test(filePath)) score += 24;
   if (
     /(^|\/)(package\.json|pyproject\.toml|go\.mod|cargo\.toml)$/i.test(filePath)

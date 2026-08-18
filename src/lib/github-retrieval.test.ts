@@ -134,4 +134,26 @@ describe("chat repository reading", () => {
       "packages/ads/CONTEXT-FOR-AGENT.md",
     );
   });
+
+  it("opens store and API files when asked to audit what is missing", async () => {
+    const github = githubWith({
+      "ads/CONTEXT-FOR-AGENT.md": "Seller login by SMS code | Done",
+      "ads/src/lib/session.ts":
+        "export function sendCode() { console.log(code) }",
+      "ads/src/app/api/my-ads/route.ts":
+        "export async function GET() { return Response.json({}) }",
+      "ads/src/app/page.tsx": "export default function Home() { return null }",
+    });
+    const snapshot = await retrieveChatRepositoryContext(
+      github as never,
+      "acme",
+      "data",
+      "main",
+      "what is missing?",
+    );
+    const paths = snapshot.files.map((file) => file.path);
+    expect(paths).toContain("ads/CONTEXT-FOR-AGENT.md");
+    expect(paths).toContain("ads/src/lib/session.ts");
+    expect(paths).toContain("ads/src/app/api/my-ads/route.ts");
+  });
 });

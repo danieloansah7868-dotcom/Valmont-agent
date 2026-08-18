@@ -22,8 +22,22 @@ export const AGENT_WORKING_METHOD = `HOW TO WORK — same method as a competent 
 
 7. Continue in place. Edit the existing file. Match the house style already in the tree. Do not start a new Next app, new store, or new API surface because one already exists.
 
-8. If the listing is empty, say you could not fetch the branch and stop. Do not invent the product, the business model, or the backlog.`;
+8. If the listing is empty, say you could not fetch the branch and stop. Do not invent the product, the business model, or the backlog.
+
+9. Deep audit. Do not trust a README or briefing alone. Cross-check every claim against source you actually opened:
+   - Claimed Done → name the route, function, or page that implements it. If you cannot find it, say "claimed, not verified".
+   - Claimed missing → confirm the code really lacks it (no handler, no function, stub, log-only).
+   - Contradictions are the real findings (briefing says SMS login is Done, session.ts only prints the code to the log).
+   Report in three buckets only: Verified in code · Claimed but not verified · Actually missing.
+   Never invent a fourth product. Never treat marketing copy as implementation.`;
 
 export const PLANNER_WORKING_METHOD = `${AGENT_WORKING_METHOD}
 
-Plan only against files you saw. Prefer editing an existing path over creating a new one. If CONTEXT-FOR-AGENT.md lists a feature as Done, do not put it in the plan.`;
+Plan only against files you saw. Prefer editing an existing path over creating a new one. If CONTEXT-FOR-AGENT.md lists a feature as Done, do not put it in the plan unless the source contradicts the briefing.`;
+
+const AUDIT_QUESTION =
+  /\b(audit|missing|backlog|review|verify|verified|what's built|what is built|what is left|what's left|what's done|what is done|gap|gaps|inspect|status|wrong|broken)\b/i;
+
+export function isAuditQuestion(value: string): boolean {
+  return AUDIT_QUESTION.test(value);
+}

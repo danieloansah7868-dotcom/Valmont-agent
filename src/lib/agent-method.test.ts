@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AGENT_WORKING_METHOD } from "@/lib/agent-method";
+import { AGENT_WORKING_METHOD, isAuditQuestion } from "@/lib/agent-method";
 import { buildChatCompletionMessages } from "@/lib/chat";
 import type { ChatSession } from "@/lib/types";
 
@@ -23,6 +23,9 @@ describe("agent working method", () => {
     expect(AGENT_WORKING_METHOD).toContain("One job");
     expect(AGENT_WORKING_METHOD).toContain("classifieds");
     expect(AGENT_WORKING_METHOD).toContain("escrow");
+    expect(AGENT_WORKING_METHOD).toContain("Deep audit");
+    expect(AGENT_WORKING_METHOD).toContain("Verified in code");
+    expect(AGENT_WORKING_METHOD).toContain("claimed, not verified");
   });
 
   it("is injected into every chat completion", () => {
@@ -33,5 +36,12 @@ describe("agent working method", () => {
     expect(messages[0]?.content).toContain("Fetch first");
     expect(messages[0]?.content).toContain("Already-built stays built");
     expect(messages[0]?.content).toContain("One job");
+    expect(messages[0]?.content).toContain("Deep audit");
+  });
+
+  it("treats missing/backlog/review questions as audits", () => {
+    expect(isAuditQuestion("what is missing?")).toBe(true);
+    expect(isAuditQuestion("deep audit the ads app")).toBe(true);
+    expect(isAuditQuestion("what is Valmont Ads?")).toBe(false);
   });
 });

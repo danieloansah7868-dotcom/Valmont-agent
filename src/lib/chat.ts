@@ -208,7 +208,7 @@ function formatRepositoryContext(context: ChatRepositoryFiles): string {
   const listing = formatBranchListing(context.paths ?? []);
   const files = orderContextFiles(context.files);
   const briefingNote =
-    " If a CONTEXT-FOR-AGENT, PROMPT-FOR-AGENT, or AGENTS.md file is present, that is the product definition — do not invent a different product from the repository name.";
+    " If a CONTEXT-FOR-AGENT, PROMPT-FOR-AGENT, or AGENTS.md file is present, that is the product definition — do not invent a different product from the repository name. Deep-audit every claim against source: Verified in code · Claimed but not verified · Actually missing.";
   if (files.length === 0 && !listing) {
     return `A repository is attached (${heading}) but the branch could not be fetched. Do not invent the product, business model, or missing features. Say you could not read the tree and ask for a specific path.`;
   }
