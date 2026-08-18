@@ -657,6 +657,21 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 onChange={(value) => update({ adminEmail: value })}
                 hint="Where Valmont will contact you about this website."
               />
+              {/*
+                The public contact address. It is deliberately separate from the
+                admin email: that one is how Valmont reaches the owner and must
+                never be published, so the preview and the eventual site read
+                this field instead. Without an input for it the preview could
+                only ever say "Not provided yet".
+              */}
+              <TextField
+                id="email"
+                label="Email shown to customers"
+                type="email"
+                value={brief.email ?? ""}
+                onChange={(value) => update({ email: value || undefined })}
+                hint="Optional, and shown on the website. Your admin email stays private."
+              />
               <TextField
                 id="phone"
                 label="Phone number"
@@ -906,9 +921,15 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 <ChevronRight className="size-4" aria-hidden="true" />
               </button>
             ) : (
-              <span className="text-sm text-slate">
-                Last step — your answers save automatically.
-              </span>
+              <button
+                type="button"
+                data-testid="step-finish"
+                onClick={() => router.push("/studio")}
+                className="btn-primary"
+              >
+                Done — back to my drafts
+                <ChevronRight className="size-4" aria-hidden="true" />
+              </button>
             )}
           </nav>
         </div>
