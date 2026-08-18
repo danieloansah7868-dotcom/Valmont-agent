@@ -31,13 +31,20 @@ const STOP_WORDS = new Set([
 
 const PINNED_CHAT_PATHS = [
   "README.md",
+  "GET-STARTED.md",
   "ads/README.md",
-  "docs/README.md",
-  "package.json",
   "ads/package.json",
   "ads/src/app/page.tsx",
-  "src/app/page.tsx",
   "ads/src/app/layout.tsx",
+  "ads/src/app/post/page.tsx",
+  "ads/src/app/my-ads/page.tsx",
+  "ads/src/app/ads/page.tsx",
+  "ads/src/lib/store.ts",
+  "ads/src/lib/types.ts",
+  "ads/src/lib/taxonomy.ts",
+  "docs/README.md",
+  "package.json",
+  "src/app/page.tsx",
 ];
 
 /**
@@ -72,6 +79,45 @@ export async function retrievePinnedRepositoryFiles(
     .filter((file): file is GitHubContextFile => file !== null)
     .sort((a, b) => b.score - a.score);
 }
+
+/** Chat-sized read: pinned product files first, then a few scored extras. */
+export async function retrieveChatRepositoryContext(
+  github: GitHubProvider,
+  owner: string,
+  repository: string,
+  ref: string,
+  question: string,
+): Promise<GitHubContextFile[]> {
+  const pinned = await retrievePinnedRepositoryFiles(
+    github,
+    owner,
+    repository,
+    ref,
+  );
+  const byPath = new Map(pinned.map((file) => [file.path, file]));
+
+  try {
+    const extra = await retrieveGitHubContext(
+      github,
+      owner,
+      repository,
+      ref,
+      question,
+      6,
+    );
+    for (const file of extra.files) {
+      const existing = byPath.get(file.path);
+      if (!existing || file.score > existing.score) byPath.set(file.path, file);
+    }
+  } catch {
+    // A huge tree must not wipe the pinned files we already read.
+  }
+
+  return [...byPath.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+}
+
 export async function retrieveGitHubContext(
   github: GitHubProvider,
   owner: string,

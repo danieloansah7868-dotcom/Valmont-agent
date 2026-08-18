@@ -4,7 +4,7 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { chatTitleFromMessage, generateChatReply } from "@/lib/chat";
 import { getChatStore } from "@/lib/chat-store";
-import { retrievePinnedRepositoryFiles } from "@/lib/github-retrieval";
+import { retrieveChatRepositoryContext } from "@/lib/github-retrieval";
 import { createModelProvider } from "@/lib/models";
 import { assertCsrf } from "@/lib/security";
 
@@ -31,16 +31,17 @@ export async function POST(
       try {
         const github = await getGitHubProvider();
         const files = await Promise.race([
-          retrievePinnedRepositoryFiles(
+          retrieveChatRepositoryContext(
             github,
             session.repository.owner,
             session.repository.name,
             session.repository.baseBranch,
+            input.content,
           ),
           new Promise<never>((_, reject) => {
             setTimeout(
               () => reject(new Error("Repository context timed out")),
-              8_000,
+              15_000,
             );
           }),
         ]);
