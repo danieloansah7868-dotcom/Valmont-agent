@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import type { LinkProps } from "next/link";
 import {
   CircleHelp,
@@ -17,16 +17,63 @@ import { SignOutButton } from "@/components/sign-out-button";
 import type { SessionUser } from "@/lib/auth";
 
 const SIDEBAR_WIDTH = 248;
-const COLLAPSED_WIDTH = 72;
 const COLLAPSE_STORAGE_KEY = "valmont:sidebar-collapsed";
 
-function readInitialCollapsed(): boolean {
-  if (typeof window === "undefined") return false;
+/*
+ * The collapse preference lives in localStorage, which the server cannot see.
+ * Seeding it straight into `useState` made the first client render disagree
+ * with the server-rendered HTML — the toggle's label read "Hide menu" from the
+ * server and "Show menu" in the browser, tripping a hydration error.
+ *
+ * `useSyncExternalStore` is the supported way to read browser-only state: it
+ * hydrates with the server snapshot, then re-renders with the real value once
+ * hydration finishes. The subscription also keeps other tabs in step.
+ */
+const collapseListeners = new Set<() => void>();
+let collapseCache: boolean | null = null;
+
+function readStoredCollapsed(): boolean {
   try {
     return window.localStorage.getItem(COLLAPSE_STORAGE_KEY) === "1";
   } catch {
+    // Private mode or a blocked storage partition: fall back to expanded.
     return false;
   }
+}
+
+function subscribeCollapsed(onChange: () => void): () => void {
+  collapseListeners.add(onChange);
+  const onStorage = (event: StorageEvent) => {
+    if (event.key !== null && event.key !== COLLAPSE_STORAGE_KEY) return;
+    collapseCache = readStoredCollapsed();
+    onChange();
+  };
+  window.addEventListener("storage", onStorage);
+  return () => {
+    collapseListeners.delete(onChange);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
+/** Cached so repeated reads return a stable value, as the hook requires. */
+function getCollapsedSnapshot(): boolean {
+  if (collapseCache === null) collapseCache = readStoredCollapsed();
+  return collapseCache;
+}
+
+/** The server has no preference to read, so it always renders expanded. */
+function getCollapsedServerSnapshot(): boolean {
+  return false;
+}
+
+function setCollapsedPreference(next: boolean): void {
+  collapseCache = next;
+  try {
+    window.localStorage.setItem(COLLAPSE_STORAGE_KEY, next ? "1" : "0");
+  } catch {
+    // Ignore storage failures; the in-memory value still drives this session.
+  }
+  for (const listener of collapseListeners) listener();
 }
 
 /**
@@ -61,18 +108,11 @@ export function AppShell({
   user: SessionUser;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
-  // Read the saved preference during the initial state computation (runs once
-  // on the client; on the server window is undefined so we default to false).
-  const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
-
-  // Persist the user's collapse preference.
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(COLLAPSE_STORAGE_KEY, collapsed ? "1" : "0");
-    } catch {
-      // Ignore storage failures (private mode, quota, etc.).
-    }
-  }, [collapsed]);
+  const collapsed = useSyncExternalStore(
+    subscribeCollapsed,
+    getCollapsedSnapshot,
+    getCollapsedServerSnapshot,
+  );
 
   // Animating on the very first client paint can cause a visible width
   // transition from the SSR width. We gate the transition class until after
@@ -98,9 +138,12 @@ export function AppShell({
     .slice(0, 2)
     .toUpperCase();
 
-  const desktopWidth = collapsed ? COLLAPSED_WIDTH : SIDEBAR_WIDTH;
+  // Collapsing slides the whole rail off-screen rather than shrinking it to an
+  // icon strip: the point of the toggle is to hand the full window width back
+  // to the page, and the header keeps an obvious control to bring it back.
+  const desktopWidth = collapsed ? 0 : SIDEBAR_WIDTH;
   const transitionClass = animate
-    ? "transition-[left,padding,width] duration-300 ease-in-out"
+    ? "transition-[left,padding,transform] duration-300 ease-in-out"
     : "";
 
   // Close on Escape for keyboard users.
@@ -140,28 +183,34 @@ export function AppShell({
           <button
             type="button"
             onClick={() => setMobileOpen(true)}
-            className="btn-quiet size-9 min-h-9 px-0 md:hidden"
+            className="btn-icon h-9 w-9 md:hidden"
             aria-label="Open navigation menu"
             aria-expanded={mobileOpen}
             aria-controls="mobile-sidebar"
           >
             <Menu className="size-5" aria-hidden="true" />
           </button>
-          {/* Collapse toggle: desktop only. */}
+          {/* Collapse toggle: desktop only. Labelled, not a bare ghost icon. */}
           <button
             type="button"
-            onClick={() => setCollapsed((value) => !value)}
-            className="btn-quiet hidden size-9 min-h-9 px-0 md:inline-flex"
-            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            data-testid="sidebar-toggle"
+            onClick={() => setCollapsedPreference(!collapsed)}
+            className="btn-icon hidden h-9 px-2.5 md:inline-flex"
+            aria-label={collapsed ? "Show the menu" : "Hide the menu"}
+            aria-expanded={!collapsed}
+            title={collapsed ? "Show the menu" : "Hide the menu"}
           >
             {collapsed ? (
-              <PanelLeftOpen className="size-5" aria-hidden="true" />
+              <PanelLeftOpen className="size-[18px]" aria-hidden="true" />
             ) : (
-              <PanelLeftClose className="size-5" aria-hidden="true" />
+              <PanelLeftClose className="size-[18px]" aria-hidden="true" />
             )}
+            <span className="hidden lg:inline">
+              {collapsed ? "Show menu" : "Hide menu"}
+            </span>
           </button>
-          <div className="md:hidden">
+          {/* When the rail is hidden the product name would vanish with it. */}
+          <div className={collapsed ? "" : "md:hidden"}>
             <Logo />
           </div>
         </div>
@@ -169,21 +218,23 @@ export function AppShell({
         <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
           <Link
             href="/"
-            className="btn-quiet hidden items-center gap-1.5 px-3 text-[13px] font-semibold sm:inline-flex"
+            className="btn-icon hidden h-9 items-center gap-1.5 px-3 sm:inline-flex"
           >
             <span className="text-copper">◆</span> Portfolio
           </Link>
           <Link
             href="/docs/security"
-            className="btn-quiet size-9 min-h-9 px-0"
+            className="btn-icon h-9 w-9"
             aria-label="Security model and setup help"
+            title="Security model and setup help"
           >
-            <CircleHelp className="size-[17px]" aria-hidden="true" />
+            <CircleHelp className="size-[18px]" aria-hidden="true" />
           </Link>
           <div className="mx-1 h-6 w-px bg-line" aria-hidden="true" />
           <Link
             href="/settings"
-            className="flex items-center gap-2 rounded-lg p-1.5 transition-colors hover:bg-ivory-100"
+            className="flex items-center gap-2 rounded-lg border border-transparent p-1.5 transition-colors hover:border-line-strong hover:bg-ivory-100"
+            title="Settings"
           >
             <span className="flex size-7 items-center justify-center rounded-full bg-brandblue text-[10px] font-bold text-ivory">
               {initials || "VA"}
@@ -201,11 +252,18 @@ export function AppShell({
         </div>
       </header>
 
-      {/* Desktop sidebar (collapsible) */}
+      {/*
+        Desktop rail. It keeps its full width at all times and slides out of
+        view on collapse, so the nav labels never squash mid-animation; the
+        header and main padding animate the reclaimed space in step with it.
+        `inert` stops a hidden rail from catching Tab focus or screen readers.
+      */}
       <aside
-        className={`fixed inset-y-0 left-0 z-40 hidden flex-col overflow-hidden border-r border-navy-700 bg-navy md:flex ${transitionClass}`}
-        style={{ width: desktopWidth }}
+        className={`fixed inset-y-0 left-0 z-40 hidden w-[248px] flex-col overflow-hidden border-r border-navy-700 bg-navy md:flex ${transitionClass}`}
+        style={{ transform: collapsed ? "translateX(-100%)" : "none" }}
         aria-label="Main navigation"
+        aria-hidden={collapsed}
+        inert={collapsed}
       >
         <div className="flex h-16 shrink-0 items-center border-b border-navy-700">
           <CloseOnNavLink
@@ -215,42 +273,38 @@ export function AppShell({
             aria-label="Valmont Agent dashboard"
           >
             <LogoMarkOnly />
-            {!collapsed && (
-              <span className="leading-none">
-                <span className="block text-[15px] font-bold tracking-[-0.01em] text-ivory">
-                  Valmont
-                  <span className="text-copper"> Agent</span>
-                </span>
-                <span className="mt-1 block text-[9px] font-semibold tracking-[0.14em] text-ivory/60 uppercase">
-                  Approval-first
-                </span>
+            <span className="leading-none">
+              <span className="block text-[15px] font-bold tracking-[-0.01em] text-ivory">
+                Valmont
+                <span className="text-copper"> Agent</span>
               </span>
-            )}
+              <span className="mt-1 block text-[9px] font-semibold tracking-[0.14em] text-ivory/60 uppercase">
+                Approval-first
+              </span>
+            </span>
           </CloseOnNavLink>
         </div>
-        <AppNav collapsed={collapsed} onNavigate={() => setMobileOpen(false)} />
-        {!collapsed && (
-          <div className="m-3 shrink-0 rounded-xl border border-ivory/15 bg-ivory/5 p-3.5">
-            <div className="flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-[11px] font-bold text-ivory">
-                <ShieldCheck
-                  className="size-3.5 text-copper"
-                  aria-hidden="true"
-                />
-                Safety boundaries
-              </span>
-              <span
-                className="size-2 rounded-full bg-pass"
+        <AppNav onNavigate={() => setMobileOpen(false)} />
+        <div className="m-3 shrink-0 rounded-xl border border-ivory/15 bg-ivory/5 p-3.5">
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5 text-[11px] font-bold text-ivory">
+              <ShieldCheck
+                className="size-3.5 text-copper"
                 aria-hidden="true"
-                title="Active"
               />
-            </div>
-            <p className="mt-1.5 text-[10px] leading-4 text-ivory/60">
-              PR creation always requires final approval. Merge and deploy are
-              disabled.
-            </p>
+              Safety boundaries
+            </span>
+            <span
+              className="size-2 rounded-full bg-pass"
+              aria-hidden="true"
+              title="Active"
+            />
           </div>
-        )}
+          <p className="mt-1.5 text-[10px] leading-4 text-ivory/60">
+            PR creation always requires final approval. Merge and deploy are
+            disabled.
+          </p>
+        </div>
       </aside>
 
       {/* Mobile slide-over drawer */}

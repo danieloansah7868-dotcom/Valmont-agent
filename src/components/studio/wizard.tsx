@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { ApiError, apiDelete, apiPatch } from "@/lib/client-api";
 import { BusinessPreview } from "./business-preview";
 import {
@@ -449,6 +450,9 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       )}
 
       <nav aria-label="Wizard steps" className="mt-5">
+        <p className="mb-2 text-xs font-semibold text-slate">
+          Step {step} of {STEPS.length} — {STEPS[step - 1]?.title}
+        </p>
         <ol className="flex flex-wrap gap-2">
           {STEPS.map((item) => (
             <li key={item.number}>
@@ -652,6 +656,21 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 value={brief.adminEmail}
                 onChange={(value) => update({ adminEmail: value })}
                 hint="Where Valmont will contact you about this website."
+              />
+              {/*
+                The public contact address. It is deliberately separate from the
+                admin email: that one is how Valmont reaches the owner and must
+                never be published, so the preview and the eventual site read
+                this field instead. Without an input for it the preview could
+                only ever say "Not provided yet".
+              */}
+              <TextField
+                id="email"
+                label="Email shown to customers"
+                type="email"
+                value={brief.email ?? ""}
+                onChange={(value) => update({ email: value || undefined })}
+                hint="Optional, and shown on the website. Your admin email stays private."
               />
               <TextField
                 id="phone"
@@ -868,6 +887,51 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               </ul>
             </div>
           )}
+
+          {/*
+            Sequential controls. The numbered buttons above allow jumping to any
+            step, but nothing signalled how to move on, so the wizard read as a
+            dead end after each screen. Autosave already persists every change,
+            so moving between steps needs no explicit save.
+          */}
+          <nav
+            aria-label="Step navigation"
+            className="mt-6 flex items-center justify-between gap-3 border-t border-line pt-4"
+          >
+            <button
+              type="button"
+              data-testid="step-back"
+              onClick={() => setStep((current) => Math.max(1, current - 1))}
+              disabled={step === 1}
+              className="btn-secondary"
+            >
+              <ChevronLeft className="size-4" aria-hidden="true" />
+              Back
+            </button>
+            {step < STEPS.length ? (
+              <button
+                type="button"
+                data-testid="step-next"
+                onClick={() =>
+                  setStep((current) => Math.min(STEPS.length, current + 1))
+                }
+                className="btn-primary"
+              >
+                Next: {STEPS[step]?.title}
+                <ChevronRight className="size-4" aria-hidden="true" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                data-testid="step-finish"
+                onClick={() => router.push("/studio")}
+                className="btn-primary"
+              >
+                Done — back to my drafts
+                <ChevronRight className="size-4" aria-hidden="true" />
+              </button>
+            )}
+          </nav>
         </div>
 
         <aside className="min-w-0">
