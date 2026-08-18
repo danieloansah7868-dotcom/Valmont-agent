@@ -186,14 +186,14 @@ export function ChatWorkspace({
   }
 
   return (
-    <div className="fixed inset-x-0 top-16 bottom-16 mx-auto flex max-w-[1440px] flex-col overflow-hidden bg-ivory-50 md:bottom-0 lg:flex-row">
-      <aside className="flex shrink-0 flex-col border-b border-line bg-white lg:h-full lg:w-[280px] lg:border-r lg:border-b-0">
-        <div className="flex items-center justify-between border-b border-line px-4 py-3 lg:py-4">
+    <div className="chat-shell fixed inset-x-0 top-16 bottom-16 mx-auto flex max-w-[1440px] flex-col overflow-hidden bg-navy md:bottom-0 lg:flex-row">
+      <aside className="flex shrink-0 flex-col border-b border-ivory/10 bg-navy-900 lg:h-full lg:w-[280px] lg:border-r lg:border-b-0">
+        <div className="flex items-center justify-between border-b border-ivory/10 px-4 py-3 lg:py-4">
           <div>
-            <p className="text-[10px] font-bold tracking-[0.16em] text-copper uppercase">
+            <p className="text-[10px] font-bold tracking-[0.16em] text-copper-300 uppercase">
               Conversations
             </p>
-            <h1 className="mt-0.5 text-base font-bold tracking-tight text-navy">
+            <h1 className="mt-0.5 text-base font-bold tracking-tight text-ivory">
               Chat with Valmont
             </h1>
           </div>
@@ -211,12 +211,12 @@ export function ChatWorkspace({
           aria-label="Chat sessions"
         >
           {sessionList.length === 0 ? (
-            <div className="min-w-56 rounded-xl border border-dashed border-line px-4 py-4 text-center lg:min-w-0">
+            <div className="min-w-56 rounded-xl border border-dashed border-ivory/15 px-4 py-4 text-center lg:min-w-0">
               <MessageSquareText
-                className="mx-auto size-5 text-slate-300"
+                className="mx-auto size-5 text-ivory/40"
                 aria-hidden="true"
               />
-              <p className="mt-2 text-[11px] leading-4 text-slate">
+              <p className="mt-2 text-[11px] leading-4 text-ivory/60">
                 Your reopenable chats will appear here.
               </p>
             </div>
@@ -229,15 +229,15 @@ export function ChatWorkspace({
                   href={`/chat/${item.id}`}
                   className={`block min-w-56 rounded-xl border px-3 py-2.5 transition-colors lg:min-w-0 ${
                     active
-                      ? "border-brandblue-200 bg-brandblue-50"
-                      : "border-transparent hover:border-line hover:bg-ivory-50"
+                      ? "border-copper/40 bg-copper/15"
+                      : "border-transparent hover:border-ivory/10 hover:bg-ivory/5"
                   }`}
                   aria-current={active ? "page" : undefined}
                 >
-                  <span className="block truncate text-[12px] font-bold text-navy">
+                  <span className="block truncate text-[12px] font-bold text-ivory">
                     {item.title}
                   </span>
-                  <span className="mt-1 flex items-center gap-1 truncate text-[10px] text-slate">
+                  <span className="mt-1 flex items-center gap-1 truncate text-[10px] text-ivory/55">
                     {item.repository ? (
                       <>
                         <GitBranch
@@ -264,14 +264,14 @@ export function ChatWorkspace({
       </aside>
 
       {session ? (
-        <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-ivory-50">
-          <header className="shrink-0 border-b border-line bg-white px-4 py-3 sm:px-6">
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-navy">
+          <header className="shrink-0 border-b border-ivory/10 bg-navy-900 px-4 py-3 sm:px-6">
             <div className="mx-auto flex max-w-3xl items-center gap-3">
               <div className="min-w-0 flex-1">
-                <h2 className="truncate text-sm font-bold text-navy">
+                <h2 className="truncate text-sm font-bold text-ivory">
                   {session.title}
                 </h2>
-                <p className="mt-0.5 flex items-center gap-1 text-[10px] text-slate">
+                <p className="mt-0.5 flex items-center gap-1 text-[10px] text-ivory/55">
                   {session.repository ? (
                     <>
                       <GitBranch className="size-3" aria-hidden="true" />
@@ -298,7 +298,7 @@ export function ChatWorkspace({
                 type="button"
                 onClick={deleteSession}
                 disabled={deleting}
-                className="btn-quiet size-9 min-h-9 px-0 text-slate hover:text-fail disabled:opacity-50"
+                className="btn-inverse size-9 min-h-9 px-0 text-ivory/70 hover:text-fail disabled:opacity-50"
                 aria-label="Delete chat"
                 title="Delete chat"
               >
@@ -326,17 +326,17 @@ export function ChatWorkspace({
             </div>
           </div>
 
-          <div className="shrink-0 border-t border-line bg-white px-4 pt-3 pb-3 sm:px-6">
+          <div className="shrink-0 border-t border-ivory/10 bg-navy-900 px-4 pt-3 pb-3 sm:px-6">
             <form onSubmit={sendMessage} className="mx-auto max-w-3xl">
               {error ? (
                 <p
-                  className="mb-2 rounded-lg border border-fail/25 bg-fail-soft px-3 py-2 text-[11px] text-fail-strong"
+                  className="mb-2 rounded-lg border border-fail/40 bg-fail-strong/30 px-3 py-2 text-[11px] text-ivory"
                   role="alert"
                 >
                   {error}
                 </p>
               ) : null}
-              <div className="flex items-end gap-2 rounded-2xl border border-line bg-white p-2 shadow-sm transition focus-within:border-brandblue-200 focus-within:ring-2 focus-within:ring-brandblue-100">
+              <div className="flex items-end gap-2 rounded-2xl border border-ivory/15 bg-navy-800 p-2 shadow-sm transition focus-within:border-copper/50 focus-within:ring-2 focus-within:ring-copper/20">
                 <label htmlFor="chat-message" className="sr-only">
                   Message Valmont
                 </label>
@@ -356,13 +356,13 @@ export function ChatWorkspace({
                   disabled={sending}
                   autoFocus
                   aria-describedby="chat-composer-hint"
-                  className="block max-h-44 min-h-10 w-full flex-1 resize-none self-center bg-transparent px-2 py-2.5 text-[13px] leading-5 text-navy outline-none placeholder:text-slate-400 disabled:opacity-60"
+                  className="block max-h-44 min-h-10 w-full flex-1 resize-none self-center bg-transparent px-2 py-2.5 text-[13px] leading-5 text-ivory outline-none placeholder:text-ivory/40 disabled:opacity-60"
                   placeholder="Message Valmont…"
                 />
                 <button
                   type="submit"
                   disabled={sending || !content.trim()}
-                  className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-copper-600 text-white transition hover:bg-copper-700 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-copper text-navy transition hover:bg-copper-600 disabled:cursor-not-allowed disabled:opacity-40"
                   aria-label="Send message"
                 >
                   <ArrowUp className="size-4" aria-hidden="true" />
@@ -370,11 +370,11 @@ export function ChatWorkspace({
               </div>
               <p
                 id="chat-composer-hint"
-                className="mt-1.5 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-center text-[9px] text-slate-400"
+                className="mt-1.5 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-center text-[9px] text-ivory/45"
               >
                 <span>Enter to send · Shift+Enter for a new line</span>
                 <span
-                  className="hidden size-0.5 rounded-full bg-slate-300 sm:inline-block"
+                  className="hidden size-0.5 rounded-full bg-ivory/30 sm:inline-block"
                   aria-hidden="true"
                 />
                 <span className="inline-flex items-center gap-1">
@@ -458,7 +458,7 @@ function MessageBubble({
     >
       {!isUser ? (
         firstOfGroup ? (
-          <span className="flex size-7 shrink-0 items-center justify-center self-start rounded-full bg-navy text-ivory">
+          <span className="flex size-7 shrink-0 items-center justify-center self-start rounded-full bg-copper text-navy">
             <Bot className="size-3.5" aria-hidden="true" />
           </span>
         ) : (
@@ -468,15 +468,15 @@ function MessageBubble({
       <div
         className={`max-w-[min(88%,42rem)] rounded-2xl px-3.5 py-2.5 text-[13px] leading-6 shadow-sm ${
           isUser
-            ? `bg-brandblue text-white ${lastOfGroup ? "rounded-br-md" : ""}`
-            : `border border-line bg-white text-navy ${lastOfGroup ? "rounded-bl-md" : ""}`
+            ? `bg-copper text-navy ${lastOfGroup ? "rounded-br-md" : ""}`
+            : `border border-ivory/12 bg-navy-800 text-ivory ${lastOfGroup ? "rounded-bl-md" : ""}`
         }`}
       >
         <p className="break-words whitespace-pre-wrap">{content}</p>
         {lastOfGroup && createdAt ? (
           <time
             className={`mt-1 block text-[9px] ${
-              isUser ? "text-white/60" : "text-slate-400"
+              isUser ? "text-navy/55" : "text-ivory/40"
             }`}
             dateTime={createdAt}
             suppressHydrationWarning
@@ -492,15 +492,15 @@ function MessageBubble({
 function TypingIndicator() {
   return (
     <div className="flex gap-2.5 pt-3" role="status" aria-live="polite">
-      <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-navy text-ivory">
+      <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-copper text-navy">
         <Bot className="size-3.5" aria-hidden="true" />
       </span>
-      <div className="flex items-center gap-1 rounded-2xl rounded-bl-md border border-line bg-white px-3.5 py-3 shadow-sm">
+      <div className="flex items-center gap-1 rounded-2xl rounded-bl-md border border-ivory/12 bg-navy-800 px-3.5 py-3 shadow-sm">
         <span className="sr-only">Valmont is typing</span>
         {[0, 1, 2].map((dot) => (
           <span
             key={dot}
-            className="size-1.5 animate-bounce rounded-full bg-slate-400"
+            className="size-1.5 animate-bounce rounded-full bg-ivory/50"
             style={{ animationDelay: `${dot * 150}ms` }}
             aria-hidden="true"
           />
@@ -525,14 +525,14 @@ function ChatWelcome({
   return (
     <div className="mx-auto max-w-xl px-2 py-6 sm:py-10">
       <div className="flex items-center gap-3">
-        <span className="flex size-10 shrink-0 items-center justify-center rounded-2xl bg-navy text-ivory shadow-sm">
+        <span className="flex size-10 shrink-0 items-center justify-center rounded-2xl bg-copper text-navy shadow-sm">
           <Bot className="size-5" aria-hidden="true" />
         </span>
         <div className="min-w-0">
-          <h2 className="text-lg font-bold tracking-tight text-navy">
+          <h2 className="text-lg font-bold tracking-tight text-ivory">
             {headline}
           </h2>
-          <p className="mt-0.5 text-[12px] leading-5 text-slate">
+          <p className="mt-0.5 text-[12px] leading-5 text-ivory/65">
             {session.repository
               ? `Read-only context from ${session.repository.fullName} on ${session.repository.baseBranch}. Ask away.`
               : "Anything goes — ideas, plans, tricky decisions, or code when you want it."}
@@ -545,16 +545,16 @@ function ChatWelcome({
             <button
               type="button"
               onClick={() => onStarter(starter)}
-              className="w-full rounded-xl border border-line bg-white px-3.5 py-2.5 text-left text-[12px] leading-5 text-navy shadow-sm transition hover:border-copper-300 hover:bg-copper-50"
+              className="w-full rounded-xl border border-ivory/15 bg-navy-800 px-3.5 py-2.5 text-left text-[12px] leading-5 text-ivory shadow-sm transition hover:border-copper/50 hover:bg-navy-700"
             >
               {starter}
             </button>
           </li>
         ))}
       </ul>
-      <p className="mt-4 flex items-start gap-1.5 text-[10px] leading-4 text-slate">
+      <p className="mt-4 flex items-start gap-1.5 text-[10px] leading-4 text-ivory/50">
         <ShieldCheck
-          className="mt-0.5 size-3 shrink-0 text-slate-400"
+          className="mt-0.5 size-3 shrink-0 text-ivory/40"
           aria-hidden="true"
         />
         Chatting never changes files. When you want something built, Create
@@ -644,20 +644,20 @@ function NewChatPanel({
   }
 
   return (
-    <section className="flex min-h-0 min-w-0 flex-1 items-start justify-center overflow-y-auto bg-ivory-50 px-4 py-8 sm:items-center sm:px-7">
+    <section className="flex min-h-0 min-w-0 flex-1 items-start justify-center overflow-y-auto bg-navy px-4 py-8 sm:items-center sm:px-7">
       <div className="w-full max-w-xl">
         <div className="flex items-center gap-3">
-          <span className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-navy text-ivory shadow-sm">
+          <span className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-copper text-navy shadow-sm">
             <MessageSquareText className="size-5" aria-hidden="true" />
           </span>
           <div className="min-w-0">
-            <p className="text-[10px] font-bold tracking-[0.16em] text-copper uppercase">
+            <p className="text-[10px] font-bold tracking-[0.16em] text-copper-300 uppercase">
               New conversation
             </p>
-            <h2 className="mt-0.5 text-xl font-bold tracking-tight text-navy">
+            <h2 className="mt-0.5 text-xl font-bold tracking-tight text-ivory">
               Chat with Valmont
             </h2>
-            <p className="mt-1 text-[12px] leading-5 text-slate">
+            <p className="mt-1 text-[12px] leading-5 text-ivory/65">
               Talk about anything, or attach a repository and branch for
               read-only context.
             </p>
@@ -701,7 +701,7 @@ function NewChatPanel({
                 </option>
               ))}
             </select>
-            <span className="mt-1.5 block text-[10px] leading-4 text-slate">
+            <span className="mt-1.5 block text-[10px] leading-4 text-ivory/50">
               This association applies only to this session and cannot modify
               files.
             </span>
