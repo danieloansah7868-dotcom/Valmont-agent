@@ -8,6 +8,12 @@ export interface GitHubContextFile {
   score: number;
 }
 
+export interface RepositorySnapshot {
+  /** Paths already on the branch. Use this to avoid inventing or duplicating files. */
+  paths: string[];
+  files: GitHubContextFile[];
+}
+
 const SOURCE_EXTENSION =
   /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|rb|php|vue|svelte|css|scss|html|md|json|ya?ml|toml)$/i;
 const STOP_WORDS = new Set([
@@ -80,14 +86,23 @@ export async function retrievePinnedRepositoryFiles(
     .sort((a, b) => b.score - a.score);
 }
 
-/** Chat-sized read: pinned product files first, then a few scored extras. */
+/** List the branch, then read files — same order a person would open a checkout. */
 export async function retrieveChatRepositoryContext(
   github: GitHubProvider,
   owner: string,
   repository: string,
   ref: string,
   question: string,
-): Promise<GitHubContextFile[]> {
+): Promise<RepositorySnapshot> {
+  let paths: string[] = [];
+  try {
+    paths = (await github.listFiles(owner, repository, ref)).filter(
+      (filePath) => !isSensitivePath(filePath) && SOURCE_EXTENSION.test(filePath),
+    );
+  } catch {
+    paths = [];
+  }
+
   const pinned = await retrievePinnedRepositoryFiles(
     github,
     owner,
@@ -96,39 +111,54 @@ export async function retrieveChatRepositoryContext(
   );
   const byPath = new Map(pinned.map((file) => [file.path, file]));
 
-  try {
-    const extra = await retrieveGitHubContext(
+  if (paths.length > 0) {
+    const extra = await readRankedFiles(
       github,
       owner,
       repository,
       ref,
+      paths,
       question,
       6,
     );
-    for (const file of extra.files) {
+    for (const file of extra) {
       const existing = byPath.get(file.path);
       if (!existing || file.score > existing.score) byPath.set(file.path, file);
     }
-  } catch {
-    // A huge tree must not wipe the pinned files we already read.
   }
 
-  return [...byPath.values()]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 10);
+  return {
+    paths,
+    files: [...byPath.values()]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10),
+  };
 }
 
-export async function retrieveGitHubContext(
+export function formatBranchListing(paths: string[], limit = 280): string {
+  if (paths.length === 0) return "";
+  const preferred = paths.filter(
+    (filePath) =>
+      /^(ads|src|app|docs)\//i.test(filePath) ||
+      /(^|\/)(readme\.md|package\.json)$/i.test(filePath),
+  );
+  const rest = paths.filter((filePath) => !preferred.includes(filePath));
+  const listed = [...preferred, ...rest].slice(0, limit);
+  const extra = paths.length - listed.length;
+  return extra > 0
+    ? `${listed.join("\n")}\n… ${extra} more files on this branch`
+    : listed.join("\n");
+}
+
+async function readRankedFiles(
   github: GitHubProvider,
   owner: string,
   repository: string,
   ref: string,
+  allPaths: string[],
   taskText: string,
-  limit = 12,
-): Promise<{ totalFiles: number; files: GitHubContextFile[] }> {
-  const allPaths = (await github.listFiles(owner, repository, ref)).filter(
-    (filePath) => !isSensitivePath(filePath) && SOURCE_EXTENSION.test(filePath),
-  );
+  limit: number,
+): Promise<GitHubContextFile[]> {
   const terms = taskTerms(taskText);
   const rankedPaths = allPaths
     .map((filePath) => ({ path: filePath, score: pathScore(filePath, terms) }))
@@ -163,13 +193,34 @@ export async function retrieveGitHubContext(
     .filter((file): file is GitHubContextFile => file !== null)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
-
   let totalCharacters = 0;
-  const bounded = files.filter((file) => {
+  return files.filter((file) => {
     totalCharacters += file.content.length;
     return totalCharacters <= 80_000;
   });
-  return { totalFiles: allPaths.length, files: bounded };
+}
+
+export async function retrieveGitHubContext(
+  github: GitHubProvider,
+  owner: string,
+  repository: string,
+  ref: string,
+  taskText: string,
+  limit = 12,
+): Promise<{ totalFiles: number; paths: string[]; files: GitHubContextFile[] }> {
+  const allPaths = (await github.listFiles(owner, repository, ref)).filter(
+    (filePath) => !isSensitivePath(filePath) && SOURCE_EXTENSION.test(filePath),
+  );
+  const files = await readRankedFiles(
+    github,
+    owner,
+    repository,
+    ref,
+    allPaths,
+    taskText,
+    limit,
+  );
+  return { totalFiles: allPaths.length, paths: allPaths, files };
 }
 
 export function selectWorkspaceContextPaths(

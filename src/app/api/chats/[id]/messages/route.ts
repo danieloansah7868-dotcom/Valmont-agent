@@ -30,7 +30,7 @@ export async function POST(
     if (session.repository) {
       try {
         const github = await getGitHubProvider();
-        const files = await Promise.race([
+        const snapshot = await Promise.race([
           retrieveChatRepositoryContext(
             github,
             session.repository.owner,
@@ -47,7 +47,8 @@ export async function POST(
         ]);
         repositoryContext = {
           repository: session.repository,
-          files,
+          files: snapshot.files,
+          paths: snapshot.paths,
         };
       } catch {
         repositoryContext = {

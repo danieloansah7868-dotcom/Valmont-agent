@@ -44,14 +44,35 @@ describe("chat repository reading", () => {
         throw new Error("tree too large");
       }),
     };
-    const files = await retrieveChatRepositoryContext(
+    const snapshot = await retrieveChatRepositoryContext(
       github as never,
       "acme",
       "data",
       "main",
       "what is missing?",
     );
-    expect(files).toHaveLength(1);
-    expect(files[0]?.content).toContain("Classifieds");
+    expect(snapshot.paths).toEqual([]);
+    expect(snapshot.files).toHaveLength(1);
+    expect(snapshot.files[0]?.content).toContain("Classifieds");
+  });
+
+  it("lists the branch before reading file contents", async () => {
+    const github = githubWith({
+      "ads/README.md": "Classifieds.",
+      "ads/src/app/page.tsx": "export default function Home() { return null }",
+    });
+    const snapshot = await retrieveChatRepositoryContext(
+      github as never,
+      "acme",
+      "data",
+      "main",
+      "continue the ads work",
+    );
+    expect(github.listFiles).toHaveBeenCalledOnce();
+    expect(snapshot.paths).toEqual([
+      "ads/README.md",
+      "ads/src/app/page.tsx",
+    ]);
+    expect(snapshot.files.map((file) => file.path)).toContain("ads/README.md");
   });
 });

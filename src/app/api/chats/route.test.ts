@@ -37,9 +37,13 @@ vi.mock("@/lib/models", () => ({
   createModelProvider: mocks.createModelProvider,
 }));
 
-vi.mock("@/lib/github-retrieval", () => ({
-  retrieveChatRepositoryContext: mocks.retrieveChatRepositoryContext,
-}));
+vi.mock("@/lib/github-retrieval", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/github-retrieval")>();
+  return {
+    ...actual,
+    retrieveChatRepositoryContext: mocks.retrieveChatRepositoryContext,
+  };
+});
 
 const csrf = "1234567890abcdef";
 
@@ -194,9 +198,10 @@ describe("chat APIs", () => {
     };
     mocks.get.mockResolvedValue(session);
     mocks.getGitHubProvider.mockResolvedValue(github);
-    mocks.retrieveChatRepositoryContext.mockResolvedValue([
-      { path: "README.md", content: "Project docs", score: 10 },
-    ]);
+    mocks.retrieveChatRepositoryContext.mockResolvedValue({
+      paths: ["README.md", "ads/src/app/page.tsx"],
+      files: [{ path: "README.md", content: "Project docs", score: 10 }],
+    });
     mocks.createModelProvider.mockReturnValue({
       chat: vi.fn().mockResolvedValue({
         content: "The README describes the project.",
