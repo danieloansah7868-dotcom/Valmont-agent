@@ -26,6 +26,9 @@ describe("agent working method", () => {
     expect(AGENT_WORKING_METHOD).toContain("Deep audit");
     expect(AGENT_WORKING_METHOD).toContain("Verified in code");
     expect(AGENT_WORKING_METHOD).toContain("claimed, not verified");
+    expect(AGENT_WORKING_METHOD).toContain("Suggest from the audit");
+    expect(AGENT_WORKING_METHOD).toContain("Do not build");
+    expect(AGENT_WORKING_METHOD).toContain("Never a menu");
   });
 
   it("is injected into every chat completion", () => {
@@ -37,11 +40,13 @@ describe("agent working method", () => {
     expect(messages[0]?.content).toContain("Already-built stays built");
     expect(messages[0]?.content).toContain("One job");
     expect(messages[0]?.content).toContain("Deep audit");
+    expect(messages[0]?.content).toContain("Suggest from the audit");
   });
 
-  it("treats missing/backlog/review questions as audits", () => {
+  it("treats missing, review, and suggestion questions as audits", () => {
     expect(isAuditQuestion("what is missing?")).toBe(true);
     expect(isAuditQuestion("deep audit the ads app")).toBe(true);
+    expect(isAuditQuestion("what do you suggest we do next?")).toBe(true);
     expect(isAuditQuestion("what is Valmont Ads?")).toBe(false);
   });
 });
