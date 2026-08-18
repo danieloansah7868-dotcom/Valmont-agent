@@ -15,7 +15,24 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+
+    # A real, throwaway PostgreSQL server so the Postgres concurrency and owner
+    # isolation tests run against the actual database engine, not SQLite.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: valmont_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - uses: actions/checkout@v4
@@ -26,10 +43,46 @@ jobs:
           cache: npm
 
       - run: npm ci
+
       - run: npm run format:check
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm test
+
+      # Apply the Drizzle migrations to the throwaway database.
+      - name: Apply database migrations
+        run: npm run db:migrate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/valmont_test
+
+      # Unit and integration tests. STUDIO_TEST_DATABASE_URL switches on the
+      # real PostgreSQL suite; DATABASE_URL is deliberately NOT set globally so
+      # the SQLite suites still exercise the SQLite code paths.
+      - name: Unit and integration tests
+        run: npm test
+        env:
+          STUDIO_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/valmont_test
+
+      # Browser binaries are installed for CI only. The production image in the
+      # Dockerfile never installs them.
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Generate a session secret for the end-to-end run
+        run: echo "SESSION_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")" >> "$GITHUB_ENV"
+
+      - name: End-to-end tests
+        run: npm run test:e2e
+        env:
+          CI: "true"
+          NEXT_TELEMETRY_DISABLED: "1"
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
 
       - run: npm run build
         env:
