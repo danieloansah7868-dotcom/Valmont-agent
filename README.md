@@ -257,6 +257,11 @@ whether an ID exists.
   pre-import snapshot. A live lease is never treated as a crash. After a
   real crash the lease expires and the next import or startup claims recovery
   with a compare-and-swap. SQLite-only complete imports take the same lease.
+  PostgreSQL Studio writes are additionally fenced inside PostgreSQL itself: a
+  durable per-owner fence row (identity only, never exported) must pass a
+  conditional check as the final statement of every Studio import/restore
+  transaction, so a transaction whose lease was replaced mid-flight can never
+  commit late writes over a finished recovery.
   Any failure — or a process killed mid-import — rolls both stores back to
   their exact previous state. Success is reported only after both halves committed; a rolled-back
   import is reported as a plain failure, never a partial success. After success

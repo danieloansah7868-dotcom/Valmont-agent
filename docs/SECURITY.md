@@ -233,7 +233,19 @@ inspects the lease and returns `409` while it is still active; it never
 restores a live job. Recovery may claim a job only after the lease expires,
 and only by an atomic compare-and-swap on the lock token and generation. An
 old process holding an obsolete token cannot write, sanitize or release the
-replacement lock. After a successful import or a successful rollback the
+replacement lock. Lease generations come from a durable per-owner counter and
+never repeat, and an expired lease can never be renewed or resurrected by its
+old holder. PostgreSQL Studio writes are additionally fenced inside
+PostgreSQL itself: a durable per-owner `studio_import_fences` row (identity
+only — owner id, job id, random token, monotonic generation; never payload,
+snapshot or credentials, and never part of a backup export) must be
+conditionally touched as the final statement of every Studio import/restore
+transaction, and recovery advances it inside the same transaction that
+restores the pre-import snapshot. An obsolete PostgreSQL transaction
+therefore either fails that final fence check and rolls back, or commits
+strictly before the replacement fence exists and is then fully undone by the
+recovery restore that serialized after it — in every ordering both stores end
+exactly at the recorded pre-import state. After a successful import or a successful rollback the
 journal payload and snapshot are logically deleted; only non-sensitive
 metadata remains. That is not guaranteed physical erasure from SQLite pages or
 leftover filesystem copies. Coordinator journal rows are never included in a
@@ -291,10 +303,10 @@ you want a clean slate.
 Security claims are only worth what has actually been executed. Do not treat a
 past total as a permanent fact — use the latest CI run on the pull request.
 
-| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit + integration (`npm test`) | Run in CI against a real PostgreSQL 16 service (`STUDIO_TEST_DATABASE_URL`). The coordinated-import suite injects a failure at every checkpoint, covers lease locking, expired-lease recovery and obsolete-token fencing. Without that variable the PostgreSQL files are reported as skipped, never as passed.                                                                                          |
-| End-to-end (`npm run test:e2e`) | Playwright schedules **11 tests across 2 projects (22 scheduled tests)** — `desktop-chromium` and `iphone` — against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests, the Nigeria/NGN/Africa/Lagos reopen test, and a no-sideways-scroll assertion in both projects. The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs this suite. |
+| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit + integration (`npm test`) | Run in CI against a real PostgreSQL 16 service (`STUDIO_TEST_DATABASE_URL`), with the Drizzle migrations applied first. The coordinated-import suite injects a failure at every checkpoint and covers lease locking, expired-lease recovery, obsolete-token fencing, monotonic generations, and — with deterministic latches, no sleeps — both orderings of the PostgreSQL fence race (replacement fence first, and obsolete transaction winning the fence row lock). Without that variable the PostgreSQL files are reported as skipped, never as passed. |
+| End-to-end (`npm run test:e2e`) | Playwright schedules **11 tests across 2 projects (22 scheduled tests)** — `desktop-chromium` and `iphone` — against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests, the Nigeria/NGN/Africa/Lagos reopen test, and a no-sideways-scroll assertion in both projects. The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs this suite.                                                                                                                                                    |
 
 CI runs the unit, integration, PostgreSQL, Playwright and container-build jobs
 on every push and pull request via `.github/workflows/ci.yml`; there is no

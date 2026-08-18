@@ -265,7 +265,34 @@ payload and a snapshot of both stores, then advance through durable
 checkpoints. A running import renews the lease and checks the token before
 every write. Recovery may claim a job only when the lease has expired, via an
 atomic compare-and-swap on the token and generation; an obsolete token cannot
-write, sanitize or release the replacement lock. A process killed mid-import
+write, sanitize or release the replacement lock. Generations are issued from a
+durable per-owner counter, so they never repeat — not after release, not after
+a restart, not for a later import by the same owner.
+
+The SQLite lease alone cannot stop an in-flight PostgreSQL transaction from
+committing after the lease was replaced, so PostgreSQL Studio writes are
+additionally fenced inside PostgreSQL itself. A durable
+`studio_import_fences` row (owner id, job id, random lock token, monotonic
+generation — identity only, never payload or credentials, never exported)
+is installed for the lease before the pre-state capture. Every Studio
+import/restore transaction verifies the fence when it starts and ends with a
+conditional touch of that row — matching the exact held identity — as the
+last statement before `COMMIT`; the touch takes the fence row's lock, so the
+check and the commit are one serialized unit. Recovery advances the fence
+inside the same transaction that restores the pre-import Studio snapshot.
+Both orderings of the race are therefore safe: if recovery's fence advance
+commits first, the obsolete transaction fails its final check and PostgreSQL
+rolls back everything it wrote; if the obsolete transaction wins the fence
+row-lock race and commits first, recovery serializes strictly after it and
+overwrites the late writes with the exact snapshot. Once the replacement
+fence is installed no obsolete transaction can commit at all. The fence row
+persists after release so generations stay monotonic even if the SQLite file
+is replaced.
+
+A lease that has already expired is never resurrected: renewal and every
+ownership assertion require an unexpired lease, and only a confirmed lost
+lease stops the heartbeat — a transient database error is retried on the
+next tick. A process killed mid-import
 lets the lease expire; the next startup or import claims recovery and rolls
 both stores back. A draft GET / startup scan skips unexpired live jobs.
 Success is reported only after both halves committed; a rolled-back import is

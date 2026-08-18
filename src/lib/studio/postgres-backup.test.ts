@@ -263,6 +263,7 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
     "chat-imported",
     "chat-committed",
     "studio-imported",
+    "studio-fenced",
     "studio-committed",
     "completed",
   ] as const)(

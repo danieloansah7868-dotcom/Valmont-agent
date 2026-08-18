@@ -21,6 +21,22 @@ import type { NormalizedBackup } from "./backup";
  * process that later wakes up cannot write, commit, sanitize or release the
  * replacement lock because every mutation names the token it was issued.
  *
+ * Generations are issued from a durable per-owner counter
+ * (`backup_import_generations`), so they are genuinely monotonic across
+ * expired-lease takeover, successful completion and release, later imports
+ * for the same owner, and process restarts. In mixed mode the counter is
+ * additionally floored to the durable PostgreSQL fence generation, so even a
+ * replaced SQLite file can never reissue an old generation.
+ *
+ * Mixed-mode PostgreSQL Studio writes are transactionally fenced by the
+ * `studio_import_fences` row (see `import-fence.ts`): every import/restore
+ * transaction ends with a conditional fence touch immediately before commit,
+ * and recovery advances the fence inside the same transaction that restores
+ * the pre-import Studio state. An obsolete transaction therefore either
+ * fails its final fence check and rolls back, or commits strictly before
+ * the replacement fence exists and is then fully undone by the recovery
+ * restore that serialized after it on the fence row's lock.
+ *
  * After a successful commit or a successful rollback, the staged payload and
  * pre-import snapshot are logically deleted from the journal (replaced with
  * empty strings). Only non-sensitive metadata remains. This is not a
@@ -213,6 +229,10 @@ export function ensureCoordinatorSchema(db: DatabaseSync): void {
       heartbeat_at TEXT NOT NULL DEFAULT '',
       expires_at TEXT NOT NULL DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS backup_import_generations (
+      owner_id TEXT PRIMARY KEY,
+      generation INTEGER NOT NULL DEFAULT 0
+    );
   `);
   for (const column of [
     "chat_sessions",
@@ -374,6 +394,62 @@ function changesOf(result: { changes: number | bigint }): number {
   return Number(result.changes);
 }
 
+/**
+ * Issues the next per-owner generation from the durable counter. Never
+ * returns a value that was issued before — not after release, not after a
+ * restart — because the counter row survives both. `floor` lets callers
+ * raise the counter first (e.g. to a legacy lock row's generation, or to the
+ * durable PostgreSQL fence generation when the SQLite file was replaced).
+ *
+ * Must run inside the caller's lock transaction so the increment and the
+ * lock write are atomic.
+ */
+function nextOwnerGeneration(
+  db: DatabaseSync,
+  ownerId: string,
+  floor = 0,
+): number {
+  db.prepare(
+    `INSERT INTO backup_import_generations (owner_id, generation)
+     VALUES (?, 0)
+     ON CONFLICT(owner_id) DO NOTHING`,
+  ).run(ownerId);
+  db.prepare(
+    `UPDATE backup_import_generations
+        SET generation = MAX(generation, ?) + 1
+      WHERE owner_id = ?`,
+  ).run(floor, ownerId);
+  const row = db
+    .prepare(
+      "SELECT generation FROM backup_import_generations WHERE owner_id = ?",
+    )
+    .get(ownerId) as { generation: number | bigint };
+  return Number(row.generation);
+}
+
+/**
+ * Raises the durable generation counter to at least `floor`. Used before a
+ * mixed-mode import so a replaced SQLite file can never fall behind the
+ * durable PostgreSQL fence generation.
+ */
+export function raiseOwnerGenerationFloor(
+  ownerId: string,
+  floor: number,
+): void {
+  const db = getSqliteChatStore().connection;
+  ensureCoordinatorSchema(db);
+  db.prepare(
+    `INSERT INTO backup_import_generations (owner_id, generation)
+     VALUES (?, ?)
+     ON CONFLICT(owner_id) DO UPDATE SET generation = MAX(generation, excluded.generation)`,
+  ).run(ownerId, floor);
+}
+
+/**
+ * The lease this process holds must still be the active, unexpired one.
+ * A lease that expired — even if no replacement has claimed it yet — is
+ * rejected: an expired holder must never be resurrected.
+ */
 export function assertOwnsImportLease(lease: ImportLockLease): void {
   const lock = getOwnerImportLock(lease.ownerId);
   if (
@@ -384,8 +460,21 @@ export function assertOwnsImportLease(lease: ImportLockLease): void {
   ) {
     throw new ImportLostLeaseError();
   }
+  if (isExpired(lock)) {
+    throw new ImportLostLeaseError(
+      "This import's owner lease expired; it cannot be resurrected.",
+    );
+  }
 }
 
+/**
+ * Extends the lease — only while it is still the active, *unexpired* one.
+ * The conditional UPDATE matches owner/job/token/generation AND a live
+ * expiry, so an already-expired lease can never be resurrected by its old
+ * holder. Zero matched rows is a confirmed lost lease; a database exception
+ * propagates unchanged so callers can retry a transient failure instead of
+ * mistaking it for a conflict.
+ */
 export function renewImportLease(lease: ImportLockLease): void {
   const store = getSqliteChatStore();
   ensureCoordinatorSchema(store.connection);
@@ -394,7 +483,8 @@ export function renewImportLease(lease: ImportLockLease): void {
     .prepare(
       `UPDATE backup_import_locks
           SET heartbeat_at = ?, expires_at = ?
-        WHERE owner_id = ? AND job_id = ? AND lock_token = ? AND generation = ?`,
+        WHERE owner_id = ? AND job_id = ? AND lock_token = ? AND generation = ?
+          AND expires_at > ?`,
     )
     .run(
       nowIso(at),
@@ -403,6 +493,7 @@ export function renewImportLease(lease: ImportLockLease): void {
       lease.jobId,
       lease.lockToken,
       lease.generation,
+      nowIso(at),
     );
   if (changesOf(result) !== 1) throw new ImportLostLeaseError();
 }
@@ -442,14 +533,30 @@ export function acquireNewImportLock(
 
     const token = randomUUID();
     const at = nowMs();
+    // Generations come from the durable per-owner counter, never from the
+    // lock row itself: deleting and re-creating the lock must not reissue an
+    // old generation.
+    const generation = nextOwnerGeneration(
+      store.connection,
+      ownerId,
+      existing ? Number(existing.generation) : 0,
+    );
     const inserted = store.connection
       .prepare(
         `INSERT INTO backup_import_locks
            (owner_id, job_id, lock_token, generation, acquired_at, heartbeat_at, expires_at)
-         VALUES (?, ?, ?, 1, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(owner_id) DO NOTHING`,
       )
-      .run(ownerId, jobId, token, nowIso(at), nowIso(at), expiresIso(at));
+      .run(
+        ownerId,
+        jobId,
+        token,
+        generation,
+        nowIso(at),
+        nowIso(at),
+        expiresIso(at),
+      );
     if (changesOf(inserted) !== 1) {
       throw new ImportInProgressError();
     }
@@ -457,7 +564,7 @@ export function acquireNewImportLock(
       ownerId,
       jobId,
       lockToken: token,
-      generation: 1,
+      generation,
     };
   });
 }
@@ -477,20 +584,33 @@ export function tryClaimExpiredOwnerLock(
     const at = nowMs();
     if (!existing) {
       const token = randomUUID();
+      const generation = nextOwnerGeneration(store.connection, ownerId);
       const inserted = store.connection
         .prepare(
           `INSERT INTO backup_import_locks
              (owner_id, job_id, lock_token, generation, acquired_at, heartbeat_at, expires_at)
-           VALUES (?, ?, ?, 1, ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(owner_id) DO NOTHING`,
         )
-        .run(ownerId, jobId, token, nowIso(at), nowIso(at), expiresIso(at));
+        .run(
+          ownerId,
+          jobId,
+          token,
+          generation,
+          nowIso(at),
+          nowIso(at),
+          expiresIso(at),
+        );
       if (changesOf(inserted) !== 1) return null;
-      return { ownerId, jobId, lockToken: token, generation: 1 };
+      return { ownerId, jobId, lockToken: token, generation };
     }
     if (!isExpired(existing, at)) return null;
     const token = randomUUID();
-    const newGeneration = Number(existing.generation) + 1;
+    const newGeneration = nextOwnerGeneration(
+      store.connection,
+      ownerId,
+      Number(existing.generation),
+    );
     const updated = store.connection
       .prepare(
         `UPDATE backup_import_locks
@@ -550,16 +670,68 @@ function heartbeatKey(lease: ImportLockLease): string {
   return `${lease.ownerId}:${lease.jobId}:${lease.lockToken}:${lease.generation}`;
 }
 
+/**
+ * Test-only injection point for the heartbeat's renewal call. Production
+ * never sets it; when null the real {@link renewImportLease} runs.
+ */
+let heartbeatRenewOverrideForTests: ((lease: ImportLockLease) => void) | null =
+  null;
+
+/** Test helper: replace (or restore, with null) the heartbeat renewal call. */
+export function setHeartbeatRenewOverrideForTests(
+  fn: ((lease: ImportLockLease) => void) | null,
+): void {
+  heartbeatRenewOverrideForTests = fn;
+}
+
+/**
+ * One heartbeat renewal attempt. Only a *confirmed* lost lease stops the
+ * heartbeat — a transient database error is swallowed and the next tick
+ * simply retries, so one hiccup cannot permanently disable renewal. Safety
+ * never depends on the heartbeat succeeding: every write is still gated on
+ * the lease token, and every PostgreSQL import transaction ends with its own
+ * fence check.
+ */
+function heartbeatTick(lease: ImportLockLease): void {
+  try {
+    if (heartbeatRenewOverrideForTests) heartbeatRenewOverrideForTests(lease);
+    else renewImportLease(lease);
+  } catch (error) {
+    if (error instanceof ImportLostLeaseError) {
+      stopImportLeaseHeartbeat(lease);
+    }
+    // Any other failure is transient: keep the timer and retry next tick.
+  }
+}
+
+/** Test helper: run one heartbeat tick synchronously. */
+export function heartbeatTickForTests(lease: ImportLockLease): void {
+  heartbeatTick(lease);
+}
+
+/** Test helper: is a heartbeat timer still registered for this lease? */
+export function importHeartbeatActiveForTests(lease: ImportLockLease): boolean {
+  return heartbeats.has(heartbeatKey(lease));
+}
+
+/**
+ * Test helper: stop every heartbeat for an owner, simulating a stalled
+ * process whose timers no longer fire. Owner ids are UUIDs, so the `:`
+ * delimiter cannot appear inside them.
+ */
+export function stopOwnerHeartbeatsForTests(ownerId: string): void {
+  for (const key of Array.from(heartbeats.keys())) {
+    if (key.startsWith(`${ownerId}:`)) {
+      clearInterval(heartbeats.get(key)!);
+      heartbeats.delete(key);
+    }
+  }
+}
+
 export function startImportLeaseHeartbeat(lease: ImportLockLease): void {
   stopImportLeaseHeartbeat(lease);
   const period = Math.max(20, Math.floor(importLeaseMs() / 3));
-  const timer = setInterval(() => {
-    try {
-      renewImportLease(lease);
-    } catch {
-      stopImportLeaseHeartbeat(lease);
-    }
-  }, period);
+  const timer = setInterval(() => heartbeatTick(lease), period);
   timer.unref?.();
   heartbeats.set(heartbeatKey(lease), timer);
 }
@@ -633,10 +805,26 @@ export async function beginImportJob(
   await recoverPendingImports(ownerId);
   refuseIfOwnerImportActive(ownerId);
 
+  if (mode === "mixed") {
+    // The PostgreSQL fence outlives the SQLite file. Floor the durable
+    // generation counter to it so a replaced SQLite database can never
+    // reissue a generation the fence has already seen.
+    const { readStudioImportFence } = await import("./import-fence");
+    const fence = await readStudioImportFence(ownerId);
+    if (fence) raiseOwnerGenerationFloor(ownerId, fence.generation);
+  }
+
   const jobId = randomUUID();
   const lease = acquireNewImportLock(ownerId, jobId);
   startImportLeaseHeartbeat(lease);
   try {
+    if (mode === "mixed") {
+      // Install the PostgreSQL fence for this lease *before* the pre-state
+      // capture: from this statement on, no obsolete transaction can commit
+      // Studio writes, so the snapshot below cannot be dirtied by one.
+      const { advanceStudioImportFence } = await import("./import-fence");
+      await advanceStudioImportFence(lease);
+    }
     renewImportLease(lease);
     const store = getSqliteChatStore();
     ensureCoordinatorSchema(store.connection);
@@ -739,7 +927,7 @@ export async function restoreJob(
     });
     if (job.mode === "mixed") {
       renewImportLease(lease);
-      await restoreStudioState(job.owner_id, pre.studio);
+      await restoreStudioState(pre.studio, lease);
     }
     renewImportLease(lease);
     sanitizeAndReleaseJob(job.id, "restored", undefined, lease);
@@ -755,19 +943,63 @@ export async function restoreJob(
   }
 }
 
-async function restoreStudioState(
-  ownerId: string,
+/**
+ * Test-only barrier invoked inside the restore transaction, immediately
+ * before the fence advance takes the fence row's lock. Lets a test prove the
+ * "obsolete transaction wins the row-lock race" ordering with a
+ * deterministic latch instead of a sleep. Production never sets it.
+ */
+let restoreFenceBarrierForTests: (() => void | Promise<void>) | null = null;
+
+/** Test helper: set (or clear, with null) the restore fence barrier. */
+export function setRestoreFenceBarrierForTests(
+  fn: (() => void | Promise<void>) | null,
+): void {
+  restoreFenceBarrierForTests = fn;
+}
+
+/**
+ * Restores the exact pre-import Studio state in PostgreSQL — fenced.
+ *
+ * The held lease is mandatory: an obsolete recovery worker cannot delete or
+ * insert Studio rows. The SQLite side is checked first (active, unexpired,
+ * exactly this lease), then everything happens in ONE PostgreSQL
+ * transaction:
+ *
+ * 1. Advance the fence to this lease. Taking the fence row's lock serializes
+ *    this transaction against any in-flight import transaction that already
+ *    touched the fence — if that transaction wins the race and commits its
+ *    late writes, this restore runs strictly after it and overwrites them
+ *    with the snapshot; once this advance commits, the obsolete transaction
+ *    can no longer commit at all. A *newer* fence throws ImportLostLeaseError
+ *    and rolls everything back.
+ * 2. Delete the owner's drafts and re-insert the snapshot rows.
+ * 3. Conditionally touch the fence as the last statement before COMMIT, so
+ *    the restore itself is also protected against being obsolete.
+ *
+ * A crash anywhere simply rolls the transaction back; the next expired-lease
+ * claimant repeats the restore with a newer generation.
+ */
+export async function restoreStudioState(
   pre: StudioPreState,
+  lease: ImportLockLease,
 ): Promise<void> {
+  assertOwnsImportLease(lease);
   const { getDatabase } = await import("@/db");
   const { studioDrafts } = await import("@/db/schema");
   const { eq } = await import("drizzle-orm");
+  const { advanceStudioImportFenceInTx, touchStudioImportFenceInTx } =
+    await import("./import-fence");
   await getDatabase().transaction(async (tx) => {
-    await tx.delete(studioDrafts).where(eq(studioDrafts.ownerId, ownerId));
+    await restoreFenceBarrierForTests?.();
+    await advanceStudioImportFenceInTx(tx, lease);
+    await tx
+      .delete(studioDrafts)
+      .where(eq(studioDrafts.ownerId, lease.ownerId));
     for (const draft of pre.drafts) {
       await tx.insert(studioDrafts).values({
         id: draft.id,
-        ownerId,
+        ownerId: lease.ownerId,
         schemaVersion: draft.schemaVersion,
         templateVersion: draft.templateRegistryVersion,
         themeVersion: draft.themeRegistryVersion,
@@ -777,6 +1009,7 @@ async function restoreStudioState(
         brief: draft.brief,
       });
     }
+    await touchStudioImportFenceInTx(tx, lease);
   });
 }
 

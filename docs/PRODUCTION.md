@@ -109,7 +109,9 @@ using `COPYFILE_EXCL` so an existing backup is never overwritten, and records a
   durable cross-store coordinator takes an owner-level lease (token +
   generation + heartbeat) before any write so a second import for that owner
   is `409` while the lease is live. Recovery claims only expired leases, via
-  compare-and-swap. A failure at any checkpoint — or a process killed
+  compare-and-swap, and PostgreSQL Studio writes are transactionally fenced by
+  a durable per-owner `studio_import_fences` row so an obsolete transaction
+  can never commit late writes after its lease was replaced. A failure at any checkpoint — or a process killed
   mid-import, after the lease expires — rolls both stores back to their exact
   previous state. SQLite-only complete imports take the same owner lease. Success is reported only after both halves committed. After success
   or a successful rollback the journal payload and snapshot are logically

@@ -368,6 +368,7 @@ export type ImportCheckpoint =
   | "chat-imported"
   | "chat-committed"
   | "studio-imported"
+  | "studio-fenced"
   | "studio-committed"
   | "completed";
 
@@ -623,9 +624,19 @@ async function importIntoPostgres(
   async function runStudioImportTransaction(
     held: ImportLockLease,
   ): Promise<void> {
+    const { verifyStudioImportFenceInTx, touchStudioImportFenceInTx } =
+      await import("./import-fence");
+    // The SQLite lease must be active and unexpired before any PostgreSQL
+    // write — but that check alone cannot close the race (replacement can
+    // happen after it and before COMMIT), so the transaction below is
+    // additionally fenced inside PostgreSQL itself.
     renewImportLease(held);
     let insertedDrafts = 0;
     await getDatabase().transaction(async (tx) => {
+      insertedDrafts = 0;
+      // Early, non-locking fence verification inside this transaction. The
+      // authoritative check is the conditional touch just before commit.
+      await verifyStudioImportFenceInTx(tx, held);
       for (const incoming of backup.studio.drafts) {
         const [existing] = await tx
           .select({ id: studioDrafts.id })
@@ -648,7 +659,17 @@ async function importIntoPostgres(
       }
       // A throw here rolls the PostgreSQL transaction back; the coordinator
       // still restores the already-committed chat half.
-      options.onCheckpoint?.("studio-imported");
+      await options.onCheckpoint?.("studio-imported");
+      // Final fence check, immediately before COMMIT. The conditional
+      // UPDATE takes the fence row's lock and matches only the held
+      // owner/job/token/generation: if recovery advanced the fence while
+      // this transaction was in flight, zero rows match, ImportLostLeaseError
+      // is thrown and PostgreSQL rolls back every Studio write above.
+      await touchStudioImportFenceInTx(tx, held);
+      // Test-only latch between the fence touch and COMMIT: with the fence
+      // row lock held, it deterministically reproduces the "obsolete
+      // transaction wins the row-lock race" ordering.
+      await options.onCheckpoint?.("studio-fenced");
     });
     // Only credited once the transaction above has committed.
     summary.studioDrafts = insertedDrafts;
