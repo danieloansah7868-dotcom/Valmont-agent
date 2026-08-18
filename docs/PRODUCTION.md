@@ -106,12 +106,12 @@ using `COPYFILE_EXCL` so an existing backup is never overwritten, and records a
 - `POST /api/backup/import` — SQLite uses the single shared database handle, so
   a mid-import failure rolls chat, memories, and drafts back together. With
   `DATABASE_URL` set, chat stays in SQLite and drafts go to PostgreSQL; the
-  durable cross-store coordinator records the staged payload and a pre-import
-  snapshot of both stores before any write, holds an owner-level lock (a second
-  import for that owner is `409`), and a failure at any checkpoint — or a
-  process killed mid-import — rolls both stores back to their exact previous
-  state, immediately or automatically on the next import attempt after a
-  restart. Success is reported only after both halves committed. After success
+  durable cross-store coordinator takes an owner-level lease (token +
+  generation + heartbeat) before any write so a second import for that owner
+  is `409` while the lease is live. Recovery claims only expired leases, via
+  compare-and-swap. A failure at any checkpoint — or a process killed
+  mid-import, after the lease expires — rolls both stores back to their exact
+  previous state. SQLite-only complete imports take the same owner lease. Success is reported only after both halves committed. After success
   or a successful rollback the journal payload and snapshot are logically
   deleted; an unresolved rollback failure keeps them until recovery finishes.
   That cleanup is not guaranteed physical erasure of SQLite pages. Legacy

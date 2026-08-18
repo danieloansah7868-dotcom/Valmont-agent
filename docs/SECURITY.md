@@ -212,10 +212,10 @@ new copy instead of overwriting existing work.
 
 **Atomicity depends on the storage backend, and the API reports which applies:**
 
-| Backend                     | `atomicity`          | Guarantee                                                                                                                                                                                                                                                                            |
-| --------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| SQLite (default)            | `single-transaction` | Chat, memories and drafts share one connection and one transaction. Any failure rolls all three back. The export reads chat and drafts inside one read transaction, so a backup file is a consistent snapshot.                                                                       |
-| PostgreSQL (`DATABASE_URL`) | `coordinated`        | Chat is still SQLite, studio is PostgreSQL. **There is no distributed transaction** and a mixed export is **not** one atomic snapshot. A durable coordinator records the staged payload and a snapshot of both stores, holds an owner-level import lock, then checkpoints each half. |
+| Backend                     | `atomicity`          | Guarantee                                                                                                                                                                                                                                                                                                                  |
+| --------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SQLite (default)            | `single-transaction` | Chat, memories and drafts share one connection and one transaction. Any failure rolls all three back. The export reads chat and drafts inside one read transaction, so a backup file is a consistent snapshot.                                                                                                             |
+| PostgreSQL (`DATABASE_URL`) | `coordinated`        | Chat is still SQLite, studio is PostgreSQL. **There is no distributed transaction** and a mixed export is **not** one atomic snapshot. A durable coordinator records the staged payload and a snapshot of both stores, holds an owner-level **lease** (token + generation + heartbeat expiry), then checkpoints each half. |
 
 On the coordinated path every failure — including a process killed between the
 two commits, a container eviction, or a dropped connection — rolls both stores
@@ -227,12 +227,18 @@ import is reported as a plain failure, never a partial success.
 `PartialImportError` is reserved for the exceptional case where the rollback
 itself cannot complete (for example PostgreSQL is unreachable at that moment);
 the response names the halves known to have committed, and the recovery snapshot
-stays on disk (with the owner lock held) so the next attempt finishes the
-rollback before importing anything new. After a successful import or a
-successful rollback the journal payload and snapshot are logically deleted;
-only non-sensitive metadata remains. That is not guaranteed physical erasure
-from SQLite pages or leftover filesystem copies. Coordinator journal rows are
-never included in a user backup export.
+stays on disk (with the owner lease held) so the next attempt finishes the
+rollback before importing anything new. A second import for the same owner
+inspects the lease and returns `409` while it is still active; it never
+restores a live job. Recovery may claim a job only after the lease expires,
+and only by an atomic compare-and-swap on the lock token and generation. An
+old process holding an obsolete token cannot write, sanitize or release the
+replacement lock. After a successful import or a successful rollback the
+journal payload and snapshot are logically deleted; only non-sensitive
+metadata remains. That is not guaranteed physical erasure from SQLite pages or
+leftover filesystem copies. Coordinator journal rows are never included in a
+user backup export. SQLite-only complete imports take the same owner lease so
+a second import is also `409` before either store changes.
 
 ### No payments, no payment data
 
@@ -282,13 +288,13 @@ you want a clean slate.
 
 ### Test status
 
-Security claims are only worth what has actually been executed. As of this
-change:
+Security claims are only worth what has actually been executed. Do not treat a
+past total as a permanent fact — use the latest CI run on the pull request.
 
-| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit + integration (`npm test`) | **Run.** 326 passing, 0 skipped (31 files), including the PostgreSQL draft-store and coordinated-import suites against a real PostgreSQL server. The coordinated-import suite injects a failure at every transaction/commit checkpoint, proves both stores return to their exact previous state, and covers interrupted-import recovery after a simulated restart. Without `STUDIO_TEST_DATABASE_URL` the 20 PostgreSQL tests skip (306 passing) and are reported as skipped, never as passed. |
-| End-to-end (`npm run test:e2e`) | **Run.** 20 passing (10 tests × `desktop-chromium` and `iphone` projects), no skips, against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests (keeping the latest typing typed after the warning, and accepting the server version) and a no-sideways-scroll assertion that runs in both projects. The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs the same suite with a real PostgreSQL 16 service.                     |
+| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit + integration (`npm test`) | Run in CI against a real PostgreSQL 16 service (`STUDIO_TEST_DATABASE_URL`). The coordinated-import suite injects a failure at every checkpoint, covers lease locking, expired-lease recovery and obsolete-token fencing. Without that variable the PostgreSQL files are reported as skipped, never as passed.                                                                                          |
+| End-to-end (`npm run test:e2e`) | Playwright schedules **11 tests across 2 projects (22 scheduled tests)** — `desktop-chromium` and `iphone` — against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests, the Nigeria/NGN/Africa/Lagos reopen test, and a no-sideways-scroll assertion in both projects. The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs this suite. |
 
 CI runs the unit, integration, PostgreSQL, Playwright and container-build jobs
 on every push and pull request via `.github/workflows/ci.yml`; there is no

@@ -10,30 +10,21 @@ import type { NormalizedBackup } from "./backup";
 /**
  * Durable cross-store recovery coordinator for complete-backup imports.
  *
- * When `DATABASE_URL` is set, Chat lives in SQLite while Studio drafts live in
- * PostgreSQL: two engines cannot share one transaction. To keep the import
- * all-or-nothing anyway, the coordinator records every import as a job *in
- * SQLite before any write happens*:
+ * Owner imports are gated by a lease: owner id, job id, a cryptographically
+ * random lock token, a heartbeat/expiry, and a monotonically increasing
+ * generation. A second import for the same owner inspects that lease and
+ * returns 409 while it is still active. It never restores a live job and
+ * never clears another process's lock.
  *
- *  1. the whole validated payload (staged),
- *  2. a durable snapshot of the owner's pre-import state in both stores,
- *  3. the job's status, advanced through durable checkpoints as each half
- *     commits,
- *  4. an owner-level lock so a second import cannot start until this one
- *     finishes or is fully rolled back.
- *
- * If anything fails at any checkpoint — or the process dies mid-import — the
- * job is still on disk with enough information to roll both stores back to
- * their exact previous state. Recovery runs automatically at process start
- * (best-effort) and at the start of the next import for that owner.
+ * Recovery may claim a job only after the lease has expired, and only by an
+ * atomic compare-and-swap on the existing token and generation. An old
+ * process that later wakes up cannot write, commit, sanitize or release the
+ * replacement lock because every mutation names the token it was issued.
  *
  * After a successful commit or a successful rollback, the staged payload and
  * pre-import snapshot are logically deleted from the journal (replaced with
  * empty strings). Only non-sensitive metadata remains. This is not a
  * guarantee of physical erasure from SQLite pages or filesystem backups.
- *
- * An unresolved rollback failure keeps the snapshot so recovery can retry,
- * and the owner lock stays held so a new import cannot overwrite it.
  */
 
 export type ImportJobStatus =
@@ -99,6 +90,28 @@ export interface ImportJobCounts {
   studioDrafts: number;
 }
 
+export interface ImportLockLease {
+  ownerId: string;
+  jobId: string;
+  lockToken: string;
+  generation: number;
+}
+
+export interface OwnerImportLockRow {
+  owner_id: string;
+  job_id: string;
+  lock_token: string;
+  generation: number;
+  acquired_at: string;
+  heartbeat_at: string;
+  expires_at: string;
+}
+
+export interface StartedImportJob {
+  jobId: string;
+  lease: ImportLockLease;
+}
+
 /**
  * Another complete-backup import is already running for this owner, or a
  * previous import could not be rolled back and still holds the owner lock.
@@ -113,6 +126,19 @@ export class ImportInProgressError extends Error {
   }
 }
 
+/**
+ * This process no longer holds the owner lease. Another worker claimed it
+ * after expiry (or the lock was released). The caller must stop writing and
+ * must not sanitize or release the replacement lock.
+ */
+export class ImportLostLeaseError extends Error {
+  readonly status = 409;
+  constructor(message = "This import is no longer holding the owner lock.") {
+    super(message);
+    this.name = "ImportLostLeaseError";
+  }
+}
+
 const JOB_STATUSES: readonly ImportJobStatus[] = [
   "prepared",
   "chat-committed",
@@ -123,13 +149,44 @@ const JOB_STATUSES: readonly ImportJobStatus[] = [
   "failed",
 ];
 
-const ACTIVE_STATUSES: readonly ImportJobStatus[] = [
+const PENDING_STATUSES: readonly ImportJobStatus[] = [
   "prepared",
   "chat-committed",
   "studio-committed",
+  "restoring",
+  "failed",
 ];
 
-const BLOCKING_STATUSES: readonly ImportJobStatus[] = ["restoring", "failed"];
+export const DEFAULT_IMPORT_LEASE_MS = 15_000;
+
+let leaseDurationMs = DEFAULT_IMPORT_LEASE_MS;
+
+/** Test helper: shorten or restore the owner-import lease. */
+export function setImportLeaseMsForTests(ms: number | null): void {
+  leaseDurationMs = ms === null ? DEFAULT_IMPORT_LEASE_MS : ms;
+}
+
+export function importLeaseMs(): number {
+  return leaseDurationMs;
+}
+
+function nowMs(): number {
+  return Date.now();
+}
+
+function nowIso(at = nowMs()): string {
+  return new Date(at).toISOString();
+}
+
+function expiresIso(at = nowMs()): string {
+  return new Date(at + leaseDurationMs).toISOString();
+}
+
+function isExpired(lock: OwnerImportLockRow, at = nowMs()): boolean {
+  if (!lock.expires_at) return true;
+  const expires = Date.parse(lock.expires_at);
+  return Number.isNaN(expires) || expires <= at;
+}
 
 /** Creates the coordinator tables on the shared SQLite connection. */
 export function ensureCoordinatorSchema(db: DatabaseSync): void {
@@ -150,7 +207,11 @@ export function ensureCoordinatorSchema(db: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS backup_import_locks (
       owner_id TEXT PRIMARY KEY,
       job_id TEXT NOT NULL,
-      acquired_at TEXT NOT NULL
+      lock_token TEXT NOT NULL DEFAULT '',
+      generation INTEGER NOT NULL DEFAULT 0,
+      acquired_at TEXT NOT NULL,
+      heartbeat_at TEXT NOT NULL DEFAULT '',
+      expires_at TEXT NOT NULL DEFAULT ''
     );
   `);
   for (const column of [
@@ -162,6 +223,29 @@ export function ensureCoordinatorSchema(db: DatabaseSync): void {
       db.exec(`ALTER TABLE backup_import_jobs ADD COLUMN ${column} INTEGER`);
     } catch {
       // Column already exists on an upgraded database.
+    }
+  }
+  ensureLockColumns(db);
+}
+
+function ensureLockColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare("PRAGMA table_info(backup_import_locks)")
+    .all() as Array<{
+    name: string;
+  }>;
+  const names = new Set(cols.map((column) => column.name));
+  const additions: Array<[string, string]> = [
+    ["lock_token", "TEXT NOT NULL DEFAULT ''"],
+    ["generation", "INTEGER NOT NULL DEFAULT 0"],
+    ["heartbeat_at", "TEXT NOT NULL DEFAULT ''"],
+    ["expires_at", "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [name, definition] of additions) {
+    if (!names.has(name)) {
+      db.exec(
+        `ALTER TABLE backup_import_locks ADD COLUMN ${name} ${definition}`,
+      );
     }
   }
 }
@@ -177,19 +261,34 @@ function setJobStatus(
   ).run(
     status,
     error === undefined ? null : JSON.stringify(String(error)),
-    new Date().toISOString(),
+    nowIso(),
     jobId,
+  );
+}
+
+function readLock(
+  db: DatabaseSync,
+  ownerId: string,
+): OwnerImportLockRow | null {
+  return (
+    (db
+      .prepare("SELECT * FROM backup_import_locks WHERE owner_id = ?")
+      .get(ownerId) as OwnerImportLockRow | undefined) ?? null
+  );
+}
+
+function readJob(db: DatabaseSync, jobId: string): ImportJobRecord | null {
+  return (
+    (db
+      .prepare("SELECT * FROM backup_import_jobs WHERE id = ?")
+      .get(jobId) as unknown as ImportJobRecord | undefined) ?? null
   );
 }
 
 export function getImportJob(jobId: string): ImportJobRecord | null {
   const db = getSqliteChatStore().connection;
   ensureCoordinatorSchema(db);
-  return (
-    (db
-      .prepare("SELECT * FROM backup_import_jobs WHERE id = ?")
-      .get(jobId) as unknown as ImportJobRecord | undefined) ?? null
-  );
+  return readJob(db, jobId);
 }
 
 /** All recorded jobs, newest first, optionally for one owner. */
@@ -208,18 +307,25 @@ export function listImportJobs(ownerId?: string): ImportJobRecord[] {
   return rows;
 }
 
-export function getOwnerImportLock(
-  ownerId: string,
-): { owner_id: string; job_id: string; acquired_at: string } | null {
+export function getOwnerImportLock(ownerId: string): OwnerImportLockRow | null {
   const db = getSqliteChatStore().connection;
   ensureCoordinatorSchema(db);
-  return (
-    (db
-      .prepare("SELECT * FROM backup_import_locks WHERE owner_id = ?")
-      .get(ownerId) as
-      { owner_id: string; job_id: string; acquired_at: string } | undefined) ??
-    null
-  );
+  return readLock(db, ownerId);
+}
+
+export function ownerImportLeaseIsActive(ownerId: string): boolean {
+  const lock = getOwnerImportLock(ownerId);
+  return Boolean(lock && !isExpired(lock));
+}
+
+/**
+ * 409 immediately when this owner already has an unexpired lease. Does not
+ * restore anything and does not touch either store.
+ */
+export function refuseIfOwnerImportActive(ownerId: string): void {
+  if (ownerImportLeaseIsActive(ownerId)) {
+    throw new ImportInProgressError();
+  }
 }
 
 /**
@@ -238,8 +344,8 @@ export function journalSensitiveBlob(): string {
 }
 
 /**
- * Captures the owner's current PostgreSQL drafts. Runs before anything is
- * written, so the snapshot is the exact state a failed import must return to.
+ * Captures the owner's current PostgreSQL drafts. Runs after the owner lock
+ * is held, so a concurrent import cannot change this snapshot.
  */
 async function captureStudioPreState(ownerId: string): Promise<StudioPreState> {
   const { getDatabase } = await import("@/db");
@@ -264,27 +370,229 @@ async function captureStudioPreState(ownerId: string): Promise<StudioPreState> {
   };
 }
 
-function releaseLock(db: DatabaseSync, ownerId: string, jobId: string): void {
+function changesOf(result: { changes: number | bigint }): number {
+  return Number(result.changes);
+}
+
+export function assertOwnsImportLease(lease: ImportLockLease): void {
+  const lock = getOwnerImportLock(lease.ownerId);
+  if (
+    !lock ||
+    lock.job_id !== lease.jobId ||
+    lock.lock_token !== lease.lockToken ||
+    Number(lock.generation) !== lease.generation
+  ) {
+    throw new ImportLostLeaseError();
+  }
+}
+
+export function renewImportLease(lease: ImportLockLease): void {
+  const store = getSqliteChatStore();
+  ensureCoordinatorSchema(store.connection);
+  const at = nowMs();
+  const result = store.connection
+    .prepare(
+      `UPDATE backup_import_locks
+          SET heartbeat_at = ?, expires_at = ?
+        WHERE owner_id = ? AND job_id = ? AND lock_token = ? AND generation = ?`,
+    )
+    .run(
+      nowIso(at),
+      expiresIso(at),
+      lease.ownerId,
+      lease.jobId,
+      lease.lockToken,
+      lease.generation,
+    );
+  if (changesOf(result) !== 1) throw new ImportLostLeaseError();
+}
+
+/**
+ * Acquire a new owner lease. Uses INSERT ... ON CONFLICT DO NOTHING so a
+ * unique conflict is a 409 and any other database error propagates unchanged.
+ */
+export function acquireNewImportLock(
+  ownerId: string,
+  jobId: string,
+): ImportLockLease {
+  const store = getSqliteChatStore();
+  ensureCoordinatorSchema(store.connection);
+  return store.runInTransaction(() => {
+    const existing = readLock(store.connection, ownerId);
+    if (existing && !isExpired(existing)) {
+      throw new ImportInProgressError();
+    }
+    if (existing && isExpired(existing)) {
+      const held = existing.job_id
+        ? readJob(store.connection, existing.job_id)
+        : null;
+      if (held && (PENDING_STATUSES as string[]).includes(held.status)) {
+        throw new ImportInProgressError(
+          "A previous import could not be rolled back. Recovery must finish before you can import again.",
+        );
+      }
+      const removed = store.connection
+        .prepare(
+          `DELETE FROM backup_import_locks
+            WHERE owner_id = ? AND lock_token = ? AND generation = ? AND expires_at <= ?`,
+        )
+        .run(ownerId, existing.lock_token, existing.generation, nowIso());
+      if (changesOf(removed) !== 1) throw new ImportInProgressError();
+    }
+
+    const token = randomUUID();
+    const at = nowMs();
+    const inserted = store.connection
+      .prepare(
+        `INSERT INTO backup_import_locks
+           (owner_id, job_id, lock_token, generation, acquired_at, heartbeat_at, expires_at)
+         VALUES (?, ?, ?, 1, ?, ?, ?)
+         ON CONFLICT(owner_id) DO NOTHING`,
+      )
+      .run(ownerId, jobId, token, nowIso(at), nowIso(at), expiresIso(at));
+    if (changesOf(inserted) !== 1) {
+      throw new ImportInProgressError();
+    }
+    return {
+      ownerId,
+      jobId,
+      lockToken: token,
+      generation: 1,
+    };
+  });
+}
+
+/**
+ * Atomically claim an expired (or missing) owner lock for recovery. Returns
+ * null when another worker won the compare-and-swap or the lease is still live.
+ */
+export function tryClaimExpiredOwnerLock(
+  ownerId: string,
+  jobId: string,
+): ImportLockLease | null {
+  const store = getSqliteChatStore();
+  ensureCoordinatorSchema(store.connection);
+  return store.runInTransaction(() => {
+    const existing = readLock(store.connection, ownerId);
+    const at = nowMs();
+    if (!existing) {
+      const token = randomUUID();
+      const inserted = store.connection
+        .prepare(
+          `INSERT INTO backup_import_locks
+             (owner_id, job_id, lock_token, generation, acquired_at, heartbeat_at, expires_at)
+           VALUES (?, ?, ?, 1, ?, ?, ?)
+           ON CONFLICT(owner_id) DO NOTHING`,
+        )
+        .run(ownerId, jobId, token, nowIso(at), nowIso(at), expiresIso(at));
+      if (changesOf(inserted) !== 1) return null;
+      return { ownerId, jobId, lockToken: token, generation: 1 };
+    }
+    if (!isExpired(existing, at)) return null;
+    const token = randomUUID();
+    const newGeneration = Number(existing.generation) + 1;
+    const updated = store.connection
+      .prepare(
+        `UPDATE backup_import_locks
+            SET lock_token = ?, generation = ?, job_id = ?,
+                acquired_at = ?, heartbeat_at = ?, expires_at = ?
+          WHERE owner_id = ?
+            AND lock_token = ?
+            AND generation = ?
+            AND expires_at <= ?`,
+      )
+      .run(
+        token,
+        newGeneration,
+        jobId,
+        nowIso(at),
+        nowIso(at),
+        expiresIso(at),
+        ownerId,
+        existing.lock_token,
+        existing.generation,
+        nowIso(at),
+      );
+    if (changesOf(updated) !== 1) return null;
+    return {
+      ownerId,
+      jobId,
+      lockToken: token,
+      generation: newGeneration,
+    };
+  });
+}
+
+export function releaseImportLock(lease: ImportLockLease): boolean {
+  const store = getSqliteChatStore();
+  ensureCoordinatorSchema(store.connection);
+  const result = store.connection
+    .prepare(
+      `DELETE FROM backup_import_locks
+        WHERE owner_id = ? AND job_id = ? AND lock_token = ? AND generation = ?`,
+    )
+    .run(lease.ownerId, lease.jobId, lease.lockToken, lease.generation);
+  return changesOf(result) === 1;
+}
+
+/** Test helper: mark the owner's lease expired without changing its token. */
+export function expireOwnerLockForTests(ownerId: string): void {
+  const db = getSqliteChatStore().connection;
+  ensureCoordinatorSchema(db);
   db.prepare(
-    "DELETE FROM backup_import_locks WHERE owner_id = ? AND job_id = ?",
-  ).run(ownerId, jobId);
+    "UPDATE backup_import_locks SET expires_at = ? WHERE owner_id = ?",
+  ).run("1970-01-01T00:00:00.000Z", ownerId);
+}
+
+const heartbeats = new Map<string, ReturnType<typeof setInterval>>();
+
+function heartbeatKey(lease: ImportLockLease): string {
+  return `${lease.ownerId}:${lease.jobId}:${lease.lockToken}:${lease.generation}`;
+}
+
+export function startImportLeaseHeartbeat(lease: ImportLockLease): void {
+  stopImportLeaseHeartbeat(lease);
+  const period = Math.max(20, Math.floor(importLeaseMs() / 3));
+  const timer = setInterval(() => {
+    try {
+      renewImportLease(lease);
+    } catch {
+      stopImportLeaseHeartbeat(lease);
+    }
+  }, period);
+  timer.unref?.();
+  heartbeats.set(heartbeatKey(lease), timer);
+}
+
+export function stopImportLeaseHeartbeat(lease: ImportLockLease): void {
+  const key = heartbeatKey(lease);
+  const timer = heartbeats.get(key);
+  if (timer) {
+    clearInterval(timer);
+    heartbeats.delete(key);
+  }
 }
 
 /**
  * Logically deletes the staged payload and pre-import snapshot, keeps
- * non-sensitive metadata, and releases the owner lock. Does not claim the
- * bytes have been wiped from SQLite pages.
+ * non-sensitive metadata, and releases the owner lock — only if `lease`
+ * still matches. Does not claim the bytes have been wiped from SQLite pages.
  */
 export function sanitizeAndReleaseJob(
   jobId: string,
   status: "completed" | "restored",
-  counts?: ImportJobCounts,
+  counts: ImportJobCounts | undefined,
+  lease: ImportLockLease,
 ): void {
   const store = getSqliteChatStore();
   ensureCoordinatorSchema(store.connection);
-  const job = getImportJob(jobId);
-  if (!job) return;
+  const job = readJob(store.connection, jobId);
+  if (!job) {
+    releaseImportLock(lease);
+    return;
+  }
   store.runInTransaction(() => {
+    assertOwnsImportLease(lease);
     store.connection
       .prepare(
         `UPDATE backup_import_jobs
@@ -303,146 +611,146 @@ export function sanitizeAndReleaseJob(
         counts?.chatSessions ?? job.chat_sessions,
         counts?.memories ?? job.memories,
         counts?.studioDrafts ?? job.studio_drafts,
-        new Date().toISOString(),
+        nowIso(),
         jobId,
       );
-    releaseLock(store.connection, job.owner_id, jobId);
+    if (!releaseImportLock(lease)) throw new ImportLostLeaseError();
   });
 }
 
 /**
- * Stage 1: validate-and-stage before any write. Captures the durable
- * pre-import state of both stores, stores the whole payload, records the
- * job as `prepared`, and takes the owner lock in the same SQLite write
- * transaction. Returns the job id.
+ * Stage 1: take the owner lock *before* capturing pre-state or writing
+ * either store. Then record the job as `prepared`. Returns the job id and
+ * the lease this process must present for every later mutation.
  */
 export async function beginImportJob(
   user: SessionUser,
   ownerId: string,
   backup: NormalizedBackup,
-): Promise<string> {
-  const store = getSqliteChatStore();
-  ensureCoordinatorSchema(store.connection);
-  const chat = store.captureUserStateSync(user.id);
-  const studio = await captureStudioPreState(ownerId);
-  const id = randomUUID();
-  const now = new Date().toISOString();
+  mode: "mixed" | "sqlite" = "mixed",
+): Promise<StartedImportJob> {
+  refuseIfOwnerImportActive(ownerId);
+  await recoverPendingImports(ownerId);
+  refuseIfOwnerImportActive(ownerId);
 
-  store.runInTransaction(() => {
-    const existingLock = store.connection
-      .prepare("SELECT * FROM backup_import_locks WHERE owner_id = ?")
-      .get(ownerId) as
-      { owner_id: string; job_id: string; acquired_at: string } | undefined;
-    if (existingLock) {
-      const held = store.connection
-        .prepare("SELECT * FROM backup_import_jobs WHERE id = ?")
-        .get(existingLock.job_id) as unknown as ImportJobRecord | undefined;
-      if (held && (ACTIVE_STATUSES as string[]).includes(held.status)) {
-        throw new ImportInProgressError();
-      }
-      if (held && (BLOCKING_STATUSES as string[]).includes(held.status)) {
-        throw new ImportInProgressError(
-          "A previous import could not be rolled back. Recovery must finish before you can import again.",
-        );
-      }
-      // Stale lock (terminal job, or the job row is gone).
-      store.connection
-        .prepare("DELETE FROM backup_import_locks WHERE owner_id = ?")
-        .run(ownerId);
-    }
-
-    const blocking = store.connection
-      .prepare(
-        `SELECT id FROM backup_import_jobs
-          WHERE owner_id = ? AND status IN ('restoring','failed')
-          LIMIT 1`,
-      )
-      .get(ownerId);
-    if (blocking) {
-      throw new ImportInProgressError(
-        "A previous import could not be rolled back. Recovery must finish before you can import again.",
-      );
-    }
-
-    store.connection
-      .prepare(
-        `INSERT INTO backup_import_jobs
-           (id, owner_id, chat_user_id, mode, source_version, status, created_at, updated_at, payload_json, pre_state_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        ownerId,
-        user.id,
-        "mixed",
-        backup.sourceVersion,
-        "prepared",
-        now,
-        now,
-        JSON.stringify(backup),
-        JSON.stringify({ chat, studio }),
-      );
-    try {
+  const jobId = randomUUID();
+  const lease = acquireNewImportLock(ownerId, jobId);
+  startImportLeaseHeartbeat(lease);
+  try {
+    renewImportLease(lease);
+    const store = getSqliteChatStore();
+    ensureCoordinatorSchema(store.connection);
+    const chat = store.captureUserStateSync(user.id);
+    const studio =
+      mode === "mixed" ? await captureStudioPreState(ownerId) : { drafts: [] };
+    renewImportLease(lease);
+    const now = nowIso();
+    store.runInTransaction(() => {
+      assertOwnsImportLease(lease);
       store.connection
         .prepare(
-          "INSERT INTO backup_import_locks (owner_id, job_id, acquired_at) VALUES (?, ?, ?)",
+          `INSERT INTO backup_import_jobs
+             (id, owner_id, chat_user_id, mode, source_version, status, created_at, updated_at, payload_json, pre_state_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(ownerId, id, now);
-    } catch {
-      throw new ImportInProgressError();
-    }
-  });
-  return id;
+        .run(
+          jobId,
+          ownerId,
+          user.id,
+          mode,
+          backup.sourceVersion,
+          "prepared",
+          now,
+          now,
+          JSON.stringify(backup),
+          JSON.stringify({ chat, studio }),
+        );
+    });
+    return { jobId, lease };
+  } catch (error) {
+    stopImportLeaseHeartbeat(lease);
+    releaseImportLock(lease);
+    throw error;
+  }
 }
 
-export function markChatCommitted(jobId: string): void {
+export function markChatCommitted(jobId: string, lease: ImportLockLease): void {
+  renewImportLease(lease);
   setJobStatus(getSqliteChatStore().connection, jobId, "chat-committed");
 }
 
-export function markStudioCommitted(jobId: string): void {
+export function markStudioCommitted(
+  jobId: string,
+  lease: ImportLockLease,
+): void {
+  renewImportLease(lease);
   setJobStatus(getSqliteChatStore().connection, jobId, "studio-committed");
 }
 
-export function markCompleted(jobId: string, counts?: ImportJobCounts): void {
-  sanitizeAndReleaseJob(jobId, "completed", counts);
+export function markCompleted(
+  jobId: string,
+  counts: ImportJobCounts | undefined,
+  lease: ImportLockLease,
+): void {
+  renewImportLease(lease);
+  sanitizeAndReleaseJob(jobId, "completed", counts, lease);
+  stopImportLeaseHeartbeat(lease);
 }
 
-export function markFailed(jobId: string, error: unknown): void {
-  setJobStatus(getSqliteChatStore().connection, jobId, "failed", error);
+export function markFailed(
+  jobId: string,
+  error: unknown,
+  lease: ImportLockLease,
+): void {
+  try {
+    renewImportLease(lease);
+    setJobStatus(getSqliteChatStore().connection, jobId, "failed", error);
+  } catch (lost) {
+    if (lost instanceof ImportLostLeaseError) return;
+    throw lost;
+  }
 }
 
 /**
- * Rolls a job back: resets the owner's chat state (one SQLite transaction)
- * and the owner's PostgreSQL drafts (one PostgreSQL transaction) to the
- * snapshot captured before the import started. Idempotent — running it again
- * simply resets to the same snapshot (or is a no-op once sanitized).
+ * Rolls a job back. Requires a live lease for this job. An obsolete token
+ * is refused before any store is touched.
  */
-export async function restoreJob(job: ImportJobRecord): Promise<void> {
+export async function restoreJob(
+  job: ImportJobRecord,
+  lease: ImportLockLease,
+): Promise<void> {
   if (job.status === "restored" || job.status === "completed") return;
+  renewImportLease(lease);
   const store = getSqliteChatStore();
   ensureCoordinatorSchema(store.connection);
   setJobStatus(store.connection, job.id, "restoring");
   const snapshot = job.pre_state_json;
   if (!snapshot) {
-    // Nothing left to restore; treat as already cleaned up.
-    sanitizeAndReleaseJob(job.id, "restored");
+    sanitizeAndReleaseJob(job.id, "restored", undefined, lease);
+    stopImportLeaseHeartbeat(lease);
     return;
   }
   const pre = JSON.parse(snapshot) as ImportPreState;
   try {
-    // Chat half: chat, memories and the memory preference all live in SQLite,
-    // so one transaction covers them. Chat rows are keyed by the session-level
-    // user id, which is not the same as the canonical Studio owner id.
+    renewImportLease(lease);
     store.runInTransaction(() => {
+      assertOwnsImportLease(lease);
       store.restoreUserSync(job.chat_user_id, pre.chat);
     });
-    // Studio half: drafts live in PostgreSQL when the coordinator is used.
-    await restoreStudioState(job.owner_id, pre.studio);
-    sanitizeAndReleaseJob(job.id, "restored");
+    if (job.mode === "mixed") {
+      renewImportLease(lease);
+      await restoreStudioState(job.owner_id, pre.studio);
+    }
+    renewImportLease(lease);
+    sanitizeAndReleaseJob(job.id, "restored", undefined, lease);
+    stopImportLeaseHeartbeat(lease);
   } catch (error) {
-    // Stay in "restoring": recovery retries on the next import / startup.
-    // Keep the snapshot and the owner lock so a new import cannot start.
-    setJobStatus(store.connection, job.id, "restoring", error);
+    if (error instanceof ImportLostLeaseError) throw error;
+    try {
+      setJobStatus(store.connection, job.id, "restoring", error);
+    } catch {
+      // Keep the original restore error.
+    }
     throw error;
   }
 }
@@ -472,62 +780,57 @@ async function restoreStudioState(
   });
 }
 
-let recoveryInFlight: Promise<void> | null = null;
-
 /**
- * Rolls back every job an interrupted or failed import left behind. Runs
- * automatically at process start and at the start of each import, so a
- * process that died between checkpoints — or an earlier rollback that could
- * not complete because a store was unreachable — is cleaned up before
- * anything new is written. Idempotent. Concurrent callers share one in-flight
- * pass so two imports cannot recover the same job twice in parallel.
+ * Rolls back every job whose lease has expired (or that has no live lock).
+ * Unexpired leases are skipped: a live import is not a crash, and a draft
+ * GET / startup scan must not roll it back.
  *
- * A pending job created in mixed mode (PostgreSQL) cannot be rolled back when
- * `DATABASE_URL` is no longer configured — its studio half is unreachable — so
- * recovery refuses rather than silently proceeding.
+ * Claiming uses compare-and-swap on the lock token and generation so only
+ * one recovery worker can restore a given owner.
  */
 export async function recoverPendingImports(ownerId?: string): Promise<void> {
-  if (recoveryInFlight) {
-    await recoveryInFlight;
-    if (!ownerId) return;
-  }
-  const run = (async () => {
-    const store = getSqliteChatStore();
-    ensureCoordinatorSchema(store.connection);
-    const jobs = (ownerId
-      ? store.connection
-          .prepare(
-            `SELECT * FROM backup_import_jobs
-                WHERE owner_id = ?
-                  AND status IN
-                    ('prepared','chat-committed','studio-committed','restoring','failed')
-                ORDER BY created_at`,
-          )
-          .all(ownerId)
-      : store.connection
-          .prepare(
-            `SELECT * FROM backup_import_jobs
-                WHERE status IN
+  const store = getSqliteChatStore();
+  ensureCoordinatorSchema(store.connection);
+  const jobs = (ownerId
+    ? store.connection
+        .prepare(
+          `SELECT * FROM backup_import_jobs
+              WHERE owner_id = ?
+                AND status IN
                   ('prepared','chat-committed','studio-committed','restoring','failed')
-                ORDER BY created_at`,
-          )
-          .all()) as unknown as ImportJobRecord[];
-    for (const job of jobs) {
-      if (job.mode === "mixed" && !process.env.DATABASE_URL) {
-        throw new Error(
-          "An interrupted mixed-store import was found, but DATABASE_URL is not configured, " +
-            "so its PostgreSQL half cannot be rolled back. Restore the PostgreSQL configuration " +
-            "and run the import again.",
-        );
-      }
-      await restoreJob(job);
+              ORDER BY created_at`,
+        )
+        .all(ownerId)
+    : store.connection
+        .prepare(
+          `SELECT * FROM backup_import_jobs
+              WHERE status IN
+                ('prepared','chat-committed','studio-committed','restoring','failed')
+              ORDER BY created_at`,
+        )
+        .all()) as unknown as ImportJobRecord[];
+  for (const job of jobs) {
+    const lock = readLock(store.connection, job.owner_id);
+    if (lock && !isExpired(lock)) {
+      // Live lease — whether it is this job or another. Do not restore.
+      continue;
     }
-  })();
-  recoveryInFlight = run;
-  try {
-    await run;
-  } finally {
-    if (recoveryInFlight === run) recoveryInFlight = null;
+    if (job.mode === "mixed" && !process.env.DATABASE_URL) {
+      throw new Error(
+        "An interrupted mixed-store import was found, but DATABASE_URL is not configured, " +
+          "so its PostgreSQL half cannot be rolled back. Restore the PostgreSQL configuration " +
+          "and run the import again.",
+      );
+    }
+    const claimed = tryClaimExpiredOwnerLock(job.owner_id, job.id);
+    if (!claimed) continue;
+    startImportLeaseHeartbeat(claimed);
+    try {
+      await restoreJob(job, claimed);
+    } catch (error) {
+      stopImportLeaseHeartbeat(claimed);
+      throw error;
+    }
   }
 }
 
@@ -536,9 +839,13 @@ let startupRecoveryScheduled = false;
 /** Best-effort recovery when the Studio store is first opened. */
 export function scheduleStartupImportRecovery(): void {
   if (startupRecoveryScheduled) return;
-  if (!process.env.DATABASE_URL) return;
   startupRecoveryScheduled = true;
   void recoverPendingImports().catch(() => {
     // The next import for the affected owner retries. Do not log snapshots.
   });
+}
+
+/** Test helper: allow another startup scan in the same process. */
+export function resetStartupImportRecoveryForTests(): void {
+  startupRecoveryScheduled = false;
 }

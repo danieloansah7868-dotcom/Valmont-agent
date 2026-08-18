@@ -14,6 +14,7 @@ import {
   parseBackup,
   PartialImportError,
 } from "./backup";
+import { ImportInProgressError } from "./import-coordinator";
 import { SqliteStudioDraftStore } from "./draft-store";
 import { createDefaultBrief } from "./site-brief/defaults";
 
@@ -586,6 +587,89 @@ describe("import atomicity is reported, not assumed", () => {
       parseBackup(JSON.parse(JSON.stringify(backup))),
     );
     expect(summary.atomicity).toBe("single-transaction");
+  });
+
+  it("refuses a second same-owner SQLite import with 409 before either store changes", async () => {
+    const now = new Date().toISOString();
+    const fileFor = (label: string, id: string) => ({
+      backupVersion: 2 as const,
+      exportedAt: now,
+      chat: {
+        version: 1 as const,
+        sessions: [
+          {
+            id,
+            title: `${label} chat`,
+            messages: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+        memories: [],
+        memoryEnabled: true,
+      },
+      studio: {
+        version: 1 as const,
+        schemaVersion: 1 as const,
+        drafts: [
+          {
+            id,
+            schemaVersion: 1,
+            createdAt: now,
+            updatedAt: now,
+            brief: createDefaultBrief({
+              businessName: `${label} Studio`,
+              adminEmail: `${label.replaceAll(" ", "").toLowerCase()}@adom.example`,
+            }),
+          },
+        ],
+      },
+    });
+
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let signalReady!: () => void;
+    const firstLockVisible = new Promise<void>((resolve) => {
+      signalReady = resolve;
+    });
+
+    const first = importBackup(
+      userA,
+      parseBackup(fileFor("Import A", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")),
+      {
+        onLockAcquired: async () => {
+          signalReady();
+          await holdFirst;
+        },
+      },
+    );
+    await firstLockVisible;
+    expect(await chatStore.list(userA.id)).toHaveLength(0);
+    expect(await drafts.list(userA)).toHaveLength(0);
+
+    await expect(
+      importBackup(
+        userA,
+        parseBackup(
+          fileFor("Import B", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        ),
+      ),
+    ).rejects.toBeInstanceOf(ImportInProgressError);
+
+    expect(await chatStore.list(userA.id)).toHaveLength(0);
+    expect(await drafts.list(userA)).toHaveLength(0);
+
+    releaseFirst();
+    const summary = await first;
+    expect(summary.atomicity).toBe("single-transaction");
+    expect(summary.chatSessions).toBe(1);
+    expect(summary.studioDrafts).toBe(1);
+    expect((await chatStore.list(userA.id))[0]!.title).toBe("Import A chat");
+    expect((await drafts.list(userA))[0]!.brief.businessName).toBe(
+      "Import A Studio",
+    );
   });
 
   // This checks the error object's shape only. It constructs the error

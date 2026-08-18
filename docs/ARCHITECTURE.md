@@ -256,23 +256,29 @@ rollback rather than assume it.
 With `DATABASE_URL` set, chat stays in SQLite while studio lives in PostgreSQL,
 so there is no distributed transaction and a mixed-store **export** is two
 separate reads, not one atomic snapshot. `import-coordinator.ts` is a durable
-cross-store recovery coordinator instead: before any write it records a job in
-SQLite holding the staged payload and a snapshot of the owner's pre-import state
-in **both** stores, takes an owner-level lock (a second import for that owner
-is a `409` before either store changes), then advances through durable
-checkpoints as each half commits. A failure at any checkpoint — or a process
-killed mid-import — rolls both stores back to their exact previous state,
-immediately or via automatic recovery at process start and at the start of the
-next import attempt. Success is reported only after both halves committed; a
-rolled-back import is reported as a clean failure, and `PartialImportError` is
-reserved for the exceptional case where the rollback itself could not complete.
-After success or a successful rollback the payload and snapshot are logically
-deleted from the journal (empty strings remain in those columns; this is not
-physical erasure of SQLite pages). An unresolved rollback failure keeps the
-snapshot and the lock so a new import cannot overwrite it. Different owners
-may import independently. The PostgreSQL suite injects failures at every
-checkpoint (`onCheckpoint`) and proves both stores return to their exact
-previous state, including after a simulated crash and restart.
+cross-store recovery coordinator instead: it first takes an owner-level
+**lease** (owner id, job id, cryptographically random lock token, heartbeat
+expiry, and a fencing generation). A second import for that owner inspects the
+lease and is a `409` before either store changes or any recovery runs. Only
+after the lock is held does it record a job in SQLite holding the staged
+payload and a snapshot of both stores, then advance through durable
+checkpoints. A running import renews the lease and checks the token before
+every write. Recovery may claim a job only when the lease has expired, via an
+atomic compare-and-swap on the token and generation; an obsolete token cannot
+write, sanitize or release the replacement lock. A process killed mid-import
+lets the lease expire; the next startup or import claims recovery and rolls
+both stores back. A draft GET / startup scan skips unexpired live jobs.
+Success is reported only after both halves committed; a rolled-back import is
+a clean failure, and `PartialImportError` is reserved for the exceptional case
+where the rollback itself could not complete. After success or a successful
+rollback the payload and snapshot are logically deleted from the journal
+(empty strings remain in those columns; this is not physical erasure of SQLite
+pages). An unresolved rollback failure keeps the snapshot and the lease so a
+new import cannot overwrite it. Different owners may import independently.
+SQLite-only complete imports take the same owner lease. The PostgreSQL suite
+injects failures at every checkpoint (`onCheckpoint`) and proves both stores
+return to their exact previous state, including after a simulated crash and
+restart.
 
 ### Request bodies
 

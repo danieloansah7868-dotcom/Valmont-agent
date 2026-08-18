@@ -43,11 +43,11 @@ staging file was removed). CI now runs on every push and pull request:
 
 - `npm ci`, `format:check`, `lint`, `typecheck`
 - Drizzle migrations against a throwaway **PostgreSQL 16 service**, then
-  `npm test` with `STUDIO_TEST_DATABASE_URL` pointing at it (the 20 PostgreSQL
-  tests run for real, including the coordinated-import failure-at-every-
-  checkpoint and interrupted-restart recovery tests)
+  `npm test` with `STUDIO_TEST_DATABASE_URL` pointing at it (the PostgreSQL
+  draft-store and coordinated-import suites run for real, including
+  lease-lock, expired-lease recovery and checkpoint rollback tests)
 - `npx playwright install --with-deps chromium`, then `npm run test:e2e`
-  (10 tests × desktop-chromium and iphone projects, no skips)
+  (11 tests × desktop-chromium and iphone projects = 22 scheduled tests)
 - `npm run build`
 - a `container` job that runs `docker build`
 

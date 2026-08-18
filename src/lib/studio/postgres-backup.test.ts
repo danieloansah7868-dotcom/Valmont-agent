@@ -214,6 +214,8 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
   afterEach(() => {
     setSqliteChatStoreForTests(null);
     process.env.DATABASE_URL = connectionString;
+    coordinator?.setImportLeaseMsForTests?.(null);
+    coordinator?.resetStartupImportRecoveryForTests?.();
     for (const dir of dirs.splice(0))
       rmSync(dir, { recursive: true, force: true });
   });
@@ -311,7 +313,8 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
     // up to the point where the chat half committed, then STOP without any
     // rollback, exactly as an abrupt crash would leave the database.
     const parsed = parseBackup(file);
-    const jobId = await coordinator.beginImportJob(owner, ownerId, parsed);
+    const started = await coordinator.beginImportJob(owner, ownerId, parsed);
+    const jobId = started.jobId;
     chatStore.runInTransaction(() => {
       chatStore.importUserSync(owner.id, {
         sessions: parsed.chat.sessions as ChatSession[],
@@ -319,12 +322,15 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
         memoryEnabled: parsed.chat.memoryEnabled,
       });
     });
-    coordinator.markChatCommitted(jobId);
+    coordinator.markChatCommitted(jobId, started.lease);
+    coordinator.stopImportLeaseHeartbeat(started.lease);
     // The chat half really did land before the "crash".
     expect(await chatStore.list(owner.id)).toHaveLength(1);
 
     // "Restart": a brand-new connection to the same SQLite file and a fresh
-    // PostgreSQL client. The coordinator record survives on disk.
+    // PostgreSQL client. The coordinator record survives on disk. The lease
+    // is expired the way a missed heartbeat after a crash would expire it.
+    coordinator.expireOwnerLockForTests(ownerId);
     setSqliteChatStoreForTests(null);
     chatStore = new SqliteChatStore(sqlitePath, legacyPath);
     setSqliteChatStoreForTests(chatStore);
@@ -348,11 +354,8 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
 
     // Crash the same way: chat half committed, job left at "chat-committed".
     const parsed = parseBackup(file);
-    const crashedJobId = await coordinator.beginImportJob(
-      owner,
-      ownerId,
-      parsed,
-    );
+    const crashed = await coordinator.beginImportJob(owner, ownerId, parsed);
+    const crashedJobId = crashed.jobId;
     chatStore.runInTransaction(() => {
       chatStore.importUserSync(owner.id, {
         sessions: parsed.chat.sessions as ChatSession[],
@@ -360,11 +363,13 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
         memoryEnabled: parsed.chat.memoryEnabled,
       });
     });
-    coordinator.markChatCommitted(crashedJobId);
+    coordinator.markChatCommitted(crashedJobId, crashed.lease);
+    coordinator.stopImportLeaseHeartbeat(crashed.lease);
+    coordinator.expireOwnerLockForTests(ownerId);
     expect(await chatStore.list(owner.id)).toHaveLength(1);
 
-    // The next import attempt self-heals: it rolls the crashed job back, then
-    // runs the new import.
+    // The next import attempt self-heals: it claims the expired lease, rolls
+    // the crashed job back, then runs the new import.
     const summary = await importBackup(owner, parseBackup(file));
 
     expect(summary.chatSessions).toBe(1);
@@ -387,7 +392,8 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
     // Chat half commits, then PostgreSQL becomes unreachable so the rollback's
     // studio half cannot run — the catastrophic case behind PartialImportError.
     const parsed = parseBackup(file);
-    const jobId = await coordinator.beginImportJob(owner, ownerId, parsed);
+    const started = await coordinator.beginImportJob(owner, ownerId, parsed);
+    const jobId = started.jobId;
     chatStore.runInTransaction(() => {
       chatStore.importUserSync(owner.id, {
         sessions: parsed.chat.sessions as ChatSession[],
@@ -395,19 +401,22 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
         memoryEnabled: parsed.chat.memoryEnabled,
       });
     });
-    coordinator.markChatCommitted(jobId);
+    coordinator.markChatCommitted(jobId, started.lease);
     expect(await chatStore.list(owner.id)).toHaveLength(1);
 
     await closeDatabase();
     process.env.DATABASE_URL = "postgres://postgres:hunter2@127.0.0.1:1/none";
 
     await expect(
-      coordinator.restoreJob(coordinator.getImportJob(jobId)),
+      coordinator.restoreJob(coordinator.getImportJob(jobId), started.lease),
     ).rejects.toThrow();
     // The job stays "restoring" — recovery retries, it is not lost.
     expect(coordinator.getImportJob(jobId).status).toBe("restoring");
 
-    // PostgreSQL comes back; recovery finishes the rollback.
+    // PostgreSQL comes back. Expire the original lease (the process that
+    // failed the rollback is gone) so recovery can claim it.
+    coordinator.stopImportLeaseHeartbeat(started.lease);
+    coordinator.expireOwnerLockForTests(ownerId);
     await closeDatabase();
     process.env.DATABASE_URL = connectionString;
     await coordinator.recoverPendingImports();
@@ -559,19 +568,29 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
     const holdFirst = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
+    let signalReady!: () => void;
+    const firstLockVisible = new Promise<void>((resolve) => {
+      signalReady = resolve;
+    });
 
     const first = importBackup(owner, parseBackup(fileA), {
-      onCheckpoint: async (cp: string) => {
-        if (cp === "job-created") await holdFirst;
+      onLockAcquired: async () => {
+        signalReady();
+        await holdFirst;
       },
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await firstLockVisible;
+    expect(coordinator.getOwnerImportLock(ownerId)).not.toBeNull();
+    expect(coordinator.ownerImportLeaseIsActive(ownerId)).toBe(true);
+    const beforeSecond = await captureBeforeState(ownerId);
+
     const second = importBackup(owner, parseBackup(fileB));
     await expect(second).rejects.toMatchObject({
       name: "ImportInProgressError",
       status: 409,
     });
+    expect(await captureBeforeState(ownerId)).toEqual(beforeSecond);
 
     releaseFirst();
     const summary = await first;
@@ -585,6 +604,174 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
     expect(studio).toHaveLength(1);
     expect(studio[0].brief.businessName).toBe("Import A Studio");
     expect(coordinator.getOwnerImportLock(ownerId)).toBeNull();
+  });
+
+  it("does not restore or release a live lease from a recovery scan or draft-store init", async () => {
+    const ownerId = await ensureStudioUser(owner);
+    await emptyStudio(ownerId);
+    const now = new Date().toISOString();
+    const file = {
+      backupVersion: 2 as const,
+      exportedAt: now,
+      chat: {
+        version: 1 as const,
+        sessions: [
+          {
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            title: "Live scan chat",
+            messages: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+        memories: [],
+        memoryEnabled: true,
+      },
+      studio: {
+        version: 1 as const,
+        schemaVersion: 1 as const,
+        drafts: [
+          {
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            schemaVersion: 1,
+            createdAt: now,
+            updatedAt: now,
+            brief: createDefaultBrief({
+              businessName: "Live Scan Studio",
+              adminEmail: "live@adom.example",
+            }),
+          },
+        ],
+      },
+    };
+
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let signalReady!: () => void;
+    const firstLockVisible = new Promise<void>((resolve) => {
+      signalReady = resolve;
+    });
+
+    const first = importBackup(owner, parseBackup(file), {
+      onLockAcquired: async () => {
+        signalReady();
+        await holdFirst;
+      },
+    });
+    await firstLockVisible;
+    const lockBefore = coordinator.getOwnerImportLock(ownerId);
+    expect(lockBefore).not.toBeNull();
+    const jobId = lockBefore.job_id;
+    expect(coordinator.getImportJob(jobId).status).toBe("prepared");
+
+    await coordinator.recoverPendingImports();
+    await coordinator.recoverPendingImports(ownerId);
+    coordinator.resetStartupImportRecoveryForTests();
+    coordinator.scheduleStartupImportRecovery();
+    const { getStudioDraftStore } = await import("./draft-store");
+    await getStudioDraftStore().list(owner);
+
+    const lockAfter = coordinator.getOwnerImportLock(ownerId);
+    expect(lockAfter.lock_token).toBe(lockBefore.lock_token);
+    expect(lockAfter.generation).toBe(lockBefore.generation);
+    expect(coordinator.getImportJob(jobId).status).toBe("prepared");
+    expect(coordinator.getImportJob(jobId).payload_json).not.toBe("");
+    expect(await chatStore.list(owner.id)).toHaveLength(0);
+    expect(await readStudioState(ownerId)).toHaveLength(0);
+
+    releaseFirst();
+    const summary = await first;
+    expect(summary.studioDrafts).toBe(1);
+    expect((await chatStore.list(owner.id))[0].title).toBe("Live scan chat");
+  });
+
+  it("lets exactly one recovery worker claim an expired lease", async () => {
+    const ownerId = await ensureStudioUser(owner);
+    await emptyStudio(ownerId);
+    const file = JSON.parse(
+      JSON.stringify({
+        backupVersion: 2,
+        exportedAt: new Date().toISOString(),
+        chat: { version: 1, sessions: [], memories: [], memoryEnabled: true },
+        studio: { version: 1, schemaVersion: 1, drafts: [] },
+      }),
+    );
+    const started = await coordinator.beginImportJob(
+      owner,
+      ownerId,
+      parseBackup(file),
+    );
+    coordinator.stopImportLeaseHeartbeat(started.lease);
+    coordinator.expireOwnerLockForTests(ownerId);
+
+    const first = coordinator.tryClaimExpiredOwnerLock(ownerId, started.jobId);
+    const second = coordinator.tryClaimExpiredOwnerLock(ownerId, started.jobId);
+    expect(first).not.toBeNull();
+    expect(second).toBeNull();
+    expect(first.generation).toBe(started.lease.generation + 1);
+    expect(first.lockToken).not.toBe(started.lease.lockToken);
+    expect(coordinator.getOwnerImportLock(ownerId).lock_token).toBe(
+      first.lockToken,
+    );
+    coordinator.releaseImportLock(first);
+  });
+
+  it("refuses writes, sanitize and release from an obsolete lock token", async () => {
+    const ownerId = await ensureStudioUser(owner);
+    await emptyStudio(ownerId);
+    const file = JSON.parse(
+      JSON.stringify({
+        backupVersion: 2,
+        exportedAt: new Date().toISOString(),
+        chat: { version: 1, sessions: [], memories: [], memoryEnabled: true },
+        studio: { version: 1, schemaVersion: 1, drafts: [] },
+      }),
+    );
+    const started = await coordinator.beginImportJob(
+      owner,
+      ownerId,
+      parseBackup(file),
+    );
+    const stale = started.lease;
+    coordinator.stopImportLeaseHeartbeat(stale);
+    coordinator.expireOwnerLockForTests(ownerId);
+    const claimed = coordinator.tryClaimExpiredOwnerLock(
+      ownerId,
+      started.jobId,
+    );
+    expect(claimed).not.toBeNull();
+
+    expect(() => coordinator.renewImportLease(stale)).toThrow(
+      /no longer holding the owner lock/,
+    );
+    expect(() => coordinator.assertOwnsImportLease(stale)).toThrow(
+      coordinator.ImportLostLeaseError,
+    );
+    expect(() => coordinator.markChatCommitted(started.jobId, stale)).toThrow(
+      coordinator.ImportLostLeaseError,
+    );
+    expect(() =>
+      coordinator.sanitizeAndReleaseJob(
+        started.jobId,
+        "completed",
+        undefined,
+        stale,
+      ),
+    ).toThrow(coordinator.ImportLostLeaseError);
+    expect(coordinator.releaseImportLock(stale)).toBe(false);
+    expect(coordinator.getOwnerImportLock(ownerId).lock_token).toBe(
+      claimed.lockToken,
+    );
+
+    await expect(
+      coordinator.restoreJob(coordinator.getImportJob(started.jobId), stale),
+    ).rejects.toBeInstanceOf(coordinator.ImportLostLeaseError);
+    expect(coordinator.getOwnerImportLock(ownerId).lock_token).toBe(
+      claimed.lockToken,
+    );
+    coordinator.releaseImportLock(claimed);
   });
 
   it("lets two different owners import at the same time without mixing data", async () => {

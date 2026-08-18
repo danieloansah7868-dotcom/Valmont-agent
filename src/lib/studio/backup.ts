@@ -6,7 +6,25 @@ import { getSqliteChatStore, type ChatMemory } from "@/lib/chat-store";
 import type { ChatSession } from "@/lib/types";
 import { canonicalUserId } from "@/lib/user-identity";
 import { siteBriefSchemaV1, type StudioDraft } from "./site-brief/schema";
-import type { ImportJobRecord } from "./import-coordinator";
+import type { ImportJobRecord, ImportLockLease } from "./import-coordinator";
+import {
+  acquireNewImportLock,
+  beginImportJob,
+  getImportJob,
+  ImportInProgressError,
+  ImportLostLeaseError,
+  markChatCommitted,
+  markCompleted,
+  markFailed,
+  markStudioCommitted,
+  recoverPendingImports,
+  refuseIfOwnerImportActive,
+  releaseImportLock,
+  renewImportLease,
+  restoreJob,
+  startImportLeaseHeartbeat,
+  stopImportLeaseHeartbeat,
+} from "./import-coordinator";
 import {
   draftIdExists,
   ensureStudioSchema,
@@ -361,6 +379,12 @@ export interface ImportOptions {
    * simulates a failure at that exact stage of the import.
    */
   onCheckpoint?: (checkpoint: ImportCheckpoint) => void | Promise<void>;
+  /**
+   * Called after the owner lock (and, on the mixed path, the job row) is
+   * durably acquired and before either store is written. Tests use this as
+   * an explicit latch instead of sleeping.
+   */
+  onLockAcquired?: () => void | Promise<void>;
 }
 
 /**
@@ -405,28 +429,59 @@ export async function importBackup(
     return summary;
   }
 
+  await importIntoSqlite(user, backup, summary, options);
+  return summary;
+}
+
+async function importIntoSqlite(
+  user: SessionUser,
+  backup: NormalizedBackup,
+  summary: ImportSummary,
+  options: ImportOptions,
+): Promise<void> {
   const store = getStudioSqliteStore();
   const ownerId = canonicalUserId(user);
   const db = store.connection;
 
-  // One transaction covering both halves, on the one shared connection. The
-  // synchronous import core is required here: an awaited call would let the
-  // transaction commit before the studio rows are written.
-  store.runInTransaction(() => {
-    const counts = store.importUserSync(user.id, {
-      sessions: backup.chat.sessions as ChatSession[],
-      memories: backup.chat.memories as ChatMemory[],
-      memoryEnabled: backup.chat.memoryEnabled,
-    });
-    summary.chatSessions = counts.chatSessions;
-    summary.memories = counts.memories;
-    summary.skippedMemories = counts.skippedMemories;
-    importStudioDrafts(db, ownerId, backup.studio, summary);
-    // Test hook: proves a failure after inserts rolls the whole import back.
-    options.failAfterInsertForTests?.();
-  });
+  refuseIfOwnerImportActive(ownerId);
+  await recoverPendingImports(ownerId);
+  refuseIfOwnerImportActive(ownerId);
 
-  return summary;
+  const jobId = randomUUID();
+  const lease = acquireNewImportLock(ownerId, jobId);
+  startImportLeaseHeartbeat(lease);
+  try {
+    await options.onLockAcquired?.();
+    renewImportLease(lease);
+    // One transaction covering both halves, on the one shared connection. The
+    // synchronous import core is required here: an awaited call would let the
+    // transaction commit before the studio rows are written.
+    store.runInTransaction(() => {
+      renewImportLease(lease);
+      const counts = store.importUserSync(user.id, {
+        sessions: backup.chat.sessions as ChatSession[],
+        memories: backup.chat.memories as ChatMemory[],
+        memoryEnabled: backup.chat.memoryEnabled,
+      });
+      summary.chatSessions = counts.chatSessions;
+      summary.memories = counts.memories;
+      summary.skippedMemories = counts.skippedMemories;
+      importStudioDrafts(db, ownerId, backup.studio, summary);
+      // Test hook: proves a failure after inserts rolls the whole import back.
+      options.failAfterInsertForTests?.();
+    });
+    releaseImportLock(lease);
+  } catch (cause) {
+    if (cause instanceof ImportInProgressError) throw cause;
+    try {
+      releaseImportLock(lease);
+    } catch {
+      // Lost the lease; do not touch the replacement lock.
+    }
+    throw cause;
+  } finally {
+    stopImportLeaseHeartbeat(lease);
+  }
 }
 
 /**
@@ -470,31 +525,27 @@ async function importIntoPostgres(
   const { studioDrafts } = await import("@/db/schema");
   const { ensureStudioUser } = await import("@/lib/user-identity");
   const { eq } = await import("drizzle-orm");
-  const {
-    beginImportJob,
-    getImportJob,
-    markChatCommitted,
-    markCompleted,
-    markFailed,
-    markStudioCommitted,
-    recoverPendingImports,
-    restoreJob,
-  } = await import("./import-coordinator");
 
   const ownerId = await ensureStudioUser(user);
-  // An earlier import that died mid-flight is rolled back before anything new
-  // is written, so an interrupted import never leaks into a later one.
+  // Live leases 409 before recovery. Expired leases are claimed atomically
+  // and rolled back before a new import can start.
+  refuseIfOwnerImportActive(ownerId);
   await recoverPendingImports(ownerId);
 
-  const jobId = await beginImportJob(user, ownerId, backup);
+  const started = await beginImportJob(user, ownerId, backup, "mixed");
+  const { jobId, lease } = started;
 
   try {
+    await options.onLockAcquired?.();
+    renewImportLease(lease);
     await options.onCheckpoint?.("job-created");
+    renewImportLease(lease);
     // Chat half: chat history and memories live in SQLite even when studio
     // uses PostgreSQL. The transaction is owned here so a checkpoint failure
     // can prove the chat transaction itself rolls back.
     const store = getSqliteChatStore();
     const chatCounts = store.runInTransaction(() => {
+      renewImportLease(lease);
       const counts = store.importUserSync(user.id, {
         sessions: backup.chat.sessions as ChatSession[],
         memories: backup.chat.memories as ChatMemory[],
@@ -513,41 +564,50 @@ async function importIntoPostgres(
     summary.chatSessions = chatCounts.chatSessions;
     summary.memories = chatCounts.memories;
     summary.skippedMemories = chatCounts.skippedMemories;
-    markChatCommitted(jobId);
+    markChatCommitted(jobId, lease);
     await options.onCheckpoint?.("chat-committed");
 
     // Studio half: drafts live in PostgreSQL; one transaction, then the
     // durable checkpoint.
-    await runStudioImportTransaction();
+    await runStudioImportTransaction(lease);
     await options.onCheckpoint?.("studio-committed");
     await options.onCheckpoint?.("completed");
-    markCompleted(jobId, {
-      chatSessions: summary.chatSessions,
-      memories: summary.memories,
-      studioDrafts: summary.studioDrafts,
-    });
+    markCompleted(
+      jobId,
+      {
+        chatSessions: summary.chatSessions,
+        memories: summary.memories,
+        studioDrafts: summary.studioDrafts,
+      },
+      lease,
+    );
   } catch (cause) {
-    if (cause instanceof Error && cause.name === "ImportInProgressError") {
-      throw cause;
+    if (cause instanceof ImportInProgressError) throw cause;
+    if (cause instanceof ImportLostLeaseError) {
+      // Another worker claimed the expired lease. Do not restore, sanitize
+      // or release — that worker owns the lock now.
+      throw new ImportFailedError(cause);
     }
     // The job's status before the rollback decides which halves were already
     // committed — capture it first, because restoreJob moves the status to
     // "restoring" as soon as it starts.
     const committedBeforeRollback = coordinatorJob(jobId).status;
-    // Roll both stores back to the snapshot taken before anything was
-    // written. If the rollback itself fails, that is the one exceptional case
-    // reported as PartialImportError; otherwise this is a clean failure.
     try {
-      await restoreJob(coordinatorJob(jobId));
+      await restoreJob(coordinatorJob(jobId), lease);
     } catch (restoreCause) {
       if (restoreCause instanceof ImportFailedError) throw restoreCause;
-      markFailed(jobId, restoreCause);
+      if (restoreCause instanceof ImportLostLeaseError) {
+        throw new ImportFailedError(restoreCause);
+      }
+      markFailed(jobId, restoreCause, lease);
       throw new PartialImportError(restoreCause, {
         chat: committedBeforeRollback !== "prepared",
         studio: committedBeforeRollback === "studio-committed",
       });
     }
     throw new ImportFailedError(cause);
+  } finally {
+    stopImportLeaseHeartbeat(lease);
   }
 
   function coordinatorJob(jobId: string): ImportJobRecord {
@@ -560,7 +620,10 @@ async function importIntoPostgres(
     return job;
   }
 
-  async function runStudioImportTransaction(): Promise<void> {
+  async function runStudioImportTransaction(
+    held: ImportLockLease,
+  ): Promise<void> {
+    renewImportLease(held);
     let insertedDrafts = 0;
     await getDatabase().transaction(async (tx) => {
       for (const incoming of backup.studio.drafts) {
@@ -589,6 +652,6 @@ async function importIntoPostgres(
     });
     // Only credited once the transaction above has committed.
     summary.studioDrafts = insertedDrafts;
-    markStudioCommitted(jobId);
+    markStudioCommitted(jobId, held);
   }
 }

@@ -251,12 +251,14 @@ whether an ID exists.
   halves inside one read transaction so a backup file is a consistent snapshot.
   With `DATABASE_URL` set, chat stays in SQLite while drafts go to PostgreSQL;
   those two engines are **not** one atomic snapshot on export. A durable
-  cross-store coordinator records the staged payload and a pre-import snapshot
-  of both stores before any write, takes an owner-level import lock so a second
-  import for the same account is refused with `409`, and any failure — or a
-  process killed mid-import — rolls both stores back to their exact previous
-  state, immediately or automatically on the next import attempt after a
-  restart. Success is reported only after both halves committed; a rolled-back
+  cross-store coordinator takes an owner-level **lease** (token, generation,
+  heartbeat expiry) so a second import for the same account is refused with
+  `409` before either store changes, then records the staged payload and a
+  pre-import snapshot. A live lease is never treated as a crash. After a
+  real crash the lease expires and the next import or startup claims recovery
+  with a compare-and-swap. SQLite-only complete imports take the same lease.
+  Any failure — or a process killed mid-import — rolls both stores back to
+  their exact previous state. Success is reported only after both halves committed; a rolled-back
   import is reported as a plain failure, never a partial success. After success
   or a successful rollback the journal keeps only non-sensitive metadata (id,
   owner, status, timestamps, counts) — the payload and snapshot are logically
@@ -302,7 +304,8 @@ cookie created with the same `SESSION_SECRET` the server was started with —
 
 The PostgreSQL draft tests only run when `STUDIO_TEST_DATABASE_URL` points at a
 throwaway database; otherwise they are reported as skipped, never as passed. CI
-provides a real PostgreSQL 16 service so they always run there. Do not treat a
+provides a real PostgreSQL 16 service so they always run there. Playwright
+schedules 11 tests across 2 projects (22 scheduled tests). Do not treat a
 past test count as a permanent fact — use the latest CI run on the pull request.
 
 The production Docker image does **not** install browser binaries.

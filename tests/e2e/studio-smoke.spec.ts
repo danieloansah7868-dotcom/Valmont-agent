@@ -10,10 +10,9 @@ import { encryptSessionValue } from "../../src/lib/security";
 const SECRET = process.env.SESSION_SECRET;
 if (!SECRET) throw new Error("SESSION_SECRET must be set for the e2e tests.");
 
-const ownerA = { id: "e2e-9001", login: "owner-a", name: "Owner A" };
-const ownerB = { id: "e2e-9002", login: "owner-b", name: "Owner B" };
+type StudioOwner = { id: string; login: string; name: string };
 
-function sessionCookieValue(user: typeof ownerA): string {
+function sessionCookieValue(user: StudioOwner): string {
   return encryptSessionValue(
     JSON.stringify({
       accessToken: "e2e-access-token",
@@ -33,18 +32,19 @@ function sessionCookieValue(user: typeof ownerA): string {
 // client-controlled header that evades the limiter.
 let e2eUserSeq = 0;
 
-function nextOwner(): typeof ownerA {
+function nextOwner(): StudioOwner {
   e2eUserSeq += 1;
+  const suffix = `${process.pid}-${e2eUserSeq}-${randomBytes(4).toString("hex")}`;
   return {
-    id: `e2e-u-${e2eUserSeq}`,
-    login: `owner-${e2eUserSeq}`,
-    name: `Owner ${e2eUserSeq}`,
+    id: `e2e-u-${suffix}`,
+    login: `owner-${suffix}`,
+    name: `Owner ${suffix}`,
   };
 }
 
 async function signIn(
   context: BrowserContext,
-  user: typeof ownerA,
+  user: StudioOwner,
   baseURL: string,
 ): Promise<string> {
   // A freshly generated CSRF token per run, never a fixed string.
@@ -386,12 +386,14 @@ test.describe("Website Studio", () => {
     browser,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    const isolationOwnerA = nextOwner();
+    const isolationOwnerB = nextOwner();
+    await signIn(context, isolationOwnerA, baseURL!);
     const draftId = await createDraft(page, "Private To Owner A");
 
-    // A completely separate browser context signed in as owner B.
+    // A completely separate browser context signed in as a different owner.
     const contextB = await browser.newContext({ baseURL });
-    const csrfB = await signIn(contextB, ownerB, baseURL!);
+    const csrfB = await signIn(contextB, isolationOwnerB, baseURL!);
     const pageB = await contextB.newPage();
 
     const foreign = await pageB.request.get(`/api/studio/drafts/${draftId}`, {
@@ -526,7 +528,7 @@ test.describe("Website Studio", () => {
     context,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
     const draftId = await createDraft(page, "Server Wins Draft");
 
     const pageB = await context.newPage();
