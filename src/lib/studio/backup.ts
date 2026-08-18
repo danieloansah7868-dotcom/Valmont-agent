@@ -6,6 +6,7 @@ import { getSqliteChatStore, type ChatMemory } from "@/lib/chat-store";
 import type { ChatSession } from "@/lib/types";
 import { canonicalUserId } from "@/lib/user-identity";
 import { siteBriefSchemaV1, type StudioDraft } from "./site-brief/schema";
+import type { ImportJobRecord } from "./import-coordinator";
 import {
   draftIdExists,
   ensureStudioSchema,
@@ -193,37 +194,53 @@ function validationFailure(error: z.ZodError): BackupValidationError {
   );
 }
 
-export async function buildBackup(user: SessionUser): Promise<BackupV2> {
+export async function buildBackup(
+  user: SessionUser,
+  options: { afterChatReadForTests?: () => void } = {},
+): Promise<BackupV2> {
   if (process.env.DATABASE_URL) {
     const chat = await getSqliteChatStore().exportUser(user.id);
     const drafts = await new PostgresStudioDraftStore().list(user);
     return assembleBackup(chat, drafts);
   }
 
-  // Chat and drafts are read back to back from the one shared connection.
-  // Note this is NOT wrapped in an explicit transaction: an export is a
-  // read-only snapshot for one user, and Phase 1 has no concurrent writer that
-  // could interleave with it. Do not describe it as transactionally consistent.
+  // Chat and drafts are read back to back from the one shared connection
+  // inside a single read transaction. The snapshot is fixed at the first read,
+  // so a writer committing on another connection between the chat read and the
+  // draft read cannot leak a later state into the export: the file is either
+  // entirely "before" or entirely "after", never a mixture of the two.
   const store = getStudioSqliteStore();
-  const chat = await store.exportUser(user.id);
   const ownerId = canonicalUserId(user);
-  const rows = store.connection
-    .prepare(
-      "SELECT * FROM studio_drafts WHERE owner_id = ? ORDER BY updated_at DESC",
-    )
-    .all(ownerId) as unknown as Array<Record<string, string | number>>;
-  const drafts: StudioDraft[] = rows.map((row) => ({
-    id: String(row.id),
-    ownerId: String(row.owner_id),
-    schemaVersion: Number(row.schema_version),
-    templateRegistryVersion: Number(row.template_version),
-    themeRegistryVersion: Number(row.theme_version),
-    revision: Number(row.revision),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    brief: JSON.parse(String(row.brief_json)),
-  }));
-  return assembleBackup(chat, drafts);
+  let chat: {
+    version: number;
+    sessions: ChatSession[];
+    memories: ChatMemory[];
+    memoryEnabled: boolean;
+  };
+  let drafts: StudioDraft[] = [];
+  store.runInReadTransaction(() => {
+    chat = store.exportUserSync(user.id);
+    // Test hook: proves the export cannot combine records from different
+    // points in time by letting another connection commit mid-export.
+    options.afterChatReadForTests?.();
+    const rows = store.connection
+      .prepare(
+        "SELECT * FROM studio_drafts WHERE owner_id = ? ORDER BY updated_at DESC",
+      )
+      .all(ownerId) as unknown as Array<Record<string, string | number>>;
+    drafts = rows.map((row) => ({
+      id: String(row.id),
+      ownerId: String(row.owner_id),
+      schemaVersion: Number(row.schema_version),
+      templateRegistryVersion: Number(row.template_version),
+      themeRegistryVersion: Number(row.theme_version),
+      revision: Number(row.revision),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      brief: JSON.parse(String(row.brief_json)),
+    }));
+  });
+  return assembleBackup(chat!, drafts);
 }
 
 function assembleBackup(
@@ -268,35 +285,82 @@ export interface ImportSummary {
   /** Drafts whose id already existed and were given a fresh id. */
   remappedDraftIds: number;
   /**
-   * How the two halves were committed.
+   * How the import was made atomic across stores.
    *
    * - `"single-transaction"` (SQLite): chat, memories and drafts share one
    *   connection and one transaction. A failure rolls back everything.
-   * - `"staged"` (PostgreSQL): chat lives in SQLite and studio in PostgreSQL,
-   *   so there is no distributed transaction. Each half is individually atomic
-   *   and they are committed in order.
+   * - `"coordinated"` (PostgreSQL): chat lives in SQLite and studio in
+   *   PostgreSQL, so there is no distributed transaction. The durable
+   *   cross-store coordinator in `import-coordinator.ts` records a staged
+   *   payload and a pre-import snapshot of both stores before any write, then
+   *   advances through durable checkpoints. Any failure — or an interrupted
+   *   import after a restart — rolls both stores back to their exact previous
+   *   state; success is reported only after both halves committed.
    */
-  atomicity: "single-transaction" | "staged";
+  atomicity: "single-transaction" | "coordinated";
 }
 
 /**
- * Raised when the chat half of a staged (PostgreSQL) import committed but the
- * studio half did not. The message tells the user exactly what landed, because
- * "import failed" would be untrue and would invite a destructive retry.
+ * Raised when an import failed AND rolling it back also failed. This is the
+ * catastrophic, exceptional case: the normal outcome of a partly-committed
+ * import is a successful rollback plus `ImportFailedError`. Only when the
+ * rollback itself cannot complete (for example PostgreSQL is unreachable) does
+ * this error escape, naming exactly which half is known to have committed so
+ * the owner is told what may have landed.
  */
 export class PartialImportError extends Error {
   readonly status = 500;
   readonly committed: { chat: boolean; studio: boolean };
-  constructor(cause: unknown) {
+  constructor(cause: unknown, committed: { chat: boolean; studio: boolean }) {
     super(
-      "Your chats and memories were imported, but the website drafts could not be saved. " +
-        "Nothing was lost from the backup file. Re-importing the same file will restore the " +
-        "drafts and will create a second copy of the chats.",
+      "The import failed and, separately, rolling it back also failed, so your data may be " +
+        "partly imported. The recovery record is on disk and will be rolled back by the next " +
+        "import attempt once the database is reachable again. Re-importing the same file now " +
+        "could create duplicate copies, so wait for recovery to finish first.",
     );
     this.name = "PartialImportError";
-    this.committed = { chat: true, studio: false };
+    this.committed = committed;
     this.cause = cause;
   }
+}
+
+/**
+ * Raised when an import failed at any checkpoint but every write that had
+ * already happened was rolled back. Both stores are back to their exact
+ * previous state, so this is a plain failure — never a partial success.
+ */
+export class ImportFailedError extends Error {
+  readonly status = 500;
+  constructor(cause: unknown) {
+    super(
+      "The import did not complete and everything it had written was rolled back. " +
+        "Your chats, memories and website drafts are unchanged. Try the import again.",
+    );
+    this.name = "ImportFailedError";
+    this.cause = cause;
+  }
+}
+
+/**
+ * The durable checkpoints of a coordinated (mixed SQLite/PostgreSQL) import.
+ * Tests inject a failure at each one and prove both stores are rolled back.
+ */
+export type ImportCheckpoint =
+  | "job-created"
+  | "chat-imported"
+  | "chat-committed"
+  | "studio-imported"
+  | "studio-committed"
+  | "completed";
+
+export interface ImportOptions {
+  /** SQLite path only: throws inside the single import transaction. */
+  failAfterInsertForTests?: () => void;
+  /**
+   * Mixed path only: called at each durable checkpoint. Throwing here
+   * simulates a failure at that exact stage of the import.
+   */
+  onCheckpoint?: (checkpoint: ImportCheckpoint) => void;
 }
 
 /**
@@ -307,12 +371,13 @@ export class PartialImportError extends Error {
  * everything.
  *
  * **PostgreSQL** (`DATABASE_URL` set): chat history still lives in SQLite while
- * studio drafts live in PostgreSQL. Two engines cannot share a transaction and
- * this codebase deliberately does not add a distributed-transaction layer in
- * Phase 1. The import is therefore *staged*: each half is individually atomic,
- * chat commits first, and if the studio half then fails the caller receives a
- * `PartialImportError` naming exactly what was written. It is never reported as
- * a clean failure.
+ * studio drafts live in PostgreSQL. Two engines cannot share a transaction, so
+ * the durable cross-store coordinator records the staged payload and a
+ * pre-import snapshot of both stores before any write, then advances through
+ * durable checkpoints. Any failure at any checkpoint — or an interruption that
+ * kills the process mid-import — rolls both stores back to their exact previous
+ * state, either immediately or on the next import attempt after a restart.
+ * Success is reported only after both halves have committed.
  *
  * Owner ids inside the file are never trusted. Chat rows are reassigned by the
  * chat store, studio rows by this function.
@@ -320,7 +385,7 @@ export class PartialImportError extends Error {
 export async function importBackup(
   user: SessionUser,
   backup: NormalizedBackup,
-  options: { failAfterInsertForTests?: () => void } = {},
+  options: ImportOptions = {},
 ): Promise<ImportSummary> {
   // Counts start empty and are filled in from what each store reports it wrote.
   // Trusting the file's own lengths is what previously let a dropped memory be
@@ -332,7 +397,7 @@ export async function importBackup(
     skippedMemories: 0,
     studioDrafts: 0,
     remappedDraftIds: 0,
-    atomicity: process.env.DATABASE_URL ? "staged" : "single-transaction",
+    atomicity: process.env.DATABASE_URL ? "coordinated" : "single-transaction",
   };
 
   if (process.env.DATABASE_URL) {
@@ -399,32 +464,86 @@ async function importIntoPostgres(
   user: SessionUser,
   backup: NormalizedBackup,
   summary: ImportSummary,
-  options: { failAfterInsertForTests?: () => void },
+  options: ImportOptions,
 ): Promise<void> {
   const { getDatabase } = await import("@/db");
   const { studioDrafts } = await import("@/db/schema");
   const { ensureStudioUser } = await import("@/lib/user-identity");
   const { eq } = await import("drizzle-orm");
+  const {
+    beginImportJob,
+    getImportJob,
+    markChatCommitted,
+    markCompleted,
+    markFailed,
+    markStudioCommitted,
+    recoverPendingImports,
+    restoreJob,
+  } = await import("./import-coordinator");
+
+  // An earlier import that died mid-flight is rolled back before anything new
+  // is written, so an interrupted import never leaks into a later one.
+  await recoverPendingImports();
+
   const ownerId = await ensureStudioUser(user);
+  const jobId = await beginImportJob(user, ownerId, backup);
 
-  // Chat history still lives in SQLite even when studio uses PostgreSQL, so it
-  // keeps its own transaction; the studio half below is fully transactional.
-  const chatCounts = await getSqliteChatStore().importUser(user.id, {
-    sessions: backup.chat.sessions as ChatSession[],
-    memories: backup.chat.memories as ChatMemory[],
-    memoryEnabled: backup.chat.memoryEnabled,
-  });
-  summary.chatSessions = chatCounts.chatSessions;
-  summary.memories = chatCounts.memories;
-  summary.skippedMemories = chatCounts.skippedMemories;
-
-  // From here the chat half is committed and cannot be rolled back by the
-  // PostgreSQL transaction below. Any failure is surfaced as a PartialImport-
-  // Error so the user is told precisely which half landed.
   try {
+    options.onCheckpoint?.("job-created");
+    // Chat half: chat history and memories live in SQLite even when studio
+    // uses PostgreSQL. The transaction is owned here so a checkpoint failure
+    // can prove the chat transaction itself rolls back.
+    const store = getSqliteChatStore();
+    const chatCounts = store.runInTransaction(() => {
+      const counts = store.importUserSync(user.id, {
+        sessions: backup.chat.sessions as ChatSession[],
+        memories: backup.chat.memories as ChatMemory[],
+        memoryEnabled: backup.chat.memoryEnabled,
+      });
+      options.onCheckpoint?.("chat-imported");
+      return counts;
+    });
+    summary.chatSessions = chatCounts.chatSessions;
+    summary.memories = chatCounts.memories;
+    summary.skippedMemories = chatCounts.skippedMemories;
+    markChatCommitted(jobId);
+    options.onCheckpoint?.("chat-committed");
+
+    // Studio half: drafts live in PostgreSQL; one transaction, then the
+    // durable checkpoint.
     await runStudioImportTransaction();
+    options.onCheckpoint?.("studio-committed");
+    options.onCheckpoint?.("completed");
+    markCompleted(jobId);
   } catch (cause) {
-    throw new PartialImportError(cause);
+    // The job's status before the rollback decides which halves were already
+    // committed — capture it first, because restoreJob moves the status to
+    // "restoring" as soon as it starts.
+    const committedBeforeRollback = coordinatorJob(jobId).status;
+    // Roll both stores back to the snapshot taken before anything was
+    // written. If the rollback itself fails, that is the one exceptional case
+    // reported as PartialImportError; otherwise this is a clean failure.
+    try {
+      await restoreJob(coordinatorJob(jobId));
+    } catch (restoreCause) {
+      if (restoreCause instanceof ImportFailedError) throw restoreCause;
+      markFailed(jobId, restoreCause);
+      throw new PartialImportError(restoreCause, {
+        chat: committedBeforeRollback !== "prepared",
+        studio: committedBeforeRollback === "studio-committed",
+      });
+    }
+    throw new ImportFailedError(cause);
+  }
+
+  function coordinatorJob(jobId: string): ImportJobRecord {
+    const job = getImportJob(jobId);
+    if (!job) {
+      throw new Error(
+        `Import coordinator lost its job record ${jobId}; recovery cannot roll the import back.`,
+      );
+    }
+    return job;
   }
 
   async function runStudioImportTransaction(): Promise<void> {
@@ -450,9 +569,12 @@ async function importIntoPostgres(
         });
         insertedDrafts += 1;
       }
-      options.failAfterInsertForTests?.();
+      // A throw here rolls the PostgreSQL transaction back; the coordinator
+      // still restores the already-committed chat half.
+      options.onCheckpoint?.("studio-imported");
     });
     // Only credited once the transaction above has committed.
     summary.studioDrafts = insertedDrafts;
+    markStudioCommitted(jobId);
   }
 }

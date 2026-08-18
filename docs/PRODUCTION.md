@@ -86,22 +86,32 @@ volume. Without a volume every container restart starts from an empty database.
 
 ### Schema versions
 
-The SQLite store records `studio-schema-version` in `chat_meta`, and PostgreSQL
-rows carry `schema_version`. Both are `1`. Startup is idempotent: the tables are
-created only if missing, and repeated restarts neither duplicate nor migrate
-anything twice. The legacy-JSON migration writes
-`<legacy path>.pre-sqlite-backup` first, using `COPYFILE_EXCL` so an existing
-backup is never overwritten, and records a `legacy-json-migrated` marker only
-after the migrated rows are committed.
+The SQLite Studio schema is versioned in a dedicated `studio_meta` table and
+upgraded through sequential, transactional migrations: the recorded version is
+written only after every migration succeeds, a failure rolls schema and
+metadata back together, a recorded version newer than the running build is
+refused, and repeated restarts are a no-op. PostgreSQL rows carry
+`schema_version`, managed by the Drizzle migrations. Both are `1`. The
+legacy-JSON chat migration writes `<legacy path>.pre-sqlite-backup` first,
+using `COPYFILE_EXCL` so an existing backup is never overwritten, and records a
+`legacy-json-migrated` marker only after the migrated rows are committed.
 
 ### Backups
 
-- `GET /api/backup/export` — one consistent read; a version 2 file containing
-  chat sessions, memories, and Studio drafts.
-- `POST /api/backup/import` — one transaction. SQLite uses the single shared
-  database handle, so a mid-import failure rolls chat, memories, and drafts back
-  together. Legacy version 1 chat-only files are still accepted; unknown
-  versions are rejected before anything is written.
+- `GET /api/backup/export` — on SQLite, chat and drafts are read inside one
+  read transaction on the single shared database handle, so the file is a
+  consistent snapshot: a version 2 file containing chat sessions, memories, and
+  Studio drafts.
+- `POST /api/backup/import` — SQLite uses the single shared database handle, so
+  a mid-import failure rolls chat, memories, and drafts back together. With
+  `DATABASE_URL` set, chat stays in SQLite and drafts go to PostgreSQL; the
+  durable cross-store coordinator records the staged payload and a pre-import
+  snapshot of both stores before any write, and a failure at any checkpoint —
+  or a process killed mid-import — rolls both stores back to their exact
+  previous state, immediately or automatically on the next import attempt after
+  a restart. Success is reported only after both halves committed. Legacy
+  version 1 chat-only files are still accepted; unknown versions are rejected
+  before anything is written.
 
 Backups contain the owner's business details. Treat a downloaded file as
 sensitive: store it encrypted, and delete copies you no longer need. Regular

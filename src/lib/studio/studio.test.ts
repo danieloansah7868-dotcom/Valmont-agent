@@ -67,10 +67,10 @@ describe("studio drafts share the chat database", () => {
     expect(getStudioSqliteStore().connection).toBe(chatStore.connection);
   });
 
-  it("records the studio schema version in the shared meta table", async () => {
+  it("records the studio schema version in the dedicated studio_meta table", async () => {
     await store.create(userA, brief());
     const row = getStudioSqliteDb()
-      .prepare("SELECT value FROM chat_meta WHERE key = ?")
+      .prepare("SELECT value FROM studio_meta WHERE key = ?")
       .get("studio-schema-version") as { value: string } | undefined;
     expect(row?.value).toBe("1");
   });

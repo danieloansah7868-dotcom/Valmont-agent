@@ -17,6 +17,9 @@ import {
   formatGhanaCurrency,
   PLANNED_PAYMENT_METHODS,
   PAYMENT_PLANNING_NOTICE,
+  SUPPORTED_COUNTRIES,
+  SUPPORTED_CURRENCIES,
+  SUPPORTED_TIMEZONES,
   isStarterValue,
 } from "./site-brief/defaults";
 import {
@@ -292,6 +295,27 @@ describe("site brief: Ghana-friendly defaults", () => {
   it("lists the sixteen Ghana regions", () => {
     expect(GHANA_REGIONS.length).toBe(16);
     expect(GHANA_REGIONS).toContain("Greater Accra");
+  });
+
+  it("exposes country, currency and timezone controls with Ghana defaults", () => {
+    // The wizard offers these as accessible selects; Ghana/GHS/Africa/Accra
+    // are the defaults and supported alternatives are available.
+    expect(SUPPORTED_COUNTRIES[0]).toBe("Ghana");
+    expect(SUPPORTED_COUNTRIES.length).toBeGreaterThan(1);
+    expect(SUPPORTED_CURRENCIES.map((c) => c.code)).toContain("GHS");
+    expect(SUPPORTED_CURRENCIES.some((c) => c.label.includes("GH₵"))).toBe(
+      true,
+    );
+    expect(SUPPORTED_CURRENCIES.length).toBeGreaterThan(1);
+    expect(SUPPORTED_TIMEZONES[0]).toBe("Africa/Accra");
+    expect(SUPPORTED_TIMEZONES.length).toBeGreaterThan(1);
+    // The defaults are part of the offered sets, so a fresh brief's values are
+    // always selectable in the wizard.
+    expect(SUPPORTED_COUNTRIES).toContain(GHANA_DEFAULTS.country);
+    expect(SUPPORTED_CURRENCIES.map((c) => c.code)).toContain(
+      GHANA_DEFAULTS.currency,
+    );
+    expect(SUPPORTED_TIMEZONES).toContain(GHANA_DEFAULTS.timezone);
   });
 });
 

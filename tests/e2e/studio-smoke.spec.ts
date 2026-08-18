@@ -27,6 +27,14 @@ function sessionCookieValue(user: typeof ownerA): string {
   );
 }
 
+// Every API rate-limit bucket is keyed by x-forwarded-for, falling back to one
+// shared "local" bucket. Without a distinct key per test, a whole e2e run would
+// exhaust the in-memory mutation budget in a single window. Each test therefore
+// carries its own synthetic client address; the limiter itself is still
+// exercised on every single request. This is test-side only — no production
+// code path is weakened.
+let rateLimitKeyCounter = 0;
+
 async function signIn(
   context: BrowserContext,
   user: typeof ownerA,
@@ -44,6 +52,16 @@ async function signIn(
     },
     { name: "valmont_csrf", value: csrf, domain: url.hostname, path: "/" },
   ]);
+  rateLimitKeyCounter += 1;
+  const clientKey = `127.0.0.${(rateLimitKeyCounter % 253) + 2}`;
+  await context.route("**/api/**", async (route) => {
+    await route.continue({
+      headers: {
+        ...route.request().headers(),
+        "x-forwarded-for": clientKey,
+      },
+    });
+  });
   return csrf;
 }
 
@@ -95,6 +113,21 @@ test.describe("Website Studio", () => {
     await page.getByLabel(/Admin email/i).fill("owner@adom.example");
     await page.getByLabel(/Phone number/i).fill("0201234567");
     await page.getByLabel(/^Tagline$/i).fill("Style that fits");
+
+    // The country, currency and timezone controls are exposed and default to
+    // Ghana, GHS and Africa/Accra, with supported alternatives selectable.
+    await expect(page.getByLabel(/^Country$/i)).toHaveValue("Ghana");
+    await expect(page.getByLabel(/^Currency$/i)).toHaveValue("GHS");
+    await expect(page.getByLabel(/^Timezone$/i)).toHaveValue("Africa/Accra");
+    await page.getByLabel(/^Currency$/i).selectOption("NGN");
+    await page.getByLabel(/^Timezone$/i).selectOption("Africa/Lagos");
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      { timeout: 15_000 },
+    );
+    await expect(page.getByLabel(/^Currency$/i)).toHaveValue("NGN");
+    await page.getByLabel(/^Currency$/i).selectOption("GHS");
+    await page.getByLabel(/^Timezone$/i).selectOption("Africa/Accra");
 
     await expect(page.getByTestId("save-state")).toHaveText(
       /All changes saved/i,
@@ -290,17 +323,17 @@ test.describe("Website Studio", () => {
     );
   });
 
-  test("fits an iPhone screen with no sideways scrolling", async ({
+  test("no page scrolls sideways on any scheduled browser project", async ({
     page,
     context,
     baseURL,
   }) => {
-    test.skip(
-      test.info().project.name !== "iphone",
-      "Runs in the iPhone project only.",
-    );
+    // Runs in every project (desktop-chromium and the iPhone viewport project):
+    // a page that scrolls sideways on a 390px iPhone screen would be a real
+    // layout failure, and on a desktop viewport it would be an obvious one too,
+    // so the assertion is meaningful in both. There is no intentional skip.
     await signIn(context, ownerA, baseURL!);
-    const draftId = await createDraft(page, "Mobile Test");
+    const draftId = await createDraft(page, "No Overflow Test");
 
     for (const path of ["/studio", `/studio/drafts/${draftId}`]) {
       await page.goto(path);
@@ -388,5 +421,120 @@ test.describe("Website Studio", () => {
 
     await page.goto(`/studio/drafts/${draftId}`);
     await expect(page.getByText(/Draft not found/i)).toBeVisible();
+  });
+
+  test('two tabs: a real 409 keeps the latest typing when "Keep what is on this screen" is chosen', async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, ownerA, baseURL!);
+    const draftId = await createDraft(page, "Conflict Draft");
+
+    // Page B opens the same draft while it is still at revision 1.
+    const pageB = await context.newPage();
+    await pageB.goto(`/studio/drafts/${draftId}`);
+    await pageB.getByRole("button", { name: /4\. Business details/i }).click();
+    await expect(pageB.getByLabel(/Business name/i)).toHaveValue(
+      "Conflict Draft",
+    );
+
+    // Page A edits the business name and its autosave commits first.
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await page.getByLabel(/Business name/i).fill("Aroko Fresh Foods");
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      { timeout: 15_000 },
+    );
+
+    // Page B edits the SAME field. Its save carries the now-stale revision,
+    // so the server returns a real 409 and the conflict choice appears.
+    await pageB.getByLabel(/Business name/i).fill("Kofi Fresh Foods");
+    await expect(pageB.getByTestId("conflict-banner")).toBeVisible({
+      timeout: 15_000,
+    });
+
+    // The user keeps typing after the warning. Autosave must stay frozen:
+    // the banner stays up, nothing is written, and the new text is preserved.
+    await pageB.getByLabel(/^Tagline$/i).fill("Fresh from the farm daily");
+    await pageB.waitForTimeout(1500);
+    await expect(pageB.getByTestId("conflict-banner")).toBeVisible();
+    await expect(pageB.getByTestId("save-state")).toHaveText(
+      /Someone else edited/i,
+    );
+
+    // “Keep what is on this screen” must save the LATEST on-screen state —
+    // including the text typed after the warning appeared.
+    await pageB
+      .getByRole("button", { name: /Keep what is on this screen/i })
+      .click();
+    await expect(pageB.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      { timeout: 15_000 },
+    );
+
+    // Reopening from the server proves the latest text persisted.
+    const reopened = await context.newPage();
+    await reopened.goto(`/studio/drafts/${draftId}`);
+    await reopened
+      .getByRole("button", { name: /4\. Business details/i })
+      .click();
+    await expect(reopened.getByLabel(/Business name/i)).toHaveValue(
+      "Kofi Fresh Foods",
+    );
+    await expect(reopened.getByLabel(/^Tagline$/i)).toHaveValue(
+      "Fresh from the farm daily",
+    );
+    await reopened.close();
+    await pageB.close();
+  });
+
+  test("two tabs: accepting the server version after a 409 keeps the other tab's text", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, ownerA, baseURL!);
+    const draftId = await createDraft(page, "Server Wins Draft");
+
+    const pageB = await context.newPage();
+    await pageB.goto(`/studio/drafts/${draftId}`);
+    await pageB.getByRole("button", { name: /4\. Business details/i }).click();
+
+    // Page A saves first; page B then edits the same field and gets a real 409.
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await page.getByLabel(/Business name/i).fill("Server Side Name");
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      { timeout: 15_000 },
+    );
+
+    await pageB.getByLabel(/Business name/i).fill("Local Side Name");
+    await expect(pageB.getByTestId("conflict-banner")).toBeVisible({
+      timeout: 15_000,
+    });
+
+    // Choosing the other version replaces the screen with the server's copy.
+    await pageB
+      .getByRole("button", { name: /Use the other version instead/i })
+      .click();
+    await expect(pageB.getByLabel(/Business name/i)).toHaveValue(
+      "Server Side Name",
+    );
+    await expect(pageB.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+    );
+
+    // Reopening proves the server version won and the local edit was dropped.
+    const reopened = await context.newPage();
+    await reopened.goto(`/studio/drafts/${draftId}`);
+    await reopened
+      .getByRole("button", { name: /4\. Business details/i })
+      .click();
+    await expect(reopened.getByLabel(/Business name/i)).toHaveValue(
+      "Server Side Name",
+    );
+    await reopened.close();
+    await pageB.close();
   });
 });

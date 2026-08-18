@@ -40,6 +40,57 @@ export function isGhanaRegion(value: string): value is GhanaRegion {
 }
 
 /**
+ * The country choices offered in the wizard. Ghana is the default; the rest
+ * are supported alternatives a draft may choose between. The Site Brief is
+ * planning data in Phase 1 — no code generation or pricing runs on these
+ * values yet — so the list is deliberately small and honest.
+ */
+export const SUPPORTED_COUNTRIES = [
+  "Ghana",
+  "Nigeria",
+  "Kenya",
+  "United Kingdom",
+  "United States",
+] as const;
+
+export type SupportedCountry = (typeof SUPPORTED_COUNTRIES)[number];
+
+export function isSupportedCountry(value: string): value is SupportedCountry {
+  return (SUPPORTED_COUNTRIES as readonly string[]).includes(value);
+}
+
+export const SUPPORTED_CURRENCIES = [
+  { code: "GHS", label: "GHS — Ghana cedi (GH₵)" },
+  { code: "NGN", label: "NGN — Nigerian naira (₦)" },
+  { code: "KES", label: "KES — Kenyan shilling (KSh)" },
+  { code: "GBP", label: "GBP — pound sterling (£)" },
+  { code: "USD", label: "USD — US dollar ($)" },
+] as const;
+
+export type SupportedCurrencyCode =
+  (typeof SUPPORTED_CURRENCIES)[number]["code"];
+
+export function isSupportedCurrency(value: string): boolean {
+  return (SUPPORTED_CURRENCIES as readonly { code: string }[]).some(
+    (item) => item.code === value,
+  );
+}
+
+export const SUPPORTED_TIMEZONES = [
+  "Africa/Accra",
+  "Africa/Lagos",
+  "Africa/Nairobi",
+  "Europe/London",
+  "America/New_York",
+] as const;
+
+export type SupportedTimezone = (typeof SUPPORTED_TIMEZONES)[number];
+
+export function isSupportedTimezone(value: string): value is SupportedTimezone {
+  return (SUPPORTED_TIMEZONES as readonly string[]).includes(value);
+}
+
+/**
  * Payment methods a business says it would *like* later. Phase 1 records the
  * preference only — nothing is connected, and no money can move.
  */

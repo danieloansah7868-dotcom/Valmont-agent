@@ -1,13 +1,14 @@
 /**
- * Real staged-import tests against PostgreSQL.
+ * Real coordinated-import tests against PostgreSQL.
  *
- * An independent review found that the previous coverage for staged imports
- * only constructed a `PartialImportError` by hand. It never ran an import with
- * `DATABASE_URL` set, never proved the studio half is transactional, and never
- * exercised the route that turns a partial import into an HTTP 500. This file
- * closes that gap.
+ * When `DATABASE_URL` is set, Chat lives in SQLite and Studio lives in
+ * PostgreSQL. There is no distributed transaction, so imports are made
+ * all-or-nothing by the durable cross-store coordinator: a job records the
+ * staged payload and a snapshot of both stores before any write, advances
+ * through durable checkpoints, and rolls both stores back to their exact
+ * previous state when anything fails — immediately, or after a restart.
  *
- * Like the other PostgreSQL suite these tests need a throwaway server:
+ * These tests need a real throwaway PostgreSQL server:
  *
  *   STUDIO_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/valmont_test
  *
@@ -27,6 +28,8 @@ import {
   vi,
 } from "vitest";
 import type { SessionUser } from "@/lib/auth";
+import type { ChatMemory } from "@/lib/chat-store";
+import type { ChatSession } from "@/lib/types";
 
 const connectionString = process.env.STUDIO_TEST_DATABASE_URL;
 
@@ -57,7 +60,7 @@ vi.mock("@/lib/security", async (importOriginal) => {
   return { ...actual, decryptSessionValue: (value: string) => value };
 });
 
-describe.runIf(connectionString)("PostgreSQL staged backup import", () => {
+describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
   /* eslint-disable @typescript-eslint/no-explicit-any */
   let SqliteChatStore: any;
   let setSqliteChatStoreForTests: any;
@@ -66,25 +69,27 @@ describe.runIf(connectionString)("PostgreSQL staged backup import", () => {
   let buildBackup: any;
   let importBackup: any;
   let parseBackup: any;
-  let PartialImportError: any;
+  let ImportFailedError: any;
   let ensureStudioUser: any;
   let getDatabase: any;
   let closeDatabase: any;
   let studioDraftsTable: any;
   let eq: any;
+  let coordinator: any;
   let chatStore: any;
   let drafts: any;
   /* eslint-enable @typescript-eslint/no-explicit-any */
 
   const dirs: string[] = [];
+  let sqlitePath = "";
+  let legacyPath = "";
 
   function freshChatStore() {
     const dir = mkdtempSync(path.join(os.tmpdir(), "valmont-pg-backup-"));
     dirs.push(dir);
-    chatStore = new SqliteChatStore(
-      path.join(dir, "chat-store.sqlite"),
-      path.join(dir, "chat-store.json"),
-    );
+    sqlitePath = path.join(dir, "chat-store.sqlite");
+    legacyPath = path.join(dir, "chat-store.json");
+    chatStore = new SqliteChatStore(sqlitePath, legacyPath);
     setSqliteChatStoreForTests(chatStore);
   }
 
@@ -120,13 +125,51 @@ describe.runIf(connectionString)("PostgreSQL staged backup import", () => {
     );
   }
 
-  async function draftRowCount(): Promise<number> {
-    const ownerId = await ensureStudioUser(owner);
-    const rows = await getDatabase()
-      .select({ id: studioDraftsTable.id })
+  interface StudioStateRow {
+    id: string;
+    schemaVersion: number;
+    templateVersion: number;
+    themeVersion: number;
+    revision: number;
+    createdAt: Date;
+    updatedAt: Date;
+    brief: unknown;
+  }
+
+  async function readStudioState(ownerId: string) {
+    const rows = (await getDatabase()
+      .select()
       .from(studioDraftsTable)
+      .where(eq(studioDraftsTable.ownerId, ownerId))) as StudioStateRow[];
+    return JSON.parse(
+      JSON.stringify(
+        rows.map((row) => ({
+          id: row.id,
+          schemaVersion: row.schemaVersion,
+          templateVersion: row.templateVersion,
+          themeVersion: row.themeVersion,
+          revision: row.revision,
+          createdAt: row.createdAt.toISOString(),
+          updatedAt: row.updatedAt.toISOString(),
+          brief: row.brief,
+        })),
+      ),
+    );
+  }
+
+  async function emptyStudio(ownerId: string) {
+    await getDatabase()
+      .delete(studioDraftsTable)
       .where(eq(studioDraftsTable.ownerId, ownerId));
-    return rows.length;
+  }
+
+  async function captureBeforeState(ownerId: string) {
+    return {
+      chat: JSON.parse(
+        JSON.stringify(chatStore.captureUserStateSync(owner.id)),
+      ),
+      studio: await readStudioState(ownerId),
+    };
   }
 
   beforeAll(async () => {
@@ -148,12 +191,13 @@ describe.runIf(connectionString)("PostgreSQL staged backup import", () => {
     buildBackup = backup.buildBackup;
     importBackup = backup.importBackup;
     parseBackup = backup.parseBackup;
-    PartialImportError = backup.PartialImportError;
+    ImportFailedError = backup.ImportFailedError;
     ensureStudioUser = identity.ensureStudioUser;
     getDatabase = db.getDatabase;
     closeDatabase = db.closeDatabase;
     studioDraftsTable = schema.studioDrafts;
     eq = drizzle.eq;
+    coordinator = await import("./import-coordinator");
 
     drafts = new PostgresStudioDraftStore();
     await ensureStudioUser(owner);
@@ -164,13 +208,12 @@ describe.runIf(connectionString)("PostgreSQL staged backup import", () => {
     process.env.DATABASE_URL = connectionString;
     freshChatStore();
     const ownerId = await ensureStudioUser(owner);
-    await getDatabase()
-      .delete(studioDraftsTable)
-      .where(eq(studioDraftsTable.ownerId, ownerId));
+    await emptyStudio(ownerId);
   });
 
   afterEach(() => {
     setSqliteChatStoreForTests(null);
+    process.env.DATABASE_URL = connectionString;
     for (const dir of dirs.splice(0))
       rmSync(dir, { recursive: true, force: true });
   });
@@ -184,75 +227,187 @@ describe.runIf(connectionString)("PostgreSQL staged backup import", () => {
     delete process.env.DATABASE_URL;
   });
 
-  it("really imports both halves and reports staged atomicity", async () => {
+  it("really imports both halves and reports coordinated atomicity", async () => {
     await seed();
     const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
 
     // Empty both halves, then restore.
     freshChatStore();
     const ownerId = await ensureStudioUser(owner);
-    await getDatabase()
-      .delete(studioDraftsTable)
-      .where(eq(studioDraftsTable.ownerId, ownerId));
+    await emptyStudio(ownerId);
 
     const summary = await importBackup(owner, parseBackup(file));
 
-    expect(summary.atomicity).toBe("staged");
+    expect(summary.atomicity).toBe("coordinated");
     expect(summary.chatSessions).toBe(1);
     expect(summary.memories).toBe(1);
     expect(summary.studioDrafts).toBe(1);
     // The drafts are really in PostgreSQL, not merely counted.
-    expect(await draftRowCount()).toBe(1);
+    expect(await readStudioState(ownerId)).toHaveLength(1);
     const restored = await drafts.list(owner);
     expect(restored).toHaveLength(1);
     expect(restored[0].brief.businessName).toBe("Adom Fashion House");
+    // The job is durably recorded as completed.
+    const jobs = coordinator.listImportJobs(ownerId);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe("completed");
   });
 
-  it("rolls the studio half back and raises PartialImportError", async () => {
+  it.each([
+    "job-created",
+    "chat-imported",
+    "chat-committed",
+    "studio-imported",
+    "studio-committed",
+    "completed",
+  ] as const)(
+    "a failure at checkpoint %s returns both stores to their exact previous state",
+    async (checkpoint) => {
+      // Pre-existing data in BOTH stores. Importing the same file again would
+      // add separate copies (colliding ids are remapped), so any surviving
+      // write after the injected failure is visible as a difference.
+      await seed();
+      const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
+      const ownerId = await ensureStudioUser(owner);
+      const before = await captureBeforeState(ownerId);
+
+      await expect(
+        importBackup(owner, parseBackup(file), {
+          onCheckpoint: (cp: string) => {
+            if (cp === checkpoint) {
+              throw new Error(`injected failure at ${checkpoint}`);
+            }
+          },
+        }),
+        `importBackup should fail at ${checkpoint}`,
+      ).rejects.toBeInstanceOf(ImportFailedError);
+
+      // The failure is reported as a clean failure, never as a partial
+      // success, and BOTH stores are exactly as they were before the import.
+      const after = await captureBeforeState(ownerId);
+      expect(after, `stores after failure at ${checkpoint}`).toEqual(before);
+      // The job is durably recorded as rolled back.
+      const jobs = coordinator.listImportJobs(ownerId);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].status).toBe("restored");
+    },
+  );
+
+  it("recovers an interrupted import after a simulated restart", async () => {
     await seed();
     const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
-
     freshChatStore();
     const ownerId = await ensureStudioUser(owner);
-    await getDatabase()
-      .delete(studioDraftsTable)
-      .where(eq(studioDraftsTable.ownerId, ownerId));
+    await emptyStudio(ownerId);
+    const before = await captureBeforeState(ownerId);
 
-    const failure = importBackup(owner, parseBackup(file), {
-      failAfterInsertForTests: () => {
-        throw new Error("connection reset");
-      },
+    // Simulate a process dying mid-import: drive the coordinator's real steps
+    // up to the point where the chat half committed, then STOP without any
+    // rollback, exactly as an abrupt crash would leave the database.
+    const parsed = parseBackup(file);
+    const jobId = await coordinator.beginImportJob(owner, ownerId, parsed);
+    chatStore.runInTransaction(() => {
+      chatStore.importUserSync(owner.id, {
+        sessions: parsed.chat.sessions as ChatSession[],
+        memories: parsed.chat.memories as ChatMemory[],
+        memoryEnabled: parsed.chat.memoryEnabled,
+      });
     });
-
-    await expect(failure).rejects.toBeInstanceOf(PartialImportError);
-    // The studio transaction rolled back: no half-written drafts.
-    expect(await draftRowCount()).toBe(0);
-    // The chat half did commit, which is exactly what the error promises.
+    coordinator.markChatCommitted(jobId);
+    // The chat half really did land before the "crash".
     expect(await chatStore.list(owner.id)).toHaveLength(1);
+
+    // "Restart": a brand-new connection to the same SQLite file and a fresh
+    // PostgreSQL client. The coordinator record survives on disk.
+    setSqliteChatStoreForTests(null);
+    chatStore = new SqliteChatStore(sqlitePath, legacyPath);
+    setSqliteChatStoreForTests(chatStore);
+    await closeDatabase();
+    process.env.DATABASE_URL = connectionString;
+
+    await coordinator.recoverPendingImports();
+
+    // Both stores are back to their exact pre-import state.
+    const after = await captureBeforeState(ownerId);
+    expect(after).toEqual(before);
+    expect(coordinator.getImportJob(jobId).status).toBe("restored");
   });
 
-  it("does not credit drafts that were rolled back", async () => {
+  it("rolls an interrupted import back automatically before the next import", async () => {
     await seed();
     const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
     freshChatStore();
+    const ownerId = await ensureStudioUser(owner);
+    await emptyStudio(ownerId);
 
-    let thrown: unknown;
-    try {
-      await importBackup(owner, parseBackup(file), {
-        failAfterInsertForTests: () => {
-          throw new Error("connection reset");
-        },
+    // Crash the same way: chat half committed, job left at "chat-committed".
+    const parsed = parseBackup(file);
+    const crashedJobId = await coordinator.beginImportJob(
+      owner,
+      ownerId,
+      parsed,
+    );
+    chatStore.runInTransaction(() => {
+      chatStore.importUserSync(owner.id, {
+        sessions: parsed.chat.sessions as ChatSession[],
+        memories: parsed.chat.memories as ChatMemory[],
+        memoryEnabled: parsed.chat.memoryEnabled,
       });
-    } catch (error) {
-      thrown = error;
-    }
-
-    expect(thrown).toBeInstanceOf(PartialImportError);
-    expect((thrown as { committed: unknown }).committed).toEqual({
-      chat: true,
-      studio: false,
     });
-    // The driver's own text must never reach the owner.
-    expect((thrown as Error).message).not.toContain("connection reset");
+    coordinator.markChatCommitted(crashedJobId);
+    expect(await chatStore.list(owner.id)).toHaveLength(1);
+
+    // The next import attempt self-heals: it rolls the crashed job back, then
+    // runs the new import.
+    const summary = await importBackup(owner, parseBackup(file));
+
+    expect(summary.chatSessions).toBe(1);
+    expect(summary.memories).toBe(1);
+    expect(summary.studioDrafts).toBe(1);
+    // The crashed job was rolled back (not duplicated by the new import).
+    expect(coordinator.getImportJob(crashedJobId).status).toBe("restored");
+    expect(await chatStore.list(owner.id)).toHaveLength(1);
+    expect(await readStudioState(ownerId)).toHaveLength(1);
+  });
+
+  it("keeps the recovery record when the rollback itself fails, then restores later", async () => {
+    await seed();
+    const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
+    freshChatStore();
+    const ownerId = await ensureStudioUser(owner);
+    await emptyStudio(ownerId);
+    const before = await captureBeforeState(ownerId);
+
+    // Chat half commits, then PostgreSQL becomes unreachable so the rollback's
+    // studio half cannot run — the catastrophic case behind PartialImportError.
+    const parsed = parseBackup(file);
+    const jobId = await coordinator.beginImportJob(owner, ownerId, parsed);
+    chatStore.runInTransaction(() => {
+      chatStore.importUserSync(owner.id, {
+        sessions: parsed.chat.sessions as ChatSession[],
+        memories: parsed.chat.memories as ChatMemory[],
+        memoryEnabled: parsed.chat.memoryEnabled,
+      });
+    });
+    coordinator.markChatCommitted(jobId);
+    expect(await chatStore.list(owner.id)).toHaveLength(1);
+
+    await closeDatabase();
+    process.env.DATABASE_URL = "postgres://postgres:hunter2@127.0.0.1:1/none";
+
+    await expect(
+      coordinator.restoreJob(coordinator.getImportJob(jobId)),
+    ).rejects.toThrow();
+    // The job stays "restoring" — recovery retries, it is not lost.
+    expect(coordinator.getImportJob(jobId).status).toBe("restoring");
+
+    // PostgreSQL comes back; recovery finishes the rollback.
+    await closeDatabase();
+    process.env.DATABASE_URL = connectionString;
+    await coordinator.recoverPendingImports();
+
+    const after = await captureBeforeState(ownerId);
+    expect(after).toEqual(before);
+    expect(coordinator.getImportJob(jobId).status).toBe("restored");
   });
 });

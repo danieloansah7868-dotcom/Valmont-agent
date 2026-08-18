@@ -1,57 +1,21 @@
-# Deferred items — agreed with the owner, to be tackled next session
-
-These are parked deliberately. Nothing here is urgent, and nothing here is broken
-for users. Recorded so they are not forgotten.
+# Follow-up items — status updated by the final-corrections session
 
 Owner note: PR #10 was merged intentionally by the owner. It was not a mistake and
-nothing about it needs to be reverted. The items below are follow-up housekeeping
-caused by that merge, plus one pre-existing task.
+nothing about it needs to be reverted. The items below were follow-up housekeeping
+caused by that merge; several have since been resolved by the Website Studio
+final-corrections PR (which supersedes PR #9 and must not be merged before an
+independent review).
 
 ---
 
 ## 1. Fix the formatting on `main`
 
-**Status:** not done, awaiting owner's go-ahead.
-
-`main` (`df702ff`) currently fails the `format:check` step. Three files are affected:
-
-- `src/app/page.tsx`
-- `src/components/app-nav.tsx`
-- `src/components/app-shell.tsx`
-
-**Nothing is broken for users.** Verified on a clean checkout of `df702ff`, with no
-other branch involved:
-
-| Check          | Result    |
-| -------------- | --------- |
-| `lint`         | pass      |
-| `typecheck`    | pass      |
-| `test`         | pass (86) |
-| `build`        | pass      |
-| `format:check` | **fail**  |
-
-The fix is one command run on `main`:
-
-```
-npx prettier --write .
-```
-
-The change is cosmetic. Verified by stripping all whitespace and comparing the
-files character by character, the only non-whitespace differences are:
-
-- `src/app/page.tsx` — one redundant pair of brackets `(` `)` removed from a
-  nested ternary that Prettier re-wrapped across lines
-- `src/components/app-shell.tsx` — one trailing comma removed
-- `src/components/app-nav.tsx` — pure line wrapping, no character change at all
-
-None of these alter behaviour.
-
-**Why it matters:** until it is fixed, every future pull request shows a red X on
-its `validate` check, even when the pull request itself is perfect. That makes it
-hard to tell a real failure from inherited noise.
-
-**Why it was not done automatically:** it touches `main`, and the standing rule is
-no changes without explicit permission.
+**Status: resolved.** The final-corrections branch fixed the formatting on
+`src/app/page.tsx`, `src/components/app-nav.tsx` and `src/components/app-shell.tsx`
+(they were inherited unformatted from `main` at `df702ff`). `npm run format:check`
+passes on the branch, so the new PR's `validate` check is green. `main` itself is
+still left untouched, per the standing rule of no changes without explicit
+permission — merging the new PR brings the fix in.
 
 ---
 
@@ -73,52 +37,32 @@ This is a policy decision for the owner, not a code change. Options range from
 
 ## 3. Activate the Phase 1 CI workflow
 
-**Status:** blocked on a human. Cannot be done by an agent.
+**Status: done.** The workflow was activated in commit `158f601`
+(`.github/ci-workflow-phase1.yml` moved to `.github/workflows/ci.yml`; the
+staging file was removed). CI now runs on every push and pull request:
 
-`.github/ci-workflow-phase1.yml` needs to be moved to `.github/workflows/ci.yml`.
+- `npm ci`, `format:check`, `lint`, `typecheck`
+- Drizzle migrations against a throwaway **PostgreSQL 16 service**, then
+  `npm test` with `STUDIO_TEST_DATABASE_URL` pointing at it (the 20 PostgreSQL
+  tests run for real, including the coordinated-import failure-at-every-
+  checkpoint and interrupted-restart recovery tests)
+- `npx playwright install --with-deps chromium`, then `npm run test:e2e`
+  (10 tests × desktop-chromium and iphone projects, no skips)
+- `npm run build`
+- a `container` job that runs `docker build`
 
-Attempted and rejected by GitHub with:
-
-> refusing to allow a GitHub App to create or update workflow
-> `.github/workflows/ci.yml` without `workflows` permission
-
-This is a hard platform security rule: automation is not permitted to edit the
-files that control what automation runs. There is no workaround from an agent
-session.
-
-A human maintainer must run, on the `arena/01a00fc5-valmont-agent` branch:
-
-```
-git mv .github/ci-workflow-phase1.yml .github/workflows/ci.yml
-git commit -m "Activate the Phase 1 CI workflow"
-git push
-```
-
-**What activating it adds:** a throwaway PostgreSQL 16 service so the 10
-PostgreSQL tests run in CI, plus Chromium so the 16 Playwright browser tests run.
-Until then CI runs neither.
-
-Note: the 10 PostgreSQL tests have since been run manually against a real
-PostgreSQL 18.4 server and all 10 pass. The 16 browser tests have still never
-been executed anywhere.
+Nothing needs to be moved or activated by a human anymore.
 
 ---
 
-## 4. Re-run PR #9's checks against the current `main`
+## 4. Re-run Phase 1 checks against the current `main`
 
-**Status:** not done. Should happen after item 1.
-
-PR #9's green checks were computed against the **old** `main` (`6131e97`), before
-PR #10 landed. GitHub has not yet recalculated them, so the green ticks on the PR
-page are stale — they do not reflect the current `main`.
-
-This was verified locally instead: PR #9 merged with the current `main` passes
-lint, typecheck, all 236 tests (including the 10 real PostgreSQL ones) and the
-production build. The only failure in that merged state is the formatting problem
-inherited from `main`, described in item 1.
-
-Once item 1 is fixed, PR #9 should be refreshed so GitHub recomputes its checks
-against the corrected `main` and the ticks mean something again.
+**Status: done by the final-corrections PR.** PR #9's checks were computed
+against the old `main` (`6131e97`) before PR #10 landed. The final-corrections
+branch is based on the current `main` (`df702ff`) and carries the complete Phase 1
+implementation plus the corrections; its own PR gets freshly computed checks
+against current `main`, so the green ticks reflect the actual head. PR #9 is
+superseded and left open for reference.
 
 ---
 
@@ -145,5 +89,7 @@ them would start returning 400.
 
 ## Unchanged status
 
-**Website Studio Phase 1 has not been merged or deployed.** PR #9 still requires an
-independent review from a separate Arena session before any merge decision.
+**Website Studio Phase 1 has not been merged or deployed.** The final-corrections
+PR still requires an independent review from a separate Arena session before any
+merge decision; it states this on the PR itself and must not be merged by the
+same session that authored it.

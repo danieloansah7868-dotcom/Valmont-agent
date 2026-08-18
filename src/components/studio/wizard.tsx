@@ -28,6 +28,9 @@ import {
   GHANA_REGIONS,
   PAYMENT_PLANNING_NOTICE,
   PLANNED_PAYMENT_METHODS,
+  SUPPORTED_COUNTRIES,
+  SUPPORTED_CURRENCIES,
+  SUPPORTED_TIMEZONES,
   formatGhanaPhone,
 } from "@/lib/studio/site-brief/defaults";
 import { changedFields, mergeBriefs } from "@/lib/studio/merge";
@@ -208,7 +211,16 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       }
 
       revisionRef.current = latest.revision;
-      const outcome = mergeBriefs(savedBriefRef.current, mine, latest.brief);
+      // The freshest local state, not the snapshot that was sent: the owner
+      // may have typed while the failed save and this fetch were in flight.
+      // Rebasing from that state means the automatic replay below and the
+      // conflict choice both carry the newest typing.
+      const latestLocal = pendingRef.current ?? mine;
+      const outcome = mergeBriefs(
+        savedBriefRef.current,
+        latestLocal,
+        latest.brief,
+      );
       savedBriefRef.current = latest.brief;
 
       if (outcome.merged) {
@@ -222,7 +234,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       // Freeze saving first, so an edit made while the choice is on screen
       // cannot escape and overwrite the other version.
       awaitingConflictChoiceRef.current = true;
-      setConflictPair({ mine, theirs: latest.brief });
+      setConflictPair({ mine: latestLocal, theirs: latest.brief });
       setSaveState({
         kind: "conflict",
         fields: outcome.conflictingFields.map(String),
@@ -332,7 +344,14 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     if (!conflictPair) return;
     awaitingConflictChoiceRef.current = false;
     setConflictPair(null);
-    pendingRef.current = conflictPair.mine;
+    // “Keep what is on this screen” means exactly that: the newest on-screen
+    // state, including anything typed after the warning appeared. The conflict
+    // snapshot is only the fallback when nothing has been typed since. The
+    // save below carries the newest revision and goes through the normal
+    // conflict loop, so the latest local state is rebased onto the newest
+    // server revision before it is written.
+    const latest = pendingRef.current ?? conflictPair.mine;
+    pendingRef.current = latest;
     setSaveState({ kind: "unsaved" });
     void flush();
   }, [conflictPair, flush]);
@@ -680,6 +699,74 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   ))}
                 </select>
               </div>
+
+              <fieldset className="grid gap-3 rounded-lg border border-line p-3">
+                <legend className="text-sm font-semibold">
+                  Country, currency and timezone
+                </legend>
+                <div className="grid gap-1">
+                  <label htmlFor="country" className="text-sm font-semibold">
+                    Country
+                  </label>
+                  <select
+                    id="country"
+                    value={brief.country}
+                    onChange={(event) =>
+                      update({ country: event.target.value })
+                    }
+                    className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                  >
+                    {SUPPORTED_COUNTRIES.map((country) => (
+                      <option key={country} value={country}>
+                        {country}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid gap-1">
+                  <label htmlFor="currency" className="text-sm font-semibold">
+                    Currency
+                  </label>
+                  <select
+                    id="currency"
+                    value={brief.currency}
+                    onChange={(event) =>
+                      update({ currency: event.target.value })
+                    }
+                    className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                  >
+                    {SUPPORTED_CURRENCIES.map((item) => (
+                      <option key={item.code} value={item.code}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid gap-1">
+                  <label htmlFor="timezone" className="text-sm font-semibold">
+                    Timezone
+                  </label>
+                  <select
+                    id="timezone"
+                    value={brief.timezone}
+                    onChange={(event) =>
+                      update({ timezone: event.target.value })
+                    }
+                    className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                  >
+                    {SUPPORTED_TIMEZONES.map((timezone) => (
+                      <option key={timezone} value={timezone}>
+                        {timezone}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <p className="text-xs text-slate-500">
+                  Ghana, GHS (GH₵) and Africa/Accra are the starting defaults.
+                  The alternatives are planning choices only — nothing is
+                  priced, charged or generated from them in Phase 1.
+                </p>
+              </fieldset>
 
               <TextField
                 id="hours"

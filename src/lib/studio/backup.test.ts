@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import type { SessionUser } from "@/lib/auth";
@@ -22,14 +23,13 @@ const userB: SessionUser = { id: "9002", login: "kofi", name: "Kofi" };
 const dirs: string[] = [];
 let chatStore: SqliteChatStore;
 let drafts: SqliteStudioDraftStore;
+let dbPath = "";
 
 function freshDatabase() {
   const dir = mkdtempSync(path.join(os.tmpdir(), "valmont-backup-"));
   dirs.push(dir);
-  chatStore = new SqliteChatStore(
-    path.join(dir, "chat-store.sqlite"),
-    path.join(dir, "chat-store.json"),
-  );
+  dbPath = path.join(dir, "chat-store.sqlite");
+  chatStore = new SqliteChatStore(dbPath, path.join(dir, "chat-store.json"));
   setSqliteChatStoreForTests(chatStore);
   drafts = new SqliteStudioDraftStore();
 }
@@ -204,6 +204,75 @@ describe("export", () => {
     const reparsed = parseBackup(JSON.parse(JSON.stringify(backup)));
     expect(reparsed.sourceVersion).toBe(2);
     expect(reparsed.studio.drafts).toHaveLength(1);
+  });
+
+  it("cannot combine chat and drafts from different points in time", async () => {
+    await seedUserA();
+    const originalSessionId = (await chatStore.list(userA.id))[0]!.id;
+    const originalDraftId = (await drafts.list(userA))[0]!.id;
+
+    // A second, adversarial connection to the same database file, standing in
+    // for another process or server that commits mid-export.
+    const other = new DatabaseSync(dbPath);
+    try {
+      const exported = await buildBackup(userA, {
+        afterChatReadForTests: () => {
+          // This runs inside the export's read transaction, AFTER the chat
+          // half has been read and BEFORE the draft half. A writer on a
+          // different connection commits a new session and a new draft here.
+          const lateSessionId = "22222222-2222-4222-8222-222222222222";
+          const lateDraftId = "33333333-3333-4333-8333-333333333333";
+          other.exec("BEGIN");
+          other
+            .prepare(
+              "INSERT INTO chat_sessions(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
+            )
+            .run(
+              lateSessionId,
+              userA.id,
+              "Late session",
+              "2026-01-02T00:00:00.000Z",
+              "2026-01-02T00:00:00.000Z",
+            );
+          other
+            .prepare(
+              `INSERT INTO studio_drafts
+                 (id, owner_id, schema_version, template_version, theme_version,
+                  revision, created_at, updated_at, brief_json)
+               VALUES (?,?,1,1,1,1,?,?,?)`,
+            )
+            .run(
+              lateDraftId,
+              canonicalUserId(userA),
+              "2026-01-02T00:00:00.000Z",
+              "2026-01-02T00:00:00.000Z",
+              JSON.stringify(
+                createDefaultBrief({ businessName: "Late Draft" }),
+              ),
+            );
+          other.exec("COMMIT");
+        },
+      });
+
+      // A snapshot export contains either the "before" state or the "after"
+      // state — never the chat half from before the write and the draft half
+      // from after it. Both late records must be absent, and both original
+      // records present, for the export to be from one point in time.
+      expect(exported.chat.sessions.map((s) => s.id)).not.toContain(
+        "22222222-2222-4222-8222-222222222222",
+      );
+      expect(exported.studio.drafts.map((d) => d.id)).not.toContain(
+        "33333333-3333-4333-8333-333333333333",
+      );
+      expect(exported.chat.sessions.map((s) => s.id)).toContain(
+        originalSessionId,
+      );
+      expect(exported.studio.drafts.map((d) => d.id)).toContain(
+        originalDraftId,
+      );
+    } finally {
+      other.close();
+    }
   });
 });
 
@@ -491,16 +560,20 @@ describe("import atomicity is reported, not assumed", () => {
   });
 
   // This checks the error object's shape only. It constructs the error
-  // directly and proves nothing about whether the staged path ever raises it.
-  // The real staged rollback, against two live engines, is covered by
-  // `postgres-backup.test.ts`, and the route's 500 response by
-  // `backup-route.test.ts`.
-  it("PartialImportError explains exactly what landed", () => {
-    const error = new PartialImportError(new Error("connection reset"));
+  // directly; the real rollback behaviour is covered against two live engines
+  // by `postgres-backup.test.ts`, and the route's 500 response by
+  // `backup-route.test.ts`. PartialImportError is the catastrophic, exceptional
+  // outcome (the rollback itself failed), not the normal result of an import
+  // that failed part-way.
+  it("PartialImportError names the halves known to have committed", () => {
+    const error = new PartialImportError(new Error("connection reset"), {
+      chat: true,
+      studio: false,
+    });
     expect(error.status).toBe(500);
     expect(error.committed).toEqual({ chat: true, studio: false });
-    expect(error.message).toMatch(/chat/i);
-    expect(error.message).toMatch(/draft/i);
+    expect(error.message).toMatch(/rolled back/i);
+    expect(error.message).toMatch(/recovery/i);
     // It must not leak the underlying driver text to the user.
     expect(error.message).not.toContain("connection reset");
   });

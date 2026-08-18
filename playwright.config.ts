@@ -24,6 +24,25 @@ if (!sessionSecret || sessionSecret.length < 32) {
 // A temporary database per run. The real .data directory is never opened.
 const dataDir = process.env.E2E_DATA_DIR ?? ".e2e-data";
 
+/**
+ * Optional override for the Chromium executable and its shared-library path.
+ * Normal CI installs the Playwright build and leaves this unset; sandboxed
+ * environments that cannot download it can point Playwright at any Chromium
+ * binary (for example a package-bundled one) instead. `undefined` keeps the
+ * default Playwright browser.
+ */
+const chromiumExecutable = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE;
+const chromiumLibs = process.env.PLAYWRIGHT_CHROMIUM_LIBS;
+const browserLaunchOptions =
+  chromiumExecutable || chromiumLibs
+    ? {
+        executablePath: chromiumExecutable || undefined,
+        env: chromiumLibs
+          ? { ...process.env, LD_LIBRARY_PATH: chromiumLibs }
+          : undefined,
+      }
+    : undefined;
+
 export default defineConfig({
   testDir: "tests/e2e",
   timeout: 60_000,
@@ -39,6 +58,7 @@ export default defineConfig({
     baseURL,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
+    launchOptions: browserLaunchOptions,
   },
   projects: [
     {

@@ -17,11 +17,15 @@ interface ImportSummary {
   skippedMemories: number;
   studioDrafts: number;
   remappedDraftIds: number;
-  atomicity: "single-transaction" | "staged";
+  atomicity: "single-transaction" | "coordinated";
   notice?: string;
 }
 
-/** The 500 body sent when the chat half committed but the drafts half did not. */
+/**
+ * The 500 body sent only when the import failed AND rolling it back also
+ * failed — the exceptional case where the durable recovery record will finish
+ * the rollback on a later attempt.
+ */
 interface PartialFailure {
   error: string;
   partial: true;
@@ -64,9 +68,9 @@ export function BackupControls() {
         const problem = (await response.json().catch(() => null)) as
           (Partial<PartialFailure> & { error?: string }) | null;
 
-        // A partial import is not a plain failure. Some data really did land,
-        // and telling the owner "import failed" would invite a retry that
-        // duplicates their chats. Surface exactly what committed.
+        // A partial response is sent only when the rollback itself failed.
+        // Surface exactly which halves are known to have landed so the owner
+        // does not retry blindly and duplicate data before recovery finishes.
         if (problem?.partial && problem.committed) {
           setStatus({
             kind: "partial",
@@ -173,17 +177,24 @@ export function BackupControls() {
           data-testid="import-partial"
           className="grid gap-1 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900"
         >
-          <strong>Your restore only partly finished.</strong>
+          <strong>
+            Your restore did not finish, and rolling it back also failed.
+          </strong>
           <span>{status.failure.error}</span>
           <span>
             Chats and memories:{" "}
-            {status.failure.committed.chat ? "restored" : "not restored"}.
-            Website drafts:{" "}
-            {status.failure.committed.studio ? "restored" : "not restored"}.
+            {status.failure.committed.chat ? "may be restored" : "not restored"}
+            . Website drafts:{" "}
+            {status.failure.committed.studio
+              ? "may be restored"
+              : "not restored"}
+            .
           </span>
           <span>
-            Importing the same file again will add a second copy of anything
-            that already came back, so check what is there before retrying.
+            The recovery record is safe on disk and the next import attempt will
+            roll everything back before it starts, so wait for that before
+            retrying — importing the same file again could otherwise create
+            duplicate copies.
           </span>
         </div>
       )}

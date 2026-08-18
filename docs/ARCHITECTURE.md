@@ -178,8 +178,14 @@ never point at an incompatible layout.
 - **SQLite (no `DATABASE_URL`)** — `studio_drafts` lives inside the **same file
   and the same `DatabaseSync` handle** as Chat. `getStudioSqliteStore()` returns
   Chat's singleton store, so a complete-backup import can put chat sessions,
-  memories, and drafts inside one real transaction. `ensureStudioSchema()` is
-  idempotent and records `studio-schema-version` in `chat_meta`.
+  memories, and drafts inside one real transaction. The Studio schema is
+  versioned in a dedicated `studio_meta` table and upgraded through sequential,
+  transactional migrations (`migrateStudioSchema` in `draft-store.ts`): the
+  recorded version is written only after every migration succeeds, a failure
+  rolls schema and metadata back together, a recorded version newer than this
+  build supports is rejected, and repeated startup is a no-op. Databases
+  created by earlier builds (version recorded in `chat_meta`) are detected and
+  moved onto the dedicated table without re-running work.
 - **PostgreSQL (`DATABASE_URL` set)** — the `studio_drafts` table from Drizzle
   migration `0002_uneven_the_anarchist.sql`: uuid primary key, `owner_id`
   referencing `users` with cascade delete, a `jsonb` brief, and the
@@ -223,24 +229,43 @@ and debounces keystrokes. On a 409 it refetches the server copy and calls
 `mergeBriefs(base, mine, theirs)`. When the two sides touched different fields
 the pending edit is reapplied and retried once; when they touched the same field
 with different values, `merged` is `null` and the conflict banner asks the owner
-to keep their version or take the other. No write is ever dropped silently.
+to keep their version or take the other. Autosave is frozen while the choice is
+on screen, and “Keep what is on this screen” saves the **newest on-screen
+state** — including anything typed after the warning appeared — not a stale
+conflict snapshot, so no write is ever dropped silently.
 
 ### Backups
 
 `buildBackup(user)` produces
 `{ backupVersion: 2, exportedAt, chat: { version: 1, ... }, studio: { version: 1, schemaVersion: 1, drafts: [...] } }`.
-`parseBackup(input)` checks the version **before** validating or writing
-anything, and accepts a legacy v1 chat-only file by lifting it into the v2
-shape. `importBackup` reassigns every record to the authenticated canonical
+On SQLite the chat and draft halves are read back to back inside **one read
+transaction on the one shared `DatabaseSync` handle**, so the file can never
+combine records from different points in time even if another writer commits
+mid-export. `parseBackup(input)` checks the version **before** validating or
+writing anything, and accepts a legacy v1 chat-only file by lifting it into the
+v2 shape. `importBackup` reassigns every record to the authenticated canonical
 owner — `ownerId` values in the file are always ignored — and remaps a colliding
 draft id to a fresh `randomUUID()` rather than overwriting. Validation errors
 report field _paths_ only (at most five), never submitted values.
 
 SQLite runs the whole import inside `store.runInTransaction` on the single
 shared handle, so a failure after any insert rolls chat, memories, and studio
-back together. PostgreSQL uses one database transaction. A
-`failAfterInsertForTests` hook lets the suite prove the rollback rather than
-assume it.
+back together. A `failAfterInsertForTests` hook lets the suite prove the
+rollback rather than assume it.
+
+With `DATABASE_URL` set, chat stays in SQLite while studio lives in PostgreSQL,
+so there is no distributed transaction. `import-coordinator.ts` is a durable
+cross-store recovery coordinator instead: before any write it records a job in
+SQLite holding the staged payload and a snapshot of the owner's pre-import state
+in **both** stores, then advances through durable checkpoints as each half
+commits. A failure at any checkpoint — or a process killed mid-import — rolls
+both stores back to their exact previous state, immediately or via automatic
+recovery at the start of the next import attempt. Success is reported only after
+both halves committed; a rolled-back import is reported as a clean failure, and
+`PartialImportError` is reserved for the exceptional case where the rollback
+itself could not complete. The PostgreSQL suite injects failures at every
+checkpoint (`onCheckpoint`) and proves both stores return to their exact
+previous state, including after a simulated crash and restart.
 
 ### Request bodies
 
@@ -252,11 +277,16 @@ Limits: `DRAFT_BODY_LIMIT_BYTES` 1 MB, `BACKUP_BODY_LIMIT_BYTES` 25 MB.
 
 ### Testing
 
-Vitest covers the resolver, stores, merge, backup, bounded reader, and the Site
-Brief. The PostgreSQL contract suite runs only when
+Vitest covers the resolver, stores, merge, backup, bounded reader, schema
+migrations, and the Site Brief. The PostgreSQL contract suite runs only when
 `STUDIO_TEST_DATABASE_URL` is set and is otherwise reported as skipped, so
 SQLite results are never presented as PostgreSQL parity; CI supplies a real
-PostgreSQL 16 service.
+PostgreSQL 16 service. The coordinated-import suite injects a failure at every
+checkpoint (`onCheckpoint`), proves both stores return to their exact previous
+state, and covers interrupted-import recovery after a simulated restart. The
+SQLite export test proves a backup cannot combine chat and drafts from
+different points in time by committing a write from a second connection between
+the two halves of an in-flight export.
 
 Playwright (`playwright.config.ts`, `tests/e2e/studio-smoke.spec.ts`) drives a
 real production build on a throwaway SQLite database, in a desktop Chromium

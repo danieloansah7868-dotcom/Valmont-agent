@@ -291,6 +291,36 @@ export class SqliteChatStore implements ChatStore {
     }
   }
 
+  /**
+   * Runs `work` inside one read transaction (`BEGIN`, deferred) on this
+   * connection. Every read inside the block sees the same SQLite snapshot,
+   * even if another connection commits a write halfway through, so a complete
+   * backup export cannot combine chat and studio records from different points
+   * in time. Nested calls join an enclosing transaction; the whole block is
+   * synchronous, so no other code can interleave statements onto this
+   * connection while the snapshot is open.
+   */
+  runInReadTransaction<T>(work: () => T): T {
+    if (this.inTransaction) return work();
+    this.inTransaction = true;
+    this.db.exec("BEGIN");
+    try {
+      const result = work();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // The transaction was already aborted by SQLite; the original error
+        // below is the meaningful one.
+      }
+      throw error;
+    } finally {
+      this.inTransaction = false;
+    }
+  }
+
   private inTransaction = false;
 
   constructor(filePath?: string, legacyPath = configuredLegacyChatStorePath()) {
@@ -395,16 +425,24 @@ export class SqliteChatStore implements ChatStore {
     }
   }
 
-  private insertSession(session: ChatSession) {
+  private insertSession(
+    session: ChatSession,
+    options: { preserveArchivedAt?: boolean } = {},
+  ) {
     const inserted = this.db
       .prepare(
-        "INSERT OR IGNORE INTO chat_sessions(id,user_id,title,repository_json,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO chat_sessions(id,user_id,title,repository_json,archived_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
       )
       .run(
         session.id,
         session.userId,
         session.title,
         session.repository ? JSON.stringify(session.repository) : null,
+        // Legacy migration never carries archived sessions; the cross-store
+        // restore path preserves the exact archivedAt from the snapshot.
+        options.preserveArchivedAt && session.archivedAt
+          ? session.archivedAt
+          : null,
         session.createdAt,
         session.updatedAt,
       );
@@ -432,6 +470,17 @@ export class SqliteChatStore implements ChatStore {
       if (Number(result.changes) > 0)
         fts.run(item.content, item.id, session.userId, session.id);
     }
+    // The summary column is derived from the messages, so restoring the exact
+    // rows also restores the same summary.
+    this.db
+      .prepare(
+        "UPDATE chat_sessions SET summary = ? WHERE id = ? AND user_id = ?",
+      )
+      .run(
+        this.summaryFor(session.id, session.userId),
+        session.id,
+        session.userId,
+      );
   }
 
   async create(input: {
@@ -742,6 +791,133 @@ export class SqliteChatStore implements ChatStore {
       this.memoryEnabled(userId),
     ]);
     return { version: 1, sessions, memories, memoryEnabled };
+  }
+
+  /**
+   * Synchronous equivalent of `exportUser`, for callers that need the chat
+   * read to share one transaction with other reads on this connection (the
+   * complete-backup export). Same data, same ordering, same scope: sessions
+   * including archived ones, memories visible to the ordinary memory list.
+   */
+  exportUserSync(userId: string) {
+    const sessions = this.db
+      .prepare(
+        "SELECT * FROM chat_sessions WHERE user_id = ? ORDER BY updated_at DESC",
+      )
+      .all(userId) as SessionRow[];
+    const memories = this.db
+      .prepare(
+        `SELECT * FROM chat_memories WHERE user_id = ? AND (scope = 'personal' OR (scope = 'repository' AND repository_id = ?)) ORDER BY updated_at DESC`,
+      )
+      .all(userId, "") as Array<Record<string, unknown>>;
+    const preference = this.db
+      .prepare(
+        "SELECT cross_chat_memory FROM chat_preferences WHERE user_id = ?",
+      )
+      .get(userId) as { cross_chat_memory: number } | undefined;
+    return {
+      version: 1,
+      sessions: sessions.map((row) => this.hydrate(row)),
+      memories: memories.map(memoryFromRow),
+      memoryEnabled: !preference || Boolean(preference.cross_chat_memory),
+    };
+  }
+
+  /**
+   * Captures the owner's *complete* chat state — every session with every
+   * message, every memory of every scope, and the memory preference — as one
+   * JSON-able object. Used by the cross-store import coordinator as the durable
+   * pre-import snapshot: restore must be able to return to this exact state,
+   * so unlike `exportUserSync` nothing is filtered out.
+   */
+  captureUserStateSync(userId: string): {
+    sessions: ChatSession[];
+    memories: ChatMemory[];
+    memoryEnabled: boolean;
+  } {
+    const sessions = this.db
+      .prepare(
+        "SELECT * FROM chat_sessions WHERE user_id = ? ORDER BY created_at, id",
+      )
+      .all(userId) as SessionRow[];
+    const memories = this.db
+      .prepare(
+        "SELECT * FROM chat_memories WHERE user_id = ? ORDER BY created_at, id",
+      )
+      .all(userId) as Array<Record<string, unknown>>;
+    const preference = this.db
+      .prepare(
+        "SELECT cross_chat_memory FROM chat_preferences WHERE user_id = ?",
+      )
+      .get(userId) as { cross_chat_memory: number } | undefined;
+    return {
+      sessions: sessions.map((row) => this.hydrate(row)),
+      memories: memories.map(memoryFromRow),
+      memoryEnabled: !preference || Boolean(preference.cross_chat_memory),
+    };
+  }
+
+  /**
+   * Replaces the owner's chat state with an exact snapshot captured earlier by
+   * `captureUserStateSync` (used to roll a partly-committed cross-store import
+   * back). Runs inside an enclosing transaction when one is open (callers
+   * should normally wrap this in `runInTransaction`); ids are written back
+   * exactly, so memory → session references in the snapshot survive.
+   */
+  restoreUserSync(
+    userId: string,
+    state: {
+      sessions: ChatSession[];
+      memories: ChatMemory[];
+      memoryEnabled: boolean;
+    },
+  ): void {
+    const ownsTransaction = !this.inTransaction;
+    if (ownsTransaction) {
+      this.inTransaction = true;
+      this.db.exec("BEGIN IMMEDIATE");
+    }
+    try {
+      this.db
+        .prepare("DELETE FROM chat_memories WHERE user_id = ?")
+        .run(userId);
+      this.db
+        .prepare("DELETE FROM chat_messages_fts WHERE user_id = ?")
+        .run(userId);
+      // Messages are removed by the session cascade; FTS rows are not.
+      this.db
+        .prepare("DELETE FROM chat_sessions WHERE user_id = ?")
+        .run(userId);
+      this.db
+        .prepare("DELETE FROM chat_preferences WHERE user_id = ?")
+        .run(userId);
+      for (const session of state.sessions) {
+        this.insertSession(session, { preserveArchivedAt: true });
+      }
+      const insertMemory = this.db.prepare(
+        "INSERT INTO chat_memories(id,user_id,scope,repository_id,category,content,source_session_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+      );
+      for (const memory of state.memories) {
+        insertMemory.run(
+          memory.id,
+          userId,
+          memory.scope,
+          memory.scope === "repository" ? (memory.repositoryId ?? null) : null,
+          memory.category,
+          memory.content,
+          memory.sourceSessionId ?? null,
+          memory.createdAt,
+          memory.updatedAt,
+        );
+      }
+      this.setMemoryEnabledSync(userId, state.memoryEnabled);
+      if (ownsTransaction) this.db.exec("COMMIT");
+    } catch (error) {
+      if (ownsTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      if (ownsTransaction) this.inTransaction = false;
+    }
   }
 
   async importUser(

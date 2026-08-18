@@ -212,22 +212,23 @@ new copy instead of overwriting existing work.
 
 **Atomicity depends on the storage backend, and the API reports which applies:**
 
-| Backend                     | `atomicity`          | Guarantee                                                                                                                                     |
-| --------------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| SQLite (default)            | `single-transaction` | Chat, memories and drafts share one connection and one transaction. Any failure rolls all three back.                                         |
-| PostgreSQL (`DATABASE_URL`) | `staged`             | Chat is still SQLite, studio is PostgreSQL. **There is no distributed transaction.** Each half is individually atomic and chat commits first. |
+| Backend                     | `atomicity`          | Guarantee                                                                                                                                                                                                                                                                           |
+| --------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SQLite (default)            | `single-transaction` | Chat, memories and drafts share one connection and one transaction. Any failure rolls all three back. The export reads chat and drafts inside one read transaction, so a backup file is a consistent snapshot.                                                                      |
+| PostgreSQL (`DATABASE_URL`) | `coordinated`        | Chat is still SQLite, studio is PostgreSQL. **There is no distributed transaction**, so a durable cross-store coordinator (`import-coordinator.ts`) records the staged payload and a snapshot of both stores in SQLite before any write, then advances through durable checkpoints. |
 
-On the staged path, if the studio half fails after chat has committed the API
-raises `PartialImportError`, which tells the user that chats and memories were
-imported, drafts were not, and that re-importing will duplicate the chats. A
-partial import is reported truthfully whenever the process survives to answer:
-it is never presented as a clean success or a clean failure. The limit is that
-this depends on a response being sent. If the process is killed, the container
-is evicted, or the connection drops between the two commits, the browser gets
-no answer at all and the owner is left to check for themselves which half
-landed. Nothing marks the import as incomplete on disk. Removing this
-limitation requires moving chat history into the same database, which is out of
-Phase 1 scope.
+On the coordinated path every failure — including a process killed between the
+two commits, a container eviction, or a dropped connection — rolls both stores
+back to their exact previous state. The rollback runs immediately when the
+process survives, and otherwise automatically at the start of the next import
+attempt, because the job record on disk is enough to restore from after a
+restart. Success is reported only after both halves committed; a rolled-back
+import is reported as a plain failure, never a partial success.
+`PartialImportError` is reserved for the exceptional case where the rollback
+itself cannot complete (for example PostgreSQL is unreachable at that moment);
+the response names the halves known to have committed, and the recovery record
+stays on disk so the next attempt finishes the rollback before importing
+anything new.
 
 ### No payments, no payment data
 
@@ -280,11 +281,11 @@ you want a clean slate.
 Security claims are only worth what has actually been executed. As of this
 change:
 
-| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit + integration (`npm test`) | **Run.** 308 passing, 0 skipped, including the PostgreSQL draft-store and staged-import tests against a real PostgreSQL 18.4 server. Without `STUDIO_TEST_DATABASE_URL` the 13 PostgreSQL tests skip and the total is 295.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| End-to-end (`npm run test:e2e`) | **Reported green by CI, not independently confirmed.** The Phase 1 workflow is active as of `158f601`, and GitHub Actions run `32111983219` records the `Install Chromium for Playwright` and `End-to-end tests` steps as `success`. The step logs could not be downloaded from either the agent sandbox or the reviewing session, so **no one has yet read a line of Playwright output**. The whole `validate` job took 146 seconds including two Next.js production builds, which is fast enough to be worth checking. Until a human opens the log and sees 8 specs across `desktop-chromium` and `iphone`, treat browser-level assertions as _reported_, not _verified_. |
+| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit + integration (`npm test`) | **Run.** 326 passing, 0 skipped (31 files), including the PostgreSQL draft-store and coordinated-import suites against a real PostgreSQL server. The coordinated-import suite injects a failure at every transaction/commit checkpoint, proves both stores return to their exact previous state, and covers interrupted-import recovery after a simulated restart. Without `STUDIO_TEST_DATABASE_URL` the 20 PostgreSQL tests skip (306 passing) and are reported as skipped, never as passed. |
+| End-to-end (`npm run test:e2e`) | **Run.** 20 passing (10 tests × `desktop-chromium` and `iphone` projects), no skips, against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests (keeping the latest typing typed after the warning, and accepting the server version) and a no-sideways-scroll assertion that runs in both projects. The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs the same suite with a real PostgreSQL 16 service.                     |
 
-The browser tests only run once a maintainer moves
-`.github/ci-workflow-phase1.yml` to `.github/workflows/ci.yml`; the automation
-token is not permitted to create workflow files.
+CI runs the unit, integration, PostgreSQL, Playwright and container-build jobs
+on every push and pull request via `.github/workflows/ci.yml`; there is no
+longer any workflow that needs to be moved or activated by a human.

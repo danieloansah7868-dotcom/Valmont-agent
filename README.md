@@ -246,9 +246,16 @@ whether an ID exists.
   signed-in account.
 - A draft ID that already exists is imported as a separate copy under a new ID
   rather than overwriting your work.
-- The whole import is one transaction. If any part fails, chats, memories, and
-  drafts all roll back together — SQLite uses a single database handle so this
-  is a real rollback, not a best-effort one.
+- The whole import is all-or-nothing. On SQLite, chat, memories and drafts
+  share one database handle and one transaction, and the export reads both
+  halves inside one read transaction so a backup file is a consistent snapshot.
+  With `DATABASE_URL` set, chat stays in SQLite while drafts go to PostgreSQL;
+  a durable cross-store coordinator records the staged payload and a
+  pre-import snapshot of both stores before any write, and any failure — or a
+  process killed mid-import — rolls both stores back to their exact previous
+  state, immediately or automatically on the next import attempt after a
+  restart. Success is reported only after both halves committed; a rolled-back
+  import is reported as a plain failure, never a partial success.
 - The older `/api/memories/export` and `/api/memories/import` endpoints keep
   their version 1 behaviour unchanged.
 

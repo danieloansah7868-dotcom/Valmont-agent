@@ -191,10 +191,11 @@ describe("POST /api/backup/import", () => {
     expect(text).not.toContain(owner.id);
   });
 
-  it("answers 500 and names exactly what landed on a partial import", async () => {
-    // A real staged failure needs two live engines and is covered against real
-    // PostgreSQL in postgres-backup.test.ts. The concern here is narrower: that
-    // this route turns PartialImportError into an honest HTTP answer.
+  it("answers 500 and names the committed halves when even rollback failed", async () => {
+    // PartialImportError is the exceptional outcome: the import failed and
+    // rolling it back also failed. Real behaviour is covered against live
+    // engines in postgres-backup.test.ts; this test proves the route turns it
+    // into an honest HTTP answer rather than a generic 500.
     vi.resetModules();
     vi.doMock("@/lib/studio/backup", async (importOriginal) => {
       const actual =
@@ -202,7 +203,10 @@ describe("POST /api/backup/import", () => {
       return {
         ...actual,
         importBackup: async () => {
-          throw new actual.PartialImportError(new Error("connection reset"));
+          throw new actual.PartialImportError(new Error("connection reset"), {
+            chat: true,
+            studio: false,
+          });
         },
       };
     });
@@ -216,9 +220,9 @@ describe("POST /api/backup/import", () => {
     expect(response.status).toBe(500);
     expect(body.partial).toBe(true);
     expect(body.committed).toEqual({ chat: true, studio: false });
-    // The owner is told which half landed, so retrying is an informed choice.
-    expect(body.error).toMatch(/chat/i);
-    expect(body.error).toMatch(/draft/i);
+    // The owner is told which half is known to have landed and that recovery
+    // will roll it back, so retrying is an informed choice.
+    expect(body.error).toMatch(/recovery/i);
     expect(JSON.stringify(body)).not.toContain("connection reset");
 
     vi.doUnmock("@/lib/studio/backup");

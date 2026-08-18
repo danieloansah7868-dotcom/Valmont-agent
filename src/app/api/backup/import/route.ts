@@ -17,10 +17,13 @@ import {
  * is filed under the person doing the import.
  *
  * The success body reports `atomicity`. On SQLite the whole import is one
- * transaction. On PostgreSQL chat lives in SQLite and drafts in PostgreSQL, so
- * the two halves commit separately; if the second half fails this returns 500
- * with `committed`, naming exactly what was written, rather than implying
- * nothing happened.
+ * transaction. On PostgreSQL chat lives in SQLite and drafts live in
+ * PostgreSQL, so the two halves are made atomic by the durable cross-store
+ * coordinator: a failure at any checkpoint rolls both stores back to their
+ * exact previous state and this returns a plain 500 (`ImportFailedError`),
+ * never a partial success. Only if the rollback itself also fails does the
+ * response carry `partial: true` with `committed`, naming the halves known to
+ * have landed.
  *
  * Every count in the success body is what was actually written. A memory whose
  * text matches a secret-redaction pattern is not imported; it is counted in
