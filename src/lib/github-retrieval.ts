@@ -29,7 +29,49 @@ const STOP_WORDS = new Set([
   "with",
 ]);
 
-/** Bounded GitHub lexical retrieval. Raw content is never persisted by this layer. */
+const PINNED_CHAT_PATHS = [
+  "README.md",
+  "ads/README.md",
+  "docs/README.md",
+  "package.json",
+  "ads/package.json",
+  "ads/src/app/page.tsx",
+  "src/app/page.tsx",
+  "ads/src/app/layout.tsx",
+];
+
+/**
+ * Reads a small, known set of files without listing the whole Git tree.
+ * Chat uses this first so a huge repo cannot time out and leave the model
+ * inventing the product.
+ */
+export async function retrievePinnedRepositoryFiles(
+  github: GitHubProvider,
+  owner: string,
+  repository: string,
+  ref: string,
+): Promise<GitHubContextFile[]> {
+  const fetched = await Promise.all(
+    PINNED_CHAT_PATHS.map(async (filePath): Promise<GitHubContextFile | null> => {
+      if (isSensitivePath(filePath)) return null;
+      try {
+        const file = await github.readFile(owner, repository, filePath, ref);
+        const redacted = redactSecrets(file.content);
+        if (redacted.length > 256_000 || redacted.includes("\0")) return null;
+        return {
+          path: file.path,
+          content: boundedExcerpt(redacted, [], 8_000),
+          score: /(^|\/)readme\.md$/i.test(file.path) ? 40 : 10,
+        };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return fetched
+    .filter((file): file is GitHubContextFile => file !== null)
+    .sort((a, b) => b.score - a.score);
+}
 export async function retrieveGitHubContext(
   github: GitHubProvider,
   owner: string,

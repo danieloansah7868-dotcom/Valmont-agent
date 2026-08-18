@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   getGitHubProvider: vi.fn(),
   list: vi.fn(),
+  retrievePinnedRepositoryFiles: vi.fn(),
   retrieveGitHubContext: vi.fn(),
 }));
 
@@ -38,7 +39,7 @@ vi.mock("@/lib/models", () => ({
 }));
 
 vi.mock("@/lib/github-retrieval", () => ({
-  retrieveGitHubContext: mocks.retrieveGitHubContext,
+  retrievePinnedRepositoryFiles: mocks.retrievePinnedRepositoryFiles,
 }));
 
 const csrf = "1234567890abcdef";
@@ -194,10 +195,9 @@ describe("chat APIs", () => {
     };
     mocks.get.mockResolvedValue(session);
     mocks.getGitHubProvider.mockResolvedValue(github);
-    mocks.retrieveGitHubContext.mockResolvedValue({
-      totalFiles: 1,
-      files: [{ path: "README.md", content: "Project docs", score: 10 }],
-    });
+    mocks.retrievePinnedRepositoryFiles.mockResolvedValue([
+      { path: "README.md", content: "Project docs", score: 10 },
+    ]);
     mocks.createModelProvider.mockReturnValue({
       chat: vi.fn().mockResolvedValue({
         content: "The README describes the project.",
@@ -226,13 +226,11 @@ describe("chat APIs", () => {
     expect(response.status).toBe(200);
     expect(github.listRepositories).not.toHaveBeenCalled();
     expect(github.listBranches).not.toHaveBeenCalled();
-    expect(mocks.retrieveGitHubContext).toHaveBeenCalledWith(
+    expect(mocks.retrievePinnedRepositoryFiles).toHaveBeenCalledWith(
       github,
       "acme",
       "app",
       "main",
-      "What does this project do?",
-      4,
     );
   });
 

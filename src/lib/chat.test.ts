@@ -58,6 +58,35 @@ describe("Chat with Valmont", () => {
     expect(messages.at(-1)?.content).not.toContain("ghp_AAAAA");
   });
 
+  it("refuses to invent a product when the repo is attached but empty", () => {
+    const messages = buildChatCompletionMessages({
+      session: session({
+        repository: {
+          id: "42",
+          owner: "acme",
+          name: "ads",
+          fullName: "acme/ads",
+          baseBranch: "main",
+        },
+      }),
+      userContent: "What is missing?",
+      repositoryContext: {
+        repository: {
+          id: "42",
+          owner: "acme",
+          name: "ads",
+          fullName: "acme/ads",
+          baseBranch: "main",
+        },
+        files: [],
+      },
+    });
+    const note = messages.find((message) =>
+      message.content.includes("could not read the tree"),
+    );
+    expect(note?.content).toContain("Do not invent the product");
+  });
+
   it("bounds model history to the most recent 24 messages", () => {
     const history = Array.from({ length: 30 }, (_, index) => ({
       id: `message-${index}`,

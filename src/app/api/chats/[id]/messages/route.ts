@@ -4,7 +4,7 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { chatTitleFromMessage, generateChatReply } from "@/lib/chat";
 import { getChatStore } from "@/lib/chat-store";
-import { retrieveGitHubContext } from "@/lib/github-retrieval";
+import { retrievePinnedRepositoryFiles } from "@/lib/github-retrieval";
 import { createModelProvider } from "@/lib/models";
 import { assertCsrf } from "@/lib/security";
 
@@ -30,29 +30,29 @@ export async function POST(
     if (session.repository) {
       try {
         const github = await getGitHubProvider();
-        const retrieved = await Promise.race([
-          retrieveGitHubContext(
+        const files = await Promise.race([
+          retrievePinnedRepositoryFiles(
             github,
             session.repository.owner,
             session.repository.name,
             session.repository.baseBranch,
-            input.content,
-            4,
           ),
           new Promise<never>((_, reject) => {
             setTimeout(
               () => reject(new Error("Repository context timed out")),
-              12_000,
+              8_000,
             );
           }),
         ]);
         repositoryContext = {
           repository: session.repository,
-          files: retrieved.files,
+          files,
         };
       } catch {
-        // Chat still answers when GitHub is slow or the tree is too large.
-        repositoryContext = undefined;
+        repositoryContext = {
+          repository: session.repository,
+          files: [],
+        };
       }
     }
 
