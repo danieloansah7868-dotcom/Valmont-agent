@@ -247,10 +247,13 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
     const restored = await drafts.list(owner);
     expect(restored).toHaveLength(1);
     expect(restored[0].brief.businessName).toBe("Adom Fashion House");
-    // The job is durably recorded as completed.
+    // The job is durably recorded as completed, without the payload/snapshot.
     const jobs = coordinator.listImportJobs(ownerId);
     expect(jobs).toHaveLength(1);
     expect(jobs[0].status).toBe("completed");
+    expect(jobs[0].payload_json).toBe("");
+    expect(jobs[0].pre_state_json).toBe("");
+    expect(coordinator.getOwnerImportLock(ownerId)).toBeNull();
   });
 
   it.each([
@@ -290,6 +293,9 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
       const jobs = coordinator.listImportJobs(ownerId);
       expect(jobs).toHaveLength(1);
       expect(jobs[0].status).toBe("restored");
+      expect(jobs[0].payload_json).toBe("");
+      expect(jobs[0].pre_state_json).toBe("");
+      expect(coordinator.getOwnerImportLock(ownerId)).toBeNull();
     },
   );
 
@@ -409,5 +415,248 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
     const after = await captureBeforeState(ownerId);
     expect(after).toEqual(before);
     expect(coordinator.getImportJob(jobId).status).toBe("restored");
+    expect(coordinator.getImportJob(jobId).payload_json).toBe("");
+    expect(coordinator.getImportJob(jobId).pre_state_json).toBe("");
+    expect(coordinator.getOwnerImportLock(ownerId)).toBeNull();
+  });
+
+  const SENTINEL = "SENTINEL-JOURNAL-ADOM-FASHION-9f3c2e";
+
+  it("strips sentinel payload text from the journal after a successful import", async () => {
+    const session = await chatStore.create({
+      userId: owner.id,
+      title: SENTINEL,
+    });
+    await chatStore.appendMessages(session.id, owner.id, [
+      {
+        id: "m-sentinel",
+        role: "user",
+        content: SENTINEL,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    await drafts.create(
+      owner,
+      createDefaultBrief({
+        businessName: SENTINEL,
+        adminEmail: "owner@adom.example",
+      }),
+    );
+    const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
+    expect(JSON.stringify(file)).toContain(SENTINEL);
+
+    freshChatStore();
+    const ownerId = await ensureStudioUser(owner);
+    await emptyStudio(ownerId);
+    await importBackup(owner, parseBackup(file));
+
+    expect(coordinator.journalSensitiveBlob()).not.toContain(SENTINEL);
+    const exported = JSON.stringify(await buildBackup(owner));
+    expect(exported).toContain(SENTINEL);
+    expect(exported).not.toContain("payload_json");
+  });
+
+  it("strips sentinel snapshot text from the journal after a completed recovery", async () => {
+    await drafts.create(
+      owner,
+      createDefaultBrief({
+        businessName: SENTINEL,
+        adminEmail: "owner@adom.example",
+      }),
+    );
+    const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
+    const ownerId = await ensureStudioUser(owner);
+
+    await expect(
+      importBackup(owner, parseBackup(file), {
+        onCheckpoint: (cp: string) => {
+          if (cp === "chat-committed") throw new Error("injected");
+        },
+      }),
+    ).rejects.toBeInstanceOf(ImportFailedError);
+
+    expect(coordinator.journalSensitiveBlob()).not.toContain(SENTINEL);
+    const jobs = coordinator.listImportJobs(ownerId);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe("restored");
+  });
+
+  it("lets exactly one of two simultaneous same-owner imports proceed", async () => {
+    const ownerId = await ensureStudioUser(owner);
+    await emptyStudio(ownerId);
+
+    const now = new Date().toISOString();
+    const fileA = {
+      backupVersion: 2 as const,
+      exportedAt: now,
+      chat: {
+        version: 1 as const,
+        sessions: [
+          {
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            title: "Import A chat",
+            messages: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+        memories: [],
+        memoryEnabled: true,
+      },
+      studio: {
+        version: 1 as const,
+        schemaVersion: 1 as const,
+        drafts: [
+          {
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            schemaVersion: 1,
+            createdAt: now,
+            updatedAt: now,
+            brief: createDefaultBrief({
+              businessName: "Import A Studio",
+              adminEmail: "a@adom.example",
+            }),
+          },
+        ],
+      },
+    };
+    const fileB = {
+      backupVersion: 2 as const,
+      exportedAt: now,
+      chat: {
+        version: 1 as const,
+        sessions: [
+          {
+            id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            title: "Import B chat",
+            messages: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+        memories: [],
+        memoryEnabled: true,
+      },
+      studio: {
+        version: 1 as const,
+        schemaVersion: 1 as const,
+        drafts: [
+          {
+            id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            schemaVersion: 1,
+            createdAt: now,
+            updatedAt: now,
+            brief: createDefaultBrief({
+              businessName: "Import B Studio",
+              adminEmail: "b@adom.example",
+            }),
+          },
+        ],
+      },
+    };
+
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const first = importBackup(owner, parseBackup(fileA), {
+      onCheckpoint: async (cp: string) => {
+        if (cp === "job-created") await holdFirst;
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const second = importBackup(owner, parseBackup(fileB));
+    await expect(second).rejects.toMatchObject({
+      name: "ImportInProgressError",
+      status: 409,
+    });
+
+    releaseFirst();
+    const summary = await first;
+    expect(summary.chatSessions).toBe(1);
+    expect(summary.studioDrafts).toBe(1);
+
+    const sessions = await chatStore.list(owner.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].title).toBe("Import A chat");
+    const studio = await readStudioState(ownerId);
+    expect(studio).toHaveLength(1);
+    expect(studio[0].brief.businessName).toBe("Import A Studio");
+    expect(coordinator.getOwnerImportLock(ownerId)).toBeNull();
+  });
+
+  it("lets two different owners import at the same time without mixing data", async () => {
+    const other: SessionUser = {
+      id: "pgb-9002",
+      login: "kofi",
+      name: "Kofi",
+    };
+    await ensureStudioUser(other);
+    const ownerIdA = await ensureStudioUser(owner);
+    const ownerIdB = await ensureStudioUser(other);
+    await emptyStudio(ownerIdA);
+    await emptyStudio(ownerIdB);
+
+    const now = new Date().toISOString();
+    const fileFor = (label: string, id: string) => ({
+      backupVersion: 2 as const,
+      exportedAt: now,
+      chat: {
+        version: 1 as const,
+        sessions: [
+          {
+            id,
+            title: `${label} chat`,
+            messages: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+        memories: [],
+        memoryEnabled: true,
+      },
+      studio: {
+        version: 1 as const,
+        schemaVersion: 1 as const,
+        drafts: [
+          {
+            id,
+            schemaVersion: 1,
+            createdAt: now,
+            updatedAt: now,
+            brief: createDefaultBrief({
+              businessName: `${label} Studio`,
+              adminEmail: `${label}@adom.example`,
+            }),
+          },
+        ],
+      },
+    });
+
+    const [summaryA, summaryB] = await Promise.all([
+      importBackup(
+        owner,
+        parseBackup(fileFor("OwnerA", "11111111-1111-4111-8111-111111111111")),
+      ),
+      importBackup(
+        other,
+        parseBackup(fileFor("OwnerB", "22222222-2222-4222-8222-222222222222")),
+      ),
+    ]);
+
+    expect(summaryA.studioDrafts).toBe(1);
+    expect(summaryB.studioDrafts).toBe(1);
+    expect((await chatStore.list(owner.id))[0].title).toBe("OwnerA chat");
+    expect((await chatStore.list(other.id))[0].title).toBe("OwnerB chat");
+    expect((await readStudioState(ownerIdA))[0].brief.businessName).toBe(
+      "OwnerA Studio",
+    );
+    expect((await readStudioState(ownerIdB))[0].brief.businessName).toBe(
+      "OwnerB Studio",
+    );
+
+    await emptyStudio(ownerIdB);
   });
 });

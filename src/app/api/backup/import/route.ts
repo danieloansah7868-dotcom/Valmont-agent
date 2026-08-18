@@ -1,7 +1,9 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { assertCsrf } from "@/lib/security";
 import { requireApiSessionUser } from "@/lib/auth";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertOwnerRateLimit, safeApiError } from "@/lib/api";
+import { canonicalUserId } from "@/lib/user-identity";
+import { ImportInProgressError } from "@/lib/studio/import-coordinator";
 import { BACKUP_BODY_LIMIT_BYTES, readBoundedJson } from "@/lib/bounded-json";
 import {
   importBackup,
@@ -33,8 +35,8 @@ import {
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "backup-import", 5);
     const user = await requireApiSessionUser();
+    assertOwnerRateLimit("backup-import", canonicalUserId(user), 5);
 
     const raw = await readBoundedJson(
       request as unknown as Request,
@@ -57,6 +59,9 @@ export async function POST(request: NextRequest) {
       status: 200,
     });
   } catch (error) {
+    if (error instanceof ImportInProgressError) {
+      return NextResponse.json({ error: error.message }, { status: 409 });
+    }
     if (error instanceof PartialImportError) {
       return NextResponse.json(
         {

@@ -99,15 +99,15 @@ Use TLS, backups, point-in-time recovery, row ownership checks, and migration re
 Controls differ by method, so they are listed by what each actually applies.
 Authentication and owner scoping are the only two that are on every route.
 
-| Control          | Implementation                                                       | Applies to                                            | Failure |
-| ---------------- | -------------------------------------------------------------------- | ----------------------------------------------------- | ------- |
-| Authentication   | `requireApiSessionUser()`                                            | every Studio and backup route, reads included         | 401     |
-| Owner scoping    | `owner_id` in the SQL itself                                         | every read, update and delete                         | 404     |
-| CSRF             | `assertCsrf` — `x-valmont-csrf` must match the `valmont_csrf` cookie | mutations only (`POST`, `PATCH`, `DELETE`, import)    | 403     |
-| Origin           | `assertSameOrigin` (called by `assertCsrf`)                          | mutations only                                        | 403     |
-| Rate limiting    | 30/min draft mutations, 10/min backup export, 5/min backup import    | mutations and both backup routes; **not** draft reads | 429     |
-| Body size        | `readBoundedJson` — 1 MB drafts, 25 MB backup import                 | requests with a body                                  | 413     |
-| Input validation | `siteBriefSchemaV1` / `parseBackup`                                  | requests with a body                                  | 400     |
+| Control          | Implementation                                                                                                                                                                                                                                                                                                                                                             | Applies to                                            | Failure |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- | ------- |
+| Authentication   | `requireApiSessionUser()`                                                                                                                                                                                                                                                                                                                                                  | every Studio and backup route, reads included         | 401     |
+| Owner scoping    | `owner_id` in the SQL itself                                                                                                                                                                                                                                                                                                                                               | every read, update and delete                         | 404     |
+| CSRF             | `assertCsrf` — `x-valmont-csrf` must match the `valmont_csrf` cookie                                                                                                                                                                                                                                                                                                       | mutations only (`POST`, `PATCH`, `DELETE`, import)    | 403     |
+| Origin           | `assertSameOrigin` (called by `assertCsrf`)                                                                                                                                                                                                                                                                                                                                | mutations only                                        | 403     |
+| Rate limiting    | Authenticated Studio/backup routes key the bucket by canonical owner id + action (`studio-mutation`, `backup-export`, `backup-import`). Client `x-forwarded-for` / `x-real-ip` values are ignored for those routes. Unrelated chat/task/OAuth routes still use the existing request-key helper. Limits: 30/min draft mutations, 10/min backup export, 5/min backup import. | mutations and both backup routes; **not** draft reads | 429     |
+| Body size        | `readBoundedJson` — 1 MB drafts, 25 MB backup import                                                                                                                                                                                                                                                                                                                       | requests with a body                                  | 413     |
+| Input validation | `siteBriefSchemaV1` / `parseBackup`                                                                                                                                                                                                                                                                                                                                        | requests with a body                                  | 400     |
 
 `GET /api/studio/drafts` and `GET /api/studio/drafts/[id]` carry authentication
 and owner scoping only. They take no body and change nothing, so CSRF and body
@@ -212,10 +212,10 @@ new copy instead of overwriting existing work.
 
 **Atomicity depends on the storage backend, and the API reports which applies:**
 
-| Backend                     | `atomicity`          | Guarantee                                                                                                                                                                                                                                                                           |
-| --------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SQLite (default)            | `single-transaction` | Chat, memories and drafts share one connection and one transaction. Any failure rolls all three back. The export reads chat and drafts inside one read transaction, so a backup file is a consistent snapshot.                                                                      |
-| PostgreSQL (`DATABASE_URL`) | `coordinated`        | Chat is still SQLite, studio is PostgreSQL. **There is no distributed transaction**, so a durable cross-store coordinator (`import-coordinator.ts`) records the staged payload and a snapshot of both stores in SQLite before any write, then advances through durable checkpoints. |
+| Backend                     | `atomicity`          | Guarantee                                                                                                                                                                                                                                                                            |
+| --------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| SQLite (default)            | `single-transaction` | Chat, memories and drafts share one connection and one transaction. Any failure rolls all three back. The export reads chat and drafts inside one read transaction, so a backup file is a consistent snapshot.                                                                       |
+| PostgreSQL (`DATABASE_URL`) | `coordinated`        | Chat is still SQLite, studio is PostgreSQL. **There is no distributed transaction** and a mixed export is **not** one atomic snapshot. A durable coordinator records the staged payload and a snapshot of both stores, holds an owner-level import lock, then checkpoints each half. |
 
 On the coordinated path every failure — including a process killed between the
 two commits, a container eviction, or a dropped connection — rolls both stores
@@ -226,9 +226,13 @@ restart. Success is reported only after both halves committed; a rolled-back
 import is reported as a plain failure, never a partial success.
 `PartialImportError` is reserved for the exceptional case where the rollback
 itself cannot complete (for example PostgreSQL is unreachable at that moment);
-the response names the halves known to have committed, and the recovery record
-stays on disk so the next attempt finishes the rollback before importing
-anything new.
+the response names the halves known to have committed, and the recovery snapshot
+stays on disk (with the owner lock held) so the next attempt finishes the
+rollback before importing anything new. After a successful import or a
+successful rollback the journal payload and snapshot are logically deleted;
+only non-sensitive metadata remains. That is not guaranteed physical erasure
+from SQLite pages or leftover filesystem copies. Coordinator journal rows are
+never included in a user backup export.
 
 ### No payments, no payment data
 

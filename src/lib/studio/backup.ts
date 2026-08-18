@@ -360,7 +360,7 @@ export interface ImportOptions {
    * Mixed path only: called at each durable checkpoint. Throwing here
    * simulates a failure at that exact stage of the import.
    */
-  onCheckpoint?: (checkpoint: ImportCheckpoint) => void;
+  onCheckpoint?: (checkpoint: ImportCheckpoint) => void | Promise<void>;
 }
 
 /**
@@ -481,15 +481,15 @@ async function importIntoPostgres(
     restoreJob,
   } = await import("./import-coordinator");
 
+  const ownerId = await ensureStudioUser(user);
   // An earlier import that died mid-flight is rolled back before anything new
   // is written, so an interrupted import never leaks into a later one.
-  await recoverPendingImports();
+  await recoverPendingImports(ownerId);
 
-  const ownerId = await ensureStudioUser(user);
   const jobId = await beginImportJob(user, ownerId, backup);
 
   try {
-    options.onCheckpoint?.("job-created");
+    await options.onCheckpoint?.("job-created");
     // Chat half: chat history and memories live in SQLite even when studio
     // uses PostgreSQL. The transaction is owned here so a checkpoint failure
     // can prove the chat transaction itself rolls back.
@@ -500,22 +500,36 @@ async function importIntoPostgres(
         memories: backup.chat.memories as ChatMemory[],
         memoryEnabled: backup.chat.memoryEnabled,
       });
-      options.onCheckpoint?.("chat-imported");
+      // Must stay synchronous: an await would commit the SQLite transaction
+      // before this function returns.
+      const maybe = options.onCheckpoint?.("chat-imported");
+      if (maybe && typeof (maybe as Promise<void>).then === "function") {
+        throw new Error(
+          "onCheckpoint('chat-imported') must be synchronous because it runs inside a SQLite transaction.",
+        );
+      }
       return counts;
     });
     summary.chatSessions = chatCounts.chatSessions;
     summary.memories = chatCounts.memories;
     summary.skippedMemories = chatCounts.skippedMemories;
     markChatCommitted(jobId);
-    options.onCheckpoint?.("chat-committed");
+    await options.onCheckpoint?.("chat-committed");
 
     // Studio half: drafts live in PostgreSQL; one transaction, then the
     // durable checkpoint.
     await runStudioImportTransaction();
-    options.onCheckpoint?.("studio-committed");
-    options.onCheckpoint?.("completed");
-    markCompleted(jobId);
+    await options.onCheckpoint?.("studio-committed");
+    await options.onCheckpoint?.("completed");
+    markCompleted(jobId, {
+      chatSessions: summary.chatSessions,
+      memories: summary.memories,
+      studioDrafts: summary.studioDrafts,
+    });
   } catch (cause) {
+    if (cause instanceof Error && cause.name === "ImportInProgressError") {
+      throw cause;
+    }
     // The job's status before the rollback decides which halves were already
     // committed — capture it first, because restoreJob moves the status to
     // "restoring" as soon as it starts.

@@ -482,6 +482,11 @@ function pgRowToDraft(row: typeof studioDrafts.$inferSelect): StudioDraft {
 }
 
 export function getStudioDraftStore(): StudioDraftStore {
-  if (process.env.DATABASE_URL) return new PostgresStudioDraftStore();
+  if (process.env.DATABASE_URL) {
+    void import("./import-coordinator").then((mod) => {
+      mod.scheduleStartupImportRecovery();
+    });
+    return new PostgresStudioDraftStore();
+  }
   return new SqliteStudioDraftStore();
 }

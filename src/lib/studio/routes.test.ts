@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { resetRateLimitForTests } from "@/lib/security";
 import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import type { SessionUser } from "@/lib/auth";
 import { SqliteStudioDraftStore } from "./draft-store";
@@ -112,6 +113,7 @@ beforeEach(() => {
   process.env.GITHUB_CLIENT_ID = "test-client-id";
   process.env.GITHUB_CLIENT_SECRET = "test-client-secret";
   process.env.SESSION_SECRET = "test-session-secret-that-is-long-enough";
+  resetRateLimitForTests();
 });
 
 afterEach(() => {
@@ -441,6 +443,20 @@ describe("studio routes: create, read, update, delete", () => {
       idParams(draft.id),
     );
     expect(again.status).toBe(404);
+  });
+
+  it("does not give a signed-in owner a fresh mutation bucket by rotating X-Forwarded-For", async () => {
+    const { POST } = await listRoute();
+    let lastStatus = 0;
+    for (let index = 0; index < 31; index += 1) {
+      const request = goodRequest("/api/studio/drafts", {
+        body: newBriefBody({ businessName: `Shop ${index}` }),
+      });
+      request.headers.set("x-forwarded-for", `203.0.113.${index + 1}`);
+      request.headers.set("x-real-ip", `198.51.100.${index + 1}`);
+      lastStatus = (await POST(request)).status;
+    }
+    expect(lastStatus).toBe(429);
   });
 });
 

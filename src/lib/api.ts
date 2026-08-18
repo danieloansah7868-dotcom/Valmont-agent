@@ -21,6 +21,22 @@ export function assertApiRateLimit(
 }
 
 /**
+ * Rate-limit an authenticated Studio or backup operation by the canonical
+ * owner id. Client-supplied `x-forwarded-for` / `x-real-ip` headers are
+ * ignored here so rotating those values cannot mint a fresh bucket.
+ */
+export function assertOwnerRateLimit(
+  operation: string,
+  ownerId: string,
+  limit = 30,
+): void {
+  if (!ownerId) throw new RateLimitError();
+  if (!checkRateLimit(`${operation}:owner:${ownerId}`, limit)) {
+    throw new RateLimitError();
+  }
+}
+
+/**
  * Errors that carry their own HTTP status. Preferring an explicit status over
  * matching words in a message means a reworded message can never silently
  * change a 409 into a 400.

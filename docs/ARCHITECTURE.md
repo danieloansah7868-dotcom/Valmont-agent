@@ -254,16 +254,23 @@ back together. A `failAfterInsertForTests` hook lets the suite prove the
 rollback rather than assume it.
 
 With `DATABASE_URL` set, chat stays in SQLite while studio lives in PostgreSQL,
-so there is no distributed transaction. `import-coordinator.ts` is a durable
+so there is no distributed transaction and a mixed-store **export** is two
+separate reads, not one atomic snapshot. `import-coordinator.ts` is a durable
 cross-store recovery coordinator instead: before any write it records a job in
 SQLite holding the staged payload and a snapshot of the owner's pre-import state
-in **both** stores, then advances through durable checkpoints as each half
-commits. A failure at any checkpoint — or a process killed mid-import — rolls
-both stores back to their exact previous state, immediately or via automatic
-recovery at the start of the next import attempt. Success is reported only after
-both halves committed; a rolled-back import is reported as a clean failure, and
-`PartialImportError` is reserved for the exceptional case where the rollback
-itself could not complete. The PostgreSQL suite injects failures at every
+in **both** stores, takes an owner-level lock (a second import for that owner
+is a `409` before either store changes), then advances through durable
+checkpoints as each half commits. A failure at any checkpoint — or a process
+killed mid-import — rolls both stores back to their exact previous state,
+immediately or via automatic recovery at process start and at the start of the
+next import attempt. Success is reported only after both halves committed; a
+rolled-back import is reported as a clean failure, and `PartialImportError` is
+reserved for the exceptional case where the rollback itself could not complete.
+After success or a successful rollback the payload and snapshot are logically
+deleted from the journal (empty strings remain in those columns; this is not
+physical erasure of SQLite pages). An unresolved rollback failure keeps the
+snapshot and the lock so a new import cannot overwrite it. Different owners
+may import independently. The PostgreSQL suite injects failures at every
 checkpoint (`onCheckpoint`) and proves both stores return to their exact
 previous state, including after a simulated crash and restart.
 

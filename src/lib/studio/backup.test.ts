@@ -206,6 +206,35 @@ describe("export", () => {
     expect(reparsed.studio.drafts).toHaveLength(1);
   });
 
+  it("does not include coordinator journal snapshots in a user backup", async () => {
+    const SENTINEL = "JOURNAL-SENTINEL-CHAT-XY7-NOT-FOR-EXPORT";
+    await seedUserA();
+    const { ensureCoordinatorSchema } = await import("./import-coordinator");
+    const db = chatStore.connection;
+    ensureCoordinatorSchema(db);
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO backup_import_jobs
+         (id, owner_id, chat_user_id, mode, source_version, status,
+          created_at, updated_at, payload_json, pre_state_json)
+       VALUES (?, ?, ?, 'mixed', 2, 'completed', ?, ?, ?, ?)`,
+    ).run(
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      canonicalUserId(userA),
+      userA.id,
+      now,
+      now,
+      JSON.stringify({ sentinel: SENTINEL }),
+      JSON.stringify({ chat: { sessions: [{ title: SENTINEL }] } }),
+    );
+
+    const backup = await buildBackup(userA);
+    const serialized = JSON.stringify(backup);
+    expect(serialized).not.toContain(SENTINEL);
+    expect(serialized).not.toContain("backup_import_jobs");
+    expect(serialized).not.toContain("payload_json");
+  });
+
   it("cannot combine chat and drafts from different points in time", async () => {
     await seedUserA();
     const originalSessionId = (await chatStore.list(userA.id))[0]!.id;

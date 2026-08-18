@@ -101,17 +101,23 @@ using `COPYFILE_EXCL` so an existing backup is never overwritten, and records a
 - `GET /api/backup/export` — on SQLite, chat and drafts are read inside one
   read transaction on the single shared database handle, so the file is a
   consistent snapshot: a version 2 file containing chat sessions, memories, and
-  Studio drafts.
+  Studio drafts. With `DATABASE_URL` set the two halves live in different
+  engines; that export is **not** one atomic cross-engine snapshot.
 - `POST /api/backup/import` — SQLite uses the single shared database handle, so
   a mid-import failure rolls chat, memories, and drafts back together. With
   `DATABASE_URL` set, chat stays in SQLite and drafts go to PostgreSQL; the
   durable cross-store coordinator records the staged payload and a pre-import
-  snapshot of both stores before any write, and a failure at any checkpoint —
-  or a process killed mid-import — rolls both stores back to their exact
-  previous state, immediately or automatically on the next import attempt after
-  a restart. Success is reported only after both halves committed. Legacy
+  snapshot of both stores before any write, holds an owner-level lock (a second
+  import for that owner is `409`), and a failure at any checkpoint — or a
+  process killed mid-import — rolls both stores back to their exact previous
+  state, immediately or automatically on the next import attempt after a
+  restart. Success is reported only after both halves committed. After success
+  or a successful rollback the journal payload and snapshot are logically
+  deleted; an unresolved rollback failure keeps them until recovery finishes.
+  That cleanup is not guaranteed physical erasure of SQLite pages. Legacy
   version 1 chat-only files are still accepted; unknown versions are rejected
-  before anything is written.
+  before anything is written. Authenticated Studio and backup routes rate-limit
+  by owner id, not by client-supplied forwarding headers.
 
 Backups contain the owner's business details. Treat a downloaded file as
 sensitive: store it encrypted, and delete copies you no longer need. Regular

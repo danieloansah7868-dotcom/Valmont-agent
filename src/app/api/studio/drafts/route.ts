@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { assertCsrf } from "@/lib/security";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertOwnerRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
+import { canonicalUserId } from "@/lib/user-identity";
 import { getStudioDraftStore } from "@/lib/studio/draft-store";
 import { siteBriefSchemaV1 } from "@/lib/studio/site-brief/schema";
 import { DRAFT_BODY_LIMIT_BYTES, readBoundedJson } from "@/lib/bounded-json";
@@ -19,8 +20,8 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "studio-mutation", 30);
     const user = await requireApiSessionUser();
+    assertOwnerRateLimit("studio-mutation", canonicalUserId(user), 30);
     const body = (await readBoundedJson(
       request as unknown as Request,
       DRAFT_BODY_LIMIT_BYTES,

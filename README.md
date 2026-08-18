@@ -250,12 +250,19 @@ whether an ID exists.
   share one database handle and one transaction, and the export reads both
   halves inside one read transaction so a backup file is a consistent snapshot.
   With `DATABASE_URL` set, chat stays in SQLite while drafts go to PostgreSQL;
-  a durable cross-store coordinator records the staged payload and a
-  pre-import snapshot of both stores before any write, and any failure — or a
+  those two engines are **not** one atomic snapshot on export. A durable
+  cross-store coordinator records the staged payload and a pre-import snapshot
+  of both stores before any write, takes an owner-level import lock so a second
+  import for the same account is refused with `409`, and any failure — or a
   process killed mid-import — rolls both stores back to their exact previous
   state, immediately or automatically on the next import attempt after a
   restart. Success is reported only after both halves committed; a rolled-back
-  import is reported as a plain failure, never a partial success.
+  import is reported as a plain failure, never a partial success. After success
+  or a successful rollback the journal keeps only non-sensitive metadata (id,
+  owner, status, timestamps, counts) — the payload and snapshot are logically
+  deleted. That is not a guarantee the bytes have been wiped from SQLite pages
+  or filesystem backups. An unresolved rollback failure keeps the snapshot and
+  the lock until recovery finishes.
 - The older `/api/memories/export` and `/api/memories/import` endpoints keep
   their version 1 behaviour unchanged.
 
@@ -295,6 +302,7 @@ cookie created with the same `SESSION_SECRET` the server was started with —
 
 The PostgreSQL draft tests only run when `STUDIO_TEST_DATABASE_URL` points at a
 throwaway database; otherwise they are reported as skipped, never as passed. CI
-provides a real PostgreSQL 16 service so they always run there.
+provides a real PostgreSQL 16 service so they always run there. Do not treat a
+past test count as a permanent fact — use the latest CI run on the pull request.
 
 The production Docker image does **not** install browser binaries.

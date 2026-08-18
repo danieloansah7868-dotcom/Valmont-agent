@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { requireApiSessionUser } from "@/lib/auth";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertOwnerRateLimit, safeApiError } from "@/lib/api";
+import { canonicalUserId } from "@/lib/user-identity";
 import { buildBackup } from "@/lib/studio/backup";
 
 /**
@@ -10,8 +11,9 @@ import { buildBackup } from "@/lib/studio/backup";
  */
 export async function GET(request: NextRequest) {
   try {
-    assertApiRateLimit(request, "backup-export", 10);
+    void request;
     const user = await requireApiSessionUser();
+    assertOwnerRateLimit("backup-export", canonicalUserId(user), 10);
     const backup = await buildBackup(user);
     const stamp = backup.exportedAt.slice(0, 10);
     return NextResponse.json(backup, {

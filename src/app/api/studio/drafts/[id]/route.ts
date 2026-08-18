@@ -1,8 +1,9 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { assertCsrf } from "@/lib/security";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertOwnerRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
+import { canonicalUserId } from "@/lib/user-identity";
 import { getStudioDraftStore } from "@/lib/studio/draft-store";
 import { siteBriefSchemaV1 } from "@/lib/studio/site-brief/schema";
 import { DRAFT_BODY_LIMIT_BYTES, readBoundedJson } from "@/lib/bounded-json";
@@ -29,9 +30,9 @@ export async function PATCH(
 ) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "studio-mutation", 30);
     const { id } = await params;
     const user = await requireApiSessionUser();
+    assertOwnerRateLimit("studio-mutation", canonicalUserId(user), 30);
     const body = (await readBoundedJson(
       request as unknown as Request,
       DRAFT_BODY_LIMIT_BYTES,
@@ -60,9 +61,9 @@ export async function DELETE(
 ) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "studio-mutation", 30);
     const { id } = await params;
     const user = await requireApiSessionUser();
+    assertOwnerRateLimit("studio-mutation", canonicalUserId(user), 30);
     const ok = await getStudioDraftStore().delete(user, id);
     if (!ok)
       return NextResponse.json({ error: "Draft not found" }, { status: 404 });

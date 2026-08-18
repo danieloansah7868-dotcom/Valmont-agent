@@ -27,13 +27,20 @@ function sessionCookieValue(user: typeof ownerA): string {
   );
 }
 
-// Every API rate-limit bucket is keyed by x-forwarded-for, falling back to one
-// shared "local" bucket. Without a distinct key per test, a whole e2e run would
-// exhaust the in-memory mutation budget in a single window. Each test therefore
-// carries its own synthetic client address; the limiter itself is still
-// exercised on every single request. This is test-side only — no production
-// code path is weakened.
-let rateLimitKeyCounter = 0;
+// Authenticated Studio/backup rate limits are keyed by owner id. Each test
+// that does not need a fixed identity therefore signs in as a fresh user so
+// one test cannot exhaust another test's mutation budget. There is no
+// client-controlled header that evades the limiter.
+let e2eUserSeq = 0;
+
+function nextOwner(): typeof ownerA {
+  e2eUserSeq += 1;
+  return {
+    id: `e2e-u-${e2eUserSeq}`,
+    login: `owner-${e2eUserSeq}`,
+    name: `Owner ${e2eUserSeq}`,
+  };
+}
 
 async function signIn(
   context: BrowserContext,
@@ -52,16 +59,6 @@ async function signIn(
     },
     { name: "valmont_csrf", value: csrf, domain: url.hostname, path: "/" },
   ]);
-  rateLimitKeyCounter += 1;
-  const clientKey = `127.0.0.${(rateLimitKeyCounter % 253) + 2}`;
-  await context.route("**/api/**", async (route) => {
-    await route.continue({
-      headers: {
-        ...route.request().headers(),
-        "x-forwarded-for": clientKey,
-      },
-    });
-  });
   return csrf;
 }
 
@@ -80,7 +77,7 @@ test.describe("Website Studio", () => {
     context,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
 
     await page.goto("/studio");
     await expect(
@@ -155,12 +152,47 @@ test.describe("Website Studio", () => {
     await reopened.close();
   });
 
+  test("non-default country, currency and timezone persist after reopen", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, nextOwner(), baseURL!);
+    const draftId = await createDraft(page, "Lagos Market Stall");
+
+    await page.getByRole("button", { name: /4\. Business details/i }).click();
+    await expect(page.getByLabel(/^Country$/i)).toHaveValue("Ghana");
+    await page.getByLabel(/^Country$/i).selectOption("Nigeria");
+    await page.getByLabel(/^Currency$/i).selectOption("NGN");
+    await page.getByLabel(/^Timezone$/i).selectOption("Africa/Lagos");
+    await expect(page.getByTestId("save-state")).toHaveText(
+      /All changes saved/i,
+      { timeout: 15_000 },
+    );
+    await expect(page.getByLabel(/^Country$/i)).toHaveValue("Nigeria");
+    await expect(page.getByLabel(/^Currency$/i)).toHaveValue("NGN");
+    await expect(page.getByLabel(/^Timezone$/i)).toHaveValue("Africa/Lagos");
+
+    await page.goto("/studio");
+    const reopened = await context.newPage();
+    await reopened.goto(`/studio/drafts/${draftId}`);
+    await reopened
+      .getByRole("button", { name: /4\. Business details/i })
+      .click();
+    await expect(reopened.getByLabel(/^Country$/i)).toHaveValue("Nigeria");
+    await expect(reopened.getByLabel(/^Currency$/i)).toHaveValue("NGN");
+    await expect(reopened.getByLabel(/^Timezone$/i)).toHaveValue(
+      "Africa/Lagos",
+    );
+    await reopened.close();
+  });
+
   test("changing the theme keeps every business detail", async ({
     page,
     context,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
     const draftId = await createDraft(page, "Kofi Motors");
 
     await page.getByRole("button", { name: /4\. Business details/i }).click();
@@ -205,7 +237,7 @@ test.describe("Website Studio", () => {
     context,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
     await createDraft(page, "Adom Fashion House");
 
     await expect(page.getByTestId("completeness-score")).toBeVisible();
@@ -239,7 +271,7 @@ test.describe("Website Studio", () => {
     context,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
     await createDraft(page, "Safe Preview Test");
 
     let dialogAppeared = false;
@@ -270,7 +302,7 @@ test.describe("Website Studio", () => {
     context,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
     await createDraft(page, "Keyboard Test");
 
     await page.getByRole("button", { name: /4\. Business details/i }).click();
@@ -332,7 +364,7 @@ test.describe("Website Studio", () => {
     // a page that scrolls sideways on a 390px iPhone screen would be a real
     // layout failure, and on a desktop viewport it would be an obvious one too,
     // so the assertion is meaningful in both. There is no intentional skip.
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
     const draftId = await createDraft(page, "No Overflow Test");
 
     for (const path of ["/studio", `/studio/drafts/${draftId}`]) {
@@ -399,7 +431,7 @@ test.describe("Website Studio", () => {
     context,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
     const draftId = await createDraft(page, "Temporary Draft");
 
     // Deletion must ask first. Assert the confirmation really appears rather
@@ -428,7 +460,7 @@ test.describe("Website Studio", () => {
     context,
     baseURL,
   }) => {
-    await signIn(context, ownerA, baseURL!);
+    await signIn(context, nextOwner(), baseURL!);
     const draftId = await createDraft(page, "Conflict Draft");
 
     // Page B opens the same draft while it is still at revision 1.

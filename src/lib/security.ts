@@ -118,3 +118,8 @@ export function checkRateLimit(
   current.count += 1;
   return current.count <= limit;
 }
+
+/** Test helper only — clears in-process buckets between cases. */
+export function resetRateLimitForTests(): void {
+  rateWindows.clear();
+}

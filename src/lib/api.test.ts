@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { safeApiError, RateLimitError, PayloadTooLargeError } from "./api";
+import {
+  safeApiError,
+  RateLimitError,
+  PayloadTooLargeError,
+  assertOwnerRateLimit,
+} from "./api";
 import { NotConnectedError } from "./auth";
+import { resetRateLimitForTests } from "./security";
 
 async function body(response: Response) {
   return (await response.json()) as { error: string };
@@ -72,6 +78,22 @@ describe("safeApiError keeps internal detail out of responses", () => {
     const validation = safeApiError(new Error("Business name is required"));
     expect(validation.status).toBe(400);
     expect((await body(validation)).error).toBe("Business name is required");
+  });
+
+  it("rate-limits an authenticated owner independently of other owners", () => {
+    resetRateLimitForTests();
+    const owner = "owner-canonical-id";
+    for (let index = 0; index < 5; index += 1) {
+      expect(() =>
+        assertOwnerRateLimit("backup-import", owner, 5),
+      ).not.toThrow();
+    }
+    expect(() => assertOwnerRateLimit("backup-import", owner, 5)).toThrow(
+      RateLimitError,
+    );
+    expect(() =>
+      assertOwnerRateLimit("backup-import", "a-different-owner", 5),
+    ).not.toThrow();
   });
 
   it("does not leak a stack frame", async () => {

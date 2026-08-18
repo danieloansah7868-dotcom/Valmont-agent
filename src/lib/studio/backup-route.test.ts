@@ -17,6 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { resetRateLimitForTests } from "@/lib/security";
 import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import type { SessionUser } from "@/lib/auth";
 import { SqliteStudioDraftStore } from "./draft-store";
@@ -119,6 +120,7 @@ beforeEach(() => {
   process.env.GITHUB_CLIENT_ID = "test-client-id";
   process.env.GITHUB_CLIENT_SECRET = "test-client-secret";
   process.env.SESSION_SECRET = "test-session-secret-that-is-long-enough";
+  resetRateLimitForTests();
   freshDatabase();
 });
 
