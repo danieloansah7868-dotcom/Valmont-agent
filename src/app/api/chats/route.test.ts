@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   getGitHubProvider: vi.fn(),
   list: vi.fn(),
   retrieveChatRepositoryContext: vi.fn(),
+  retrievePinnedRepositoryFiles: vi.fn(),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -38,10 +39,12 @@ vi.mock("@/lib/models", () => ({
 }));
 
 vi.mock("@/lib/github-retrieval", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/github-retrieval")>();
+  const actual =
+    await importOriginal<typeof import("@/lib/github-retrieval")>();
   return {
     ...actual,
     retrieveChatRepositoryContext: mocks.retrieveChatRepositoryContext,
+    retrievePinnedRepositoryFiles: mocks.retrievePinnedRepositoryFiles,
   };
 });
 
@@ -236,6 +239,72 @@ describe("chat APIs", () => {
       "app",
       "main",
       "What does this project do?",
+    );
+  });
+
+  it("falls back to pinned briefings when the full tree times out", async () => {
+    const session = emptySession({
+      repository: {
+        id: "42",
+        owner: "acme",
+        name: "Valmont-data",
+        fullName: "acme/Valmont-data",
+        baseBranch: "main",
+      },
+    });
+    const github = { listRepositories: vi.fn(), listBranches: vi.fn() };
+    mocks.get.mockResolvedValue(session);
+    mocks.getGitHubProvider.mockResolvedValue(github);
+    mocks.retrieveChatRepositoryContext.mockRejectedValue(
+      new Error("Repository context timed out"),
+    );
+    mocks.retrievePinnedRepositoryFiles.mockResolvedValue([
+      {
+        path: "ads/CONTEXT-FOR-AGENT.md",
+        content: "Classifieds only.",
+        score: 60,
+      },
+    ]);
+    const chat = vi.fn().mockResolvedValue({
+      content: "Valmont Ads is classifieds, not an ad network.",
+      model: "gemini-test",
+      provider: "openai-compatible",
+      finishReason: "stop",
+      toolCalls: [],
+      usage: { inputTokens: 10, outputTokens: 8, totalTokens: 18 },
+    });
+    mocks.createModelProvider.mockReturnValue({ chat });
+    mocks.appendMessages.mockImplementation(
+      async (_id, _userId, messages, titleIfNew) => ({
+        ...session,
+        title: titleIfNew ?? session.title,
+        messages,
+      }),
+    );
+
+    const response = await sendMessage(
+      mutationRequest("http://localhost/api/chats/chat-1/messages", {
+        content: "What is Valmont Ads?",
+      }),
+      { params: Promise.resolve({ id: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.retrievePinnedRepositoryFiles).toHaveBeenCalledWith(
+      github,
+      "acme",
+      "Valmont-data",
+      "main",
+    );
+    expect(chat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            role: "system",
+            content: expect.stringContaining("Classifieds only."),
+          }),
+        ]),
+      }),
     );
   });
 

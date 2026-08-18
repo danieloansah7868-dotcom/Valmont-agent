@@ -4,7 +4,10 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { chatTitleFromMessage, generateChatReply } from "@/lib/chat";
 import { getChatStore } from "@/lib/chat-store";
-import { retrieveChatRepositoryContext } from "@/lib/github-retrieval";
+import {
+  retrieveChatRepositoryContext,
+  retrievePinnedRepositoryFiles,
+} from "@/lib/github-retrieval";
 import { createModelProvider } from "@/lib/models";
 import { assertCsrf } from "@/lib/security";
 
@@ -30,26 +33,40 @@ export async function POST(
     if (session.repository) {
       try {
         const github = await getGitHubProvider();
-        const snapshot = await Promise.race([
-          retrieveChatRepositoryContext(
+        try {
+          const snapshot = await Promise.race([
+            retrieveChatRepositoryContext(
+              github,
+              session.repository.owner,
+              session.repository.name,
+              session.repository.baseBranch,
+              input.content,
+            ),
+            new Promise<never>((_, reject) => {
+              setTimeout(
+                () => reject(new Error("Repository context timed out")),
+                15_000,
+              );
+            }),
+          ]);
+          repositoryContext = {
+            repository: session.repository,
+            files: snapshot.files,
+            paths: snapshot.paths,
+          };
+        } catch {
+          const files = await retrievePinnedRepositoryFiles(
             github,
             session.repository.owner,
             session.repository.name,
             session.repository.baseBranch,
-            input.content,
-          ),
-          new Promise<never>((_, reject) => {
-            setTimeout(
-              () => reject(new Error("Repository context timed out")),
-              15_000,
-            );
-          }),
-        ]);
-        repositoryContext = {
-          repository: session.repository,
-          files: snapshot.files,
-          paths: snapshot.paths,
-        };
+          );
+          repositoryContext = {
+            repository: session.repository,
+            files,
+            paths: files.map((file) => file.path),
+          };
+        }
       } catch {
         repositoryContext = {
           repository: session.repository,

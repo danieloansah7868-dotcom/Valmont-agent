@@ -58,6 +58,49 @@ describe("Chat with Valmont", () => {
     expect(messages.at(-1)?.content).not.toContain("ghp_AAAAA");
   });
 
+  it("puts agent briefing files first so the model cannot invent the product", () => {
+    const messages = buildChatCompletionMessages({
+      session: session(),
+      userContent: "What is Valmont Ads?",
+      repositoryContext: {
+        repository: {
+          id: "42",
+          owner: "acme",
+          name: "Valmont-data",
+          fullName: "acme/Valmont-data",
+          baseBranch: "arena/ads",
+        },
+        paths: [
+          "ads/CONTEXT-FOR-AGENT.md",
+          "ads/src/app/page.tsx",
+          "ads/README.md",
+        ],
+        files: [
+          {
+            path: "ads/src/app/page.tsx",
+            content: "export default function Home() { return null }",
+            score: 10,
+          },
+          {
+            path: "ads/CONTEXT-FOR-AGENT.md",
+            content:
+              "A classifieds marketplace for Ghana. Kofi sells a fridge. Not an ad network.",
+            score: 60,
+          },
+        ],
+      },
+    });
+    const note = messages.find((message) =>
+      message.content.includes("<repository_context>"),
+    );
+    expect(note?.content).toContain("product definition");
+    expect(note?.content).toContain("classifieds marketplace");
+    expect(note?.content.indexOf("CONTEXT-FOR-AGENT")).toBeLessThan(
+      note?.content.indexOf("ads/src/app/page.tsx") ?? Number.POSITIVE_INFINITY,
+    );
+    expect(messages[0]?.content).toContain("product definition");
+  });
+
   it("refuses to invent a product when the repo is attached but empty", () => {
     const messages = buildChatCompletionMessages({
       session: session({
@@ -213,6 +256,8 @@ describe("Chat with Valmont", () => {
     });
 
     expect(chat).toHaveBeenCalledTimes(2);
-    expect(result.assistantMessage.content).toBe("The ads app lives under ads/.");
+    expect(result.assistantMessage.content).toBe(
+      "The ads app lives under ads/.",
+    );
   });
 });

@@ -38,6 +38,9 @@ const STOP_WORDS = new Set([
 const PINNED_CHAT_PATHS = [
   "README.md",
   "GET-STARTED.md",
+  "AGENTS.md",
+  "ads/CONTEXT-FOR-AGENT.md",
+  "ads/PROMPT-FOR-AGENT.md",
   "ads/README.md",
   "ads/package.json",
   "ads/src/app/page.tsx",
@@ -53,6 +56,13 @@ const PINNED_CHAT_PATHS = [
   "src/app/page.tsx",
 ];
 
+const AGENT_BRIEFING_PATH =
+  /(^|\/)(context-for-agent|prompt-for-agent|agents)\.md$/i;
+
+export function isAgentBriefingPath(filePath: string): boolean {
+  return AGENT_BRIEFING_PATH.test(filePath);
+}
+
 /**
  * Reads a small, known set of files without listing the whole Git tree.
  * Chat uses this first so a huge repo cannot time out and leave the model
@@ -65,61 +75,82 @@ export async function retrievePinnedRepositoryFiles(
   ref: string,
 ): Promise<GitHubContextFile[]> {
   const fetched = await Promise.all(
-    PINNED_CHAT_PATHS.map(async (filePath): Promise<GitHubContextFile | null> => {
-      if (isSensitivePath(filePath)) return null;
-      try {
-        const file = await github.readFile(owner, repository, filePath, ref);
-        const redacted = redactSecrets(file.content);
-        if (redacted.length > 256_000 || redacted.includes("\0")) return null;
-        return {
-          path: file.path,
-          content: boundedExcerpt(redacted, [], 8_000),
-          score: /(^|\/)readme\.md$/i.test(file.path) ? 40 : 10,
-        };
-      } catch {
-        return null;
-      }
-    }),
+    PINNED_CHAT_PATHS.map(
+      async (filePath): Promise<GitHubContextFile | null> => {
+        if (isSensitivePath(filePath)) return null;
+        try {
+          const file = await github.readFile(owner, repository, filePath, ref);
+          const redacted = redactSecrets(file.content);
+          if (redacted.length > 256_000 || redacted.includes("\0")) return null;
+          return {
+            path: file.path,
+            content: boundedExcerpt(redacted, [], 8_000),
+            score: pinnedFileScore(file.path),
+          };
+        } catch {
+          return null;
+        }
+      },
+    ),
   );
   return fetched
     .filter((file): file is GitHubContextFile => file !== null)
     .sort((a, b) => b.score - a.score);
 }
 
-/** List the branch, then read files — same order a person would open a checkout. */
+/**
+ * List the branch and read files under a deadline. Pinned briefings start
+ * immediately so a slow tree walk cannot leave the model inventing the product.
+ */
 export async function retrieveChatRepositoryContext(
   github: GitHubProvider,
   owner: string,
   repository: string,
   ref: string,
   question: string,
+  timeoutMs = 12_000,
 ): Promise<RepositorySnapshot> {
-  let paths: string[] = [];
-  try {
-    paths = (await github.listFiles(owner, repository, ref)).filter(
-      (filePath) => !isSensitivePath(filePath) && SOURCE_EXTENSION.test(filePath),
-    );
-  } catch {
-    paths = [];
-  }
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => Math.max(0, deadline - Date.now());
 
-  const pinned = await retrievePinnedRepositoryFiles(
+  const listPromise = github
+    .listFiles(owner, repository, ref)
+    .then((listed) =>
+      listed.filter(
+        (filePath) =>
+          !isSensitivePath(filePath) && SOURCE_EXTENSION.test(filePath),
+      ),
+    )
+    .catch(() => [] as string[]);
+
+  const pinnedPromise = retrievePinnedRepositoryFiles(
     github,
     owner,
     repository,
     ref,
   );
+
+  const pinned = await withTimeout(pinnedPromise, remaining(), []);
+  const paths = await withTimeout(listPromise, remaining(), []);
   const byPath = new Map(pinned.map((file) => [file.path, file]));
 
-  if (paths.length > 0) {
-    const extra = await readRankedFiles(
-      github,
-      owner,
-      repository,
-      ref,
-      paths,
-      question,
-      6,
+  const unreadBriefings = paths.filter(
+    (filePath) => isAgentBriefingPath(filePath) && !byPath.has(filePath),
+  );
+  if (unreadBriefings.length > 0 && remaining() > 800) {
+    const briefings = await withTimeout(
+      readNamedFiles(github, owner, repository, ref, unreadBriefings, 60),
+      remaining(),
+      [],
+    );
+    for (const file of briefings) byPath.set(file.path, file);
+  }
+
+  if (paths.length > 0 && remaining() > 1_500) {
+    const extra = await withTimeout(
+      readRankedFiles(github, owner, repository, ref, paths, question, 6),
+      remaining(),
+      [],
     );
     for (const file of extra) {
       const existing = byPath.get(file.path);
@@ -129,9 +160,7 @@ export async function retrieveChatRepositoryContext(
 
   return {
     paths,
-    files: [...byPath.values()]
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 10),
+    files: [...byPath.values()].sort((a, b) => b.score - a.score).slice(0, 10),
   };
 }
 
@@ -139,6 +168,7 @@ export function formatBranchListing(paths: string[], limit = 280): string {
   if (paths.length === 0) return "";
   const preferred = paths.filter(
     (filePath) =>
+      isAgentBriefingPath(filePath) ||
       /^(ads|src|app|docs)\//i.test(filePath) ||
       /(^|\/)(readme\.md|package\.json)$/i.test(filePath),
   );
@@ -148,6 +178,57 @@ export function formatBranchListing(paths: string[], limit = 280): string {
   return extra > 0
     ? `${listed.join("\n")}\n… ${extra} more files on this branch`
     : listed.join("\n");
+}
+
+async function readNamedFiles(
+  github: GitHubProvider,
+  owner: string,
+  repository: string,
+  ref: string,
+  filePaths: string[],
+  score: number,
+): Promise<GitHubContextFile[]> {
+  const fetched = await Promise.all(
+    filePaths
+      .slice(0, 8)
+      .map(async (filePath): Promise<GitHubContextFile | null> => {
+        if (isSensitivePath(filePath)) return null;
+        try {
+          const file = await github.readFile(owner, repository, filePath, ref);
+          const redacted = redactSecrets(file.content);
+          if (redacted.length > 256_000 || redacted.includes("\0")) return null;
+          return {
+            path: file.path,
+            content: boundedExcerpt(redacted, [], 8_000),
+            score,
+          };
+        } catch {
+          return null;
+        }
+      }),
+  );
+  return fetched.filter((file): file is GitHubContextFile => file !== null);
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  fallback: T,
+): Promise<T> {
+  if (ms <= 0) return Promise.resolve(fallback);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallback);
+      },
+    );
+  });
 }
 
 async function readRankedFiles(
@@ -207,7 +288,11 @@ export async function retrieveGitHubContext(
   ref: string,
   taskText: string,
   limit = 12,
-): Promise<{ totalFiles: number; paths: string[]; files: GitHubContextFile[] }> {
+): Promise<{
+  totalFiles: number;
+  paths: string[];
+  files: GitHubContextFile[];
+}> {
   const allPaths = (await github.listFiles(owner, repository, ref)).filter(
     (filePath) => !isSensitivePath(filePath) && SOURCE_EXTENSION.test(filePath),
   );
@@ -244,12 +329,19 @@ function taskTerms(value: string): string[] {
     .slice(0, 24);
 }
 
+function pinnedFileScore(filePath: string): number {
+  if (isAgentBriefingPath(filePath)) return 60;
+  if (/(^|\/)readme\.md$/i.test(filePath)) return 40;
+  return 10;
+}
+
 function pathScore(filePath: string, terms: string[]): number {
   const lower = filePath.toLowerCase();
   let score = terms.reduce(
     (total, term) => total + (lower.includes(term) ? 12 : 0),
     0,
   );
+  if (isAgentBriefingPath(filePath)) score += 50;
   if (/(^|\/)readme\.md$/i.test(filePath)) score += 24;
   if (
     /(^|\/)(package\.json|pyproject\.toml|go\.mod|cargo\.toml)$/i.test(filePath)
