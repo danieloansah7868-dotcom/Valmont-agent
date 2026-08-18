@@ -104,6 +104,9 @@ describe("Chat with Valmont", () => {
       "assistant-secret-value",
     );
     expect(result.userMessage).toMatchObject({ role: "user" });
+    expect(
+      Date.parse(result.assistantMessage.createdAt),
+    ).toBeGreaterThanOrEqual(Date.parse(result.userMessage.createdAt));
   });
 
   it("creates an editable, bounded task handoff without changing the chat", () => {

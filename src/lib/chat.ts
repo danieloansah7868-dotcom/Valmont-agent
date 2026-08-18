@@ -108,20 +108,20 @@ export async function generateChatReply(input: {
       "The model returned an empty chat response. Check MODEL_NAME / MODEL_BASE_URL, then try a shorter question.",
     );
   }
-  const now = new Date().toISOString();
+  const now = Date.now();
 
   return {
     userMessage: {
       id: randomUUID(),
       role: "user",
       content: userContent,
-      createdAt: now,
+      createdAt: new Date(now).toISOString(),
     },
     assistantMessage: {
       id: randomUUID(),
       role: "assistant",
       content: assistantContent,
-      createdAt: now,
+      createdAt: new Date(now + 1).toISOString(),
       model: response.model,
       inputTokens: response.usage?.inputTokens,
       outputTokens: response.usage?.outputTokens,
