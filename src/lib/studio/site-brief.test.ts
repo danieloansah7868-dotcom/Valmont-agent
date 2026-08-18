@@ -650,6 +650,26 @@ describe("isHttpsSafeUrl private-address blocking", () => {
     expect(isHttpsSafeUrl("https://[64:ff9b:1::7f00:1]/")).toBe(false);
   });
 
+  // Raised by independent review of 158f601 and reproduced before fixing.
+  // RFC 6052 does not keep the IPv4 address in a fixed place: under the
+  // local-use /48 prefix it sits at bits 48-63 and 72-95, not in the final
+  // two words. The previous extractor only read the tail, so an attacker
+  // could park a loopback in the /48 slots and a public address in the tail.
+  it("rejects a NAT64 /48 address whose payload is private but whose tail is public", () => {
+    expect(isHttpsSafeUrl("https://[64:ff9b:1:7f00:1:0:808:808]/")).toBe(false);
+    expect(isHttpsSafeUrl("https://[64:ff9b:1:a9fe:a9fe:0:808:808]/")).toBe(
+      false,
+    );
+  });
+
+  // Teredo (RFC 4380) hides the client IPv4 in the last two words, XORed
+  // with all-ones, and the server IPv4 unobfuscated in words 2-3.
+  it("rejects Teredo addresses hiding a private destination", () => {
+    expect(
+      isHttpsSafeUrl("https://[2001:0:4136:e378:8000:63bf:80ff:fffe]/"),
+    ).toBe(false);
+  });
+
   it("rejects 6to4 addresses hiding a private destination", () => {
     // 2002:<ipv4>::/48 carries the address in the two words after the prefix.
     expect(isHttpsSafeUrl("https://[2002:7f00:1::]/")).toBe(false);
@@ -662,6 +682,9 @@ describe("isHttpsSafeUrl private-address blocking", () => {
     expect(isHttpsSafeUrl("https://[::ffff:8.8.8.8]/")).toBe(true);
     expect(isHttpsSafeUrl("https://[64:ff9b::8.8.8.8]/")).toBe(true);
     expect(isHttpsSafeUrl("https://[2002:0808:0808::]/")).toBe(true);
+    // A NAT64 /48 carrying a public payload. The zero padding in its tail is
+    // not an address and must not be read as 0.0.0.0, which is reserved.
+    expect(isHttpsSafeUrl("https://[64:ff9b:1:808:808::]/")).toBe(true);
     expect(isHttpsSafeUrl("https://[2606:4700:4700::1111]/")).toBe(true);
   });
 

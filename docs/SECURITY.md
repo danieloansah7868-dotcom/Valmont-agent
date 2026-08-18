@@ -150,9 +150,19 @@ writer's changes are discarded without the owner being told.
   `fe80::/10`, `ff00::/8` and `2001:db8::/32`. Because several IPv6 forms carry
   an IPv4 address inside them, the embedded address is extracted and tested too
   — IPv4-mapped (`::ffff:169.254.169.254`), IPv4-compatible (`::7f00:1`), SIIT
-  (`::ffff:0:7f00:1`), NAT64 (`64:ff9b::7f00:1`, `64:ff9b:1::/48`) and 6to4
-  (`2002:7f00:1::`). A public address in any of those encodings is still
-  allowed; it is the destination that is judged, not the notation. This blocks
+  (`::ffff:0:7f00:1`), NAT64 (`64:ff9b::7f00:1`, `64:ff9b:1::/48`), 6to4
+  (`2002:7f00:1::`) and Teredo (`2001:0::/32`, both the unobfuscated server
+  address and the XOR-obfuscated client address). A public address in any of
+  those encodings is still allowed; it is the destination that is judged, not
+  the notation.
+
+  NAT64 is handled per RFC 6052 rather than by reading the last two words.
+  The address does not sit in a fixed place: under the local-use `64:ff9b:1::/48`
+  prefix it occupies bits 48-63 and 72-95, straddling the reserved suffix byte.
+  An earlier version of this check read only the tail, which allowed
+  `64:ff9b:1:7f00:1:0:808:808` — a loopback in the payload slots with a public
+  address parked in the tail — and wrongly refused `64:ff9b:1:808:808::`,
+  whose public payload has a zero tail. Both cases are now covered by tests. This blocks
   `javascript:`, `data:`, and SSRF-shaped values. **Phase 1 never fetches a URL
   a user typed** — these values are only rendered as links, with
   `rel="noopener noreferrer nofollow"`, after passing the same check the schema
@@ -169,8 +179,8 @@ writer's changes are discarded without the owner being told.
 
 - **Text** — the preview renders text as text. There is no
   `dangerouslySetInnerHTML` anywhere in the Studio, so `<img src=x onerror=...>`
-  is displayed literally, never executed. A browser test asserts this (not yet
-  executed — see "Test status").
+  is displayed literally, never executed. A browser test asserts this (CI
+  reports it green; the log has not been read — see "Test status").
 - **Colours** — strict `#RRGGBB`. **Phones** — E.164 `/^\+\d{8,15}$/`.
 - **Assets** — `assetStatus` is `z.literal("not_provided")`: a marker, not a
   URL. There is no upload control and no arbitrary asset URL can be stored.
@@ -243,6 +253,12 @@ number is replaced with `[REDACTED_CARD_NUMBER]` before the value is stored.
   A novel credential format will pass through.
 - Redaction happens at the schema boundary. Anything written through a path
   that bypasses `siteBriefSchemaV1` is not covered.
+- **It covers free-text fields only.** `businessName`, `adminEmail` and
+  `domainName` are validated for shape but not redacted, so a Luhn-valid digit
+  run typed into a business name is stored as written. Raised by independent
+  review. These fields are constrained and short, redacting a name field risks
+  mangling legitimate input, and the honest position is that the rule "never
+  store card numbers" is enforced by not asking for them — not by filtering.
 
 Nobody should be encouraged to paste payment details on the strength of this.
 The correct control remains not collecting them, and Phase 1 asks for none.
@@ -264,10 +280,10 @@ you want a clean slate.
 Security claims are only worth what has actually been executed. As of this
 change:
 
-| Suite                           | Status                                                                                                                                                                                                                                |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit + integration (`npm test`) | **Run.** 308 passing, 0 skipped, including the PostgreSQL draft-store and staged-import tests against a real PostgreSQL 18.4 server. Without `STUDIO_TEST_DATABASE_URL` the 13 PostgreSQL tests skip and the total is 295.            |
-| End-to-end (`npm run test:e2e`) | **Never executed.** Chromium cannot be downloaded in the environment used so far. The specs exist and are discoverable; treat every browser-level assertion in this document as _intended_, not _verified_, until a green run exists. |
+| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit + integration (`npm test`) | **Run.** 308 passing, 0 skipped, including the PostgreSQL draft-store and staged-import tests against a real PostgreSQL 18.4 server. Without `STUDIO_TEST_DATABASE_URL` the 13 PostgreSQL tests skip and the total is 295.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| End-to-end (`npm run test:e2e`) | **Reported green by CI, not independently confirmed.** The Phase 1 workflow is active as of `158f601`, and GitHub Actions run `32111983219` records the `Install Chromium for Playwright` and `End-to-end tests` steps as `success`. The step logs could not be downloaded from either the agent sandbox or the reviewing session, so **no one has yet read a line of Playwright output**. The whole `validate` job took 146 seconds including two Next.js production builds, which is fast enough to be worth checking. Until a human opens the log and sees 8 specs across `desktop-chromium` and `iphone`, treat browser-level assertions as _reported_, not _verified_. |
 
 The browser tests only run once a maintainer moves
 `.github/ci-workflow-phase1.yml` to `.github/workflows/ci.yml`; the automation

@@ -129,13 +129,46 @@ function embeddedIpv4Candidates(groups: number[]): number[] {
   if (zeros(4) && groups[4] === 0xffff && groups[5] === 0) {
     candidates.push(join(groups[6], groups[7]));
   }
-  // NAT64 64:ff9b::/96 and 64:ff9b:1::/48 both end with the IPv4 address.
+  // NAT64. RFC 6052 does not put the IPv4 address in a fixed place: its
+  // position depends on the prefix length, and bits 64-71 are a reserved
+  // suffix byte the address skips over. The well-known 64:ff9b::/96 keeps it
+  // in the final two words, but local-use 64:ff9b:1::/48 splits it across
+  // bits 48-63 and 72-95 — words 3 and 4 with a byte-straddle. An earlier fix
+  // only read the last two words, so a /48-embedded loopback slipped through
+  // while a public address sat in the tail. Judge every documented position.
   if (groups[0] === 0x0064 && groups[1] === 0xff9b) {
-    candidates.push(join(groups[6], groups[7]));
+    // /96 form: 64:ff9b::a.b.c.d — words 2-5 are zero. Reading the tail
+    // unconditionally also mis-flagged a /48 address whose padding tail is
+    // 0.0.0.0 (a reserved value) even when the real payload was public.
+    if (
+      groups[2] === 0 &&
+      groups[3] === 0 &&
+      groups[4] === 0 &&
+      groups[5] === 0
+    ) {
+      candidates.push(join(groups[6], groups[7]));
+    }
+    // /48 form: 64:ff9b:1:AABB:CC:DD00:: — bits 48-63 then 72-95.
+    if (groups[2] === 0x0001) {
+      const high = groups[3]; // bits 48-63  -> a.b
+      const mid = groups[4]; // bits 64-79  -> reserved byte, then c
+      const low = groups[5]; // bits 80-95  -> d, then padding
+      candidates.push(
+        (((high << 16) | ((mid & 0x00ff) << 8) | ((low >> 8) & 0xff)) >>>
+          0) as number,
+      );
+    }
   }
   // 6to4 puts the IPv4 address immediately after the 2002 prefix.
   if (groups[0] === 0x2002) {
     candidates.push(join(groups[1], groups[2]));
+  }
+  // Teredo (RFC 4380) 2001:0::/32 carries the client's IPv4 in the final two
+  // words, obfuscated by XOR with all-ones. The server's IPv4 sits in words
+  // 2-3 unobfuscated. Both are real destinations, so both are judged.
+  if (groups[0] === 0x2001 && groups[1] === 0x0000) {
+    candidates.push(join(groups[2], groups[3]));
+    candidates.push((join(groups[6], groups[7]) ^ 0xffffffff) >>> 0);
   }
   return candidates;
 }

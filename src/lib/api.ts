@@ -109,8 +109,15 @@ export function safeApiError(error: unknown) {
   // and it is wrong in the same way: reword "Task not found" and the status
   // silently becomes 400. It survives here only because pre-existing chat and
   // task routes still throw bare `Error`s that rely on it, and re-typing those
-  // is outside Website Studio's scope. No Studio code path reaches this branch
-  // — every Studio error carries a numeric `status`. Recorded in NEXT-STEPS.md.
+  // is outside Website Studio's scope. Recorded in NEXT-STEPS.md.
+  //
+  // An earlier version of this comment claimed no Studio path reaches the
+  // fallback. That was wrong, and an independent review caught it: the draft
+  // routes call `siteBriefSchemaV1.parse`, and a Zod validation failure is a
+  // bare `ZodError` with no `status`, so it lands here and is answered 400.
+  // That is the correct status for malformed input, so the behaviour is right
+  // even though the old justification was not. The hazard is unchanged —
+  // anything reaching this branch gets its status from message text.
   const status =
     error instanceof NotConnectedError
       ? 401
