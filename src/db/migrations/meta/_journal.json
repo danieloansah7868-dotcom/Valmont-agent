@@ -15,6 +15,20 @@
       "when": 1786730143494,
       "tag": "0001_drop_demo_columns",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786968120848,
+      "tag": "0002_uneven_the_anarchist",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1787063418667,
+      "tag": "0003_cloudy_hawkeye",
+      "breakpoints": true
     }
   ]
 }

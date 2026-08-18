@@ -61,3 +61,87 @@ Before exposing Valmont to customers, organizations you do not control, or publi
 8. Keep branch protection and mandatory GitHub reviews enabled.
 
 Valmont intentionally has no merge or deployment method. Your existing reviewed CI/CD process should deploy only after a human merges the pull request in GitHub.
+
+## Website Studio Storage
+
+### Choosing a backend
+
+Studio follows the same rule as the rest of Valmont:
+
+- **`DATABASE_URL` set** — drafts go to PostgreSQL, in the `studio_drafts` table
+  created by migration `0002_uneven_the_anarchist.sql`. Run `npm run db:migrate`
+  before first use. This is the recommended production setup: it survives
+  container replacement and supports more than one application instance.
+- **`DATABASE_URL` unset** — drafts go to SQLite, in **exactly the same file as
+  Chat**. Suitable for a single instance with a persistent volume only.
+
+There is no Studio-specific environment variable. `CHAT_STORE_PATH` and
+`CHAT_SQLITE_PATH` control both Chat and Studio through the shared resolver in
+`src/lib/sqlite-path.ts`. Never point the two variables at the same file; the
+resolver asserts they differ and will refuse to open a legacy `.json` store as
+SQLite.
+
+If you run SQLite in Docker, mount the directory holding the store as a named
+volume. Without a volume every container restart starts from an empty database.
+
+### Schema versions
+
+The SQLite Studio schema is versioned in a dedicated `studio_meta` table and
+upgraded through sequential, transactional migrations: the recorded version is
+written only after every migration succeeds, a failure rolls schema and
+metadata back together, a recorded version newer than the running build is
+refused, and repeated restarts are a no-op. PostgreSQL rows carry
+`schema_version`, managed by the Drizzle migrations. Both are `1`. The
+legacy-JSON chat migration writes `<legacy path>.pre-sqlite-backup` first,
+using `COPYFILE_EXCL` so an existing backup is never overwritten, and records a
+`legacy-json-migrated` marker only after the migrated rows are committed.
+
+### Backups
+
+- `GET /api/backup/export` — on SQLite, chat and drafts are read inside one
+  read transaction on the single shared database handle, so the file is a
+  consistent snapshot: a version 2 file containing chat sessions, memories, and
+  Studio drafts. With `DATABASE_URL` set the two halves live in different
+  engines; that export is **not** one atomic cross-engine snapshot.
+- `POST /api/backup/import` — SQLite uses the single shared database handle, so
+  a mid-import failure rolls chat, memories, and drafts back together. With
+  `DATABASE_URL` set, chat stays in SQLite and drafts go to PostgreSQL; the
+  durable cross-store coordinator takes an owner-level lease (token +
+  generation + heartbeat) before any write so a second import for that owner
+  is `409` while the lease is live. Recovery claims only expired leases, via
+  compare-and-swap, and PostgreSQL Studio writes are transactionally fenced by
+  a durable per-owner `studio_import_fences` row so an obsolete transaction
+  can never commit late writes after its lease was replaced. A failure at any checkpoint — or a process killed
+  mid-import, after the lease expires — rolls both stores back to their exact
+  previous state. SQLite-only complete imports take the same owner lease. Success is reported only after both halves committed. After success
+  or a successful rollback the journal payload and snapshot are logically
+  deleted; an unresolved rollback failure keeps them until recovery finishes.
+  That cleanup is not guaranteed physical erasure of SQLite pages. Legacy
+  version 1 chat-only files are still accepted; unknown versions are rejected
+  before anything is written. Authenticated Studio and backup routes rate-limit
+  by owner id, not by client-supplied forwarding headers.
+
+Backups contain the owner's business details. Treat a downloaded file as
+sensitive: store it encrypted, and delete copies you no longer need. Regular
+exports are the recommended backup mechanism for SQLite deployments; for
+PostgreSQL use your normal database backups as well.
+
+### Request limits
+
+Draft mutations accept at most 1 MB and backup imports at most 25 MB, enforced
+by counting real bytes while streaming. If a reverse proxy sits in front of
+Valmont, set its own body limit to at least 25 MB or large restores will be
+rejected before they reach the application.
+
+### Browsers are not installed in production
+
+The production image (`node:22.13-bookworm-slim`, Next.js standalone output,
+running as `USER node`) installs **no Playwright browser binaries**. Browser
+tests belong in CI, where `npx playwright install --with-deps chromium` runs as
+an explicit step. Do not add that step to the Dockerfile.
+
+### What Phase 1 does not do in production
+
+No file uploads, no payment processing, no repository generation, and no
+deployments. Nothing in the Studio can take an order or move money. Do not
+describe a generated Brief to a customer as a working website.

@@ -138,3 +138,204 @@ Missing credentials fail loudly at every boundary rather than being papered over
 - `JsonTaskStore` starts empty; the PostgreSQL schema carries no demo columns.
 
 `missingLiveRequirements()` drives the connect prompts, settings page, and `/api/health` `missingConfiguration` array so operators see exactly which variables remain unset.
+
+## Website Studio Phase 1
+
+Phase 1 is a **planning surface**. It captures a Site Brief and nothing more: no
+build pipeline, no deployment, no payments. Phases 2–6 are deliberately absent
+from the codebase.
+
+### Modules
+
+| Path                                     | Responsibility                                                                     |
+| ---------------------------------------- | ---------------------------------------------------------------------------------- |
+| `src/lib/studio/categories.ts`           | 15 website types plus 11 online-shop sub-types.                                    |
+| `src/lib/studio/packages.ts`             | Lite / Starter / Business / Empire, each with page and product limits.             |
+| `src/lib/studio/themes.ts`               | 7 themes, exported as design tokens only — never forked layouts.                   |
+| `src/lib/studio/templates.ts`            | Real template registry: manifests, per-category compatibility, and reconciliation. |
+| `src/lib/studio/site-brief/schema.ts`    | `siteBriefSchemaV1` — Zod base object plus cross-field `superRefine`.              |
+| `src/lib/studio/site-brief/defaults.ts`  | Ghana defaults, region list, `formatGhanaPhone`, planned-payment labels.           |
+| `src/lib/studio/site-brief/readiness.ts` | `computeBriefCompleteness` and the preview placeholder helper.                     |
+| `src/lib/studio/draft-store.ts`          | `SqliteStudioDraftStore` and `PostgresStudioDraftStore` behind one interface.      |
+| `src/lib/studio/merge.ts`                | Field-level three-way merge used by the 409 recovery path.                         |
+| `src/lib/studio/backup.ts`               | Backup v2 build, parse, and transactional import.                                  |
+| `src/lib/sqlite-path.ts`                 | The single SQLite path resolver shared by Chat and Studio.                         |
+| `src/lib/bounded-json.ts`                | Streaming, byte-counted request-body reader.                                       |
+
+### Template registry
+
+`SiteBriefV1` accepts `selectedTemplate`, so a registry must genuinely exist —
+otherwise the field would be a lie. `templates.ts` holds a manifest per layout
+(`id`, `label`, `description`, ordered `sections`, `compatibleCategories`).
+`"*"` means the layout suits every website type, which guarantees the "Custom
+Website" category can never have zero choices. The schema's `superRefine`
+rejects a template that does not suit the chosen category, and the wizard calls
+`reconcileTemplate(category, current)` when the category changes so a draft can
+never point at an incompatible layout.
+
+### Persistence
+
+- **SQLite (no `DATABASE_URL`)** — `studio_drafts` lives inside the **same file
+  and the same `DatabaseSync` handle** as Chat. `getStudioSqliteStore()` returns
+  Chat's singleton store, so a complete-backup import can put chat sessions,
+  memories, and drafts inside one real transaction. The Studio schema is
+  versioned in a dedicated `studio_meta` table and upgraded through sequential,
+  transactional migrations (`migrateStudioSchema` in `draft-store.ts`): the
+  recorded version is written only after every migration succeeds, a failure
+  rolls schema and metadata back together, a recorded version newer than this
+  build supports is rejected, and repeated startup is a no-op. Databases
+  created by earlier builds (version recorded in `chat_meta`) are detected and
+  moved onto the dedicated table without re-running work.
+- **PostgreSQL (`DATABASE_URL` set)** — the `studio_drafts` table from Drizzle
+  migration `0002_uneven_the_anarchist.sql`: uuid primary key, `owner_id`
+  referencing `users` with cascade delete, a `jsonb` brief, and the
+  `studio_drafts_owner_updated_idx` index.
+
+`src/lib/user-identity.ts` maps a GitHub id to a canonical UUID with
+`deterministicUuid("github:" + id)`, and `ensureStudioUser` upserts the row only
+when PostgreSQL is in use.
+
+### Shared SQLite path resolution
+
+`src/lib/sqlite-path.ts` is the one place that answers "which file?". It exports
+`DEFAULT_CHAT_STORE_PATH`, `deriveSqliteChatStorePath`,
+`configuredLegacyChatStorePath`, `configuredSqliteChatStorePath`,
+`legacyBackupPath`, `assertDistinctStorePaths`, and `resolveSqliteStorePaths`.
+Chat and Studio both call it, so they cannot drift onto different files. The
+legacy JSON path and the SQLite path are asserted to differ, and a `.json`
+legacy source is never opened as a SQLite database. Studio adds no environment
+variable of its own.
+
+### Optimistic concurrency
+
+Both stores perform a single atomic conditional update and inspect the returned
+rows:
+
+```sql
+UPDATE studio_drafts
+   SET brief_json = $1, revision = revision + 1, updated_at = $2
+ WHERE id = $3 AND owner_id = $4 AND revision = $5
+RETURNING *
+```
+
+Zero rows means either a stale revision or a draft that is not yours. The store
+distinguishes the two with a follow-up owner-scoped existence check and raises
+`DraftConflictError` (409) or `DraftNotFoundError` (404). A `200` on zero rows is
+impossible. `DraftNotFoundError` carries an identical message for a foreign
+draft and a made-up id, so existence is never disclosed.
+
+Client-side, `wizard.tsx` serializes saves through a single in-flight promise
+and debounces keystrokes. On a 409 it refetches the server copy and calls
+`mergeBriefs(base, mine, theirs)`. When the two sides touched different fields
+the pending edit is reapplied and retried once; when they touched the same field
+with different values, `merged` is `null` and the conflict banner asks the owner
+to keep their version or take the other. Autosave is frozen while the choice is
+on screen, and “Keep what is on this screen” saves the **newest on-screen
+state** — including anything typed after the warning appeared — not a stale
+conflict snapshot, so no write is ever dropped silently.
+
+### Backups
+
+`buildBackup(user)` produces
+`{ backupVersion: 2, exportedAt, chat: { version: 1, ... }, studio: { version: 1, schemaVersion: 1, drafts: [...] } }`.
+On SQLite the chat and draft halves are read back to back inside **one read
+transaction on the one shared `DatabaseSync` handle**, so the file can never
+combine records from different points in time even if another writer commits
+mid-export. `parseBackup(input)` checks the version **before** validating or
+writing anything, and accepts a legacy v1 chat-only file by lifting it into the
+v2 shape. `importBackup` reassigns every record to the authenticated canonical
+owner — `ownerId` values in the file are always ignored — and remaps a colliding
+draft id to a fresh `randomUUID()` rather than overwriting. Validation errors
+report field _paths_ only (at most five), never submitted values.
+
+SQLite runs the whole import inside `store.runInTransaction` on the single
+shared handle, so a failure after any insert rolls chat, memories, and studio
+back together. A `failAfterInsertForTests` hook lets the suite prove the
+rollback rather than assume it.
+
+With `DATABASE_URL` set, chat stays in SQLite while studio lives in PostgreSQL,
+so there is no distributed transaction and a mixed-store **export** is two
+separate reads, not one atomic snapshot. `import-coordinator.ts` is a durable
+cross-store recovery coordinator instead: it first takes an owner-level
+**lease** (owner id, job id, cryptographically random lock token, heartbeat
+expiry, and a fencing generation). A second import for that owner inspects the
+lease and is a `409` before either store changes or any recovery runs. Only
+after the lock is held does it record a job in SQLite holding the staged
+payload and a snapshot of both stores, then advance through durable
+checkpoints. A running import renews the lease and checks the token before
+every write. Recovery may claim a job only when the lease has expired, via an
+atomic compare-and-swap on the token and generation; an obsolete token cannot
+write, sanitize or release the replacement lock. Generations are issued from a
+durable per-owner counter, so they never repeat — not after release, not after
+a restart, not for a later import by the same owner.
+
+The SQLite lease alone cannot stop an in-flight PostgreSQL transaction from
+committing after the lease was replaced, so PostgreSQL Studio writes are
+additionally fenced inside PostgreSQL itself. A durable
+`studio_import_fences` row (owner id, job id, random lock token, monotonic
+generation — identity only, never payload or credentials, never exported)
+is installed for the lease before the pre-state capture. Every Studio
+import/restore transaction verifies the fence when it starts and ends with a
+conditional touch of that row — matching the exact held identity — as the
+last statement before `COMMIT`; the touch takes the fence row's lock, so the
+check and the commit are one serialized unit. Recovery advances the fence
+inside the same transaction that restores the pre-import Studio snapshot.
+Both orderings of the race are therefore safe: if recovery's fence advance
+commits first, the obsolete transaction fails its final check and PostgreSQL
+rolls back everything it wrote; if the obsolete transaction wins the fence
+row-lock race and commits first, recovery serializes strictly after it and
+overwrites the late writes with the exact snapshot. Once the replacement
+fence is installed no obsolete transaction can commit at all. The fence row
+persists after release so generations stay monotonic even if the SQLite file
+is replaced.
+
+A lease that has already expired is never resurrected: renewal and every
+ownership assertion require an unexpired lease, and only a confirmed lost
+lease stops the heartbeat — a transient database error is retried on the
+next tick. A process killed mid-import
+lets the lease expire; the next startup or import claims recovery and rolls
+both stores back. A draft GET / startup scan skips unexpired live jobs.
+Success is reported only after both halves committed; a rolled-back import is
+a clean failure, and `PartialImportError` is reserved for the exceptional case
+where the rollback itself could not complete. After success or a successful
+rollback the payload and snapshot are logically deleted from the journal
+(empty strings remain in those columns; this is not physical erasure of SQLite
+pages). An unresolved rollback failure keeps the snapshot and the lease so a
+new import cannot overwrite it. Different owners may import independently.
+SQLite-only complete imports take the same owner lease. The PostgreSQL suite
+injects failures at every checkpoint (`onCheckpoint`) and proves both stores
+return to their exact previous state, including after a simulated crash and
+restart.
+
+### Request bodies
+
+`readBoundedJson(request, limitBytes)` reads `Request.body` through
+`getReader()`, adds up real chunk sizes, cancels the stream the moment the limit
+is passed, and only parses once the whole body is safely buffered. It therefore
+holds when `Content-Length` is absent, false, or the transfer is chunked.
+Limits: `DRAFT_BODY_LIMIT_BYTES` 1 MB, `BACKUP_BODY_LIMIT_BYTES` 25 MB.
+
+### Testing
+
+Vitest covers the resolver, stores, merge, backup, bounded reader, schema
+migrations, and the Site Brief. The PostgreSQL contract suite runs only when
+`STUDIO_TEST_DATABASE_URL` is set and is otherwise reported as skipped, so
+SQLite results are never presented as PostgreSQL parity; CI supplies a real
+PostgreSQL 16 service. The coordinated-import suite injects a failure at every
+checkpoint (`onCheckpoint`), proves both stores return to their exact previous
+state, and covers interrupted-import recovery after a simulated restart. The
+SQLite export test proves a backup cannot combine chat and drafts from
+different points in time by committing a write from a second connection between
+the two halves of an in-flight export.
+
+Playwright (`playwright.config.ts`, `tests/e2e/studio-smoke.spec.ts`) drives a
+real production build on a throwaway SQLite database, in a desktop Chromium
+project and an iPhone 13 project. It signs in with a genuine encrypted session
+cookie minted from the server's own `SESSION_SECRET`; no production code path is
+weakened for tests. The production Dockerfile installs no browser binaries.
+
+### Deferred
+
+Uploads and object storage, repository generation, sandboxed builds, preview
+deployments, admin roles, e-commerce, payments, and template versioning all
+remain unimplemented.

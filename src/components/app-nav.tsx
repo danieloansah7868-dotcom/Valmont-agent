@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   ListChecks,
   MessageSquareText,
+  PanelsTopLeft,
   Plus,
   Settings,
 } from "lucide-react";
@@ -16,14 +17,21 @@ import {
 const links = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
   { href: "/chat", label: "Chat with Valmont", icon: MessageSquareText },
+  { href: "/studio", label: "Website Studio", icon: PanelsTopLeft },
   { href: "/repositories", label: "Repositories", icon: FolderGit2 },
   { href: "/tasks", label: "Tasks", icon: ListChecks },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
 const mobileLinks = links.filter(({ href }) =>
-  ["/dashboard", "/chat", "/tasks"].includes(href),
+  ["/dashboard", "/chat", "/studio", "/tasks"].includes(href),
 );
+
+/** Shorter labels so five tabs still fit a narrow phone without wrapping. */
+const mobileLabels: Record<string, string> = {
+  "/chat": "Chat",
+  "/studio": "Studio",
+};
 
 function useIsActive(pathname: string) {
   return (href: string) =>
@@ -167,7 +175,11 @@ export function AppNav({ collapsed = false, onNavigate }: NavProps) {
           onNavigate={onNavigate}
           className="flex min-h-11 items-center gap-3 rounded-lg px-3 text-[14px] font-semibold text-copper-300 transition-colors hover:bg-copper/10 hover:text-copper"
         >
-          <Home className="size-[18px] shrink-0" strokeWidth={1.8} aria-hidden="true" />
+          <Home
+            className="size-[18px] shrink-0"
+            strokeWidth={1.8}
+            aria-hidden="true"
+          />
           Portfolio home
         </NavLink>
       </nav>
@@ -190,7 +202,7 @@ export function AppNav({ collapsed = false, onNavigate }: NavProps) {
               aria-current={active ? "page" : undefined}
             >
               <Icon className="size-5" aria-hidden="true" />
-              {href === "/chat" ? "Chat" : label}
+              {mobileLabels[href] ?? label}
             </NavLink>
           );
         })}

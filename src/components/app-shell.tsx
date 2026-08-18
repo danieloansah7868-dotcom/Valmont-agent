@@ -68,10 +68,7 @@ export function AppShell({
   // Persist the user's collapse preference.
   useEffect(() => {
     try {
-      window.localStorage.setItem(
-        COLLAPSE_STORAGE_KEY,
-        collapsed ? "1" : "0",
-      );
+      window.localStorage.setItem(COLLAPSE_STORAGE_KEY, collapsed ? "1" : "0");
     } catch {
       // Ignore storage failures (private mode, quota, etc.).
     }
@@ -319,7 +316,10 @@ function LogoMarkOnly() {
       aria-hidden="true"
     >
       <svg viewBox="0 0 64 64" className="size-[62%]" focusable="false">
-        <path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#0A1F44" />
+        <path
+          d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z"
+          fill="#0A1F44"
+        />
         <path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B" />
       </svg>
     </span>

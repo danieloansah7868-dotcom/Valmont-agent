@@ -1,4 +1,5 @@
 import {
+  bigint,
   boolean,
   index,
   integer,
@@ -245,6 +246,66 @@ export const toolExecutions = pgTable(
   },
   (table) => [index("tool_executions_task_idx").on(table.taskId)],
 );
+
+export const studioDrafts = pgTable(
+  "studio_drafts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    ownerId: uuid("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    schemaVersion: integer("schema_version").notNull().default(1),
+    templateVersion: integer("template_version").notNull().default(1),
+    themeVersion: integer("theme_version").notNull().default(1),
+    revision: integer("revision").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    brief: jsonb("brief").notNull(),
+  },
+  (table) => [
+    index("studio_drafts_owner_updated_idx").on(table.ownerId, table.updatedAt),
+  ],
+);
+
+/**
+ * Durable per-owner import fence for PostgreSQL Studio writes.
+ *
+ * Mixed complete-backup imports write Chat into SQLite and Studio into
+ * PostgreSQL. The SQLite lease alone cannot fence an in-flight PostgreSQL
+ * transaction: the lease can expire and be replaced *after* a SQLite token
+ * check but *before* the PostgreSQL COMMIT. This row closes that gap: every
+ * PostgreSQL Studio import/restore transaction must end with a conditional
+ * touch of this row (matching owner, job, token and generation) immediately
+ * before commit, and recovery advances it inside the same transaction that
+ * restores Studio state. PostgreSQL row-level locking then serializes the
+ * two, so an obsolete transaction either fails its final fence check and
+ * rolls back, or commits strictly before the replacement fence is installed
+ * and is then fully undone by the recovery restore that serialized after it.
+ *
+ * The row deliberately persists after a successful release so generations
+ * stay monotonic for the owner even if the SQLite file is replaced. It holds
+ * identity only — never a backup payload, pre-state snapshot, credential or
+ * any other sensitive data — and it is never included in exported backups.
+ */
+export const studioImportFences = pgTable("studio_import_fences", {
+  /** Canonical owner id — the Studio/PostgreSQL identity. */
+  ownerId: uuid("owner_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  /** Coordinator job id the fence currently belongs to. */
+  jobId: text("job_id").notNull(),
+  /** Cryptographically random lock token issued with the SQLite lease. */
+  lockToken: text("lock_token").notNull(),
+  /** Monotonic per-owner generation; never decreases, never resets. */
+  generation: bigint("generation", { mode: "number" }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
 
 export const pullRequests = pgTable("pull_requests", {
   id: uuid("id").primaryKey().defaultRandom(),

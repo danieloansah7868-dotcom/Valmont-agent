@@ -140,7 +140,11 @@ const pillars = [
 function VentureCard({ venture }: { venture: Venture }) {
   const Icon = venture.icon;
   const isLink = Boolean(venture.href || venture.external);
-  const Wrapper: React.ElementType = isLink ? (venture.external ? "a" : Link) : "div";
+  const Wrapper: React.ElementType = isLink
+    ? venture.external
+      ? "a"
+      : Link
+    : "div";
   const linkProps = venture.external
     ? { href: venture.external, target: "_blank", rel: "noopener noreferrer" }
     : venture.href
@@ -169,7 +173,10 @@ function VentureCard({ venture }: { venture: Venture }) {
         </h3>
         {venture.live && (
           <span className="inline-flex items-center gap-1 rounded-full bg-pass-soft px-2 py-0.5 text-[9px] font-bold text-pass-strong">
-            <span className="size-1.5 rounded-full bg-pass" aria-hidden="true" />
+            <span
+              className="size-1.5 rounded-full bg-pass"
+              aria-hidden="true"
+            />
             LIVE
           </span>
         )}
@@ -219,7 +226,11 @@ export default function PortfolioPage() {
       {/* Nav */}
       <nav className="sticky top-0 z-30 border-b border-line/70 bg-ivory-50/85 backdrop-blur-md">
         <div className="mx-auto flex h-[72px] max-w-[1180px] items-center justify-between px-5 sm:px-8">
-          <Link href="/" className="inline-flex items-center gap-2.5" aria-label="Valmont home">
+          <Link
+            href="/"
+            className="inline-flex items-center gap-2.5"
+            aria-label="Valmont home"
+          >
             <LogoMark />
             <span className="leading-none">
               <span className="block text-[17px] font-bold tracking-[-0.01em] text-navy">
@@ -231,9 +242,15 @@ export default function PortfolioPage() {
             </span>
           </Link>
           <div className="hidden items-center gap-1 md:flex">
-            <a href="#ventures" className="btn-quiet text-[13px]">Ventures</a>
-            <a href="#about" className="btn-quiet text-[13px]">About</a>
-            <a href="#contact" className="btn-quiet text-[13px]">Contact</a>
+            <a href="#ventures" className="btn-quiet text-[13px]">
+              Ventures
+            </a>
+            <a href="#about" className="btn-quiet text-[13px]">
+              About
+            </a>
+            <a href="#contact" className="btn-quiet text-[13px]">
+              Contact
+            </a>
           </div>
           <Link href="/agent" className="btn-primary min-h-10 px-4 text-[13px]">
             <Bot className="size-4" aria-hidden="true" />
@@ -271,11 +288,17 @@ export default function PortfolioPage() {
               advertising — all engineered to work better together.
             </p>
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
-              <a href="#ventures" className="btn-primary min-h-12 px-5 text-[15px]">
+              <a
+                href="#ventures"
+                className="btn-primary min-h-12 px-5 text-[15px]"
+              >
                 Explore the ventures
                 <ArrowRight className="size-4" aria-hidden="true" />
               </a>
-              <Link href="/agent" className="btn-secondary min-h-12 px-5 text-[15px]">
+              <Link
+                href="/agent"
+                className="btn-secondary min-h-12 px-5 text-[15px]"
+              >
                 <Bot className="size-[18px]" aria-hidden="true" />
                 Try Val Agent
               </Link>
@@ -288,7 +311,10 @@ export default function PortfolioPage() {
                     key={tag}
                     className="flex items-center gap-2 text-[12.5px] font-semibold text-slate"
                   >
-                    <span className="size-1.5 rounded-full bg-copper" aria-hidden="true" />
+                    <span
+                      className="size-1.5 rounded-full bg-copper"
+                      aria-hidden="true"
+                    />
                     {tag}
                   </span>
                 ),
@@ -360,8 +386,12 @@ export default function PortfolioPage() {
                 <ShieldCheck className="size-4" aria-hidden="true" />
               </span>
               <div>
-                <p className="text-[11px] font-bold text-navy">Approval-first</p>
-                <p className="mt-0.5 text-[10px] text-slate">across the stack</p>
+                <p className="text-[11px] font-bold text-navy">
+                  Approval-first
+                </p>
+                <p className="mt-0.5 text-[10px] text-slate">
+                  across the stack
+                </p>
               </div>
             </div>
           </div>
@@ -376,11 +406,17 @@ export default function PortfolioPage() {
             return (
               <div key={p.title} className="flex gap-4">
                 <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-copper-50 text-copper-700 ring-1 ring-inset ring-copper-300">
-                  <PIcon className="size-5" strokeWidth={1.9} aria-hidden="true" />
+                  <PIcon
+                    className="size-5"
+                    strokeWidth={1.9}
+                    aria-hidden="true"
+                  />
                 </span>
                 <div>
                   <h3 className="text-[15px] font-bold text-navy">{p.title}</h3>
-                  <p className="mt-2 text-[13.5px] leading-6 text-slate">{p.copy}</p>
+                  <p className="mt-2 text-[13.5px] leading-6 text-slate">
+                    {p.copy}
+                  </p>
                 </div>
               </div>
             );
@@ -389,7 +425,10 @@ export default function PortfolioPage() {
       </section>
 
       {/* Ventures */}
-      <section id="ventures" className="mx-auto max-w-[1180px] scroll-mt-24 px-5 py-20 sm:px-8 sm:py-24">
+      <section
+        id="ventures"
+        className="mx-auto max-w-[1180px] scroll-mt-24 px-5 py-20 sm:px-8 sm:py-24"
+      >
         <div className="flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-end">
           <div>
             <p className="text-[11px] font-bold tracking-[0.16em] text-copper-700 uppercase">
@@ -422,7 +461,10 @@ export default function PortfolioPage() {
         <div className="relative mx-auto grid max-w-[1180px] items-center gap-12 px-5 py-20 sm:px-8 sm:py-24 lg:grid-cols-2">
           <div>
             <span className="inline-flex items-center gap-2 rounded-full border border-copper/40 bg-copper/10 px-3 py-1.5 text-[11px] font-bold text-copper-300">
-              <span className="size-1.5 rounded-full bg-copper" aria-hidden="true" />
+              <span
+                className="size-1.5 rounded-full bg-copper"
+                aria-hidden="true"
+              />
               LIVE NOW
             </span>
             <h2 className="text-balance mt-6 text-[36px] leading-[1.08] font-[750] tracking-[-0.035em] text-ivory sm:text-[48px]">
@@ -436,11 +478,17 @@ export default function PortfolioPage() {
               server-side.
             </p>
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
-              <Link href="/agent" className="btn-primary min-h-12 px-5 text-[15px]">
+              <Link
+                href="/agent"
+                className="btn-primary min-h-12 px-5 text-[15px]"
+              >
                 Open Val Agent
                 <ArrowRight className="size-4" aria-hidden="true" />
               </Link>
-              <Link href="/docs/security" className="btn-inverse min-h-12 px-5 text-[15px]">
+              <Link
+                href="/docs/security"
+                className="btn-inverse min-h-12 px-5 text-[15px]"
+              >
                 <ShieldCheck className="size-[18px]" aria-hidden="true" />
                 Security model
               </Link>
@@ -498,7 +546,10 @@ export default function PortfolioPage() {
       </section>
 
       {/* About */}
-      <section id="about" className="mx-auto max-w-[1180px] scroll-mt-24 px-5 py-20 sm:px-8 sm:py-24">
+      <section
+        id="about"
+        className="mx-auto max-w-[1180px] scroll-mt-24 px-5 py-20 sm:px-8 sm:py-24"
+      >
         <div className="grid gap-12 lg:grid-cols-[0.9fr_1.1fr]">
           <div>
             <p className="text-[11px] font-bold tracking-[0.16em] text-copper-700 uppercase">
@@ -542,7 +593,10 @@ export default function PortfolioPage() {
       </section>
 
       {/* Contact CTA */}
-      <section id="contact" className="mx-auto max-w-[1180px] scroll-mt-24 px-5 pb-20 sm:px-8 sm:pb-24">
+      <section
+        id="contact"
+        className="mx-auto max-w-[1180px] scroll-mt-24 px-5 pb-20 sm:px-8 sm:pb-24"
+      >
         <div className="panel-navy relative overflow-hidden p-8 sm:p-12">
           <div
             className="pointer-events-none absolute -right-20 -bottom-20 h-[320px] w-[320px] rounded-full bg-[radial-gradient(circle,rgba(232,130,43,0.4)_0%,transparent_68%)]"
@@ -559,11 +613,17 @@ export default function PortfolioPage() {
               </p>
             </div>
             <div className="flex flex-col gap-3 sm:flex-row lg:flex-col">
-              <a href="mailto:hello@valmont.app" className="btn-primary min-h-12 px-6 text-[15px]">
+              <a
+                href="mailto:hello@valmont.app"
+                className="btn-primary min-h-12 px-6 text-[15px]"
+              >
                 Get in touch
                 <ArrowRight className="size-4" aria-hidden="true" />
               </a>
-              <Link href="/agent" className="btn-inverse min-h-12 px-6 text-[15px]">
+              <Link
+                href="/agent"
+                className="btn-inverse min-h-12 px-6 text-[15px]"
+              >
                 <Bot className="size-[18px]" aria-hidden="true" />
                 Try Val Agent
               </Link>
@@ -582,10 +642,21 @@ export default function PortfolioPage() {
             </span>
           </div>
           <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-[12.5px] font-semibold text-slate">
-            <a href="#ventures" className="hover:text-copper-700">Ventures</a>
-            <a href="#about" className="hover:text-copper-700">About</a>
-            <Link href="/agent" className="hover:text-copper-700">Val Agent</Link>
-            <a href="mailto:hello@valmont.app" className="hover:text-copper-700">Contact</a>
+            <a href="#ventures" className="hover:text-copper-700">
+              Ventures
+            </a>
+            <a href="#about" className="hover:text-copper-700">
+              About
+            </a>
+            <Link href="/agent" className="hover:text-copper-700">
+              Val Agent
+            </Link>
+            <a
+              href="mailto:hello@valmont.app"
+              className="hover:text-copper-700"
+            >
+              Contact
+            </a>
           </div>
         </div>
       </footer>
