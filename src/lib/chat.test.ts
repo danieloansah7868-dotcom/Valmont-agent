@@ -98,7 +98,8 @@ describe("Chat with Valmont", () => {
     expect(note?.content.indexOf("CONTEXT-FOR-AGENT")).toBeLessThan(
       note?.content.indexOf("ads/src/app/page.tsx") ?? Number.POSITIVE_INFINITY,
     );
-    expect(messages[0]?.content).toContain("product definition");
+    expect(messages[0]?.content).toContain("Fetch first");
+    expect(messages[0]?.content).toContain("Already-built stays built");
   });
 
   it("refuses to invent a product when the repo is attached but empty", () => {

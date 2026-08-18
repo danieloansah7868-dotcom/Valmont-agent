@@ -316,11 +316,14 @@ export function selectWorkspaceContextPaths(
 ): string[] {
   const allowed = new Set(allPaths.filter((item) => !isSensitivePath(item)));
   const requested = requestedPaths.filter((item) => allowed.has(item));
+  const briefings = allPaths.filter(
+    (item) => allowed.has(item) && isAgentBriefingPath(item),
+  );
   const terms = taskTerms(taskText);
   const ranked = allPaths
     .filter((item) => allowed.has(item) && SOURCE_EXTENSION.test(item))
     .sort((a, b) => pathScore(b, terms) - pathScore(a, terms));
-  return [...new Set([...requested, ...ranked])].slice(0, limit);
+  return [...new Set([...briefings, ...requested, ...ranked])].slice(0, limit);
 }
 
 function taskTerms(value: string): string[] {
