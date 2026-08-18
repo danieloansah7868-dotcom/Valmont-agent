@@ -79,6 +79,54 @@ html.chat-page body {
   height: 100%;
   overflow: hidden;
   overscroll-behavior: none;
+  background: var(--color-navy);
+}
+
+.chat-shell,
+.chat-shell h1,
+.chat-shell h2,
+.chat-shell h3,
+.chat-shell h4 {
+  color: var(--color-ivory);
+}
+
+.chat-shell .card {
+  background: var(--color-navy-800);
+  border-color: rgb(236 233 222 / 0.14);
+}
+
+.chat-shell .label {
+  color: var(--color-ivory);
+}
+
+.chat-shell .input,
+.chat-shell .select,
+.chat-shell .textarea {
+  background: var(--color-navy-900);
+  border-color: rgb(236 233 222 / 0.22);
+  color: var(--color-ivory);
+}
+
+.chat-shell .input::placeholder,
+.chat-shell .textarea::placeholder {
+  color: rgb(236 233 222 / 0.45);
+}
+
+.chat-shell .btn-secondary {
+  background: rgb(236 233 222 / 0.08);
+  border-color: rgb(236 233 222 / 0.28);
+  color: var(--color-ivory);
+}
+
+.chat-shell .btn-secondary:hover {
+  background: rgb(194 110 46 / 0.18);
+  border-color: var(--color-copper);
+  color: var(--color-ivory);
+}
+
+.chat-shell .btn-quiet:hover {
+  background: rgb(236 233 222 / 0.1);
+  color: var(--color-ivory);
 }
 
 body {
@@ -151,6 +199,17 @@ a {
     var(--color-navy) 0%,
     var(--color-navy-700) 100%
   );
+  color: var(--color-ivory);
+}
+
+.panel-navy h1,
+.panel-navy h2,
+.panel-navy h3,
+.panel-navy h4,
+.bg-navy h1,
+.bg-navy h2,
+.bg-navy h3,
+.bg-navy h4 {
   color: var(--color-ivory);
 }
 
@@ -227,6 +286,34 @@ a {
 .btn-danger:hover {
   border-color: var(--color-fail);
   background: var(--color-fail-soft);
+}
+
+.btn-header {
+  display: inline-flex;
+  min-height: 36px;
+  min-width: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 9px;
+  background: var(--color-paper);
+  padding: 0 10px;
+  color: var(--color-navy);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+.btn-header:hover {
+  border-color: var(--color-copper);
+  background: var(--color-copper-50);
+  color: var(--color-navy);
 }
 
 .btn-quiet {

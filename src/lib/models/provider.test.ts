@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { createModelProvider, tryCreateModelProvider } from "@/lib/models";
-import { OpenAICompatibleProvider } from "@/lib/models/openai-compatible";
+import {
+  extractMessageText,
+  OpenAICompatibleProvider,
+} from "@/lib/models/openai-compatible";
 import type { ModelProvider } from "@/lib/models/types";
 
 type FetchInput = Parameters<typeof fetch>[0];
@@ -9,6 +12,19 @@ type FetchInit = Parameters<typeof fetch>[1];
 function acceptsProvider(provider: ModelProvider): string {
   return provider.id;
 }
+
+describe("extractMessageText", () => {
+  it("joins Gemini-style content parts into a string", () => {
+    expect(
+      extractMessageText([
+        { type: "text", text: "Hello " },
+        { type: "text", text: "Valmont" },
+      ]),
+    ).toBe("Hello Valmont");
+    expect(extractMessageText("plain")).toBe("plain");
+    expect(extractMessageText(null)).toBe("");
+  });
+});
 
 describe("model provider abstraction", () => {
   it("refuses to fabricate output when no credentials are set", () => {

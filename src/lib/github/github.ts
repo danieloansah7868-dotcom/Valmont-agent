@@ -100,9 +100,6 @@ export class GitHubApiProvider implements GitHubProvider {
     }>(
       `/repos/${owner}/${repository}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
     );
-    if (result.truncated) {
-      throw new Error("Repository tree is too large for bounded retrieval");
-    }
     return result.tree
       .filter(
         (entry) =>

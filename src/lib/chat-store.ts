@@ -856,7 +856,7 @@ export class SqliteChatStore implements ChatStore {
   private hydrate(row: SessionRow): ChatSession {
     const messages = this.db
       .prepare(
-        "SELECT * FROM chat_messages WHERE session_id = ? AND user_id = ? ORDER BY created_at, id",
+        "SELECT * FROM chat_messages WHERE session_id = ? AND user_id = ? ORDER BY created_at, rowid",
       )
       .all(row.id, row.user_id) as Array<Record<string, unknown>>;
     return {

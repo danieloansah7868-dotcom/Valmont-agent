@@ -2,10 +2,11 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: { default: "Valmont — Portfolio", template: "%s · Valmont" },
+  title: { default: "Valmont — Private portfolio", template: "%s · Valmont" },
   description:
-    "The Valmont portfolio — a connected ecosystem of ventures spanning payments, banking, data, web, AI, gadgets, electrical services, and advertising.",
+    "Private Valmont workspace. The internal portfolio of Valmont products, including Valmont Agent and Valmont Chat. GitHub sign-in required.",
   applicationName: "Valmont",
+  robots: { index: false, follow: false },
 };
 
 export const viewport: Viewport = {
