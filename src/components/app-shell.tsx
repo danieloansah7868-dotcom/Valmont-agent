@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import type { LinkProps } from "next/link";
 import {
   CircleHelp,
@@ -19,13 +19,61 @@ import type { SessionUser } from "@/lib/auth";
 const SIDEBAR_WIDTH = 248;
 const COLLAPSE_STORAGE_KEY = "valmont:sidebar-collapsed";
 
-function readInitialCollapsed(): boolean {
-  if (typeof window === "undefined") return false;
+/*
+ * The collapse preference lives in localStorage, which the server cannot see.
+ * Seeding it straight into `useState` made the first client render disagree
+ * with the server-rendered HTML — the toggle's label read "Hide menu" from the
+ * server and "Show menu" in the browser, tripping a hydration error.
+ *
+ * `useSyncExternalStore` is the supported way to read browser-only state: it
+ * hydrates with the server snapshot, then re-renders with the real value once
+ * hydration finishes. The subscription also keeps other tabs in step.
+ */
+const collapseListeners = new Set<() => void>();
+let collapseCache: boolean | null = null;
+
+function readStoredCollapsed(): boolean {
   try {
     return window.localStorage.getItem(COLLAPSE_STORAGE_KEY) === "1";
   } catch {
+    // Private mode or a blocked storage partition: fall back to expanded.
     return false;
   }
+}
+
+function subscribeCollapsed(onChange: () => void): () => void {
+  collapseListeners.add(onChange);
+  const onStorage = (event: StorageEvent) => {
+    if (event.key !== null && event.key !== COLLAPSE_STORAGE_KEY) return;
+    collapseCache = readStoredCollapsed();
+    onChange();
+  };
+  window.addEventListener("storage", onStorage);
+  return () => {
+    collapseListeners.delete(onChange);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
+/** Cached so repeated reads return a stable value, as the hook requires. */
+function getCollapsedSnapshot(): boolean {
+  if (collapseCache === null) collapseCache = readStoredCollapsed();
+  return collapseCache;
+}
+
+/** The server has no preference to read, so it always renders expanded. */
+function getCollapsedServerSnapshot(): boolean {
+  return false;
+}
+
+function setCollapsedPreference(next: boolean): void {
+  collapseCache = next;
+  try {
+    window.localStorage.setItem(COLLAPSE_STORAGE_KEY, next ? "1" : "0");
+  } catch {
+    // Ignore storage failures; the in-memory value still drives this session.
+  }
+  for (const listener of collapseListeners) listener();
 }
 
 /**
@@ -60,18 +108,11 @@ export function AppShell({
   user: SessionUser;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
-  // Read the saved preference during the initial state computation (runs once
-  // on the client; on the server window is undefined so we default to false).
-  const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
-
-  // Persist the user's collapse preference.
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(COLLAPSE_STORAGE_KEY, collapsed ? "1" : "0");
-    } catch {
-      // Ignore storage failures (private mode, quota, etc.).
-    }
-  }, [collapsed]);
+  const collapsed = useSyncExternalStore(
+    subscribeCollapsed,
+    getCollapsedSnapshot,
+    getCollapsedServerSnapshot,
+  );
 
   // Animating on the very first client paint can cause a visible width
   // transition from the SSR width. We gate the transition class until after
@@ -153,7 +194,7 @@ export function AppShell({
           <button
             type="button"
             data-testid="sidebar-toggle"
-            onClick={() => setCollapsed((value) => !value)}
+            onClick={() => setCollapsedPreference(!collapsed)}
             className="btn-icon hidden h-9 px-2.5 md:inline-flex"
             aria-label={collapsed ? "Show the menu" : "Hide the menu"}
             aria-expanded={!collapsed}
