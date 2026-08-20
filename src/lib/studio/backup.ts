@@ -5,7 +5,11 @@ import type { SessionUser } from "@/lib/auth";
 import { getSqliteChatStore, type ChatMemory } from "@/lib/chat-store";
 import type { ChatSession } from "@/lib/types";
 import { canonicalUserId } from "@/lib/user-identity";
-import { siteBriefSchemaV1, type StudioDraft } from "./site-brief/schema";
+import {
+  siteBriefSchemaV1,
+  type SiteBriefV1,
+  type StudioDraft,
+} from "./site-brief/schema";
 import type { ImportJobRecord, ImportLockLease } from "./import-coordinator";
 import {
   acquireNewImportLock,
@@ -255,7 +259,16 @@ export async function buildBackup(
       revision: Number(row.revision),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
-      brief: JSON.parse(String(row.brief_json)),
+      brief: (() => {
+        const parsed = JSON.parse(String(row.brief_json)) as SiteBriefV1;
+        if (!parsed.assets || typeof parsed.assets !== "object") {
+          parsed.assets = { logo: null, photos: [] };
+        } else {
+          if (!parsed.assets.logo) parsed.assets.logo = null;
+          if (!Array.isArray(parsed.assets.photos)) parsed.assets.photos = [];
+        }
+        return parsed;
+      })(),
     }));
   });
   return assembleBackup(chat!, drafts);

@@ -212,13 +212,37 @@ describe("studio routes: CSRF and origin", () => {
 });
 
 describe("studio routes: body limits and validation", () => {
-  it("rejects a draft body over 1 MB with 413", async () => {
+  it("rejects a draft body over 2.5 MB with 413", async () => {
     const { POST } = await listRoute();
-    const huge = newBriefBody({ description: "x".repeat(1_100_000) });
+    // Every textual field has a Zod max length, so the easiest way to build a
+    // body that trips the size guard (before Zod runs) is to add an unknown
+    // key with a huge padding string. Zod's default `.strip()` drops unknown
+    // keys, but bounded-json rejects on byte length before Zod sees it.
+    const huge = JSON.stringify({
+      ...JSON.parse(newBriefBody()),
+      _pad: "x".repeat(2_600_000),
+    });
+    expect(huge.length).toBeGreaterThan(2_500_000);
     const response = await POST(
       goodRequest("/api/studio/drafts", { body: huge }),
     );
     expect(response.status).toBe(413);
+  });
+
+  it("accepts a ~1 MB body (Phase 2 raised the cap from 1 MB to 2.5 MB for image data)", async () => {
+    const { POST } = await listRoute();
+    const mid = JSON.stringify({
+      ...JSON.parse(newBriefBody()),
+      _pad: "x".repeat(1_050_000),
+    });
+    expect(mid.length).toBeGreaterThan(1_000_000);
+    expect(mid.length).toBeLessThan(2_500_000);
+    const response = await POST(
+      goodRequest("/api/studio/drafts", { body: mid }),
+    );
+    // Size guard should NOT fire; Zod will strip the unknown key and accept
+    // the rest (since the base brief is valid), so expect 201 Created.
+    expect(response.status).toBe(201);
   });
 
   it("rejects an invalid brief with 400 and no echoed value", async () => {

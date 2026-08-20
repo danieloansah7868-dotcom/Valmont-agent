@@ -173,7 +173,7 @@ export function createDefaultBrief(
     selectedTheme: "clean-corporate",
     selectedTemplate: "classic-hero",
     adminEmail: "owner@example.com",
-    assetStatus: "not_provided",
+    assets: { logo: null, photos: [] },
     plannedPaymentMethods: [],
     country: GHANA_DEFAULTS.country,
     currency: GHANA_DEFAULTS.currency,

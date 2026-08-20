@@ -31,6 +31,8 @@ export function BusinessPreview({ brief }: { brief: Partial<SiteBriefV1> }) {
     brief.mapsLink && isHttpsSafeUrl(brief.mapsLink) ? brief.mapsLink : null;
 
   const accent = theme?.tokens.colors.primary ?? "#0b2545";
+  const logo = brief.assets?.logo ?? null;
+  const photos = brief.assets?.photos ?? [];
 
   return (
     <section
@@ -43,16 +45,29 @@ export function BusinessPreview({ brief }: { brief: Partial<SiteBriefV1> }) {
           Preview{template ? ` · ${template.label}` : ""}
           {theme ? ` · ${theme.label}` : ""}
         </p>
-        <h2
-          className={`mt-1 text-lg font-bold ${name.isPlaceholder ? "text-slate-400 italic" : "text-navy"}`}
-        >
-          {name.text}
-        </h2>
-        <p
-          className={`text-sm ${tagline.isPlaceholder ? "text-slate-400 italic" : "text-slate"}`}
-        >
-          {tagline.text}
-        </p>
+        <div className="mt-1 flex items-start gap-3">
+          {logo ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={logo.dataUrl}
+              alt=""
+              data-testid="preview-logo"
+              className="h-14 w-14 shrink-0 rounded-md object-contain ring-1 ring-line"
+            />
+          ) : null}
+          <div className="min-w-0">
+            <h2
+              className={`text-lg font-bold ${name.isPlaceholder ? "text-slate-400 italic" : "text-navy"}`}
+            >
+              {name.text}
+            </h2>
+            <p
+              className={`text-sm ${tagline.isPlaceholder ? "text-slate-400 italic" : "text-slate"}`}
+            >
+              {tagline.text}
+            </p>
+          </div>
+        </div>
       </header>
 
       <div className="border-t border-line p-4 text-sm">
@@ -124,6 +139,28 @@ export function BusinessPreview({ brief }: { brief: Partial<SiteBriefV1> }) {
         )}
         {(brief.serviceAreas?.length ?? 0) > 0 && (
           <PreviewList title="Areas served" items={brief.serviceAreas!} />
+        )}
+
+        {photos.length > 0 && (
+          <div className="mt-3">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Photos
+            </h3>
+            <div
+              data-testid="preview-photos"
+              className="mt-1 grid grid-cols-2 gap-1"
+            >
+              {photos.map((photo, i) => (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  key={`${photo.fileName}-${i}`}
+                  src={photo.dataUrl}
+                  alt={photo.fileName}
+                  className="aspect-[4/3] w-full rounded-md object-cover"
+                />
+              ))}
+            </div>
+          </div>
         )}
       </div>
 
