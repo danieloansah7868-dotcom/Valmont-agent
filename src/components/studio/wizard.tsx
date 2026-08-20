@@ -1035,10 +1035,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             >
               Delete this draft permanently?
             </h3>
-            <p
-              id="delete-confirm-body"
-              className="mt-1 text-xs text-red-800"
-            >
+            <p id="delete-confirm-body" className="mt-1 text-xs text-red-800">
               This cannot be undone. Everything you entered for this business
               will be removed.
             </p>
@@ -1078,8 +1075,8 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               Delete this draft
             </button>
             <p className="mt-1 text-xs text-slate-500">
-              Deleting removes the draft permanently. Download a backup first
-              if you want to keep a copy.
+              Deleting removes the draft permanently. Download a backup first if
+              you want to keep a copy.
             </p>
           </div>
         )}

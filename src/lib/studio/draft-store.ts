@@ -464,7 +464,10 @@ function withAssets(brief: SiteBriefV1): SiteBriefV1 {
     return { ...brief, assets: { logo: null, photos: [] } };
   }
   if (!brief.assets.photos) {
-    return { ...brief, assets: { logo: brief.assets.logo ?? null, photos: [] } };
+    return {
+      ...brief,
+      assets: { logo: brief.assets.logo ?? null, photos: [] },
+    };
   }
   return brief;
 }

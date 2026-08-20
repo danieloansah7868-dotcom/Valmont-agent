@@ -148,8 +148,7 @@ export function checkAssetBudget(
   let projected = 0;
   // If replacing the logo, the old one is dropped; if removing, count the rest.
   if (adding.kind === "logo") {
-    projected =
-      (current.photos.reduce((a, p) => a + p.size, 0) + adding.size);
+    projected = current.photos.reduce((a, p) => a + p.size, 0) + adding.size;
   } else {
     projected =
       (current.logo ? current.logo.size : 0) +

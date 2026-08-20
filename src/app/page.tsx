@@ -484,10 +484,10 @@ export default function PortfolioPage() {
               approval-first coding partner.
             </h2>
             <p className="mt-6 max-w-[520px] text-[16px] leading-7 text-ivory/70">
-              Valmont Agent inspects your repository, proposes a plan, and waits.
-              You approve every meaningful boundary — from implementation to
-              pull request. It never merges, never deploys, and keeps your keys
-              server-side.
+              Valmont Agent inspects your repository, proposes a plan, and
+              waits. You approve every meaningful boundary — from implementation
+              to pull request. It never merges, never deploys, and keeps your
+              keys server-side.
             </p>
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
               <Link

@@ -105,7 +105,7 @@ async function resizeImage(
 async function b64ByteLength(dataUrl: string): Promise<number> {
   const comma = dataUrl.indexOf(",");
   const b64 = dataUrl.slice(comma + 1);
-  const padding = (b64.match(/=*$/)?.[0]?.length ?? 0);
+  const padding = b64.match(/=*$/)?.[0]?.length ?? 0;
   return Math.round((b64.length * 3) / 4) - padding;
 }
 

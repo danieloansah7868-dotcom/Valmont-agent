@@ -18,7 +18,10 @@ const storedImageSchema = z.object({
   dataUrl: z
     .string()
     .max(1_600_000, "Image is too large")
-    .regex(/^data:image\/(png|jpeg|webp|gif);base64,/, "Image must be a data URL"),
+    .regex(
+      /^data:image\/(png|jpeg|webp|gif);base64,/,
+      "Image must be a data URL",
+    ),
   fileName: z.string().max(200),
   mime: z
     .string()
