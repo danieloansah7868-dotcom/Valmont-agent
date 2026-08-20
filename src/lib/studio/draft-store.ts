@@ -453,6 +453,22 @@ export function draftIdExists(db: DatabaseSync, id: string): boolean {
   );
 }
 
+/**
+ * Older Phase 1 drafts were stored before the `assets` field existed.
+ * Normalizing here means every code path — list/get/update/create — returns
+ * a brief that carries the field, so the UI and backup code never has to
+ * defensively handle "missing assets" after a Phase 1 → Phase 2 upgrade.
+ */
+function withAssets(brief: SiteBriefV1): SiteBriefV1 {
+  if (!brief.assets) {
+    return { ...brief, assets: { logo: null, photos: [] } };
+  }
+  if (!brief.assets.photos) {
+    return { ...brief, assets: { logo: brief.assets.logo ?? null, photos: [] } };
+  }
+  return brief;
+}
+
 function rowToDraft(row: StudioDraftRow): StudioDraft {
   return {
     id: row.id,
@@ -463,7 +479,7 @@ function rowToDraft(row: StudioDraftRow): StudioDraft {
     revision: row.revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    brief: JSON.parse(row.brief_json) as SiteBriefV1,
+    brief: withAssets(JSON.parse(row.brief_json) as SiteBriefV1),
   };
 }
 
@@ -477,7 +493,7 @@ function pgRowToDraft(row: typeof studioDrafts.$inferSelect): StudioDraft {
     revision: row.revision,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
-    brief: row.brief as SiteBriefV1,
+    brief: withAssets(row.brief as SiteBriefV1),
   };
 }
 

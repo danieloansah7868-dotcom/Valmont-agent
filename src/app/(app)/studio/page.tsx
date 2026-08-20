@@ -89,7 +89,6 @@ export default async function StudioPage() {
           Not working yet — planned for later phases
         </h2>
         <ul className="mt-2 list-disc pl-4 text-xs text-slate-600">
-          <li>Logo and photo uploads — Phase 2</li>
           <li>Building the real website code — Phase 5</li>
           <li>
             Payments and checkout (Mobile Money, Paystack, Valmont Pay, cards) —

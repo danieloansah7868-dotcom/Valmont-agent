@@ -34,6 +34,7 @@ import {
   formatGhanaPhone,
 } from "@/lib/studio/site-brief/defaults";
 import { changedFields, mergeBriefs } from "@/lib/studio/merge";
+import { AssetUploader } from "./asset-uploader";
 
 const STEPS = [
   { number: 1, title: "Website type" },
@@ -79,6 +80,14 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
   } | null>(null);
   /** Number of unsaved field changes, tracked in state so render stays pure. */
   const [pendingCount, setPendingCount] = useState(0);
+  /**
+   * Current server-confirmed revision, mirrored from revisionRef so the
+   * AssetUploader (which renders during the main render) can read it without
+   * touching a ref inside render.
+   */
+  const [serverRevision, setServerRevision] = useState<number>(
+    initial.revision,
+  );
 
   /**
    * Everything the save loop needs lives in refs so the loop never restarts
@@ -276,6 +285,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       savedBriefRef.current = updated.brief;
       if (!unmountedRef.current) {
         setPendingCount(0);
+        setServerRevision(updated.revision);
         setSaveState({ kind: "saved", at: updated.updatedAt });
       }
     } catch (cause) {
@@ -366,6 +376,16 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     setPendingCount(0);
     setSaveState({ kind: "saved", at: new Date().toISOString() });
   }, [conflictPair]);
+
+  async function goToStudio() {
+    // Flush any pending autosave before navigating away, so the user
+    // never loses the last few keystrokes by clicking Done mid-save.
+    if (pendingRef.current) {
+      await flushRef.current();
+    }
+    router.push("/studio");
+    router.refresh();
+  }
 
   async function removeDraft() {
     setDeleting(true);
@@ -617,6 +637,39 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   are shown.
                 </p>
               </fieldset>
+
+              <section className="rounded-lg border border-line bg-white p-3">
+                <h3 className="text-sm font-semibold text-navy">
+                  Logo and photos
+                </h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  Pictures you upload stay with this draft and show up in the
+                  preview. They are included when you download a backup.
+                </p>
+                <div className="mt-3">
+                  <AssetUploader
+                    draftId={id}
+                    assets={brief.assets ?? { logo: null, photos: [] }}
+                    expectedRevision={serverRevision}
+                    onSaved={({ assets, revision }) => {
+                      revisionRef.current = revision;
+                      const merged = { ...brief, assets };
+                      setBrief(merged);
+                      savedBriefRef.current = merged;
+                      pendingRef.current = null;
+                      setPendingCount(0);
+                      setServerRevision(revision);
+                      setSaveState({
+                        kind: "saved",
+                        at: new Date().toISOString(),
+                      });
+                    }}
+                    onError={() => {
+                      /* error is shown inside the uploader */
+                    }}
+                  />
+                </div>
+              </section>
             </div>
           )}
 
@@ -933,7 +986,39 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         </aside>
       </div>
 
-      <div className="mt-8 border-t border-line pt-4">
+      <div className="mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setStep((s) => Math.max(1, s - 1))}
+            disabled={step <= 1}
+            data-testid="wizard-back"
+            className="btn-secondary min-h-10 px-3 text-sm"
+          >
+            Back
+          </button>
+          {step < STEPS.length ? (
+            <button
+              type="button"
+              onClick={() => setStep((s) => Math.min(STEPS.length, s + 1))}
+              data-testid="wizard-next"
+              className="btn-primary min-h-10 px-3 text-sm"
+            >
+              Next
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void goToStudio()}
+              disabled={saveState.kind === "saving"}
+              data-testid="done-to-studio"
+              className="btn-primary min-h-10 inline-flex items-center gap-2 px-4 text-sm"
+            >
+              {saveState.kind === "saving" ? "Saving…" : "Done"}
+            </button>
+          )}
+        </div>
+
         {confirmingDelete ? (
           <div
             ref={deleteDialogRef}
@@ -942,7 +1027,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             aria-labelledby="delete-confirm-heading"
             aria-describedby="delete-confirm-body"
             data-testid="delete-confirm"
-            className="rounded-lg border border-red-300 bg-red-50 p-4"
+            className="w-full rounded-lg border border-red-300 bg-red-50 p-4"
           >
             <h3
               id="delete-confirm-heading"
@@ -950,7 +1035,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             >
               Delete this draft permanently?
             </h3>
-            <p id="delete-confirm-body" className="mt-1 text-xs text-red-800">
+            <p
+              id="delete-confirm-body"
+              className="mt-1 text-xs text-red-800"
+            >
               This cannot be undone. Everything you entered for this business
               will be removed.
             </p>
@@ -976,7 +1064,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             </div>
           </div>
         ) : (
-          <>
+          <div className="text-right">
             <button
               type="button"
               onClick={(event) => {
@@ -990,10 +1078,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               Delete this draft
             </button>
             <p className="mt-1 text-xs text-slate-500">
-              Deleting removes the draft permanently. Download a backup first if
-              you want to keep a copy.
+              Deleting removes the draft permanently. Download a backup first
+              if you want to keep a copy.
             </p>
-          </>
+          </div>
         )}
       </div>
     </div>

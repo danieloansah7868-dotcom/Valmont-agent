@@ -5,8 +5,35 @@ import { isPackageId } from "../packages";
 import { isTemplateId, isTemplateCompatible } from "../templates";
 import { isThemeId, HEX_COLOR_RE } from "../themes";
 import { isGhanaRegion } from "./defaults";
+import { ACCEPTED_MIME_TYPES } from "../assets";
 
 export const SITE_BRIEF_VERSION = 1 as const;
+
+/**
+ * A stored image (logo or photo). Images are kept as data URLs inside the
+ * brief so backup/import carries them automatically and no filesystem or
+ * binary column is required. Size/shape checks live in ../assets.ts.
+ */
+const storedImageSchema = z.object({
+  dataUrl: z
+    .string()
+    .max(1_600_000, "Image is too large")
+    .regex(/^data:image\/(png|jpeg|webp|gif);base64,/, "Image must be a data URL"),
+  fileName: z.string().max(200),
+  mime: z
+    .string()
+    .refine((v) => ACCEPTED_MIME_TYPES.has(v), "Unsupported image type"),
+  width: z.number().int().min(1).max(4000),
+  height: z.number().int().min(1).max(4000),
+  size: z.number().int().min(1).max(1_500_000),
+});
+
+const assetsSchema = z
+  .object({
+    logo: storedImageSchema.nullable().default(null),
+    photos: z.array(storedImageSchema).max(8).default([]),
+  })
+  .default({ logo: null, photos: [] });
 
 /**
  * Every IPv4 block that is not ordinary public unicast, as a
@@ -318,7 +345,7 @@ const baseSiteBriefV1 = z.object({
   domainName: domainName.optional(),
   preferredLanguage: z.string().max(20).optional(),
   existingWebsite: httpsUrl.optional(),
-  assetStatus: z.literal("not_provided").default("not_provided"),
+  assets: assetsSchema,
   products: z
     .array(
       z.object({
