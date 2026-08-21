@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { LinkProps } from "next/link";
 import {
   CircleHelp,
@@ -19,15 +19,6 @@ import type { SessionUser } from "@/lib/auth";
 const SIDEBAR_WIDTH = 248;
 const COLLAPSED_WIDTH = 72;
 const COLLAPSE_STORAGE_KEY = "valmont:sidebar-collapsed";
-
-function readInitialCollapsed(): boolean {
-  if (typeof window === "undefined") return false;
-  try {
-    return window.localStorage.getItem(COLLAPSE_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
 
 /**
  * A Link that also closes the mobile drawer when clicked. Keeps the
@@ -61,12 +52,16 @@ export function AppShell({
   user: SessionUser;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
-  // Read the saved preference during the initial state computation (runs once
-  // on the client; on the server window is undefined so we default to false).
-  const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
+  // Start expanded so the first client render matches the server-rendered
+  // HTML; the saved preference is restored after mount (see the rAF effect).
+  const [collapsed, setCollapsed] = useState(false);
+  // Blocks the persistence effect from writing the mount-time default before
+  // the saved preference has been restored.
+  const restoredRef = useRef(false);
 
   // Persist the user's collapse preference.
   useEffect(() => {
+    if (!restoredRef.current) return;
     try {
       window.localStorage.setItem(COLLAPSE_STORAGE_KEY, collapsed ? "1" : "0");
     } catch {
@@ -75,12 +70,26 @@ export function AppShell({
   }, [collapsed]);
 
   // Animating on the very first client paint can cause a visible width
-  // transition from the SSR width. We gate the transition class until after
-  // mount via a rAF, which runs asynchronously and keeps effects clean.
+  // transition from the SSR width. We restore the saved collapse preference
+  // in a rAF (which runs asynchronously and keeps effects clean), then gate
+  // the transition class until the *next* frame so the restored width snaps
+  // into place without a visible animation.
   const [animate, setAnimate] = useState(false);
   useEffect(() => {
-    const frame = requestAnimationFrame(() => setAnimate(true));
-    return () => cancelAnimationFrame(frame);
+    let animateFrame: number | undefined;
+    const restoreFrame = requestAnimationFrame(() => {
+      try {
+        setCollapsed(window.localStorage.getItem(COLLAPSE_STORAGE_KEY) === "1");
+      } catch {
+        // Ignore storage failures (private mode, quota, etc.).
+      }
+      restoredRef.current = true;
+      animateFrame = requestAnimationFrame(() => setAnimate(true));
+    });
+    return () => {
+      cancelAnimationFrame(restoreFrame);
+      if (animateFrame !== undefined) cancelAnimationFrame(animateFrame);
+    };
   }, []);
 
   // Lock body scroll while the mobile drawer is open.
@@ -140,25 +149,25 @@ export function AppShell({
           <button
             type="button"
             onClick={() => setMobileOpen(true)}
-            className="btn-quiet size-9 min-h-9 px-0 md:hidden"
+            className="btn-quiet size-10 min-h-10 px-0 md:hidden"
             aria-label="Open navigation menu"
             aria-expanded={mobileOpen}
             aria-controls="mobile-sidebar"
           >
-            <Menu className="size-5" aria-hidden="true" />
+            <Menu className="size-6" aria-hidden="true" />
           </button>
           {/* Collapse toggle: desktop only. */}
           <button
             type="button"
             onClick={() => setCollapsed((value) => !value)}
-            className="btn-quiet hidden size-9 min-h-9 px-0 md:inline-flex"
+            className="btn-quiet hidden size-10 min-h-10 px-0 md:inline-flex"
             aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
             title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           >
             {collapsed ? (
-              <PanelLeftOpen className="size-5" aria-hidden="true" />
+              <PanelLeftOpen className="size-6" aria-hidden="true" />
             ) : (
-              <PanelLeftClose className="size-5" aria-hidden="true" />
+              <PanelLeftClose className="size-6" aria-hidden="true" />
             )}
           </button>
           <div className="md:hidden">
