@@ -18,7 +18,9 @@ import {
   reconcileTemplate,
 } from "@/lib/studio/templates";
 import {
+  PAYMENT_METHODS,
   siteBriefSchemaV1,
+  type CatalogItem,
   type SiteBriefV1,
   type StudioDraft,
 } from "@/lib/studio/site-brief/schema";
@@ -26,8 +28,6 @@ import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { evaluateSaveGate } from "@/lib/studio/save-gate";
 import {
   GHANA_REGIONS,
-  PAYMENT_PLANNING_NOTICE,
-  PLANNED_PAYMENT_METHODS,
   SUPPORTED_COUNTRIES,
   SUPPORTED_CURRENCIES,
   SUPPORTED_TIMEZONES,
@@ -41,7 +41,51 @@ const STEPS = [
   { number: 2, title: "Package" },
   { number: 3, title: "Look and layout" },
   { number: 4, title: "Business details" },
+  { number: 5, title: "Payments and delivery" },
 ] as const;
+
+/**
+ * Parses priced-item text like "Jollof Rice - 45, Banku - 30" into catalogue
+ * items. An entry with no "- price" part becomes an unpriced item. Existing
+ * items are matched by name so their ids (and any images) are preserved.
+ */
+function parsePricedItems(
+  text: string,
+  existing: CatalogItem[],
+): CatalogItem[] {
+  const byName = new Map(
+    existing.map((item) => [item.name.trim().toLowerCase(), item]),
+  );
+  return text
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((entry, index) => {
+      const match = /^(.*?)(?:\s*-\s*([0-9]+(?:\.[0-9]{1,2})?))?$/.exec(entry);
+      const rawName = (match?.[1] ?? entry).trim();
+      const priceText = match?.[2];
+      const prior = byName.get(rawName.toLowerCase());
+      const item: CatalogItem = {
+        id: prior?.id ?? `item-${Date.now()}-${index}`,
+        name: rawName,
+      };
+      if (priceText !== undefined) item.price = Number(priceText);
+      else if (prior?.price !== undefined) item.price = prior.price;
+      if (prior?.category) item.category = prior.category;
+      if (prior?.description) item.description = prior.description;
+      if (prior?.image) item.image = prior.image;
+      return item;
+    });
+}
+
+/** Renders catalogue items back to editable "Name - price" text. */
+function formatPricedItems(items: CatalogItem[]): string {
+  return items
+    .map((item) =>
+      item.price !== undefined ? `${item.name} - ${item.price}` : item.name,
+    )
+    .join(", ");
+}
 
 type SaveState =
   | { kind: "saved"; at: string }
@@ -840,13 +884,11 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               <TextField
                 id="products"
                 label="Products you sell"
-                value={brief.products.map((product) => product.name).join(", ")}
+                value={formatPricedItems(brief.items)}
                 onChange={(value) =>
-                  update({
-                    products: toList(value).map((name) => ({ name })),
-                  })
+                  update({ items: parsePricedItems(value, brief.items) })
                 }
-                hint="Just the names, separated by commas. No prices, stock or checkout in Phase 1."
+                hint='Add a price with a dash, e.g. "Jollof Rice - 45, Banku - 30". Prices turn on the shop and basket in Step 5.'
               />
 
               <TextField
@@ -865,33 +907,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 hint="A note for planning only — no delivery is arranged by this app."
               />
 
-              <fieldset className="grid gap-2 rounded-lg border border-line p-3">
-                <legend className="text-sm font-semibold">
-                  Payment methods you might want later
-                </legend>
-                <p className="text-xs text-amber-800">
-                  {PAYMENT_PLANNING_NOTICE}
-                </p>
-                {PLANNED_PAYMENT_METHODS.map((method) => (
-                  <label key={method.id} className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={brief.plannedPaymentMethods.includes(method.id)}
-                      onChange={(event) =>
-                        update({
-                          plannedPaymentMethods: event.target.checked
-                            ? [...brief.plannedPaymentMethods, method.id]
-                            : brief.plannedPaymentMethods.filter(
-                                (item) => item !== method.id,
-                              ),
-                        })
-                      }
-                    />
-                    <span className="text-sm">{method.label}</span>
-                  </label>
-                ))}
-              </fieldset>
-
               <TextArea
                 id="specialInstructions"
                 label="Anything else Valmont should know"
@@ -900,6 +915,210 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   update({ specialInstructions: value || undefined })
                 }
               />
+            </div>
+          )}
+
+          {step === 5 && (
+            <div className="grid gap-4">
+              <fieldset className="grid gap-2 rounded-lg border border-line p-3">
+                <legend className="text-sm font-semibold">
+                  Accept orders and payments
+                </legend>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={brief.payments.enabled}
+                    onChange={(event) =>
+                      update({
+                        payments: {
+                          ...brief.payments,
+                          enabled: event.target.checked,
+                        },
+                      })
+                    }
+                    data-testid="payments-enabled"
+                  />
+                  <span className="text-sm">
+                    Turn on a basket and checkout on this website
+                  </span>
+                </label>
+                <p className="text-xs text-slate-600">
+                  Add prices to your products in Step 4 so customers can add
+                  them to a basket and pay.
+                </p>
+              </fieldset>
+
+              {brief.payments.enabled && (
+                <>
+                  <fieldset className="grid gap-2 rounded-lg border border-line p-3">
+                    <legend className="text-sm font-semibold">
+                      How can customers pay?
+                    </legend>
+                    {PAYMENT_METHODS.map((method) => (
+                      <label key={method.id} className="flex items-start gap-2">
+                        <input
+                          type="checkbox"
+                          className="mt-1"
+                          checked={brief.payments.methods.includes(method.id)}
+                          onChange={(event) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                methods: event.target.checked
+                                  ? [...brief.payments.methods, method.id]
+                                  : brief.payments.methods.filter(
+                                      (id) => id !== method.id,
+                                    ),
+                              },
+                            })
+                          }
+                        />
+                        <span>
+                          <span className="block text-sm font-semibold">
+                            {method.label}
+                          </span>
+                          <span className="block text-xs text-slate-600">
+                            {method.description}
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                  </fieldset>
+
+                  <fieldset className="grid gap-3 rounded-lg border border-line p-3">
+                    <legend className="text-sm font-semibold">Delivery</legend>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={brief.payments.delivery.enabled}
+                        onChange={(event) =>
+                          update({
+                            payments: {
+                              ...brief.payments,
+                              delivery: {
+                                ...brief.payments.delivery,
+                                enabled: event.target.checked,
+                              },
+                            },
+                          })
+                        }
+                      />
+                      <span className="text-sm">Offer delivery</span>
+                    </label>
+
+                    {brief.payments.delivery.enabled && (
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        <NumberField
+                          id="deliveryFee"
+                          label="Delivery fee"
+                          value={brief.payments.delivery.fee}
+                          onChange={(value) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                delivery: {
+                                  ...brief.payments.delivery,
+                                  fee: value,
+                                },
+                              },
+                            })
+                          }
+                        />
+                        <NumberField
+                          id="minimumOrder"
+                          label="Minimum order"
+                          value={brief.payments.delivery.minimumOrder}
+                          onChange={(value) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                delivery: {
+                                  ...brief.payments.delivery,
+                                  minimumOrder: value,
+                                },
+                              },
+                            })
+                          }
+                        />
+                        <NumberField
+                          id="freeDeliveryAbove"
+                          label="Free delivery above"
+                          value={brief.payments.delivery.freeDeliveryAbove ?? 0}
+                          onChange={(value) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                delivery: {
+                                  ...brief.payments.delivery,
+                                  freeDeliveryAbove:
+                                    value > 0 ? value : undefined,
+                                },
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    )}
+                  </fieldset>
+
+                  <fieldset className="grid gap-3 rounded-lg border border-line p-3">
+                    <legend className="text-sm font-semibold">
+                      Order notifications
+                    </legend>
+                    <p className="text-xs text-slate-600">
+                      Where the business is told about new orders.
+                    </p>
+                    <TextField
+                      id="notifyEmail"
+                      label="Email for orders"
+                      type="email"
+                      value={brief.payments.notifications.email ?? ""}
+                      onChange={(value) =>
+                        update({
+                          payments: {
+                            ...brief.payments,
+                            notifications: {
+                              ...brief.payments.notifications,
+                              email: value || undefined,
+                            },
+                          },
+                        })
+                      }
+                    />
+                    <TextField
+                      id="notifyWhatsapp"
+                      label="WhatsApp for orders"
+                      type="tel"
+                      value={brief.payments.notifications.whatsapp ?? ""}
+                      onChange={(value) =>
+                        update({
+                          payments: {
+                            ...brief.payments,
+                            notifications: {
+                              ...brief.payments.notifications,
+                              whatsapp: formatGhanaPhone(value) || undefined,
+                            },
+                          },
+                        })
+                      }
+                    />
+                  </fieldset>
+
+                  <TextArea
+                    id="checkoutNote"
+                    label="Message shown at checkout"
+                    value={brief.payments.checkoutNote ?? ""}
+                    onChange={(value) =>
+                      update({
+                        payments: {
+                          ...brief.payments,
+                          checkoutNote: value || undefined,
+                        },
+                      })
+                    }
+                  />
+                </>
+              )}
             </div>
           )}
 
@@ -981,7 +1200,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           </section>
 
           <div className="mt-4">
-            <BusinessPreview brief={brief} />
+            <BusinessPreview brief={brief} draftId={id} />
           </div>
         </aside>
       </div>
@@ -1125,6 +1344,40 @@ function TextField({
           {hint}
         </p>
       )}
+    </div>
+  );
+}
+
+function NumberField({
+  id,
+  label,
+  value,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <div className="grid gap-1">
+      <label htmlFor={id} className="text-sm font-semibold">
+        {label}
+      </label>
+      <input
+        id={id}
+        name={id}
+        type="number"
+        min={0}
+        step="0.01"
+        inputMode="decimal"
+        value={Number.isFinite(value) ? value : 0}
+        onChange={(event) => {
+          const next = Number(event.target.value);
+          onChange(Number.isFinite(next) ? next : 0);
+        }}
+        className="w-full rounded-lg border border-line px-3 py-2 text-base"
+      />
     </div>
   );
 }

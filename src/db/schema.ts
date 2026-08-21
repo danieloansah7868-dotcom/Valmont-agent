@@ -307,6 +307,53 @@ export const studioImportFences = pgTable("studio_import_fences", {
     .defaultNow(),
 });
 
+/**
+ * Phase 3 orders. A customer basket that has been checked out. Rows are created
+ * by the public checkout endpoint and advanced by the payments webhook. The
+ * `access_code` is an unguessable secret that both the hosted payment page and
+ * the webhook are keyed on, so no row is addressable without it.
+ */
+export const studioOrders = pgTable(
+  "studio_orders",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    ownerId: uuid("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    draftId: uuid("draft_id")
+      .notNull()
+      .references(() => studioDrafts.id, { onDelete: "cascade" }),
+    accessCode: text("access_code").notNull().unique(),
+    status: text("status").notNull().default("pending"),
+    currency: text("currency").notNull().default("GHS"),
+    subtotal: integer("subtotal").notNull().default(0),
+    deliveryFee: integer("delivery_fee").notNull().default(0),
+    total: integer("total").notNull().default(0),
+    linesJson: jsonb("lines_json").notNull(),
+    customerName: text("customer_name").notNull(),
+    customerPhone: text("customer_phone").notNull(),
+    customerEmail: text("customer_email"),
+    customerAddress: text("customer_address"),
+    paymentMethod: text("payment_method").notNull(),
+    paymentRef: text("payment_ref"),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    fulfilledAt: timestamp("fulfilled_at", { withTimezone: true }),
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    merchantNote: text("merchant_note"),
+  },
+  (table) => [
+    index("studio_orders_owner_created_idx").on(table.ownerId, table.createdAt),
+    index("studio_orders_draft_idx").on(table.draftId),
+    uniqueIndex("studio_orders_access_code_idx").on(table.accessCode),
+  ],
+);
+
 export const pullRequests = pgTable("pull_requests", {
   id: uuid("id").primaryKey().defaultRandom(),
   taskId: uuid("task_id")

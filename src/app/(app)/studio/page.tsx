@@ -4,12 +4,31 @@ import { getStudioDraftStore } from "@/lib/studio/draft-store";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { getCategory } from "@/lib/studio/categories";
 import { BackupControls } from "@/components/studio/backup-controls";
+import { canonicalUserId } from "@/lib/user-identity";
+import { getOrdersStore, type OrderRecord } from "@/lib/studio/orders";
+import { formatMoney, STATUS_LABELS } from "@/lib/studio/valmont-pay";
 
 export const dynamic = "force-dynamic";
+
+const PAID_BADGE: Record<string, string> = {
+  paid: "bg-green-100 text-green-800",
+  fulfilled: "bg-green-100 text-green-800",
+  pending: "bg-amber-100 text-amber-900",
+  cod_pending: "bg-blue-100 text-blue-900",
+  payment_failed: "bg-red-100 text-red-800",
+  cancelled: "bg-slate-200 text-slate-700",
+};
 
 export default async function StudioPage() {
   const user = await requireSessionUser();
   const drafts = await getStudioDraftStore().list(user);
+
+  // Only fetch orders when at least one draft actually has payments switched on.
+  const hasShop = drafts.some((draft) => draft.brief.payments?.enabled);
+  let orders: OrderRecord[] = [];
+  if (hasShop) {
+    orders = await getOrdersStore().listForOwner(canonicalUserId(user), 10);
+  }
 
   return (
     <div className="mx-auto w-full max-w-[980px] p-4 sm:p-6">
@@ -72,6 +91,53 @@ export default async function StudioPage() {
         )}
       </section>
 
+      {hasShop && (
+        <section className="mt-8" aria-labelledby="orders-heading">
+          <h2 id="orders-heading" className="text-lg font-semibold text-navy">
+            Recent orders
+          </h2>
+          {orders.length === 0 ? (
+            <p className="mt-2 text-sm text-slate-600">
+              No orders yet. When a customer checks out, their order appears
+              here.
+            </p>
+          ) : (
+            <ul className="mt-3 grid gap-2" data-testid="orders-list">
+              {orders.map((order) => (
+                <li
+                  key={order.id}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-line bg-white p-3"
+                >
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-navy">
+                      {order.customerName} · {order.id.slice(0, 8)}
+                    </p>
+                    <p className="text-xs text-slate-600">
+                      {new Date(order.createdAt).toLocaleString("en-GB", {
+                        timeZone: "Africa/Accra",
+                      })}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                        PAID_BADGE[order.status] ??
+                        "bg-slate-200 text-slate-700"
+                      }`}
+                    >
+                      {STATUS_LABELS[order.status]}
+                    </span>
+                    <span className="text-sm font-semibold">
+                      {formatMoney(order.total, order.currency)}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
       <section className="mt-8" aria-labelledby="backup-heading">
         <h2 id="backup-heading" className="text-lg font-semibold text-navy">
           Backup
@@ -90,11 +156,6 @@ export default async function StudioPage() {
         </h2>
         <ul className="mt-2 list-disc pl-4 text-xs text-slate-600">
           <li>Building the real website code — Phase 5</li>
-          <li>
-            Payments and checkout (Mobile Money, Paystack, Valmont Pay, cards) —
-            Phase 3. Anything you record now is a note about your preferences
-            only; nothing can take a payment.
-          </li>
           <li>Publishing the website online — Phase 6</li>
         </ul>
       </section>
