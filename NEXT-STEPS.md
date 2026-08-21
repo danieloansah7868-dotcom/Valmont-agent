@@ -101,7 +101,7 @@ What it adds:
 - A new wizard **Step 5 "Payments and delivery"**, and Step 4 now takes prices
   inline (`"Jollof Rice - 45, Banku - 30"`).
 - A working basket + inline checkout in the preview, a public `POST
-  /api/studio/drafts/[id]/checkout` that **re-prices every basket server-side**
+/api/studio/drafts/[id]/checkout` that **re-prices every basket server-side**
   (never trusting a client price), a `POST /api/payments/webhook` keyed on an
   unguessable per-order access code, and `/pay/[code]` + `/orders/[id]/confirmed`
   pages.
