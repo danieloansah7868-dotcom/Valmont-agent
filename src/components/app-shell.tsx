@@ -132,7 +132,7 @@ export function AppShell({
       )}
 
       <header
-        className={`fixed inset-x-0 top-0 z-50 flex h-16 items-center border-b border-line bg-ivory-50/95 px-4 backdrop-blur md:px-7 ${transitionClass}`}
+        className={`fixed inset-x-0 top-0 z-50 flex h-20 items-center border-b border-line bg-ivory-50/95 px-4 backdrop-blur md:px-7 ${transitionClass}`}
         style={{ left: desktopWidth }}
       >
         <div className="flex items-center gap-2">
@@ -169,30 +169,30 @@ export function AppShell({
         <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
           <Link
             href="/"
-            className="btn-quiet hidden items-center gap-1.5 px-3 text-[13px] font-semibold sm:inline-flex"
+            className="btn-quiet hidden items-center gap-1.5 px-3.5 text-[15px] font-bold sm:inline-flex"
           >
             <span className="text-copper">◆</span> Portfolio
           </Link>
           <Link
             href="/docs/security"
-            className="btn-quiet size-9 min-h-9 px-0"
+            className="btn-quiet size-10 min-h-10 px-0"
             aria-label="Security model and setup help"
           >
-            <CircleHelp className="size-[17px]" aria-hidden="true" />
+            <CircleHelp className="size-5" aria-hidden="true" />
           </Link>
-          <div className="mx-1 h-6 w-px bg-line" aria-hidden="true" />
+          <div className="mx-1 h-7 w-px bg-line" aria-hidden="true" />
           <Link
             href="/settings"
-            className="flex items-center gap-2 rounded-lg p-1.5 transition-colors hover:bg-ivory-100"
+            className="flex items-center gap-2.5 rounded-lg p-1.5 transition-colors hover:bg-ivory-100"
           >
-            <span className="flex size-7 items-center justify-center rounded-full bg-brandblue text-[10px] font-bold text-ivory">
+            <span className="flex size-9 items-center justify-center rounded-full bg-brandblue text-xs font-bold text-ivory">
               {initials || "VA"}
             </span>
             <span className="hidden text-left lg:block">
-              <span className="block max-w-32 truncate text-[11px] font-bold text-navy">
+              <span className="block max-w-40 truncate text-[14px] font-bold text-navy">
                 {user.name}
               </span>
-              <span className="block text-[10px] text-slate">
+              <span className="block text-[12px] font-medium text-slate">
                 @{user.login}
               </span>
             </span>
@@ -207,7 +207,7 @@ export function AppShell({
         style={{ width: desktopWidth }}
         aria-label="Main navigation"
       >
-        <div className="flex h-16 shrink-0 items-center border-b border-navy-700">
+        <div className="flex h-20 shrink-0 items-center border-b border-navy-700">
           <CloseOnNavLink
             href="/dashboard"
             onNavigate={() => setMobileOpen(false)}
@@ -262,7 +262,7 @@ export function AppShell({
         aria-label="Mobile navigation"
         aria-hidden={!mobileOpen}
       >
-        <div className="flex h-16 shrink-0 items-center justify-between border-b border-navy-700 px-4">
+        <div className="flex h-20 shrink-0 items-center justify-between border-b border-navy-700 px-4">
           <Logo inverse />
           <button
             type="button"
@@ -298,7 +298,7 @@ export function AppShell({
 
       <main
         id="main-content"
-        className={`min-h-[calc(100dvh-4rem)] pt-16 md:min-h-dvh ${transitionClass}`}
+        className={`min-h-[calc(100dvh-5rem)] pt-20 md:min-h-dvh ${transitionClass}`}
         style={{ paddingLeft: desktopWidth }}
       >
         {children}
