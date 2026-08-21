@@ -87,6 +87,38 @@ them would start returning 400.
 
 ---
 
+## Website Studio Phase 3 — payments & checkout (this branch)
+
+**Status: implemented on this branch, awaiting review.** Phase 3 adds a real
+basket and checkout to a Studio shop, backed by Valmont Pay with a local
+test-mode simulator.
+
+What it adds:
+
+- Priced catalogue (`items`) and a `payments` config on the Site Brief
+  (methods, delivery fee/minimum/free-above, order notifications, checkout
+  note). Legacy name-only `products` are auto-migrated into `items` on read.
+- A new wizard **Step 5 "Payments and delivery"**, and Step 4 now takes prices
+  inline (`"Jollof Rice - 45, Banku - 30"`).
+- A working basket + inline checkout in the preview, a public `POST
+/api/studio/drafts/[id]/checkout` that **re-prices every basket server-side**
+  (never trusting a client price), a `POST /api/payments/webhook` keyed on an
+  unguessable per-order access code, and `/pay/[code]` + `/orders/[id]/confirmed`
+  pages.
+- An orders store (SQLite + PostgreSQL) and Drizzle migration `0004` for the
+  `studio_orders` table.
+- Test mode vs live mode is decided by `VALMONT_PAY_API_URL` +
+  `VALMONT_PAY_API_KEY` (see `.env.example`). With them unset, no real money
+  moves.
+
+Deliberately **not** in this phase (follow-ups): sending the order
+notifications (fields exist, no send logic yet), a merchant "mark fulfilled"
+action, HMAC webhook signature verification (placeholder until Valmont Pay
+publishes its signing scheme), per-item image upload UI, including orders in
+backup/export, and Playwright e2e coverage of the checkout flow.
+
+---
+
 ## Unchanged status
 
 **Website Studio Phase 1 has not been merged or deployed.** The final-corrections
