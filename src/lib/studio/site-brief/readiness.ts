@@ -126,7 +126,8 @@ const RULES: Rule[] = [
     label: "Services or products",
     severity: "recommended",
     hint: "List a few services you provide, or the kinds of products you sell.",
-    satisfied: (brief) => filled(brief.services) || filled(brief.products),
+    satisfied: (brief) =>
+      filled(brief.services) || filled(brief.products) || filled(brief.items),
   },
   {
     field: "coverage",

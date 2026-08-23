@@ -571,4 +571,23 @@ test.describe("Website Studio", () => {
     await reopened.close();
     await pageB.close();
   });
+
+  test("the public share link opens the shop without signing in", async ({
+    page,
+    context,
+    browser,
+    baseURL,
+  }) => {
+    await signIn(context, nextOwner(), baseURL!);
+    const draftId = await createDraft(page, "Public Akwaaba");
+    await expect(page.getByTestId("copy-share-link")).toBeVisible();
+
+    const guestContext = await browser.newContext({ baseURL });
+    const guest = await guestContext.newPage();
+    await guest.goto(`/s/${draftId}`);
+    await expect(
+      guest.getByRole("heading", { name: "Public Akwaaba" }),
+    ).toBeVisible();
+    await guestContext.close();
+  });
 });

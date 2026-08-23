@@ -13,6 +13,7 @@ import {
   type PricedLine,
 } from "@/lib/studio/valmont-pay";
 import { isPaymentMethodId } from "@/lib/studio/site-brief/schema";
+import { notifyMerchantNewOrder } from "@/lib/studio/notifications";
 
 const CHECKOUT_BODY_LIMIT_BYTES = 100_000;
 
@@ -108,6 +109,7 @@ export async function POST(
         name: item.name,
         price: item.price,
         quantity: line.quantity,
+        image: item.image,
       });
       pricedLines.push({ price: item.price, quantity: line.quantity });
     }
@@ -161,6 +163,15 @@ export async function POST(
       customerEmail: payload.customerEmail || undefined,
       customerAddress: payload.customerAddress || undefined,
       paymentMethod: payload.paymentMethod,
+      merchantNote: payload.note || undefined,
+    });
+
+    void notifyMerchantNewOrder({
+      order,
+      brief: draft.brief,
+      origin: request.nextUrl.origin,
+    }).catch(() => {
+      /* Never fail checkout because a notification did not send. */
     });
 
     // Cash on delivery and manual methods (bank/momo without Valmont Pay) take

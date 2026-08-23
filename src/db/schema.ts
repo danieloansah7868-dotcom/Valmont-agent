@@ -339,6 +339,10 @@ export const studioOrders = pgTable(
     paidAt: timestamp("paid_at", { withTimezone: true }),
     fulfilledAt: timestamp("fulfilled_at", { withTimezone: true }),
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    preparingAt: timestamp("preparing_at", { withTimezone: true }),
+    outForDeliveryAt: timestamp("out_for_delivery_at", { withTimezone: true }),
+    refundedAt: timestamp("refunded_at", { withTimezone: true }),
+    statusHistory: jsonb("status_history").notNull().default([]),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
