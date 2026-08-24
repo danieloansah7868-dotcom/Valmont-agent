@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 /**
  * The test-mode payment page. It stands in for the hosted Valmont Pay page when
@@ -21,7 +21,6 @@ export function PaySimulator({
   orderId: string;
   amountLabel: string;
 }) {
-  const router = useRouter();
   const [busy, setBusy] = useState<"pay" | "cancel" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -29,23 +28,68 @@ export function PaySimulator({
     setBusy(outcome === "success" ? "pay" : "cancel");
     setError(null);
     try {
-      const response = await fetch(
-        `/api/payments/webhook?access_code=${encodeURIComponent(accessCode)}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ status: outcome }),
-        },
-      );
-      if (!response.ok) {
-        throw new Error("The test payment could not be recorded.");
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 10_000);
+      let response: Response | null = null;
+      try {
+        response = await fetch(
+          `/api/payments/webhook?access_code=${encodeURIComponent(accessCode)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ status: outcome }),
+            signal: controller.signal,
+          },
+        );
+      } finally {
+        window.clearTimeout(timeout);
       }
-      router.push(`/orders/${orderId}/confirmed`);
-      router.refresh();
+      if (response && !response.ok)
+        throw new Error("The test payment could not be recorded.");
+
+      if (outcome === "success") {
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const check = await fetch(
+            `/api/payments/status/${encodeURIComponent(accessCode)}`,
+            { cache: "no-store" },
+          );
+          if (
+            check.ok &&
+            ((await check.json()) as { status?: string }).status === "paid"
+          )
+            break;
+          await new Promise((resolve) => window.setTimeout(resolve, 500));
+        }
+      }
+      // A full navigation cannot be held up by a slow router/rendering state.
+      // A hard navigation avoids the dev router getting stuck on “Rendering…”.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+      window.location.assign(`/orders/${orderId}/confirmed`);
     } catch (cause) {
+      // The server may have saved an aborted request, so check once before showing an error.
+      try {
+        const check = await fetch(
+          `/api/payments/status/${encodeURIComponent(accessCode)}`,
+          { cache: "no-store" },
+        );
+        if (
+          outcome === "success" &&
+          check.ok &&
+          ((await check.json()) as { status?: string }).status === "paid"
+        ) {
+          // A hard navigation avoids the dev router getting stuck on “Rendering…”.
+          // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+          window.location.assign(`/orders/${orderId}/confirmed`);
+          return;
+        }
+      } catch {
+        /* The always-visible order link remains available. */
+      }
       setBusy(null);
       setError(
-        cause instanceof Error ? cause.message : "Something went wrong.",
+        cause instanceof Error && cause.name !== "AbortError"
+          ? cause.message
+          : "This is taking longer than expected. Your payment may already be recorded; use View your order below.",
       );
     }
   }
@@ -85,6 +129,12 @@ export function PaySimulator({
           {error}
         </p>
       )}
+      <Link
+        href={`/orders/${orderId}/confirmed`}
+        className="mt-4 inline-flex text-sm font-semibold text-brandblue underline"
+      >
+        View your order
+      </Link>
     </div>
   );
 }

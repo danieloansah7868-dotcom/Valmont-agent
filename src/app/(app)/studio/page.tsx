@@ -32,6 +32,21 @@ export default async function StudioPage() {
         it later on any device.
       </p>
 
+      <section className="mt-6 rounded-xl border border-copper bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="font-semibold text-navy">Payments</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Set up Valmont Pay safely in Test mode before accepting real
+              payments.
+            </p>
+          </div>
+          <Link href="/studio/payments" className="btn-secondary inline-flex">
+            Open payment settings
+          </Link>
+        </div>
+      </section>
+
       <Link
         href="/studio/drafts/new"
         className="btn-primary mt-5 inline-flex w-full justify-center sm:w-auto"
@@ -156,7 +171,6 @@ export default async function StudioPage() {
           Not working yet — planned for later phases
         </h2>
         <ul className="mt-2 list-disc pl-4 text-xs text-slate-600">
-          <li>Live Valmont Pay merchant onboarding — Phase 5</li>
           <li>Custom domain for this website — Phase 5</li>
         </ul>
       </section>
