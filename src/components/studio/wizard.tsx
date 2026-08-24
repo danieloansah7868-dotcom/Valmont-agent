@@ -19,28 +19,34 @@ import {
   reconcileTemplate,
 } from "@/lib/studio/templates";
 import {
+  PAYMENT_METHODS,
+  REDUNDANT_WHEN_VALMONT_PAY,
   siteBriefSchemaV1,
+  type PaymentMethodId,
   type SiteBriefV1,
   type StudioDraft,
 } from "@/lib/studio/site-brief/schema";
+import { formatPricedItems, parsePricedItems } from "@/lib/studio/catalog";
+import { ShareLinkButton } from "./share-link-button";
+import { ProductImagesEditor } from "./product-images";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { evaluateSaveGate } from "@/lib/studio/save-gate";
 import {
   GHANA_REGIONS,
-  PAYMENT_PLANNING_NOTICE,
-  PLANNED_PAYMENT_METHODS,
   SUPPORTED_COUNTRIES,
   SUPPORTED_CURRENCIES,
   SUPPORTED_TIMEZONES,
   formatGhanaPhone,
 } from "@/lib/studio/site-brief/defaults";
 import { changedFields, mergeBriefs } from "@/lib/studio/merge";
+import { AssetUploader } from "./asset-uploader";
 
 const STEPS = [
   { number: 1, title: "Website type" },
   { number: 2, title: "Package" },
   { number: 3, title: "Look and layout" },
   { number: 4, title: "Business details" },
+  { number: 5, title: "Payments and delivery" },
 ] as const;
 
 type SaveState =
@@ -80,6 +86,14 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
   } | null>(null);
   /** Number of unsaved field changes, tracked in state so render stays pure. */
   const [pendingCount, setPendingCount] = useState(0);
+  /**
+   * Current server-confirmed revision, mirrored from revisionRef so the
+   * AssetUploader (which renders during the main render) can read it without
+   * touching a ref inside render.
+   */
+  const [serverRevision, setServerRevision] = useState<number>(
+    initial.revision,
+  );
 
   /**
    * Everything the save loop needs lives in refs so the loop never restarts
@@ -277,6 +291,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       savedBriefRef.current = updated.brief;
       if (!unmountedRef.current) {
         setPendingCount(0);
+        setServerRevision(updated.revision);
         setSaveState({ kind: "saved", at: updated.updatedAt });
       }
     } catch (cause) {
@@ -411,6 +426,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         <h1 className="text-xl font-bold text-navy sm:text-2xl">
           {brief.businessName || "Untitled website"}
         </h1>
+        <ShareLinkButton draftId={id} compact />
         <span
           data-testid="save-state"
           role="status"
@@ -638,6 +654,39 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   are shown.
                 </p>
               </fieldset>
+
+              <section className="rounded-lg border border-line bg-white p-3">
+                <h3 className="text-sm font-semibold text-navy">
+                  Logo and photos
+                </h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  Pictures you upload stay with this draft and show up in the
+                  preview. They are included when you download a backup.
+                </p>
+                <div className="mt-3">
+                  <AssetUploader
+                    draftId={id}
+                    assets={brief.assets ?? { logo: null, photos: [] }}
+                    expectedRevision={serverRevision}
+                    onSaved={({ assets, revision }) => {
+                      revisionRef.current = revision;
+                      const merged = { ...brief, assets };
+                      setBrief(merged);
+                      savedBriefRef.current = merged;
+                      pendingRef.current = null;
+                      setPendingCount(0);
+                      setServerRevision(revision);
+                      setSaveState({
+                        kind: "saved",
+                        at: new Date().toISOString(),
+                      });
+                    }}
+                    onError={() => {
+                      /* error is shown inside the uploader */
+                    }}
+                  />
+                </div>
+              </section>
             </div>
           )}
 
@@ -820,16 +869,41 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 hint="Separate each one with a comma."
               />
 
-              <TextField
+              <TextArea
                 id="products"
                 label="Products you sell"
-                value={brief.products.map((product) => product.name).join(", ")}
+                value={formatPricedItems(brief.items)}
                 onChange={(value) =>
-                  update({
-                    products: toList(value).map((name) => ({ name })),
-                  })
+                  update({ items: parsePricedItems(value, brief.items) })
                 }
-                hint="Just the names, separated by commas. No prices, stock or checkout in Phase 1."
+              />
+              <p className="text-xs text-slate-500">
+                One item per line works best, or separate with commas. Add a
+                price with a dash, e.g. Jollof Rice - 45.
+              </p>
+              {brief.items.length > 0 && (
+                <ul
+                  data-testid="parsed-items-preview"
+                  className="grid gap-1 rounded-lg border border-line bg-ivory-50 p-3 text-sm"
+                >
+                  {brief.items.map((item) => (
+                    <li
+                      key={item.id}
+                      className="flex items-center justify-between gap-3"
+                    >
+                      <span>{item.name}</span>
+                      <span className="text-xs font-semibold text-copper">
+                        {item.price !== undefined
+                          ? `GH₵${item.price}`
+                          : "No price — shown as information only"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <ProductImagesEditor
+                items={brief.items}
+                onChange={(items) => update({ items })}
               />
 
               <TextField
@@ -848,33 +922,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 hint="A note for planning only — no delivery is arranged by this app."
               />
 
-              <fieldset className="grid gap-2 rounded-lg border border-line p-3">
-                <legend className="text-sm font-semibold">
-                  Payment methods you might want later
-                </legend>
-                <p className="text-xs text-amber-800">
-                  {PAYMENT_PLANNING_NOTICE}
-                </p>
-                {PLANNED_PAYMENT_METHODS.map((method) => (
-                  <label key={method.id} className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={brief.plannedPaymentMethods.includes(method.id)}
-                      onChange={(event) =>
-                        update({
-                          plannedPaymentMethods: event.target.checked
-                            ? [...brief.plannedPaymentMethods, method.id]
-                            : brief.plannedPaymentMethods.filter(
-                                (item) => item !== method.id,
-                              ),
-                        })
-                      }
-                    />
-                    <span className="text-sm">{method.label}</span>
-                  </label>
-                ))}
-              </fieldset>
-
               <TextArea
                 id="specialInstructions"
                 label="Anything else Valmont should know"
@@ -883,6 +930,229 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   update({ specialInstructions: value || undefined })
                 }
               />
+            </div>
+          )}
+
+          {step === 5 && (
+            <div className="grid gap-4">
+              <fieldset className="grid gap-2 rounded-lg border border-line p-3">
+                <legend className="text-sm font-semibold">
+                  Accept orders and payments
+                </legend>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={brief.payments.enabled}
+                    onChange={(event) =>
+                      update({
+                        payments: {
+                          ...brief.payments,
+                          enabled: event.target.checked,
+                        },
+                      })
+                    }
+                    data-testid="payments-enabled"
+                  />
+                  <span className="text-sm">
+                    Turn on a basket and checkout on this website
+                  </span>
+                </label>
+                <p className="text-xs text-slate-600">
+                  Add prices to your products in Step 4 so customers can add
+                  them to a basket and pay.
+                </p>
+              </fieldset>
+
+              {brief.payments.enabled && (
+                <>
+                  <fieldset className="grid gap-2 rounded-lg border border-line p-3">
+                    <legend className="text-sm font-semibold">
+                      How can customers pay?
+                    </legend>
+                    {PAYMENT_METHODS.filter((method) => {
+                      if (
+                        brief.payments.methods.includes("valmont_pay") &&
+                        REDUNDANT_WHEN_VALMONT_PAY.includes(method.id)
+                      ) {
+                        return false;
+                      }
+                      return true;
+                    }).map((method) => (
+                      <label key={method.id} className="flex items-start gap-2">
+                        <input
+                          type="checkbox"
+                          className="mt-1"
+                          checked={brief.payments.methods.includes(method.id)}
+                          onChange={(event) => {
+                            let methods: PaymentMethodId[] = event.target
+                              .checked
+                              ? [...brief.payments.methods, method.id]
+                              : brief.payments.methods.filter(
+                                  (id) => id !== method.id,
+                                );
+                            if (
+                              method.id === "valmont_pay" &&
+                              event.target.checked
+                            ) {
+                              methods = methods.filter(
+                                (id) =>
+                                  !REDUNDANT_WHEN_VALMONT_PAY.includes(id),
+                              );
+                            }
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                methods,
+                              },
+                            });
+                          }}
+                        />
+                        <span>
+                          <span className="block text-sm font-semibold">
+                            {method.label}
+                          </span>
+                          <span className="block text-xs text-slate-600">
+                            {method.description}
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                  </fieldset>
+
+                  <fieldset className="grid gap-3 rounded-lg border border-line p-3">
+                    <legend className="text-sm font-semibold">Delivery</legend>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={brief.payments.delivery.enabled}
+                        onChange={(event) =>
+                          update({
+                            payments: {
+                              ...brief.payments,
+                              delivery: {
+                                ...brief.payments.delivery,
+                                enabled: event.target.checked,
+                              },
+                            },
+                          })
+                        }
+                      />
+                      <span className="text-sm">Offer delivery</span>
+                    </label>
+
+                    {brief.payments.delivery.enabled && (
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        <NumberField
+                          id="deliveryFee"
+                          label="Delivery fee"
+                          value={brief.payments.delivery.fee}
+                          onChange={(value) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                delivery: {
+                                  ...brief.payments.delivery,
+                                  fee: value,
+                                },
+                              },
+                            })
+                          }
+                        />
+                        <NumberField
+                          id="minimumOrder"
+                          label="Minimum order"
+                          value={brief.payments.delivery.minimumOrder}
+                          onChange={(value) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                delivery: {
+                                  ...brief.payments.delivery,
+                                  minimumOrder: value,
+                                },
+                              },
+                            })
+                          }
+                        />
+                        <NumberField
+                          id="freeDeliveryAbove"
+                          label="Free delivery above"
+                          value={brief.payments.delivery.freeDeliveryAbove ?? 0}
+                          onChange={(value) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                delivery: {
+                                  ...brief.payments.delivery,
+                                  freeDeliveryAbove:
+                                    value > 0 ? value : undefined,
+                                },
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    )}
+                  </fieldset>
+
+                  <fieldset className="grid gap-3 rounded-lg border border-line p-3">
+                    <legend className="text-sm font-semibold">
+                      Order notifications
+                    </legend>
+                    <p className="text-xs text-slate-600">
+                      Where the business is told about new orders.
+                    </p>
+                    <TextField
+                      id="notifyEmail"
+                      label="Email for orders"
+                      type="email"
+                      value={brief.payments.notifications.email ?? ""}
+                      onChange={(value) =>
+                        update({
+                          payments: {
+                            ...brief.payments,
+                            notifications: {
+                              ...brief.payments.notifications,
+                              email: value || undefined,
+                            },
+                          },
+                        })
+                      }
+                    />
+                    <TextField
+                      id="notifyWhatsapp"
+                      label="WhatsApp for orders"
+                      type="tel"
+                      value={brief.payments.notifications.whatsapp ?? ""}
+                      onChange={(value) =>
+                        update({
+                          payments: {
+                            ...brief.payments,
+                            notifications: {
+                              ...brief.payments.notifications,
+                              whatsapp: formatGhanaPhone(value) || undefined,
+                            },
+                          },
+                        })
+                      }
+                    />
+                  </fieldset>
+
+                  <TextArea
+                    id="checkoutNote"
+                    label="Message shown at checkout"
+                    value={brief.payments.checkoutNote ?? ""}
+                    onChange={(value) =>
+                      update({
+                        payments: {
+                          ...brief.payments,
+                          checkoutNote: value || undefined,
+                        },
+                      })
+                    }
+                  />
+                </>
+              )}
             </div>
           )}
 
@@ -1015,12 +1285,47 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           </section>
 
           <div className="mt-4">
-            <BusinessPreview brief={brief} />
+            <BusinessPreview brief={brief} draftId={id} />
           </div>
         </aside>
       </div>
 
-      <div className="mt-8 border-t border-line pt-4">
+      <div className="mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setStep((s) => Math.max(1, s - 1))}
+            disabled={step <= 1}
+            data-testid="wizard-back"
+            className="btn-secondary min-h-10 px-3 text-sm"
+          >
+            Back
+          </button>
+          {step < STEPS.length ? (
+            <button
+              type="button"
+              onClick={() => setStep((s) => Math.min(STEPS.length, s + 1))}
+              data-testid="wizard-next"
+              className="btn-primary min-h-10 px-3 text-sm"
+            >
+              Next
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void finishAndLeave()}
+              disabled={!validation.ok || saveState.kind === "saving"}
+              title={
+                validation.ok ? undefined : "Fix the highlighted answers first."
+              }
+              data-testid="done-to-studio"
+              className="btn-primary min-h-10 inline-flex items-center gap-2 px-4 text-sm"
+            >
+              {saveState.kind === "saving" ? "Saving…" : "Done"}
+            </button>
+          )}
+        </div>
+
         {confirmingDelete ? (
           <div
             ref={deleteDialogRef}
@@ -1029,7 +1334,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             aria-labelledby="delete-confirm-heading"
             aria-describedby="delete-confirm-body"
             data-testid="delete-confirm"
-            className="rounded-lg border border-red-300 bg-red-50 p-4"
+            className="w-full rounded-lg border border-red-300 bg-red-50 p-4"
           >
             <h3
               id="delete-confirm-heading"
@@ -1063,7 +1368,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             </div>
           </div>
         ) : (
-          <>
+          <div className="text-right">
             <button
               type="button"
               onClick={(event) => {
@@ -1080,7 +1385,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               Deleting removes the draft permanently. Download a backup first if
               you want to keep a copy.
             </p>
-          </>
+          </div>
         )}
       </div>
     </div>
@@ -1127,6 +1432,40 @@ function TextField({
           {hint}
         </p>
       )}
+    </div>
+  );
+}
+
+function NumberField({
+  id,
+  label,
+  value,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <div className="grid gap-1">
+      <label htmlFor={id} className="text-sm font-semibold">
+        {label}
+      </label>
+      <input
+        id={id}
+        name={id}
+        type="number"
+        min={0}
+        step="0.01"
+        inputMode="decimal"
+        value={Number.isFinite(value) ? value : 0}
+        onChange={(event) => {
+          const next = Number(event.target.value);
+          onChange(Number.isFinite(next) ? next : 0);
+        }}
+        className="w-full rounded-lg border border-line px-3 py-2 text-base"
+      />
     </div>
   );
 }

@@ -10,6 +10,7 @@ import {
   Globe,
   Layers,
   Megaphone,
+  MessageSquare,
   PlugZap,
   ShieldCheck,
   Sparkles,
@@ -35,8 +36,8 @@ type Venture = {
 
 const ventures: Venture[] = [
   {
-    slug: "val-pay",
-    name: "Val Pay",
+    slug: "valmont-pay",
+    name: "Valmont Pay",
     tagline: "Payments, simplified.",
     description:
       "A fast, reliable payments layer for sending, receiving, and settling money across wallets, cards, and accounts.",
@@ -44,8 +45,8 @@ const ventures: Venture[] = [
     category: "Fintech",
   },
   {
-    slug: "val-data",
-    name: "Val Data",
+    slug: "valmont-data",
+    name: "Valmont Data",
     tagline: "Data that decides.",
     description:
       "Data pipelines, analytics, and insights that turn raw activity into the decisions that move a business forward.",
@@ -53,8 +54,8 @@ const ventures: Venture[] = [
     category: "Data & Analytics",
   },
   {
-    slug: "val-electrical",
-    name: "Val Electrical",
+    slug: "valmont-electrical",
+    name: "Valmont Electrical",
     tagline: "Power, done properly.",
     description:
       "Electrical installation, maintenance, and smart-power solutions for homes, businesses, and industrial sites.",
@@ -62,8 +63,8 @@ const ventures: Venture[] = [
     category: "Services",
   },
   {
-    slug: "val-gadgets",
-    name: "Val Gadgets",
+    slug: "valmont-gadgets",
+    name: "Valmont Gadgets",
     tagline: "Tech you can trust.",
     description:
       "Curated phones, accessories, and smart devices — sourced, checked, and supported with real after-sales care.",
@@ -71,8 +72,8 @@ const ventures: Venture[] = [
     category: "Retail",
   },
   {
-    slug: "val-web",
-    name: "Val Web",
+    slug: "valmont-web",
+    name: "Valmont Web",
     tagline: "Websites that work.",
     description:
       "Design and engineering for fast, responsive websites and web apps that look sharp and convert visitors.",
@@ -80,8 +81,8 @@ const ventures: Venture[] = [
     category: "Web",
   },
   {
-    slug: "val-ecosystem",
-    name: "Val Ecosystem",
+    slug: "valmont-ecosystem",
+    name: "Valmont Ecosystem",
     tagline: "One connected network.",
     description:
       "The connecting layer across every Valmont venture — shared identity, payments, data, and tooling under one roof.",
@@ -89,8 +90,8 @@ const ventures: Venture[] = [
     category: "Platform",
   },
   {
-    slug: "val-bank",
-    name: "Val Bank",
+    slug: "valmont-bank",
+    name: "Valmont Bank",
     tagline: "Banking, rebuilt.",
     description:
       "Modern digital banking: accounts, transfers, cards, and savings built around how people actually manage money.",
@@ -98,8 +99,8 @@ const ventures: Venture[] = [
     category: "Fintech",
   },
   {
-    slug: "val-agent",
-    name: "Val Agent",
+    slug: "valmont-agent",
+    name: "Valmont Agent",
     tagline: "An agent you stay in control of.",
     description:
       "A private, approval-first AI coding agent for GitHub repositories — it proposes, you approve every meaningful step.",
@@ -109,8 +110,19 @@ const ventures: Venture[] = [
     live: true,
   },
   {
-    slug: "val-ads",
-    name: "Val Ads Web",
+    slug: "valmont-chat",
+    name: "Valmont Chat",
+    tagline: "Chat that plans and builds.",
+    description:
+      "A conversational AI partner that turns an idea into a website brief, a plan, and the code to ship it — always with you in the loop.",
+    icon: MessageSquare,
+    category: "AI / Chat",
+    href: "/chat",
+    live: true,
+  },
+  {
+    slug: "valmont-ads",
+    name: "Valmont Ads Web",
     tagline: "Ads that find their audience.",
     description:
       "Digital advertising and campaign management — targeted reach, clear reporting, and measurable return on spend.",
@@ -212,7 +224,7 @@ export default function PortfolioPage() {
         <div className="mx-auto flex max-w-[1180px] items-center justify-between gap-4 px-5 py-2 text-[11px] sm:px-8">
           <span className="flex items-center gap-2 font-semibold text-ivory/80">
             <BellRing className="size-3.5 text-copper" aria-hidden="true" />
-            Val Agent is live — an approval-first AI coding agent.
+            Valmont Agent is live — an approval-first AI coding agent.
           </span>
           <Link
             href="/agent"
@@ -254,7 +266,7 @@ export default function PortfolioPage() {
           </div>
           <Link href="/agent" className="btn-primary min-h-10 px-4 text-[13px]">
             <Bot className="size-4" aria-hidden="true" />
-            Open Val Agent
+            Open Valmont Agent
           </Link>
         </div>
       </nav>
@@ -300,7 +312,7 @@ export default function PortfolioPage() {
                 className="btn-secondary min-h-12 px-5 text-[15px]"
               >
                 <Bot className="size-[18px]" aria-hidden="true" />
-                Try Val Agent
+                Try Valmont Agent
               </Link>
             </div>
 
@@ -357,7 +369,7 @@ export default function PortfolioPage() {
                         aria-hidden="true"
                       />
                       <span className="text-[10px] leading-tight font-bold text-ivory/90">
-                        {v.name.replace("Val ", "")}
+                        {v.name.replace("Valmont ", "")}
                       </span>
                     </div>
                   );
@@ -452,7 +464,7 @@ export default function PortfolioPage() {
         </div>
       </section>
 
-      {/* Featured: Val Agent */}
+      {/* Featured: Valmont Agent */}
       <section className="relative overflow-hidden bg-navy text-ivory">
         <div
           className="pointer-events-none absolute -top-32 -right-24 h-[460px] w-[460px] rounded-full bg-[radial-gradient(circle,rgba(232,130,43,0.35)_0%,transparent_66%)]"
@@ -468,21 +480,21 @@ export default function PortfolioPage() {
               LIVE NOW
             </span>
             <h2 className="text-balance mt-6 text-[36px] leading-[1.08] font-[750] tracking-[-0.035em] text-ivory sm:text-[48px]">
-              Meet <span className="text-copper">Val Agent</span> — your
+              Meet <span className="text-copper">Valmont Agent</span> — your
               approval-first coding partner.
             </h2>
             <p className="mt-6 max-w-[520px] text-[16px] leading-7 text-ivory/70">
-              Val Agent inspects your repository, proposes a plan, and waits.
-              You approve every meaningful boundary — from implementation to
-              pull request. It never merges, never deploys, and keeps your keys
-              server-side.
+              Valmont Agent inspects your repository, proposes a plan, and
+              waits. You approve every meaningful boundary — from implementation
+              to pull request. It never merges, never deploys, and keeps your
+              keys server-side.
             </p>
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
               <Link
                 href="/agent"
                 className="btn-primary min-h-12 px-5 text-[15px]"
               >
-                Open Val Agent
+                Open Valmont Agent
                 <ArrowRight className="size-4" aria-hidden="true" />
               </Link>
               <Link
@@ -625,7 +637,7 @@ export default function PortfolioPage() {
                 className="btn-inverse min-h-12 px-6 text-[15px]"
               >
                 <Bot className="size-[18px]" aria-hidden="true" />
-                Try Val Agent
+                Try Valmont Agent
               </Link>
             </div>
           </div>
@@ -649,7 +661,7 @@ export default function PortfolioPage() {
               About
             </a>
             <Link href="/agent" className="hover:text-copper-700">
-              Val Agent
+              Valmont Agent
             </Link>
             <a
               href="mailto:hello@valmont.app"

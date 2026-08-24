@@ -5,8 +5,38 @@ import { isPackageId } from "../packages";
 import { isTemplateId, isTemplateCompatible } from "../templates";
 import { isThemeId, HEX_COLOR_RE } from "../themes";
 import { isGhanaRegion } from "./defaults";
+import { ACCEPTED_MIME_TYPES } from "../assets";
 
 export const SITE_BRIEF_VERSION = 1 as const;
+
+/**
+ * A stored image (logo or photo). Images are kept as data URLs inside the
+ * brief so backup/import carries them automatically and no filesystem or
+ * binary column is required. Size/shape checks live in ../assets.ts.
+ */
+const storedImageSchema = z.object({
+  dataUrl: z
+    .string()
+    .max(1_600_000, "Image is too large")
+    .regex(
+      /^data:image\/(png|jpeg|webp|gif);base64,/,
+      "Image must be a data URL",
+    ),
+  fileName: z.string().max(200),
+  mime: z
+    .string()
+    .refine((v) => ACCEPTED_MIME_TYPES.has(v), "Unsupported image type"),
+  width: z.number().int().min(1).max(4000),
+  height: z.number().int().min(1).max(4000),
+  size: z.number().int().min(1).max(1_500_000),
+});
+
+const assetsSchema = z
+  .object({
+    logo: storedImageSchema.nullable().default(null),
+    photos: z.array(storedImageSchema).max(8).default([]),
+  })
+  .default({ logo: null, photos: [] });
 
 /**
  * Every IPv4 block that is not ordinary public unicast, as a
@@ -267,8 +297,6 @@ const e164 = z
   .string()
   .regex(/^\+\d{8,15}$/, "Phone must be E.164 like +233...");
 
-const socialLink = z.object({ platform: z.string().max(40), url: httpsUrl });
-
 /**
  * Free text the owner types, cleaned on the way in.
  *
@@ -283,6 +311,174 @@ const freeText = (max: number) =>
     .string()
     .max(max)
     .transform((value) => redactPaymentData(redactSecrets(value)));
+
+const socialLink = z.object({ platform: z.string().max(40), url: httpsUrl });
+
+/**
+ * Phase 3 payments. The operational payment methods a shop can switch on for a
+ * real checkout, each with a short plain-language description. This is separate
+ * from `plannedPaymentMethods`, which is Phase-1 planning data only.
+ */
+export const PAYMENT_METHODS = [
+  {
+    id: "valmont_pay",
+    label: "Mobile Money, Card and Bank transfer",
+    description:
+      "One checkout that accepts Mobile Money, cards and bank transfer. Money settles to your account.",
+  },
+  {
+    id: "momo",
+    label: "Mobile Money",
+    description: "MTN MoMo, Telecel Cash and AirtelTigo Money.",
+  },
+  {
+    id: "card",
+    label: "Debit / credit card",
+    description: "Visa and Mastercard.",
+  },
+  {
+    id: "bank",
+    label: "Bank transfer",
+    description: "Customer transfers to your bank and confirms.",
+  },
+  {
+    id: "cod",
+    label: "Cash on delivery",
+    description: "Customer pays cash when the order arrives.",
+  },
+] as const;
+
+export type PaymentMethodId = (typeof PAYMENT_METHODS)[number]["id"];
+
+export function isPaymentMethodId(value: string): value is PaymentMethodId {
+  return PAYMENT_METHODS.some((method) => method.id === value);
+}
+
+/**
+ * Methods shown to a customer at checkout. When Valmont Pay is on, the
+ * manual Mobile Money / card / bank boxes are redundant — they are the
+ * same rails, just without the hosted page — so they are hidden.
+ */
+export function customerFacingPaymentMethods(
+  methods: readonly string[],
+): PaymentMethodId[] {
+  const enabled = methods.filter(isPaymentMethodId);
+  if (enabled.includes("valmont_pay")) {
+    return enabled.filter((id) => id === "valmont_pay" || id === "cod");
+  }
+  return enabled;
+}
+
+/** Manual methods that duplicate Valmont Pay and should stay out of the wizard. */
+export const REDUNDANT_WHEN_VALMONT_PAY: readonly PaymentMethodId[] = [
+  "momo",
+  "card",
+  "bank",
+];
+
+/**
+ * A money amount typed by the owner. Accepts a number or a string (people type
+ * "45" or "45.00" or "GH₵45"); everything that is not a digit or a decimal
+ * point is stripped before parsing. Two decimal places, non-negative, and
+ * capped so a typo cannot create an absurd order total.
+ */
+const priceAmount = z
+  .union([z.number(), z.string()])
+  .transform((value) => {
+    if (typeof value === "number") return value;
+    const cleaned = value.replace(/[^0-9.]/g, "");
+    return cleaned === "" ? 0 : Number(cleaned);
+  })
+  .pipe(
+    z
+      .number()
+      .min(0, "Price cannot be negative")
+      .max(1_000_000, "Price is too large")
+      .refine(
+        (n) => Number.isFinite(n) && Math.round(n * 100) === n * 100,
+        "Price can have at most two decimal places",
+      ),
+  );
+
+export { priceAmount };
+
+/**
+ * A single item in a shop's catalogue. A priced item can be added to a basket
+ * and paid for; an unpriced item is shown for information only.
+ */
+export const catalogItemSchema = z.object({
+  id: z.string().max(64),
+  name: freeText(80),
+  price: priceAmount.optional(),
+  category: freeText(40).optional(),
+  description: freeText(300).optional(),
+  image: z
+    .string()
+    .max(1_600_000)
+    .regex(/^data:image\//, "Image must be a data URL")
+    .optional(),
+});
+
+export type CatalogItem = z.infer<typeof catalogItemSchema>;
+
+const paymentsConfigSchema = z
+  .object({
+    /** Master switch: when false, no basket, checkout or payment is offered. */
+    enabled: z.boolean().default(false),
+    /** Which operational methods a customer may choose at checkout. */
+    methods: z
+      .array(z.enum(["valmont_pay", "momo", "card", "bank", "cod"]))
+      .max(5)
+      .default([]),
+    valmontPay: z
+      .object({
+        merchantId: z.string().max(120).optional(),
+        /** Never sent to the browser: stripped by the public draft reader. */
+        apiKey: z.string().max(200).optional(),
+        provisioned: z.boolean().default(false),
+      })
+      .default({ provisioned: false }),
+    delivery: z
+      .object({
+        enabled: z.boolean().default(false),
+        fee: priceAmount.default(0),
+        minimumOrder: priceAmount.default(0),
+        freeDeliveryAbove: priceAmount.optional(),
+      })
+      .default({ enabled: false, fee: 0, minimumOrder: 0 }),
+    notifications: z
+      .object({
+        email: z.string().email().max(254).optional(),
+        whatsapp: e164.optional(),
+      })
+      .default({}),
+    checkoutNote: freeText(500).optional(),
+    /** Reserved for a future multi-stage (deposit/balance) checkout. */
+    staged: z
+      .object({
+        enabled: z.boolean().default(false),
+        stages: z
+          .array(
+            z.object({
+              label: freeText(60),
+              percent: z.number().min(0).max(100),
+            }),
+          )
+          .max(4)
+          .default([]),
+      })
+      .default({ enabled: false, stages: [] }),
+  })
+  .default({
+    enabled: false,
+    methods: [],
+    valmontPay: { provisioned: false },
+    delivery: { enabled: false, fee: 0, minimumOrder: 0 },
+    notifications: {},
+    staged: { enabled: false, stages: [] },
+  });
+
+export type PaymentsConfig = z.infer<typeof paymentsConfigSchema>;
 
 const baseSiteBriefV1 = z.object({
   schemaVersion: z.literal(1),
@@ -318,7 +514,7 @@ const baseSiteBriefV1 = z.object({
   domainName: domainName.optional(),
   preferredLanguage: z.string().max(20).optional(),
   existingWebsite: httpsUrl.optional(),
-  assetStatus: z.literal("not_provided").default("not_provided"),
+  assets: assetsSchema,
   products: z
     .array(
       z.object({
@@ -328,6 +524,14 @@ const baseSiteBriefV1 = z.object({
     )
     .max(50)
     .default([]),
+  /**
+   * Phase 3 priced catalogue. This supersedes the name-only `products` list
+   * above (kept for backward compatibility and auto-migrated into `items` by
+   * the draft store). A priced item can be added to a basket and paid for.
+   */
+  items: z.array(catalogItemSchema).max(200).default([]),
+  /** Phase 3 payments and delivery configuration. */
+  payments: paymentsConfigSchema,
   country: z.string().max(60).default("Ghana"),
   currency: z.string().max(10).default("GHS"),
   timezone: z.string().max(40).default("Africa/Accra"),

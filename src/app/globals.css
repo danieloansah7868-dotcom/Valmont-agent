@@ -58,26 +58,22 @@
   --color-attention-soft: #fbf1e0;
 }
 
-/*
- * Element defaults live in Tailwind's `base` layer so any utility class can
- * override them.
- */
 @layer base {
   :root {
     color-scheme: light;
     --shadow-brand: 0 18px 48px rgb(9 21 52 / 0.12);
   }
-
+  
   * {
     box-sizing: border-box;
   }
-
+  
   html {
     background: var(--color-ivory-50);
     color: var(--color-navy);
     scroll-behavior: smooth;
   }
-
+  
   /* Chat is a viewport workspace: its transcript owns vertical scrolling. */
   html.chat-page,
   html.chat-page body {
@@ -85,7 +81,7 @@
     overflow: hidden;
     overscroll-behavior: none;
   }
-
+  
   body {
     min-height: 100vh;
     margin: 0;
@@ -98,46 +94,43 @@
       "cv11" 1;
     -webkit-font-smoothing: antialiased;
   }
-
+  
   h1,
   h2,
   h3,
   h4 {
     color: var(--color-navy);
   }
-
+  
   button,
   a {
     -webkit-tap-highlight-color: transparent;
   }
-
+  
   /* Visible, consistent copper focus ring everywhere. */
   :focus-visible {
     outline: 2px solid var(--color-copper);
     outline-offset: 2px;
     border-radius: 6px;
   }
-
+  
   ::selection {
     background: var(--color-copper-100);
     color: var(--color-navy);
   }
+  
 }
 
-/* Project utilities sit in the `utilities` layer alongside Tailwind's own. */
 @layer utilities {
   .text-balance {
     text-wrap: balance;
   }
 }
 
-/*
- * Component classes MUST live in the `components` layer. Unlayered CSS beats
- * every layered rule in the cascade, so leaving these at the top level made
- * `.btn-quiet` outrank utilities like `md:hidden`, `px-0` and `size-9` — icon
- * buttons in the app header rendered at the wrong size and the desktop/mobile
- * variants both stayed visible. Keeping them layered restores the normal
- * "utility wins" contract the components rely on.
+/* ---------- surfaces / buttons / forms / code / loading ----------
+ * These live in @layer components so Tailwind utilities (px-0, hidden,
+ * size-9, md:hidden, …) can override them. Unlayered component CSS in
+ * Tailwind v4 always wins, which crushed the icon-only header buttons.
  */
 @layer components {
   /* ---------- surfaces ---------- */
@@ -258,11 +251,7 @@
     color: var(--color-navy);
   }
 
-  /*
-   * Square icon button for toolbars. Transparent ghost buttons were effectively
-   * invisible against the ivory header, so this keeps a permanent outline and a
-   * full-contrast navy glyph. Sizing is left to utilities.
-   */
+  /* Outlined icon control keeps toolbar actions visible on the ivory header. */
   .btn-icon {
     display: inline-flex;
     align-items: center;
@@ -276,10 +265,7 @@
     font-weight: 650;
     line-height: 1;
     cursor: pointer;
-    transition:
-      background-color 150ms ease,
-      border-color 150ms ease,
-      color 150ms ease;
+    transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
   }
 
   .btn-icon:hover {

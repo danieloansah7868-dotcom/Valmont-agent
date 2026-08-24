@@ -4,12 +4,24 @@ import { getStudioDraftStore } from "@/lib/studio/draft-store";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { getCategory } from "@/lib/studio/categories";
 import { BackupControls } from "@/components/studio/backup-controls";
+import { ShareLinkButton } from "@/components/studio/share-link-button";
+import { canonicalUserId } from "@/lib/user-identity";
+import { getOrdersStore, type OrderRecord } from "@/lib/studio/orders";
+import { formatMoney } from "@/lib/studio/valmont-pay";
+import { STATUS_BADGE_CLASS, STATUS_LABELS } from "@/lib/studio/order-status";
+import { formatAccra } from "@/lib/studio/format";
 
 export const dynamic = "force-dynamic";
 
 export default async function StudioPage() {
   const user = await requireSessionUser();
   const drafts = await getStudioDraftStore().list(user);
+
+  const hasShop = drafts.some((draft) => draft.brief.payments?.enabled);
+  let orders: OrderRecord[] = [];
+  if (hasShop) {
+    orders = await getOrdersStore().listForOwner(canonicalUserId(user), 10);
+  }
 
   return (
     <div className="mx-auto w-full max-w-[980px] p-4 sm:p-6">
@@ -60,17 +72,72 @@ export default async function StudioPage() {
                     {completeness.missingRequired.length === 1 ? "" : "s"} left
                   </p>
                   <p className="mt-1 text-xs text-slate-500">
-                    Last saved{" "}
-                    {new Date(draft.updatedAt).toLocaleString("en-GB", {
-                      timeZone: "Africa/Accra",
-                    })}
+                    Last saved {formatAccra(draft.updatedAt)}
                   </p>
+                  <div className="mt-3">
+                    <ShareLinkButton draftId={draft.id} compact />
+                  </div>
                 </li>
               );
             })}
           </ul>
         )}
       </section>
+
+      {hasShop && (
+        <section className="mt-8" aria-labelledby="orders-heading">
+          <div className="flex flex-wrap items-end justify-between gap-2">
+            <h2 id="orders-heading" className="text-lg font-semibold text-navy">
+              Recent orders
+            </h2>
+            <Link
+              href="/studio/orders"
+              className="text-sm font-semibold text-brandblue underline"
+            >
+              View all orders
+            </Link>
+          </div>
+          {orders.length === 0 ? (
+            <p className="mt-2 text-sm text-slate-600">
+              No orders yet. When a customer checks out, their order appears
+              here.
+            </p>
+          ) : (
+            <ul className="mt-3 grid gap-2" data-testid="orders-list">
+              {orders.map((order) => (
+                <li key={order.id}>
+                  <Link
+                    href={`/studio/orders/${order.id}`}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-line bg-white p-3 hover:border-copper"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-navy">
+                        {order.customerName} · {order.id.slice(0, 8)}
+                      </p>
+                      <p className="text-xs text-slate-600">
+                        {formatAccra(order.createdAt)}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                          STATUS_BADGE_CLASS[order.status] ??
+                          "bg-slate-200 text-slate-700"
+                        }`}
+                      >
+                        {STATUS_LABELS[order.status]}
+                      </span>
+                      <span className="text-sm font-semibold">
+                        {formatMoney(order.total, order.currency)}
+                      </span>
+                    </div>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       <section className="mt-8" aria-labelledby="backup-heading">
         <h2 id="backup-heading" className="text-lg font-semibold text-navy">
@@ -89,14 +156,8 @@ export default async function StudioPage() {
           Not working yet — planned for later phases
         </h2>
         <ul className="mt-2 list-disc pl-4 text-xs text-slate-600">
-          <li>Logo and photo uploads — Phase 2</li>
-          <li>Building the real website code — Phase 5</li>
-          <li>
-            Payments and checkout (Mobile Money, Paystack, Valmont Pay, cards) —
-            Phase 3. Anything you record now is a note about your preferences
-            only; nothing can take a payment.
-          </li>
-          <li>Publishing the website online — Phase 6</li>
+          <li>Live Valmont Pay merchant onboarding — Phase 5</li>
+          <li>Custom domain for this website — Phase 5</li>
         </ul>
       </section>
 
