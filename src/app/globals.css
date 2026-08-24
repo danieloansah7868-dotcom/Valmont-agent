@@ -63,17 +63,17 @@
     color-scheme: light;
     --shadow-brand: 0 18px 48px rgb(9 21 52 / 0.12);
   }
-  
+
   * {
     box-sizing: border-box;
   }
-  
+
   html {
     background: var(--color-ivory-50);
     color: var(--color-navy);
     scroll-behavior: smooth;
   }
-  
+
   /* Chat is a viewport workspace: its transcript owns vertical scrolling. */
   html.chat-page,
   html.chat-page body {
@@ -81,7 +81,7 @@
     overflow: hidden;
     overscroll-behavior: none;
   }
-  
+
   body {
     min-height: 100vh;
     margin: 0;
@@ -94,31 +94,30 @@
       "cv11" 1;
     -webkit-font-smoothing: antialiased;
   }
-  
+
   h1,
   h2,
   h3,
   h4 {
     color: var(--color-navy);
   }
-  
+
   button,
   a {
     -webkit-tap-highlight-color: transparent;
   }
-  
+
   /* Visible, consistent copper focus ring everywhere. */
   :focus-visible {
     outline: 2px solid var(--color-copper);
     outline-offset: 2px;
     border-radius: 6px;
   }
-  
+
   ::selection {
     background: var(--color-copper-100);
     color: var(--color-navy);
   }
-  
 }
 
 @layer utilities {
@@ -265,7 +264,10 @@
     font-weight: 650;
     line-height: 1;
     cursor: pointer;
-    transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+    transition:
+      background-color 150ms ease,
+      border-color 150ms ease,
+      color 150ms ease;
   }
 
   .btn-icon:hover {
