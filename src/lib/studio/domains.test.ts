@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { getDomainStore } from "./domains";
-import { getSqliteChatStore } from "@/lib/chat-store";
-import { DatabaseSync } from "node:sqlite";
+
+
 
 describe("DomainStore (SQLite)", () => {
   let store: ReturnType<typeof getDomainStore>;

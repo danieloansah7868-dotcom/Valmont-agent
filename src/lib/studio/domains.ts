@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { getDatabase } from "@/db";
 import { studioDomains } from "@/db/schema";
 import { getSqliteChatStore } from "@/lib/chat-store";
-import type { SessionUser } from "@/lib/auth";
+
 
 export const DOMAIN_STATUS = ["not_set", "pending", "active", "error"] as const;
 export type DomainStatus = (typeof DOMAIN_STATUS)[number];

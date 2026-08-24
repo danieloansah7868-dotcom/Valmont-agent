@@ -2,9 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { POST } from "./route";
 import { NextRequest } from "next/server";
 import * as auth from "@/lib/auth";
-import * as apiLib from "@/lib/api";
 import dns from "node:dns/promises";
-import { getStudioDraftStore } from "@/lib/studio/draft-store";
 
 vi.mock("@/lib/auth");
 vi.mock("@/lib/security", () => ({ assertCsrf: vi.fn() }));
@@ -34,12 +32,14 @@ describe("Custom Domain API", () => {
   
   beforeEach(async () => {
     vi.resetAllMocks();
-    vi.mocked(auth.requireApiSessionUser).mockResolvedValue({ id: userId } as any);
+    // @ts-expect-error Mocked value
+    vi.mocked(auth.requireApiSessionUser).mockResolvedValue({ id: userId });
     
     // Spy on getStudioDraftStore
     const fakeStore = {
+      // @ts-expect-error Mocked value
       get: vi.fn().mockResolvedValue({ id: "draft-123", ownerId: "user-123" })
-    } as any;
+    };
     vi.spyOn(await import("@/lib/studio/draft-store"), "getStudioDraftStore").mockReturnValue(fakeStore);
     
     __mocks.getDomainByHostname.mockResolvedValue(null);
@@ -66,8 +66,10 @@ describe("Custom Domain API", () => {
   it("falls back to lookup and sets status active if IP matches", async () => {
     vi.mocked(dns.resolveCname).mockRejectedValue(new Error("ENODATA"));
     vi.mocked(dns.lookup).mockImplementation((hostname: string) => {
-      if (hostname === "test.com" || hostname === "valmont.test") return Promise.resolve({ address: "1.2.3.4", family: 4 }) as any;
-      return Promise.resolve({ address: "0.0.0.0", family: 4 }) as any;
+      // @ts-expect-error Mocked value
+      if (hostname === "test.com" || hostname === "valmont.test") return Promise.resolve({ address: "1.2.3.4", family: 4 });
+      // @ts-expect-error Mocked value
+      return Promise.resolve({ address: "0.0.0.0", family: 4 });
     });
 
     const req = new NextRequest("http://localhost/api/studio/drafts/draft-123/domain", { 
@@ -84,9 +86,12 @@ describe("Custom Domain API", () => {
   it("sets status error if DNS doesn't match", async () => {
     vi.mocked(dns.resolveCname).mockResolvedValue(["other.test"]);
     vi.mocked(dns.lookup).mockImplementation((hostname: string) => {
-      if (hostname === "test.com") return Promise.resolve({ address: "1.1.1.1", family: 4 }) as any;
-      if (hostname === "valmont.test") return Promise.resolve({ address: "2.2.2.2", family: 4 }) as any;
-      return Promise.resolve({ address: "0.0.0.0", family: 4 }) as any;
+      // @ts-expect-error Mocked value
+      if (hostname === "test.com") return Promise.resolve({ address: "1.1.1.1", family: 4 });
+      // @ts-expect-error Mocked value
+      if (hostname === "valmont.test") return Promise.resolve({ address: "2.2.2.2", family: 4 });
+      // @ts-expect-error Mocked value
+      return Promise.resolve({ address: "0.0.0.0", family: 4 });
     });
 
     const req = new NextRequest("http://localhost/api/studio/drafts/draft-123/domain", { 

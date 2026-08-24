@@ -85,7 +85,7 @@ export function CustomDomainCard({ draftId }: { draftId: string }) {
             </p>
             {!process.env.NEXT_PUBLIC_STUDIO_PLATFORM_HOST && (
               <p className="mt-2 text-[10px] text-amber-600">
-                Note: The public Valmont address isn't configured on this machine.
+                Note: The public Valmont address isn&apos;t configured on this machine.
               </p>
             )}
           </div>

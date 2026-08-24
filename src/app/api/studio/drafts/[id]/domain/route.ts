@@ -72,7 +72,7 @@ export async function POST(
           if (cnames.some(c => c.toLowerCase() === targetHost.toLowerCase())) {
             isConnected = true;
           }
-        } catch (e) {
+        } catch {
           // fallback to lookup if resolveCname fails (e.g., hosts file)
           const domainIp = await dns.lookup(normalizedHostname);
           const targetIp = await dns.lookup(targetHost);
@@ -86,7 +86,7 @@ export async function POST(
         } else {
           status = "error";
         }
-      } catch (err) {
+      } catch {
         status = "error";
       }
     }
