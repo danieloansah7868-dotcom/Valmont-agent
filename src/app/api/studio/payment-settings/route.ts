@@ -3,6 +3,7 @@ import { requireApiSessionUser } from "@/lib/auth";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { safeApiError } from "@/lib/api";
 import { assertCsrf } from "@/lib/security";
+import { assertCanManagePaymentSettings } from "@/lib/studio/payment-admin";
 import {
   publicPaymentSettings,
   updatePaymentSettings,
@@ -11,7 +12,8 @@ import {
 
 export async function GET() {
   try {
-    await requireApiSessionUser();
+    const user = await requireApiSessionUser();
+    assertCanManagePaymentSettings(user);
     return NextResponse.json(publicPaymentSettings());
   } catch (error) {
     return safeApiError(error);
@@ -20,7 +22,8 @@ export async function GET() {
 
 export async function PATCH(request: NextRequest) {
   try {
-    await requireApiSessionUser();
+    const user = await requireApiSessionUser();
+    assertCanManagePaymentSettings(user);
     assertCsrf(request);
     const body = (await readBoundedJson(
       request,
