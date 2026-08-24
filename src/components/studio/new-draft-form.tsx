@@ -19,11 +19,21 @@ import type { StudioDraft } from "@/lib/studio/site-brief/schema";
  * Collects the two things a draft cannot be created without, then creates it.
  * Creation happens on submit (a POST), never on page load, so simply visiting
  * the page does not change anything.
+ *
+ * `initialCategory` comes from the Studio dashboard's "Start from a Valmont
+ * template" list, so the owner can begin a new client website already pointed
+ * at the right website type.
  */
-export function NewDraftForm() {
+export function NewDraftForm({
+  initialCategory,
+}: {
+  initialCategory?: CategoryId;
+}) {
   const router = useRouter();
   const [businessName, setBusinessName] = useState("");
-  const [category, setCategory] = useState<CategoryId>("business-profile");
+  const [category, setCategory] = useState<CategoryId>(
+    initialCategory ?? "business-profile",
+  );
   const [ecomSubcategory, setEcomSubcategory] = useState<
     EcomSubcategoryId | ""
   >("");

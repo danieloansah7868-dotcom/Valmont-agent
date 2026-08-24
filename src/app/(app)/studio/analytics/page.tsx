@@ -25,8 +25,7 @@ export default async function StudioAnalyticsPage() {
       </Link>
       <h1 className="mt-4 text-2xl font-bold text-navy">Sales analytics</h1>
       <p className="mt-2 text-sm text-slate-600">
-        Sales from paid and fulfilled orders across all of your Studio
-        businesses.
+        Sales from paid and fulfilled orders across your online-shop websites.
       </p>
       <section className="mt-6 grid gap-3 sm:grid-cols-3">
         {[

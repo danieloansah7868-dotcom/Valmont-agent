@@ -2,8 +2,6 @@ import Link from "next/link";
 import { requireSessionUser } from "@/lib/auth";
 import { canonicalUserId } from "@/lib/user-identity";
 import { getOrdersStore } from "@/lib/studio/orders";
-import { getStudioDraftStore } from "@/lib/studio/draft-store";
-import { BusinessSwitcher } from "@/components/studio/business-switcher";
 import {
   ORDER_FILTERS,
   STATUS_BADGE_CLASS,
@@ -15,57 +13,42 @@ import { formatAccra } from "@/lib/studio/format";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * The optional shop-order tool for online-shop websites.
+ *
+ * Phase 5 item 3 moved the Studio dashboard to a client-project view, so this
+ * page went back to being what it always was: one owner-scoped order list with
+ * status filters. The combined "orders across your businesses" dashboard added
+ * by the earlier item-3 attempt is gone — orders are not part of the website
+ * dashboard.
+ */
 export default async function OrdersPage({
   searchParams,
 }: {
-  searchParams: Promise<{ filter?: string; business?: string }>;
+  searchParams: Promise<{ filter?: string }>;
 }) {
   const user = await requireSessionUser();
-  const { filter: rawFilter, business: requestedBusinessId } =
-    await searchParams;
+  const { filter: rawFilter } = await searchParams;
   const filter = ORDER_FILTERS.some((entry) => entry.id === rawFilter)
     ? (rawFilter as OrderFilterId)
     : "all";
 
-  // The draft store is owner-scoped. Only ids returned here are accepted as a
-  // business filter, so a guessed id can never select somebody else's data.
-  const drafts = await getStudioDraftStore().list(user);
-  const businesses = drafts.map((draft) => ({
-    id: draft.id,
-    name: draft.brief.businessName,
-  }));
-  const selectedBusiness = businesses.find(
-    (business) => business.id === requestedBusinessId,
-  );
-  const businessNames = new Map(
-    businesses.map((business) => [business.id, business.name]),
-  );
-  const ownerId = canonicalUserId(user);
   const store = getOrdersStore();
-  const businessFilter = selectedBusiness
-    ? { draftId: selectedBusiness.id }
-    : {};
-  const allOrders = await store.listForOwner(ownerId, {
-    limit: 5_000,
+  const all = await store.listForOwner(canonicalUserId(user), {
+    limit: 200,
     filter: "all",
-    ...businessFilter,
   });
-  const orders =
-    filter === "all"
-      ? allOrders
-      : await store.listForOwner(ownerId, {
-          limit: 5_000,
-          filter,
-          ...businessFilter,
-        });
+  const orders = await store.listForOwner(canonicalUserId(user), {
+    limit: 200,
+    filter,
+  });
 
   const counts = Object.fromEntries(
     ORDER_FILTERS.map((entry) => [
       entry.id,
       entry.id === "all"
-        ? allOrders.length
-        : allOrders.filter((order) => entry.statuses.includes(order.status))
-            .length,
+        ? all.length
+        : all.filter((order) => entry.statuses.includes(order.status)).length,
     ]),
   ) as Record<OrderFilterId, number>;
 
@@ -73,36 +56,16 @@ export default async function OrdersPage({
     <div className="mx-auto w-full max-w-[980px] p-4 sm:p-6">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-navy">
-            Orders across your businesses
-          </h1>
+          <h1 className="text-2xl font-bold text-navy">Shop orders</h1>
           <p className="mt-1 text-sm text-slate">
-            {selectedBusiness
-              ? `Showing orders for ${selectedBusiness.name}.`
-              : businesses.length > 1
-                ? `All orders from your ${businesses.length} businesses are together here.`
-                : "Open an order to see the customer details and move it along."}
+            Orders from your online-shop websites. Open an order to see the
+            customer details and move it along.
           </p>
         </div>
         <Link href="/studio" className="btn-quiet">
           Back to Studio
         </Link>
       </div>
-
-      {businesses.length > 0 && (
-        <div className="mt-5 rounded-xl border border-brandblue/20 bg-brandblue/5 p-4">
-          <BusinessSwitcher
-            businesses={businesses}
-            selectedBusinessId={selectedBusiness?.id}
-            basePath="/studio/orders"
-            filter={filter}
-          />
-          <p className="mt-2 text-xs text-slate-600">
-            Keep “All businesses” selected for one combined order list, or
-            choose one business to focus on its orders.
-          </p>
-        </div>
-      )}
 
       <div
         className="mt-5 flex flex-wrap gap-2"
@@ -114,7 +77,11 @@ export default async function OrdersPage({
           return (
             <Link
               key={entry.id}
-              href={ordersHref(entry.id, selectedBusiness?.id)}
+              href={
+                entry.id === "all"
+                  ? "/studio/orders"
+                  : `/studio/orders?filter=${entry.id}`
+              }
               role="tab"
               aria-selected={active}
               className={`rounded-full px-3 py-1.5 text-sm font-semibold ${
@@ -145,10 +112,6 @@ export default async function OrdersPage({
                 className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-line bg-white p-3 hover:border-copper"
               >
                 <div className="min-w-0">
-                  <p className="text-xs font-semibold text-brandblue">
-                    {businessNames.get(order.draftId) ??
-                      "Business no longer in Studio"}
-                  </p>
                   <p className="text-sm font-semibold text-navy">
                     {order.customerName} · {order.id.slice(0, 8)}
                   </p>
@@ -176,12 +139,4 @@ export default async function OrdersPage({
       )}
     </div>
   );
-}
-
-function ordersHref(filter: OrderFilterId, businessId?: string): string {
-  const params = new URLSearchParams();
-  if (filter !== "all") params.set("filter", filter);
-  if (businessId) params.set("business", businessId);
-  const query = params.toString();
-  return query ? `/studio/orders?${query}` : "/studio/orders";
 }
