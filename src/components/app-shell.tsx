@@ -123,7 +123,10 @@ export function AppShell({
   }, [mobileOpen]);
 
   return (
-    <div className="min-h-screen bg-ivory-50 pb-16 md:pb-0">
+    <div
+      className="min-h-screen bg-ivory-50 pb-16 md:pb-0"
+      style={{ "--app-rail": `${desktopWidth}px` } as React.CSSProperties}
+    >
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-[70] focus:rounded-lg focus:bg-navy focus:px-4 focus:py-2 focus:text-sm focus:font-bold focus:text-ivory"
@@ -141,15 +144,14 @@ export function AppShell({
       )}
 
       <header
-        className={`fixed inset-x-0 top-0 z-50 flex h-20 items-center border-b border-line bg-ivory-50/95 px-4 backdrop-blur md:px-7 ${transitionClass}`}
-        style={{ left: desktopWidth }}
+        className={`fixed inset-x-0 top-0 z-50 flex h-20 items-center border-b border-line bg-ivory-50/95 px-4 backdrop-blur md:left-[var(--app-rail)] md:px-7 ${transitionClass}`}
       >
         <div className="flex items-center gap-2">
           {/* Hamburger: opens the mobile slide-over drawer. */}
           <button
             type="button"
             onClick={() => setMobileOpen(true)}
-            className="btn-quiet size-10 min-h-10 px-0 md:hidden"
+            className="btn-icon size-10 md:hidden"
             aria-label="Open navigation menu"
             aria-expanded={mobileOpen}
             aria-controls="mobile-sidebar"
@@ -160,7 +162,7 @@ export function AppShell({
           <button
             type="button"
             onClick={() => setCollapsed((value) => !value)}
-            className="btn-quiet hidden size-10 min-h-10 px-0 md:inline-flex"
+            className="btn-icon hidden h-10 px-3 md:inline-flex"
             aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
             title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           >
@@ -307,8 +309,7 @@ export function AppShell({
 
       <main
         id="main-content"
-        className={`min-h-[calc(100dvh-5rem)] pt-20 md:min-h-dvh ${transitionClass}`}
-        style={{ paddingLeft: desktopWidth }}
+        className={`min-h-[calc(100dvh-5rem)] pt-20 md:min-h-dvh md:pl-[var(--app-rail)] ${transitionClass}`}
       >
         {children}
       </main>

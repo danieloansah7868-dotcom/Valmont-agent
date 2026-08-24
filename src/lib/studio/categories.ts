@@ -8,6 +8,7 @@ export const CATEGORY_IDS = [
   "salon",
   "clinic",
   "real-estate",
+  "travel-tourism",
   "ngo",
   "portfolio",
   "consultant",
@@ -117,6 +118,19 @@ export const categories: CategoryManifest[] = [
     label: "Real Estate & Property",
     description: "Property listings and enquiries.",
     requiredPagesHint: ["home", "properties", "contact"],
+  },
+  {
+    id: "travel-tourism",
+    label: "Travel & Tourism",
+    description: "Tours, destinations, itineraries and booking requests.",
+    requiredPagesHint: [
+      "home",
+      "destinations",
+      "tours",
+      "itineraries",
+      "booking",
+      "contact",
+    ],
   },
   {
     id: "ngo",
