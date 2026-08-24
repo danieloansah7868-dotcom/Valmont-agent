@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import {
   computeTotals,
   formatMoney,
@@ -7,8 +11,28 @@ import {
   STATUS_LABELS,
 } from "./valmont-pay";
 
+const dirs: string[] = [];
+
+beforeEach(() => {
+  // Payment resolution consults the settings table on the shared Studio
+  // database; point it at a throwaway file so tests never touch real data.
+  const dir = mkdtempSync(path.join(os.tmpdir(), "valmont-pay-"));
+  dirs.push(dir);
+  setSqliteChatStoreForTests(
+    new SqliteChatStore(
+      path.join(dir, "chat-store.sqlite"),
+      path.join(dir, "chat-store.json"),
+    ),
+  );
+  vi.stubEnv("DATABASE_URL", "");
+  vi.stubEnv("SESSION_SECRET", "test-session-secret");
+});
+
 afterEach(() => {
+  setSqliteChatStoreForTests(null);
   vi.unstubAllEnvs();
+  for (const dir of dirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
 });
 
 describe("computeTotals", () => {
@@ -82,18 +106,20 @@ describe("formatMoney", () => {
 });
 
 describe("isLiveConfigured / paymentUrlFor", () => {
-  it("is test mode when the env vars are missing", () => {
+  it("is test mode when the env vars are missing", async () => {
     vi.stubEnv("VALMONT_PAY_API_URL", "");
     vi.stubEnv("VALMONT_PAY_API_KEY", "");
-    expect(isLiveConfigured()).toBe(false);
-    expect(paymentUrlFor("abc123")).toBe("/pay/abc123");
+    await expect(isLiveConfigured()).resolves.toBe(false);
+    await expect(paymentUrlFor("abc123")).resolves.toBe("/pay/abc123");
   });
 
-  it("is live only when both env vars are set", () => {
+  it("is live only when both env vars are set (legacy env-only deployments)", async () => {
     vi.stubEnv("VALMONT_PAY_API_URL", "https://pay.example.com");
     vi.stubEnv("VALMONT_PAY_API_KEY", "secret");
-    expect(isLiveConfigured()).toBe(true);
-    expect(paymentUrlFor("abc123")).toContain("access_code=abc123");
+    await expect(isLiveConfigured()).resolves.toBe(true);
+    await expect(paymentUrlFor("abc123")).resolves.toContain(
+      "access_code=abc123",
+    );
   });
 });
 
