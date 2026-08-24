@@ -179,6 +179,12 @@ export function AppShell({
 
         <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
           <Link
+            href="/"
+            className="btn-quiet hidden items-center gap-1.5 px-3.5 text-[15px] font-bold sm:inline-flex"
+          >
+            <span className="text-copper">◆</span> Portfolio
+          </Link>
+          <Link
             href="/docs/security"
             className="btn-quiet size-10 min-h-10 px-0"
             aria-label="Security model and setup help"

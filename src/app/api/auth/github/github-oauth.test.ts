@@ -84,7 +84,7 @@ describe("GitHub OAuth canonical redirects", () => {
     const response = await completeGitHubOAuth(request);
 
     expect(response.headers.get("location")).toBe(
-      "http://localhost:3000/agent?auth_error=github",
+      "http://localhost:3000/?auth_error=github",
     );
   });
 
@@ -116,7 +116,7 @@ describe("GitHub OAuth canonical redirects", () => {
     );
 
     expect(response.headers.get("location")).toBe(
-      "http://localhost:3000/agent?connect=unconfigured",
+      "http://localhost:3000/?connect=unconfigured",
     );
   });
 
@@ -135,7 +135,7 @@ describe("GitHub OAuth canonical redirects", () => {
       "https://example.com/api/auth/github/callback",
     );
     expect(error.headers.get("location")).toBe(
-      "https://example.com/agent?auth_error=github",
+      "https://example.com/?auth_error=github",
     );
   });
 
@@ -177,7 +177,7 @@ describe("GitHub OAuth canonical redirects", () => {
       "http://dev.internal:4123/api/auth/github/callback",
     );
     expect(error.headers.get("location")).toBe(
-      "http://dev.internal:4123/agent?auth_error=github",
+      "http://dev.internal:4123/?auth_error=github",
     );
   });
 
@@ -209,7 +209,7 @@ describe("GitHub OAuth canonical redirects", () => {
       ),
     );
     expect(invalidState.headers.get("location")).toBe(
-      "http://localhost:3000/agent?auth_error=github",
+      "http://localhost:3000/?auth_error=github",
     );
     expect(fetchMock).not.toHaveBeenCalled();
 

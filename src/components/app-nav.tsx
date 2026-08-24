@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import type { LinkProps } from "next/link";
 import {
   FolderGit2,
+  Home,
   LayoutDashboard,
   ListChecks,
   MessageSquareText,
@@ -113,6 +114,24 @@ export function AppNav({ collapsed = false, onNavigate }: NavProps) {
             </NavLink>
           );
         })}
+
+        <div className="my-2 h-px bg-ivory/10" aria-hidden="true" />
+
+        <NavLink
+          href="/"
+          onNavigate={onNavigate}
+          className={`flex min-h-10 items-center gap-3 rounded-lg px-3 text-[13px] font-semibold text-copper-300 transition-colors hover:bg-copper/10 hover:text-copper ${
+            collapsed ? "justify-center" : ""
+          }`}
+          title={collapsed ? "Valmont Portfolio" : undefined}
+        >
+          <Home
+            className="size-[17px] shrink-0"
+            strokeWidth={1.8}
+            aria-hidden="true"
+          />
+          {!collapsed && <span className="truncate">Portfolio home</span>}
+        </NavLink>
       </nav>
 
       {/* Mobile drawer nav (full-width list, only inside the slide-over) */}
@@ -150,6 +169,19 @@ export function AppNav({ collapsed = false, onNavigate }: NavProps) {
             </NavLink>
           );
         })}
+        <div className="my-2 h-px bg-ivory/10" aria-hidden="true" />
+        <NavLink
+          href="/"
+          onNavigate={onNavigate}
+          className="flex min-h-11 items-center gap-3 rounded-lg px-3 text-[14px] font-semibold text-copper-300 transition-colors hover:bg-copper/10 hover:text-copper"
+        >
+          <Home
+            className="size-[18px] shrink-0"
+            strokeWidth={1.8}
+            aria-hidden="true"
+          />
+          Portfolio home
+        </NavLink>
       </nav>
 
       {/* Mobile bottom tab bar (visible when the drawer is closed) */}

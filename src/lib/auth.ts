@@ -62,10 +62,10 @@ export async function getSessionUser(): Promise<SessionUser | null> {
   };
 }
 
-/** Sends unauthenticated visitors to the private agency access screen. */
+/** Server-component helper: sends unauthenticated visitors back to the landing page. */
 export async function requireSessionUser(): Promise<SessionUser> {
   const user = await getSessionUser();
-  if (!user) redirect("/agent?connect=required");
+  if (!user) redirect("/?connect=required");
   return user;
 }
 

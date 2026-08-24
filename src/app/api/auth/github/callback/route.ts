@@ -21,7 +21,7 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const errorRedirect = new URL("/agent?auth_error=github", origin);
+  const errorRedirect = new URL("/?auth_error=github", origin);
   if (!githubConfigured()) return NextResponse.redirect(errorRedirect);
   const state = request.nextUrl.searchParams.get("state");
   const code = request.nextUrl.searchParams.get("code");
