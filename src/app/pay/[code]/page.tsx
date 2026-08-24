@@ -1,11 +1,11 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { getOrdersStore } from "@/lib/studio/orders";
-import { formatMoney } from "@/lib/studio/valmont-pay";
 import {
+  formatMoney,
   isLiveConfigured,
   paymentUrlFor,
-} from "@/lib/studio/valmont-pay-server";
+} from "@/lib/studio/valmont-pay";
 import { PaySimulator } from "@/components/studio/pay-simulator";
 
 export const dynamic = "force-dynamic";

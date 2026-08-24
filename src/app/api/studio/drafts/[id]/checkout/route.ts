@@ -6,11 +6,12 @@ import { assertSameOrigin } from "@/lib/security";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { internalGetDraftForCheckout } from "@/lib/studio/draft-public";
 import { getOrdersStore, type OrderLine } from "@/lib/studio/orders";
-import { computeTotals, type PricedLine } from "@/lib/studio/valmont-pay";
 import {
+  computeTotals,
   createPaymentLink,
   isLiveConfigured,
-} from "@/lib/studio/valmont-pay-server";
+  type PricedLine,
+} from "@/lib/studio/valmont-pay";
 import { isPaymentMethodId } from "@/lib/studio/site-brief/schema";
 import { notifyMerchantNewOrder } from "@/lib/studio/notifications";
 

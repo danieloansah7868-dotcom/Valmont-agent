@@ -12,108 +12,54 @@
  *     whole checkout flow is testable on a self-hosted machine with no external
  *     account.
  *
- * Live mode is enabled only when BOTH `VALMONT_PAY_API_URL` and
- * `VALMONT_PAY_API_KEY` are set. With either missing, the app runs in test mode
- * and no real money can move.
+ * Live mode is enabled only when BOTH Valmont Pay keys are known (saved on
+ * the Studio → Settings → Payments page, or provided as the
+ * `VALMONT_PAY_API_URL` / `VALMONT_PAY_API_KEY` environment variables) AND the
+ * payment mode is switched to Live. In every other case the app runs in test
+ * mode with the local simulator and no real money can move.
  */
+
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { resolvePaymentConfig } from "./payment-settings";
+import { buildPublicUrl } from "./money";
+
+// The pure money helpers live in ./money so client components (the public
+// storefront) can use them without pulling server-only payment configuration
+// into the browser bundle. They are re-exported here so the many existing
+// server-side import sites keep working unchanged.
+export {
+  buildPublicUrl,
+  computeTotals,
+  formatMoney,
+  type DeliveryPricing,
+  type OrderTotals,
+  type PricedLine,
+} from "./money";
 
 export type { OrderStatus as OrderStatusLabelKey } from "./order-status";
 export { STATUS_LABELS } from "./order-status";
 
-/** A basket line as priced by the server (never trusted from the client). */
-export interface PricedLine {
-  /** Unit price in major currency units, e.g. 45 or 45.5. */
-  price: number;
-  quantity: number;
-}
-
-export interface DeliveryPricing {
-  enabled: boolean;
-  fee: number;
-  minimumOrder: number;
-  freeDeliveryAbove?: number;
-}
-
-export interface OrderTotals {
-  subtotal: number;
-  deliveryFee: number;
-  total: number;
-}
-
-/** Major units -> integer minor units (pesewas/cents). */
-function toMinor(amount: number): number {
-  return Math.round(amount * 100);
-}
-
-/** Integer minor units -> major units. */
-function toMajor(minor: number): number {
-  return minor / 100;
+/**
+ * True only when real payments can move: Live mode is selected on the
+ * Settings → Payments page AND both Valmont Pay keys are present. Test mode
+ * (the default) always returns false, even while keys are saved.
+ */
+export async function isLiveConfigured(): Promise<boolean> {
+  return (await resolvePaymentConfig()).liveActive;
 }
 
 /**
- * Computes an order's totals in integer minor units so no floating-point drift
- * can creep into the amount a customer is charged. Delivery is added only when
- * enabled, and waived when a free-delivery threshold is met.
+ * Where the customer goes to pay. In live mode this is the hosted Valmont Pay
+ * page; in test mode it is the local `/pay/[code]` simulator route.
  */
-export function computeTotals(
-  lines: PricedLine[],
-  delivery: DeliveryPricing,
-): OrderTotals {
-  const subtotalMinor = lines.reduce(
-    (sum, line) =>
-      sum + toMinor(line.price) * Math.max(0, Math.trunc(line.quantity)),
-    0,
-  );
-
-  let deliveryMinor = 0;
-  if (delivery.enabled) {
-    deliveryMinor = toMinor(delivery.fee);
-    if (
-      delivery.freeDeliveryAbove !== undefined &&
-      delivery.freeDeliveryAbove > 0 &&
-      subtotalMinor >= toMinor(delivery.freeDeliveryAbove)
-    ) {
-      deliveryMinor = 0;
-    }
+export async function paymentUrlFor(accessCode: string): Promise<string> {
+  const config = await resolvePaymentConfig();
+  if (config.liveActive) {
+    return buildPublicUrl(config.apiUrl!, "pay", {
+      access_code: accessCode,
+    });
   }
-
-  return {
-    subtotal: toMajor(subtotalMinor),
-    deliveryFee: toMajor(deliveryMinor),
-    total: toMajor(subtotalMinor + deliveryMinor),
-  };
-}
-
-const CURRENCY_SYMBOLS: Record<string, string> = {
-  GHS: "GH₵",
-  NGN: "₦",
-  KES: "KSh",
-  GBP: "£",
-  USD: "$",
-};
-
-/** Money for display, e.g. `GH₵45.00`. Never used for arithmetic. */
-export function formatMoney(amount: number, currency = "GHS"): string {
-  const symbol = CURRENCY_SYMBOLS[currency] ?? `${currency} `;
-  return `${symbol}${amount.toLocaleString("en-GH", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
-
-/** Joins a base, a path and query parameters into a single URL string. */
-export function buildPublicUrl(
-  base: string,
-  path: string,
-  params: Record<string, string> = {},
-): string {
-  const url = new URL(
-    path.replace(/^\//, ""),
-    base.endsWith("/") ? base : `${base}/`,
-  );
-  for (const [key, value] of Object.entries(params))
-    url.searchParams.set(key, value);
-  return url.toString();
+  return `/pay/${accessCode}`;
 }
 
 export interface CreatePaymentLinkRequest {
@@ -132,4 +78,128 @@ export interface CreatePaymentLinkRequest {
 export interface CreatePaymentLinkResult {
   paymentLink: string;
   live: boolean;
+}
+
+/**
+ * Creates a payment link. In live mode it POSTs to the Valmont Pay API with a
+ * Bearer key; in test mode it returns the local simulator link. The exact live
+ * request shape will be finalised when Valmont Pay publishes its API; the call
+ * is isolated here so only this function changes.
+ */
+export async function createPaymentLink(
+  req: CreatePaymentLinkRequest,
+): Promise<CreatePaymentLinkResult> {
+  const config = await resolvePaymentConfig();
+  if (!config.liveActive) {
+    return {
+      paymentLink: await paymentUrlFor(req.accessCode),
+      live: false,
+    };
+  }
+
+  const endpoint = buildPublicUrl(config.apiUrl!, "links");
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${config.apiKey!}`,
+    },
+    body: JSON.stringify({
+      amount: Math.round(req.amount * 100),
+      currency: req.currency,
+      reference: req.reference,
+      description: req.description,
+      access_code: req.accessCode,
+      customer: {
+        name: req.customerName,
+        email: req.customerEmail,
+        phone: req.customerPhone,
+      },
+      callback_url: req.callbackUrl,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error("Valmont Pay could not create a payment link right now.");
+  }
+
+  const data = (await response.json()) as { url?: string; link?: string };
+  const paymentLink = data.url ?? data.link;
+  if (!paymentLink) {
+    throw new Error("Valmont Pay returned no payment link.");
+  }
+  return { paymentLink, live: true };
+}
+
+/** Signature headers the webhook route looks at, in priority order. */
+export interface WebhookSignatureHeaders {
+  /** `x-valmont-signature` — Valmont Pay's own header. */
+  valmont?: string | null;
+  /**
+   * `x-paystack-signature` — Valmont Pay wraps Paystack, whose webhooks sign
+   * the raw body with HMAC-SHA512 using the account secret key. Accepted so a
+   * pass-through deployment verifies correctly too.
+   */
+  paystack?: string | null;
+}
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a, "utf8");
+  const right = Buffer.from(b, "utf8");
+  // Lengths leak through timing either way; compare only equal-length buffers
+  // and let unequal lengths fail closed.
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+/**
+ * The signatures we accept for a live webhook, given the raw body and the
+ * saved signing secret. Valmont Pay has not published its scheme yet, so we
+ * accept the realistic candidates — Paystack-compatible HMAC-SHA512 hex, and
+ * HMAC-SHA256 in hex or base64 — and compare each in constant time.
+ */
+function candidateWebhookSignatures(body: string, secret: string): string[] {
+  return [
+    createHmac("sha512", secret).update(body, "utf8").digest("hex"),
+    createHmac("sha256", secret).update(body, "utf8").digest("hex"),
+    createHmac("sha256", secret).update(body, "utf8").digest("base64"),
+  ];
+}
+
+/**
+ * Verifies a webhook signature.
+ *
+ * - Test mode: the local simulator is the only caller and the unguessable
+ *   access code in the URL is the access control, so the request is accepted.
+ * - Live mode: a saved signing secret is REQUIRED. Every live webhook must
+ *   carry a valid HMAC signature — an unsigned or wrongly-signed live webhook
+ *   is refused, so nobody can mark an order paid by guessing its access code.
+ */
+export async function verifyWebhookSignature(
+  body: string,
+  headers: WebhookSignatureHeaders,
+): Promise<boolean> {
+  const config = await resolvePaymentConfig();
+  if (!config.liveActive) {
+    void body;
+    void headers;
+    return true;
+  }
+
+  if (!config.webhookSecret) {
+    // Fail closed: without a signing secret there is no way to tell a real
+    // Valmont Pay callback from a forgery. The settings page warns about this
+    // before Live mode is switched on.
+    return false;
+  }
+
+  const presented = [headers.valmont, headers.paystack]
+    .map((value) => value?.trim())
+    .filter((value): value is string => Boolean(value));
+  if (presented.length === 0) return false;
+
+  const candidates = candidateWebhookSignatures(body, config.webhookSecret);
+  return presented.some((signature) =>
+    candidates.some((candidate) => timingSafeStringEqual(signature, candidate)),
+  );
 }
