@@ -8,6 +8,16 @@ export const TEMPLATE_IDS = [
   "destination-showcase",
   "tour-booking",
   "luxury-escape",
+  "product-catalogue",
+  "service-showcase",
+  "booking-journey",
+  "property-collection",
+  "campus-life",
+  "ministry-community",
+  "impact-story",
+  "creative-case-studies",
+  "professional-profile",
+  "member-hub",
 ] as const;
 export type TemplateId = (typeof TEMPLATE_IDS)[number];
 
@@ -111,6 +121,92 @@ export const templates: TemplateManifest[] = [
       "A refined, image-led layout for premium stays, retreats and experiences.",
     sections: ["hero", "about", "gallery", "highlights", "contact"],
     compatibleCategories: ["travel-tourism", "hotel"],
+  },
+  {
+    id: "product-catalogue",
+    label: "Product Catalogue",
+    description:
+      "A product-first layout with featured items, categories and a clear order button.",
+    sections: ["hero", "card-grid", "highlights", "contact"],
+    compatibleCategories: ["online-shop", "restaurant", "clinic"],
+  },
+  {
+    id: "service-showcase",
+    label: "Service Showcase",
+    description:
+      "A confident services layout with benefits, testimonials and a contact call to action.",
+    sections: ["hero", "services", "highlights", "contact"],
+    compatibleCategories: [
+      "business-profile",
+      "consultant",
+      "salon",
+      "clinic",
+      "custom",
+    ],
+  },
+  {
+    id: "booking-journey",
+    label: "Booking Journey",
+    description:
+      "Lead visitors from an offer to availability, booking and contact in clear steps.",
+    sections: ["hero", "services", "booking", "contact"],
+    compatibleCategories: ["hotel", "travel-tourism", "salon", "booking"],
+  },
+  {
+    id: "property-collection",
+    label: "Property Collection",
+    description:
+      "A listing-led layout for homes, land, rentals and property enquiries.",
+    sections: ["hero", "card-grid", "gallery", "contact"],
+    compatibleCategories: ["real-estate"],
+  },
+  {
+    id: "campus-life",
+    label: "Campus Life",
+    description:
+      "An education layout for programmes, admissions, events and school stories.",
+    sections: ["hero", "programmes", "events", "contact"],
+    compatibleCategories: ["school"],
+  },
+  {
+    id: "ministry-community",
+    label: "Ministry & Community",
+    description:
+      "A welcoming church layout for service times, ministries, sermons and events.",
+    sections: ["hero", "ministries", "story-list", "events", "contact"],
+    compatibleCategories: ["church"],
+  },
+  {
+    id: "impact-story",
+    label: "Impact Story",
+    description:
+      "A mission-focused layout for programmes, outcomes, supporters and donations.",
+    sections: ["hero", "about", "programmes", "highlights", "contact"],
+    compatibleCategories: ["ngo"],
+  },
+  {
+    id: "creative-case-studies",
+    label: "Creative Case Studies",
+    description:
+      "Put selected work, before-and-after stories and client results at the centre.",
+    sections: ["hero", "projects", "gallery", "contact"],
+    compatibleCategories: ["portfolio", "business-profile", "custom"],
+  },
+  {
+    id: "professional-profile",
+    label: "Professional Profile",
+    description:
+      "A focused personal or expert profile with credentials, services and contact.",
+    sections: ["hero", "about", "services", "contact"],
+    compatibleCategories: ["consultant", "portfolio", "business-profile"],
+  },
+  {
+    id: "member-hub",
+    label: "Member Hub",
+    description:
+      "A structured layout for member benefits, features, help and sign-in information.",
+    sections: ["hero", "features", "highlights", "contact"],
+    compatibleCategories: ["customer-portal"],
   },
 ];
 
