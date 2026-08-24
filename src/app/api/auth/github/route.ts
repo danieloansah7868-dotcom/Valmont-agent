@@ -16,7 +16,9 @@ export async function GET(request: NextRequest) {
   }
 
   if (!githubConfigured()) {
-    return NextResponse.redirect(new URL("/?connect=unconfigured", origin));
+    return NextResponse.redirect(
+      new URL("/agent?connect=unconfigured", origin),
+    );
   }
   const state = randomBytes(24).toString("base64url");
   const callback = new URL("/api/auth/github/callback", origin);

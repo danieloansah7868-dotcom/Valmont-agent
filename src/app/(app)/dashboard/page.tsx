@@ -5,7 +5,6 @@ import {
   Clock3,
   FolderGit2,
   GitPullRequest,
-  Home,
   ListChecks,
   Plus,
   ShieldCheck,
@@ -64,14 +63,9 @@ export default async function DashboardPage() {
         title={`Welcome back, ${user.name.split(" ")[0] ?? user.login}`}
         description="Review agent work and decide what moves forward."
         actions={
-          <>
-            <Link href="/" className="btn-secondary">
-              <Home className="size-4" aria-hidden="true" /> Portfolio
-            </Link>
-            <Link href="/tasks/new" className="btn-primary">
-              <Plus className="size-4" aria-hidden="true" /> New coding task
-            </Link>
-          </>
+          <Link href="/tasks/new" className="btn-primary">
+            <Plus className="size-4" aria-hidden="true" /> New coding task
+          </Link>
         }
       />
 
