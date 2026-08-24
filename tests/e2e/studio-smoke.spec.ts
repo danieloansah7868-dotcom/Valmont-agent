@@ -406,14 +406,15 @@ test.describe("Website Studio", () => {
     ).toHaveCount(1);
     await expect(switcher.locator("option")).toHaveCount(3); // + placeholder
 
-    // The card carries the project details: type, layout, theme, domain and
-    // a completion summary.
+    // The card carries the project details: type, layout, theme, domain and a
+    // completion summary. The helper creates a draft with the form's defaults,
+    // so this is a Business & Company Profile on the Classic Hero layout.
     const card = page
       .getByTestId("website-card")
       .filter({ hasText: "Adom Fashion House" });
-    await expect(card).toContainText(/Business Profile/i);
-    await expect(card).toContainText(/Layout /);
-    await expect(card).toContainText(/Theme /);
+    await expect(card).toContainText("Business & Company Profile");
+    await expect(card).toContainText("Layout Classic Hero");
+    await expect(card).toContainText("Theme Clean & Corporate");
     await expect(card.getByTestId("website-domain-status")).toContainText(
       /No custom domain yet/i,
     );
