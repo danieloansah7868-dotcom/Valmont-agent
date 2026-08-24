@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { requireSessionUser } from "@/lib/auth";
 import { getStudioDraftStore } from "@/lib/studio/draft-store";
+import { getDomainStore } from "@/lib/studio/domains";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { getCategory } from "@/lib/studio/categories";
 import { BackupControls } from "@/components/studio/backup-controls";
@@ -17,6 +18,7 @@ export const dynamic = "force-dynamic";
 export default async function StudioPage() {
   const user = await requireSessionUser();
   const drafts = await getStudioDraftStore().list(user);
+  const domains = await getDomainStore().getDomainsForOwner(user.id);
   const paymentConfig = await resolvePaymentConfig();
 
   const hasShop = drafts.some((draft) => draft.brief.payments?.enabled);
@@ -56,6 +58,7 @@ export default async function StudioPage() {
             {drafts.map((draft) => {
               const completeness = computeBriefCompleteness(draft.brief);
               const category = getCategory(draft.brief.category);
+              const domain = domains.find(d => d.draft_id === draft.id);
               return (
                 <li
                   key={draft.id}
@@ -79,6 +82,16 @@ export default async function StudioPage() {
                   <div className="mt-3">
                     <ShareLinkButton draftId={draft.id} compact />
                   </div>
+                  {domain && domain.status === 'active' && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Connected domain: <a href={`http://${domain.hostname}`} target="_blank" className="underline">{domain.hostname}</a>
+                    </p>
+                  )}
+                  {domain && domain.status !== 'active' && (
+                    <p className="mt-2 text-xs text-amber-600">
+                      Domain {domain.hostname} ({domain.status === 'pending' ? 'waiting for DNS' : 'configuration problem'})
+                    </p>
+                  )}
                 </li>
               );
             })}

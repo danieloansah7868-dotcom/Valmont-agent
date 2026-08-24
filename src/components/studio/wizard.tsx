@@ -28,6 +28,7 @@ import {
 } from "@/lib/studio/site-brief/schema";
 import { formatPricedItems, parsePricedItems } from "@/lib/studio/catalog";
 import { ShareLinkButton } from "./share-link-button";
+import { CustomDomainCard } from "./custom-domain-card";
 import { ProductImagesEditor } from "./product-images";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { evaluateSaveGate } from "@/lib/studio/save-gate";
@@ -1283,6 +1284,8 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               </>
             )}
           </section>
+          
+          <CustomDomainCard draftId={id} />
 
           <div className="mt-4">
             <BusinessPreview brief={brief} draftId={id} />

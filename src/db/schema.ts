@@ -365,6 +365,32 @@ export const studioOrders = pgTable(
  * plaintext never leaves the server and is never included in backups or API
  * responses.
  */
+/**
+ * Phase 5 custom domains.
+ */
+export const studioDomains = pgTable(
+  "studio_domains",
+  {
+    draftId: uuid("draft_id")
+      .primaryKey()
+      .references(() => studioDrafts.id, { onDelete: "cascade" }),
+    ownerId: uuid("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    hostname: text("hostname").notNull().unique(),
+    status: text("status").notNull().default("not_set"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("studio_domains_owner_idx").on(table.ownerId),
+  ],
+);
+
 export const studioSettings = pgTable("studio_settings", {
   id: integer("id").primaryKey(),
   mode: text("mode").notNull().default("test"),

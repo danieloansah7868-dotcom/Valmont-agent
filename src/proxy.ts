@@ -1,7 +1,43 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { getDomainStore } from "./lib/studio/domains";
 
-export function proxy(request: NextRequest) {
-  const response = NextResponse.next();
+export async function proxy(request: NextRequest) {
+  const hostHeader = request.headers.get("host") || "";
+  const host = hostHeader.split(":")[0];
+  const pathname = request.nextUrl.pathname;
+  
+  const platformHost = process.env.STUDIO_PLATFORM_HOST || "localhost";
+  const isPlatformHost = 
+    host === "localhost" || 
+    host === "127.0.0.1" || 
+    host === platformHost ||
+    (process.env.NEXT_PUBLIC_STUDIO_PLATFORM_HOST && host === process.env.NEXT_PUBLIC_STUDIO_PLATFORM_HOST);
+    
+  const isProtectedPath = 
+    pathname.startsWith("/api") || 
+    pathname.startsWith("/studio") || 
+    pathname.startsWith("/s/") || 
+    pathname === "/s" || 
+    pathname.startsWith("/pay") || 
+    pathname.startsWith("/orders") || 
+    pathname.startsWith("/_next");
+
+  let rewriteUrl = null;
+  if (!isPlatformHost && !isProtectedPath && request.method === "GET" && pathname === "/") {
+    try {
+      const domainStore = getDomainStore();
+      const domain = await domainStore.getDomainByHostname(host);
+      if (domain && domain.status === "active") {
+        rewriteUrl = request.nextUrl.clone();
+        rewriteUrl.pathname = `/s/${domain.draft_id}`;
+      }
+    } catch (err) {
+      console.error("Proxy domain error:", err);
+    }
+  }
+
+  const response = rewriteUrl ? NextResponse.rewrite(rewriteUrl) : NextResponse.next();
+
   if (!request.cookies.has("valmont_csrf")) {
     response.cookies.set(
       "valmont_csrf",
@@ -15,6 +51,7 @@ export function proxy(request: NextRequest) {
       },
     );
   }
+
   return response;
 }
 
