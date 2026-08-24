@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { LinkProps } from "next/link";
 import {
   CircleHelp,
@@ -19,15 +19,6 @@ import type { SessionUser } from "@/lib/auth";
 const SIDEBAR_WIDTH = 248;
 const COLLAPSED_WIDTH = 72;
 const COLLAPSE_STORAGE_KEY = "valmont:sidebar-collapsed";
-
-function readInitialCollapsed(): boolean {
-  if (typeof window === "undefined") return false;
-  try {
-    return window.localStorage.getItem(COLLAPSE_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
 
 /**
  * A Link that also closes the mobile drawer when clicked. Keeps the
@@ -61,12 +52,16 @@ export function AppShell({
   user: SessionUser;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
-  // Read the saved preference during the initial state computation (runs once
-  // on the client; on the server window is undefined so we default to false).
-  const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
+  // Start expanded so the first client render matches the server-rendered
+  // HTML; the saved preference is restored after mount (see the rAF effect).
+  const [collapsed, setCollapsed] = useState(false);
+  // Blocks the persistence effect from writing the mount-time default before
+  // the saved preference has been restored.
+  const restoredRef = useRef(false);
 
   // Persist the user's collapse preference.
   useEffect(() => {
+    if (!restoredRef.current) return;
     try {
       window.localStorage.setItem(COLLAPSE_STORAGE_KEY, collapsed ? "1" : "0");
     } catch {
@@ -75,12 +70,26 @@ export function AppShell({
   }, [collapsed]);
 
   // Animating on the very first client paint can cause a visible width
-  // transition from the SSR width. We gate the transition class until after
-  // mount via a rAF, which runs asynchronously and keeps effects clean.
+  // transition from the SSR width. We restore the saved collapse preference
+  // in a rAF (which runs asynchronously and keeps effects clean), then gate
+  // the transition class until the *next* frame so the restored width snaps
+  // into place without a visible animation.
   const [animate, setAnimate] = useState(false);
   useEffect(() => {
-    const frame = requestAnimationFrame(() => setAnimate(true));
-    return () => cancelAnimationFrame(frame);
+    let animateFrame: number | undefined;
+    const restoreFrame = requestAnimationFrame(() => {
+      try {
+        setCollapsed(window.localStorage.getItem(COLLAPSE_STORAGE_KEY) === "1");
+      } catch {
+        // Ignore storage failures (private mode, quota, etc.).
+      }
+      restoredRef.current = true;
+      animateFrame = requestAnimationFrame(() => setAnimate(true));
+    });
+    return () => {
+      cancelAnimationFrame(restoreFrame);
+      if (animateFrame !== undefined) cancelAnimationFrame(animateFrame);
+    };
   }, []);
 
   // Lock body scroll while the mobile drawer is open.
@@ -114,7 +123,10 @@ export function AppShell({
   }, [mobileOpen]);
 
   return (
-    <div className="min-h-screen bg-ivory-50 pb-16 md:pb-0">
+    <div
+      className="min-h-screen bg-ivory-50 pb-16 md:pb-0"
+      style={{ "--app-rail": `${desktopWidth}px` } as React.CSSProperties}
+    >
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-[70] focus:rounded-lg focus:bg-navy focus:px-4 focus:py-2 focus:text-sm focus:font-bold focus:text-ivory"
@@ -132,33 +144,32 @@ export function AppShell({
       )}
 
       <header
-        className={`fixed inset-x-0 top-0 z-50 flex h-16 items-center border-b border-line bg-ivory-50/95 px-4 backdrop-blur md:px-7 ${transitionClass}`}
-        style={{ left: desktopWidth }}
+        className={`fixed inset-x-0 top-0 z-50 flex h-20 items-center border-b border-line bg-ivory-50/95 px-4 backdrop-blur md:left-[var(--app-rail)] md:px-7 ${transitionClass}`}
       >
         <div className="flex items-center gap-2">
           {/* Hamburger: opens the mobile slide-over drawer. */}
           <button
             type="button"
             onClick={() => setMobileOpen(true)}
-            className="btn-quiet size-9 min-h-9 px-0 md:hidden"
+            className="btn-icon size-10 md:hidden"
             aria-label="Open navigation menu"
             aria-expanded={mobileOpen}
             aria-controls="mobile-sidebar"
           >
-            <Menu className="size-5" aria-hidden="true" />
+            <Menu className="size-6" aria-hidden="true" />
           </button>
           {/* Collapse toggle: desktop only. */}
           <button
             type="button"
             onClick={() => setCollapsed((value) => !value)}
-            className="btn-quiet hidden size-9 min-h-9 px-0 md:inline-flex"
+            className="btn-icon hidden h-10 px-3 md:inline-flex"
             aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
             title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           >
             {collapsed ? (
-              <PanelLeftOpen className="size-5" aria-hidden="true" />
+              <PanelLeftOpen className="size-6" aria-hidden="true" />
             ) : (
-              <PanelLeftClose className="size-5" aria-hidden="true" />
+              <PanelLeftClose className="size-6" aria-hidden="true" />
             )}
           </button>
           <div className="md:hidden">
@@ -169,30 +180,30 @@ export function AppShell({
         <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
           <Link
             href="/"
-            className="btn-quiet hidden items-center gap-1.5 px-3 text-[13px] font-semibold sm:inline-flex"
+            className="btn-quiet hidden items-center gap-1.5 px-3.5 text-[15px] font-bold sm:inline-flex"
           >
             <span className="text-copper">◆</span> Portfolio
           </Link>
           <Link
             href="/docs/security"
-            className="btn-quiet size-9 min-h-9 px-0"
+            className="btn-quiet size-10 min-h-10 px-0"
             aria-label="Security model and setup help"
           >
-            <CircleHelp className="size-[17px]" aria-hidden="true" />
+            <CircleHelp className="size-5" aria-hidden="true" />
           </Link>
-          <div className="mx-1 h-6 w-px bg-line" aria-hidden="true" />
+          <div className="mx-1 h-7 w-px bg-line" aria-hidden="true" />
           <Link
             href="/settings"
-            className="flex items-center gap-2 rounded-lg p-1.5 transition-colors hover:bg-ivory-100"
+            className="flex items-center gap-2.5 rounded-lg p-1.5 transition-colors hover:bg-ivory-100"
           >
-            <span className="flex size-7 items-center justify-center rounded-full bg-brandblue text-[10px] font-bold text-ivory">
+            <span className="flex size-9 items-center justify-center rounded-full bg-brandblue text-xs font-bold text-ivory">
               {initials || "VA"}
             </span>
             <span className="hidden text-left lg:block">
-              <span className="block max-w-32 truncate text-[11px] font-bold text-navy">
+              <span className="block max-w-40 truncate text-[14px] font-bold text-navy">
                 {user.name}
               </span>
-              <span className="block text-[10px] text-slate">
+              <span className="block text-[12px] font-medium text-slate">
                 @{user.login}
               </span>
             </span>
@@ -207,7 +218,7 @@ export function AppShell({
         style={{ width: desktopWidth }}
         aria-label="Main navigation"
       >
-        <div className="flex h-16 shrink-0 items-center border-b border-navy-700">
+        <div className="flex h-20 shrink-0 items-center border-b border-navy-700">
           <CloseOnNavLink
             href="/dashboard"
             onNavigate={() => setMobileOpen(false)}
@@ -262,7 +273,7 @@ export function AppShell({
         aria-label="Mobile navigation"
         aria-hidden={!mobileOpen}
       >
-        <div className="flex h-16 shrink-0 items-center justify-between border-b border-navy-700 px-4">
+        <div className="flex h-20 shrink-0 items-center justify-between border-b border-navy-700 px-4">
           <Logo inverse />
           <button
             type="button"
@@ -298,8 +309,7 @@ export function AppShell({
 
       <main
         id="main-content"
-        className={`min-h-[calc(100dvh-4rem)] pt-16 md:min-h-dvh ${transitionClass}`}
-        style={{ paddingLeft: desktopWidth }}
+        className={`min-h-[calc(100dvh-5rem)] pt-20 md:min-h-dvh md:pl-[var(--app-rail)] ${transitionClass}`}
       >
         {children}
       </main>

@@ -257,7 +257,7 @@ describe("site brief: Ghana-friendly defaults", () => {
     expect(brief.country).toBe("Ghana");
     expect(brief.currency).toBe("GHS");
     expect(brief.timezone).toBe("Africa/Accra");
-    expect(brief.assetStatus).toBe("not_provided");
+    expect(brief.assets).toEqual({ logo: null, photos: [] });
     expect(GHANA_DEFAULTS.country).toBe("Ghana");
   });
 
@@ -447,18 +447,45 @@ describe("site brief: free text is cleaned before storage", () => {
   });
 });
 
-describe("site brief: asset status stays a marker", () => {
-  it("only accepts the not_provided marker", () => {
+describe("site brief: assets field holds uploaded images", () => {
+  it("defaults to empty logo and photos when not provided", () => {
+    const parsed = siteBriefSchemaV1.parse(completeBrief());
+    expect(parsed.assets).toEqual({ logo: null, photos: [] });
+  });
+
+  it("rejects an image that is not an accepted mime type", () => {
     expect(
       siteBriefSchemaV1.safeParse({
         ...completeBrief(),
-        assetStatus: "https://example.com/logo.png",
+        assets: {
+          logo: {
+            dataUrl: "data:image/svg+xml;base64,PHN2Zy8+",
+            fileName: "logo.svg",
+            mime: "image/svg+xml",
+            width: 100,
+            height: 100,
+            size: 10,
+          },
+          photos: [],
+        },
       }).success,
     ).toBe(false);
+  });
+
+  it("caps the photo list at 8", () => {
+    const tooMany = Array.from({ length: 9 }, (_, i) => ({
+      dataUrl:
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=",
+      fileName: `p${i}.png`,
+      mime: "image/png",
+      width: 1,
+      height: 1,
+      size: 68,
+    }));
     expect(
       siteBriefSchemaV1.safeParse({
         ...completeBrief(),
-        assetStatus: "uploaded",
+        assets: { logo: null, photos: tooMany },
       }).success,
     ).toBe(false);
   });

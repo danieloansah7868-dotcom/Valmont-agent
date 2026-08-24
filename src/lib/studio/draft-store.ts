@@ -453,6 +453,58 @@ export function draftIdExists(db: DatabaseSync, id: string): boolean {
   );
 }
 
+/**
+ * Brings a stored brief up to the current shape so no read path has to defend
+ * against fields added in a later phase.
+ *
+ * - Phase 2 added `assets`; a pre-Phase-2 draft gets an empty assets object.
+ * - Phase 3 added `items` (a priced catalogue) and `payments`. A pre-Phase-3
+ *   draft has neither, so the name-only `products` list is carried forward into
+ *   `items` (each becomes an unpriced item) and the payments block is filled
+ *   with safe, disabled defaults. This means list/get/update/create,
+ *   backup import and the public reader all return the same complete shape.
+ */
+export function normalizeBrief(brief: SiteBriefV1): SiteBriefV1 {
+  const next: SiteBriefV1 = { ...brief };
+
+  if (!next.assets) {
+    next.assets = { logo: null, photos: [] };
+  } else if (!next.assets.photos) {
+    next.assets = { logo: next.assets.logo ?? null, photos: [] };
+  }
+
+  if (!Array.isArray(next.items)) {
+    next.items = [];
+  }
+  // Carry legacy name-only products into the priced catalogue once, so a draft
+  // created before Phase 3 shows its products in the shop even before the owner
+  // adds prices. Only done when items is still empty to avoid duplication.
+  if (
+    next.items.length === 0 &&
+    Array.isArray(next.products) &&
+    next.products.length > 0
+  ) {
+    next.items = next.products.map((product, index) => ({
+      id: `legacy-${index}`,
+      name: product.name,
+      category: product.category,
+    }));
+  }
+
+  if (!next.payments) {
+    next.payments = {
+      enabled: false,
+      methods: [],
+      valmontPay: { provisioned: false },
+      delivery: { enabled: false, fee: 0, minimumOrder: 0 },
+      notifications: {},
+      staged: { enabled: false, stages: [] },
+    };
+  }
+
+  return next;
+}
+
 function rowToDraft(row: StudioDraftRow): StudioDraft {
   return {
     id: row.id,
@@ -463,7 +515,7 @@ function rowToDraft(row: StudioDraftRow): StudioDraft {
     revision: row.revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    brief: JSON.parse(row.brief_json) as SiteBriefV1,
+    brief: normalizeBrief(JSON.parse(row.brief_json) as SiteBriefV1),
   };
 }
 
@@ -477,7 +529,7 @@ function pgRowToDraft(row: typeof studioDrafts.$inferSelect): StudioDraft {
     revision: row.revision,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
-    brief: row.brief as SiteBriefV1,
+    brief: normalizeBrief(row.brief as SiteBriefV1),
   };
 }
 

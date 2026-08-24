@@ -33,10 +33,10 @@ export const themes: ThemeManifest[] = [
     description: "Strong type, high contrast.",
     tokens: {
       colors: {
-        primary: "#0f2452",
-        accent: "#c46a2a",
-        surface: "#fffdf7",
-        text: "#1a1a1a",
+        primary: "#0A1F44",
+        accent: "#E8822B",
+        surface: "#F8F6F0",
+        text: "#0A1F44",
       },
       typography: { heading: "Geist", body: "Geist" },
       layout: { radius: "1rem", spacing: "1rem" },

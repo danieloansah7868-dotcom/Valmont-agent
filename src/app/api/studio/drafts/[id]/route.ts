@@ -6,7 +6,10 @@ import { requireApiSessionUser } from "@/lib/auth";
 import { canonicalUserId } from "@/lib/user-identity";
 import { getStudioDraftStore } from "@/lib/studio/draft-store";
 import { siteBriefSchemaV1 } from "@/lib/studio/site-brief/schema";
-import { DRAFT_BODY_LIMIT_BYTES, readBoundedJson } from "@/lib/bounded-json";
+import { readBoundedJson } from "@/lib/bounded-json";
+// Phase 2: briefs can include embedded image data URLs, so allow a
+// larger payload on the update endpoint.
+const BRIEF_BODY_LIMIT_BYTES = 2_500_000; // ~2.5 MB
 
 export async function GET(
   _: NextRequest,
@@ -35,7 +38,7 @@ export async function PATCH(
     assertOwnerRateLimit("studio-mutation", canonicalUserId(user), 30);
     const body = (await readBoundedJson(
       request as unknown as Request,
-      DRAFT_BODY_LIMIT_BYTES,
+      BRIEF_BODY_LIMIT_BYTES,
     )) as Record<string, unknown>;
     const { expectedRevision, ...briefData } = z
       .object({ expectedRevision: z.number().int().min(1) })

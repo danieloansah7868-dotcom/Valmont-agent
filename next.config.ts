@@ -14,7 +14,7 @@ const scriptSrc = isDev
   ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
   : "script-src 'self' 'unsafe-inline'";
 const connectSrc = isDev
-  ? "connect-src 'self' ws: wss: http://localhost:3000 http://127.0.0.1:3000"
+  ? "connect-src 'self' ws: wss: http: https:"
   : "connect-src 'self'";
 
 const nextConfig: NextConfig = {
