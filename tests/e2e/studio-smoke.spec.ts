@@ -380,6 +380,82 @@ test.describe("Website Studio", () => {
     }
   });
 
+  test("the dashboard switches between the owner's own client websites", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, nextOwner(), baseURL!);
+
+    const fashion = await createDraft(page, "Adom Fashion House");
+    await createDraft(page, "Kofi Motors");
+
+    await page.goto("/studio");
+    await expect(
+      page.getByRole("heading", { name: /Your websites/i }),
+    ).toBeVisible();
+
+    // Both client websites are offered, and only those two.
+    const switcher = page.getByTestId("website-switcher");
+    await expect(switcher).toBeVisible();
+    await expect(
+      switcher.locator("option", { hasText: "Adom Fashion House" }),
+    ).toHaveCount(1);
+    await expect(
+      switcher.locator("option", { hasText: "Kofi Motors" }),
+    ).toHaveCount(1);
+    await expect(switcher.locator("option")).toHaveCount(3); // + placeholder
+
+    // The card carries the project details: type, layout, theme, domain and
+    // a completion summary.
+    const card = page
+      .getByTestId("website-card")
+      .filter({ hasText: "Adom Fashion House" });
+    await expect(card).toContainText(/Business Profile/i);
+    await expect(card).toContainText(/Layout /);
+    await expect(card).toContainText(/Theme /);
+    await expect(card.getByTestId("website-domain-status")).toContainText(
+      /No custom domain yet/i,
+    );
+    await expect(card.getByTestId("website-completion")).toContainText(
+      /required items? left|Ready to hand off/i,
+    );
+
+    // Choosing a website in the switcher opens that website's editor.
+    await switcher.selectOption(fashion);
+    await page.waitForURL(/\/studio\/drafts\/[0-9a-f-]{36}$/);
+    expect(page.url().endsWith(fashion)).toBe(true);
+    await expect(
+      page.getByRole("button", { name: /4\. Business details/i }),
+    ).toBeVisible();
+  });
+
+  test("starting from a template pre-selects the website type", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    await signIn(context, nextOwner(), baseURL!);
+
+    await page.goto("/studio");
+    await page
+      .getByTestId("template-starters")
+      .getByRole("link", { name: /Online Shop/i })
+      .click();
+    await page.waitForURL(/\/studio\/drafts\/new\?type=online-shop$/);
+    await expect(page.getByLabel(/What kind of website is this/i)).toHaveValue(
+      "online-shop",
+    );
+    // The shop sub-type question only appears for a shop.
+    await expect(page.getByLabel(/What does the shop sell/i)).toBeVisible();
+
+    // An unknown type is simply ignored: no pre-selection, no error.
+    await page.goto("/studio/drafts/new?type=nonsense");
+    await expect(page.getByLabel(/What kind of website is this/i)).toHaveValue(
+      "business-profile",
+    );
+  });
+
   test("owner B gets the same not-found for owner A's draft as for a random id", async ({
     page,
     context,
@@ -414,9 +490,24 @@ test.describe("Website Studio", () => {
     await pageB.goto("/studio/drafts/00000000-0000-4000-a000-000000000000");
     await expect(pageB.getByText(/Draft not found/i)).toBeVisible();
 
-    // Owner B's own studio does not list it.
+    // Owner B's own studio does not list it. Owner B has a website of their
+    // own, so the switcher really is rendered and really is missing owner A's.
+    await createDraft(pageB, "Private To Owner B");
     await pageB.goto("/studio");
     await expect(pageB.getByText("Private To Owner A")).toHaveCount(0);
+    const switcherB = pageB.getByTestId("website-switcher");
+    await expect(switcherB).toBeVisible();
+    await expect(
+      switcherB.locator("option", { hasText: "Private To Owner B" }),
+    ).toHaveCount(1);
+    await expect(switcherB.locator("option")).toHaveCount(2); // + placeholder
+    await expect(
+      switcherB.locator("option", { hasText: "Private To Owner A" }),
+    ).toHaveCount(0);
+    // A guessed ?website= id selects nothing on owner B's dashboard.
+    await pageB.goto(`/studio?website=${draftId}`);
+    await expect(pageB.getByText("Private To Owner A")).toHaveCount(0);
+    await expect(pageB.getByTestId("website-card")).toHaveCount(1);
 
     // Owner A's draft is untouched.
     await page.goto(`/studio/drafts/${draftId}`);
