@@ -5,6 +5,9 @@ export const TEMPLATE_IDS = [
   "split-features",
   "magazine",
   "minimal-cards",
+  "destination-showcase",
+  "tour-booking",
+  "luxury-escape",
 ] as const;
 export type TemplateId = (typeof TEMPLATE_IDS)[number];
 
@@ -43,6 +46,7 @@ export const templates: TemplateManifest[] = [
       "online-shop",
       "restaurant",
       "hotel",
+      "travel-tourism",
       "salon",
       "real-estate",
       "customer-portal",
@@ -62,6 +66,7 @@ export const templates: TemplateManifest[] = [
       "church",
       "school",
       "business-profile",
+      "travel-tourism",
       "custom",
     ],
   },
@@ -79,8 +84,33 @@ export const templates: TemplateManifest[] = [
       "customer-portal",
       "portfolio",
       "business-profile",
+      "travel-tourism",
       "custom",
     ],
+  },
+  {
+    id: "destination-showcase",
+    label: "Destination Showcase",
+    description:
+      "Large destination photos with featured trips and a clear enquiry button.",
+    sections: ["hero", "gallery", "feature-grid", "contact"],
+    compatibleCategories: ["travel-tourism", "hotel"],
+  },
+  {
+    id: "tour-booking",
+    label: "Tour Booking",
+    description:
+      "A practical tours layout for packages, itineraries and booking requests.",
+    sections: ["hero", "services", "highlights", "booking", "contact"],
+    compatibleCategories: ["travel-tourism", "hotel", "booking"],
+  },
+  {
+    id: "luxury-escape",
+    label: "Luxury Escape",
+    description:
+      "A refined, image-led layout for premium stays, retreats and experiences.",
+    sections: ["hero", "about", "gallery", "highlights", "contact"],
+    compatibleCategories: ["travel-tourism", "hotel"],
   },
 ];
 
