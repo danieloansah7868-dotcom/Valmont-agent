@@ -41,9 +41,17 @@ export default async function StudioPage() {
               payments.
             </p>
           </div>
-          <Link href="/studio/payments" className="btn-secondary inline-flex">
-            Open payment settings
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            <Link
+              href="/studio/analytics"
+              className="btn-secondary inline-flex"
+            >
+              View analytics
+            </Link>
+            <Link href="/studio/payments" className="btn-secondary inline-flex">
+              Open payment settings
+            </Link>
+          </div>
         </div>
       </section>
 
