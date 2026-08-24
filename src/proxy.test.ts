@@ -6,13 +6,17 @@ vi.mock("@/lib/studio/domains", () => {
   const getDomainByHostname = vi.fn();
   return {
     getDomainStore: () => ({
-      getDomainByHostname
+      getDomainByHostname,
     }),
-    __mocks: { getDomainByHostname }
+    __mocks: { getDomainByHostname },
   };
 });
 
-import { __mocks } from "@/lib/studio/domains";
+import * as domainsModule from "@/lib/studio/domains";
+
+const { __mocks } = domainsModule as unknown as {
+  __mocks: Record<string, import("vitest").Mock>;
+};
 
 describe("Proxy Middleware", () => {
   beforeEach(() => {
@@ -24,26 +28,28 @@ describe("Proxy Middleware", () => {
     __mocks.getDomainByHostname.mockResolvedValue({
       draft_id: "my-draft-123",
       status: "active",
-      hostname: "shop.com"
+      hostname: "shop.com",
     });
 
     const req = new NextRequest("http://shop.com/");
     req.headers.set("host", "shop.com");
-    
+
     const res = await proxy(req);
-    expect(res.headers.get("x-middleware-rewrite")).toBe("http://shop.com/s/my-draft-123");
+    expect(res.headers.get("x-middleware-rewrite")).toBe(
+      "http://shop.com/s/my-draft-123",
+    );
   });
 
   it("does not rewrite if domain is not active", async () => {
     __mocks.getDomainByHostname.mockResolvedValue({
       draft_id: "my-draft-123",
       status: "pending",
-      hostname: "shop.com"
+      hostname: "shop.com",
     });
 
     const req = new NextRequest("http://shop.com/");
     req.headers.set("host", "shop.com");
-    
+
     const res = await proxy(req);
     expect(res.headers.get("x-middleware-rewrite")).toBeNull();
   });
@@ -52,12 +58,12 @@ describe("Proxy Middleware", () => {
     __mocks.getDomainByHostname.mockResolvedValue({
       draft_id: "my-draft-123",
       status: "active",
-      hostname: "shop.com"
+      hostname: "shop.com",
     });
 
     const req = new NextRequest("http://shop.com/api/test");
     req.headers.set("host", "shop.com");
-    
+
     const res = await proxy(req);
     expect(res.headers.get("x-middleware-rewrite")).toBeNull();
   });
@@ -65,7 +71,7 @@ describe("Proxy Middleware", () => {
   it("does not rewrite platform host", async () => {
     const req = new NextRequest("http://valmont.test/");
     req.headers.set("host", "valmont.test");
-    
+
     const res = await proxy(req);
     expect(res.headers.get("x-middleware-rewrite")).toBeNull();
   });

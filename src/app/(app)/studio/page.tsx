@@ -18,7 +18,9 @@ export const dynamic = "force-dynamic";
 export default async function StudioPage() {
   const user = await requireSessionUser();
   const drafts = await getStudioDraftStore().list(user);
-  const domains = await getDomainStore().getDomainsForOwner(user.id);
+  const domains = await getDomainStore().getDomainsForOwner(
+    canonicalUserId(user),
+  );
   const paymentConfig = await resolvePaymentConfig();
 
   const hasShop = drafts.some((draft) => draft.brief.payments?.enabled);
@@ -58,7 +60,7 @@ export default async function StudioPage() {
             {drafts.map((draft) => {
               const completeness = computeBriefCompleteness(draft.brief);
               const category = getCategory(draft.brief.category);
-              const domain = domains.find(d => d.draft_id === draft.id);
+              const domain = domains.find((d) => d.draft_id === draft.id);
               return (
                 <li
                   key={draft.id}
@@ -79,17 +81,35 @@ export default async function StudioPage() {
                   <p className="mt-1 text-xs text-slate-500">
                     Last saved {formatAccra(draft.updatedAt)}
                   </p>
-                  <div className="mt-3">
+                  <div className="mt-3 flex flex-wrap items-center gap-3">
                     <ShareLinkButton draftId={draft.id} compact />
+                    <Link
+                      href={`/studio/drafts/${draft.id}#custom-domain-card`}
+                      className="text-xs font-medium text-navy underline"
+                      data-testid="custom-domain-link"
+                    >
+                      {domain ? "Custom domain" : "Set up a custom domain"}
+                    </Link>
                   </div>
-                  {domain && domain.status === 'active' && (
+                  {domain && domain.status === "active" && (
                     <p className="mt-2 text-xs text-slate-500">
-                      Connected domain: <a href={`http://${domain.hostname}`} target="_blank" className="underline">{domain.hostname}</a>
+                      Connected domain:{" "}
+                      <a
+                        href={`http://${domain.hostname}`}
+                        target="_blank"
+                        className="underline"
+                      >
+                        {domain.hostname}
+                      </a>
                     </p>
                   )}
-                  {domain && domain.status !== 'active' && (
+                  {domain && domain.status !== "active" && (
                     <p className="mt-2 text-xs text-amber-600">
-                      Domain {domain.hostname} ({domain.status === 'pending' ? 'waiting for DNS' : 'configuration problem'})
+                      Domain {domain.hostname} (
+                      {domain.status === "pending"
+                        ? "waiting for DNS"
+                        : "configuration problem"}
+                      )
                     </p>
                   )}
                 </li>
@@ -199,18 +219,6 @@ export default async function StudioPage() {
         <div className="mt-3">
           <BackupControls />
         </div>
-      </section>
-
-      <section
-        className="mt-8 rounded-xl border border-line bg-white p-4"
-        aria-labelledby="not-yet-heading"
-      >
-        <h2 id="not-yet-heading" className="text-sm font-semibold">
-          Not working yet — planned for later phases
-        </h2>
-        <ul className="mt-2 list-disc pl-4 text-xs text-slate-600">
-          <li>Custom domain for this website — Phase 5</li>
-        </ul>
       </section>
 
       <p className="mt-4 text-xs text-slate-500">

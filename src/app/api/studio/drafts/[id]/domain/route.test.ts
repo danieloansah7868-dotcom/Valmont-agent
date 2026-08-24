@@ -19,29 +19,38 @@ vi.mock("@/lib/studio/domains", () => {
   return {
     getDomainStore: () => ({
       getDomainByHostname,
-      setDomain
+      setDomain,
     }),
-    __mocks: { getDomainByHostname, setDomain }
+    __mocks: { getDomainByHostname, setDomain },
   };
 });
-import { __mocks } from "@/lib/studio/domains";
+import * as domainsModule from "@/lib/studio/domains";
+
+const { __mocks } = domainsModule as unknown as {
+  __mocks: Record<string, import("vitest").Mock>;
+};
 
 describe("Custom Domain API", () => {
   const draftId = "draft-123";
   const userId = "user-123";
-  
+
   beforeEach(async () => {
     vi.resetAllMocks();
-    // @ts-expect-error Mocked value
-    vi.mocked(auth.requireApiSessionUser).mockResolvedValue({ id: userId });
-    
+    vi.mocked(auth.requireApiSessionUser).mockResolvedValue({
+      id: userId,
+      login: "danny",
+      name: "Danny",
+    });
+
     // Spy on getStudioDraftStore
     const fakeStore = {
-      // @ts-expect-error Mocked value
-      get: vi.fn().mockResolvedValue({ id: "draft-123", ownerId: "user-123" })
-    };
-    vi.spyOn(await import("@/lib/studio/draft-store"), "getStudioDraftStore").mockReturnValue(fakeStore);
-    
+      get: vi.fn().mockResolvedValue({ id: "draft-123", ownerId: "user-123" }),
+    } as unknown as import("@/lib/studio/draft-store").StudioDraftStore;
+    vi.spyOn(
+      await import("@/lib/studio/draft-store"),
+      "getStudioDraftStore",
+    ).mockReturnValue(fakeStore);
+
     __mocks.getDomainByHostname.mockResolvedValue(null);
     __mocks.setDomain.mockResolvedValue(undefined);
 
@@ -50,12 +59,15 @@ describe("Custom Domain API", () => {
 
   it("checks DNS and sets status active if CNAME matches", async () => {
     vi.mocked(dns.resolveCname).mockResolvedValue(["valmont.test"]);
-    
-    const req = new NextRequest("http://localhost/api/studio/drafts/draft-123/domain", { 
-      method: "POST", 
-      body: JSON.stringify({ hostname: "test.com" }),
-      headers: { "content-type": "application/json" }
-    });
+
+    const req = new NextRequest(
+      "http://localhost/api/studio/drafts/draft-123/domain",
+      {
+        method: "POST",
+        body: JSON.stringify({ hostname: "test.com" }),
+        headers: { "content-type": "application/json" },
+      },
+    );
     const res = await POST(req, { params: Promise.resolve({ id: draftId }) });
     const data = await res.json();
 
@@ -66,17 +78,19 @@ describe("Custom Domain API", () => {
   it("falls back to lookup and sets status active if IP matches", async () => {
     vi.mocked(dns.resolveCname).mockRejectedValue(new Error("ENODATA"));
     vi.mocked(dns.lookup).mockImplementation((hostname: string) => {
-      // @ts-expect-error Mocked value
-      if (hostname === "test.com" || hostname === "valmont.test") return Promise.resolve({ address: "1.2.3.4", family: 4 });
-      // @ts-expect-error Mocked value
+      if (hostname === "test.com" || hostname === "valmont.test")
+        return Promise.resolve({ address: "1.2.3.4", family: 4 });
       return Promise.resolve({ address: "0.0.0.0", family: 4 });
     });
 
-    const req = new NextRequest("http://localhost/api/studio/drafts/draft-123/domain", { 
-      method: "POST",
-      body: JSON.stringify({ hostname: "test.com" }),
-      headers: { "content-type": "application/json" }
-    });
+    const req = new NextRequest(
+      "http://localhost/api/studio/drafts/draft-123/domain",
+      {
+        method: "POST",
+        body: JSON.stringify({ hostname: "test.com" }),
+        headers: { "content-type": "application/json" },
+      },
+    );
     const res = await POST(req, { params: Promise.resolve({ id: draftId }) });
     const data = await res.json();
 
@@ -86,19 +100,21 @@ describe("Custom Domain API", () => {
   it("sets status error if DNS doesn't match", async () => {
     vi.mocked(dns.resolveCname).mockResolvedValue(["other.test"]);
     vi.mocked(dns.lookup).mockImplementation((hostname: string) => {
-      // @ts-expect-error Mocked value
-      if (hostname === "test.com") return Promise.resolve({ address: "1.1.1.1", family: 4 });
-      // @ts-expect-error Mocked value
-      if (hostname === "valmont.test") return Promise.resolve({ address: "2.2.2.2", family: 4 });
-      // @ts-expect-error Mocked value
+      if (hostname === "test.com")
+        return Promise.resolve({ address: "1.1.1.1", family: 4 });
+      if (hostname === "valmont.test")
+        return Promise.resolve({ address: "2.2.2.2", family: 4 });
       return Promise.resolve({ address: "0.0.0.0", family: 4 });
     });
 
-    const req = new NextRequest("http://localhost/api/studio/drafts/draft-123/domain", { 
-      method: "POST",
-      body: JSON.stringify({ hostname: "test.com" }),
-      headers: { "content-type": "application/json" }
-    });
+    const req = new NextRequest(
+      "http://localhost/api/studio/drafts/draft-123/domain",
+      {
+        method: "POST",
+        body: JSON.stringify({ hostname: "test.com" }),
+        headers: { "content-type": "application/json" },
+      },
+    );
     const res = await POST(req, { params: Promise.resolve({ id: draftId }) });
     const data = await res.json();
 
