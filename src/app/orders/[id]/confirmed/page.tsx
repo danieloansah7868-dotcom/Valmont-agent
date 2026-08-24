@@ -1,4 +1,6 @@
 import Link from "next/link";
+import { getSessionUser } from "@/lib/auth";
+import { orderConfirmationDestination } from "@/lib/studio/order-confirmation";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { formatMoney, STATUS_LABELS } from "@/lib/studio/valmont-pay";
 
@@ -29,6 +31,8 @@ export default async function OrderConfirmedPage({
     );
   }
 
+  const viewer = await getSessionUser();
+  const destination = orderConfirmationDestination(order, viewer);
   const paid = order.status === "paid";
   const cod = order.status === "cod_pending";
   const failed = order.status === "payment_failed";
@@ -127,8 +131,15 @@ export default async function OrderConfirmedPage({
         Contact the business directly if you have any questions about this
         order.
       </p>
-      <Link href="/" className="mt-2 inline-block text-sm underline">
-        Back to home
+      <Link
+        href={destination.href}
+        className={
+          destination.isOwner
+            ? "btn-primary mt-4 inline-flex"
+            : "mt-2 inline-block text-sm underline"
+        }
+      >
+        {destination.label}
       </Link>
     </main>
   );
