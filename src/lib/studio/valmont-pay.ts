@@ -101,13 +101,6 @@ export function formatMoney(amount: number, currency = "GHS"): string {
   })}`;
 }
 
-/** True only when both Valmont Pay environment variables are present. */
-export function isLiveConfigured(): boolean {
-  return Boolean(
-    process.env.VALMONT_PAY_API_URL && process.env.VALMONT_PAY_API_KEY,
-  );
-}
-
 /** Joins a base, a path and query parameters into a single URL string. */
 export function buildPublicUrl(
   base: string,
@@ -118,23 +111,9 @@ export function buildPublicUrl(
     path.replace(/^\//, ""),
     base.endsWith("/") ? base : `${base}/`,
   );
-  for (const [key, value] of Object.entries(params)) {
+  for (const [key, value] of Object.entries(params))
     url.searchParams.set(key, value);
-  }
   return url.toString();
-}
-
-/**
- * Where the customer goes to pay. In live mode this is the hosted Valmont Pay
- * page; in test mode it is the local `/pay/[code]` simulator route.
- */
-export function paymentUrlFor(accessCode: string): string {
-  if (isLiveConfigured()) {
-    return buildPublicUrl(process.env.VALMONT_PAY_API_URL!, "pay", {
-      access_code: accessCode,
-    });
-  }
-  return `/pay/${accessCode}`;
 }
 
 export interface CreatePaymentLinkRequest {
@@ -153,75 +132,4 @@ export interface CreatePaymentLinkRequest {
 export interface CreatePaymentLinkResult {
   paymentLink: string;
   live: boolean;
-}
-
-/**
- * Creates a payment link. In live mode it POSTs to the Valmont Pay API with a
- * Bearer key; in test mode it returns the local simulator link. The exact live
- * request shape will be finalised when Valmont Pay publishes its API; the call
- * is isolated here so only this function changes.
- */
-export async function createPaymentLink(
-  req: CreatePaymentLinkRequest,
-): Promise<CreatePaymentLinkResult> {
-  if (!isLiveConfigured()) {
-    return { paymentLink: paymentUrlFor(req.accessCode), live: false };
-  }
-
-  const endpoint = buildPublicUrl(process.env.VALMONT_PAY_API_URL!, "links");
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${process.env.VALMONT_PAY_API_KEY!}`,
-    },
-    body: JSON.stringify({
-      amount: Math.round(req.amount * 100),
-      currency: req.currency,
-      reference: req.reference,
-      description: req.description,
-      access_code: req.accessCode,
-      customer: {
-        name: req.customerName,
-        email: req.customerEmail,
-        phone: req.customerPhone,
-      },
-      callback_url: req.callbackUrl,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error("Valmont Pay could not create a payment link right now.");
-  }
-
-  const data = (await response.json()) as { url?: string; link?: string };
-  const paymentLink = data.url ?? data.link;
-  if (!paymentLink) {
-    throw new Error("Valmont Pay returned no payment link.");
-  }
-  return { paymentLink, live: true };
-}
-
-/**
- * Verifies a webhook signature. In test mode there is no signing secret, so a
- * request that reaches the webhook (already gated by the unguessable access
- * code) is accepted. HMAC verification against a shared secret will be added
- * here once Valmont Pay publishes its signing scheme.
- */
-export function verifyWebhookSignature(
-  body: string,
-  signatureHeader: string | null,
-): boolean {
-  if (!isLiveConfigured()) {
-    // Test mode: the local simulator is the only caller and the access code in
-    // the URL is the access control. There is nothing to verify against.
-    void body;
-    void signatureHeader;
-    return true;
-  }
-  // TODO: HMAC-SHA256 over the raw body with the Valmont Pay signing secret,
-  // compared in constant time, once the signing scheme is published.
-  void body;
-  void signatureHeader;
-  return true;
 }

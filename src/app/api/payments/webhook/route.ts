@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { safeApiError } from "@/lib/api";
 import { getOrdersStore } from "@/lib/studio/orders";
-import { verifyWebhookSignature } from "@/lib/studio/valmont-pay";
+import { verifyWebhookSignature } from "@/lib/studio/valmont-pay-server";
 
 const WEBHOOK_BODY_LIMIT_BYTES = 50_000;
 

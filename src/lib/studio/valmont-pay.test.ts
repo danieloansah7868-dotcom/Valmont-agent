@@ -1,11 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  computeTotals,
-  formatMoney,
-  isLiveConfigured,
-  paymentUrlFor,
-  STATUS_LABELS,
-} from "./valmont-pay";
+import { computeTotals, formatMoney, STATUS_LABELS } from "./valmont-pay";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -78,22 +72,6 @@ describe("formatMoney", () => {
 
   it("falls back to the currency code for unknown currencies", () => {
     expect(formatMoney(10, "XOF")).toBe("XOF 10.00");
-  });
-});
-
-describe("isLiveConfigured / paymentUrlFor", () => {
-  it("is test mode when the env vars are missing", () => {
-    vi.stubEnv("VALMONT_PAY_API_URL", "");
-    vi.stubEnv("VALMONT_PAY_API_KEY", "");
-    expect(isLiveConfigured()).toBe(false);
-    expect(paymentUrlFor("abc123")).toBe("/pay/abc123");
-  });
-
-  it("is live only when both env vars are set", () => {
-    vi.stubEnv("VALMONT_PAY_API_URL", "https://pay.example.com");
-    vi.stubEnv("VALMONT_PAY_API_KEY", "secret");
-    expect(isLiveConfigured()).toBe(true);
-    expect(paymentUrlFor("abc123")).toContain("access_code=abc123");
   });
 });
 
