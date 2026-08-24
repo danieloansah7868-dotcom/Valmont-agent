@@ -6,59 +6,68 @@ import { assertCsrf } from "@/lib/security";
 import { assertOwnerRateLimit, safeApiError } from "@/lib/api";
 import { getDomainStore, DomainStatus } from "@/lib/studio/domains";
 import { getStudioDraftStore } from "@/lib/studio/draft-store";
+import { canonicalUserId } from "@/lib/user-identity";
 import { readBoundedJson, DRAFT_BODY_LIMIT_BYTES } from "@/lib/bounded-json";
 
 export async function GET(
   request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
 ) {
   try {
     const user = await requireApiSessionUser();
     const { id } = await params;
-    
+
     // Auth & Draft ownership
     const draft = await getStudioDraftStore().get(user, id);
-    if (!draft) return NextResponse.json({ error: "Not found" }, { status: 404 });
+    if (!draft)
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
 
     const domainStore = getDomainStore();
     const domain = await domainStore.getDomain(id);
-    
+
     if (!domain) return NextResponse.json(null);
-    return NextResponse.json({ hostname: domain.hostname, status: domain.status });
+    return NextResponse.json({
+      hostname: domain.hostname,
+      status: domain.status,
+    });
   } catch (err) {
     return safeApiError(err);
   }
 }
 
 const postSchema = z.object({
-  hostname: z.string().min(1).max(253)
+  hostname: z.string().min(1).max(253),
 });
 
 export async function POST(
   request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
 ) {
   try {
     const user = await requireApiSessionUser();
     const { id } = await params;
-    
+
     assertCsrf(request);
-    assertOwnerRateLimit("domain_write", user.id);
-    
+    assertOwnerRateLimit("domain_write", canonicalUserId(user));
+
     const draft = await getStudioDraftStore().get(user, id);
-    if (!draft) return NextResponse.json({ error: "Not found" }, { status: 404 });
+    if (!draft)
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
 
     const body = await readBoundedJson(request, DRAFT_BODY_LIMIT_BYTES);
     const { hostname } = postSchema.parse(body);
-    
+
     // Normalize hostname
     const normalizedHostname = hostname.trim().toLowerCase();
-    
+
     // Ensure unique hostname
     const domainStore = getDomainStore();
-    const existing = await domainStore.getDomainByHostname(normalizedHostname); 
+    const existing = await domainStore.getDomainByHostname(normalizedHostname);
     if (existing && existing.draft_id !== id) {
-      return NextResponse.json({ error: "Domain is already in use by another draft" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Domain is already in use by another draft" },
+        { status: 400 },
+      );
     }
 
     // Verify DNS
@@ -69,7 +78,9 @@ export async function POST(
         let isConnected = false;
         try {
           const cnames = await dns.resolveCname(normalizedHostname);
-          if (cnames.some(c => c.toLowerCase() === targetHost.toLowerCase())) {
+          if (
+            cnames.some((c) => c.toLowerCase() === targetHost.toLowerCase())
+          ) {
             isConnected = true;
           }
         } catch {
@@ -80,7 +91,7 @@ export async function POST(
             isConnected = true;
           }
         }
-        
+
         if (isConnected) {
           status = "active";
         } else {
@@ -91,8 +102,13 @@ export async function POST(
       }
     }
 
-    await domainStore.setDomain(id, user.id, normalizedHostname, status);
-    
+    await domainStore.setDomain(
+      id,
+      canonicalUserId(user),
+      normalizedHostname,
+      status,
+    );
+
     return NextResponse.json({ hostname: normalizedHostname, status });
   } catch (err) {
     return safeApiError(err);
@@ -101,21 +117,22 @@ export async function POST(
 
 export async function DELETE(
   request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
 ) {
   try {
     const user = await requireApiSessionUser();
     const { id } = await params;
-    
+
     assertCsrf(request);
-    assertOwnerRateLimit("domain_write", user.id);
-    
+    assertOwnerRateLimit("domain_write", canonicalUserId(user));
+
     const draft = await getStudioDraftStore().get(user, id);
-    if (!draft) return NextResponse.json({ error: "Not found" }, { status: 404 });
+    if (!draft)
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
 
     const domainStore = getDomainStore();
     await domainStore.deleteDomain(id);
-    
+
     return new NextResponse(null, { status: 204 });
   } catch (err) {
     return safeApiError(err);

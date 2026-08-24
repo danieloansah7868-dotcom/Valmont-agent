@@ -4,7 +4,6 @@ import { getDatabase } from "@/db";
 import { studioDomains } from "@/db/schema";
 import { getSqliteChatStore } from "@/lib/chat-store";
 
-
 export const DOMAIN_STATUS = ["not_set", "pending", "active", "error"] as const;
 export type DomainStatus = (typeof DOMAIN_STATUS)[number];
 
@@ -33,7 +32,12 @@ interface DomainStore {
   getDomain(draftId: string): Promise<DomainRow | null>;
   getDomainsForOwner(ownerId: string): Promise<DomainRow[]>;
   getDomainByHostname(hostname: string): Promise<DomainRow | null>;
-  setDomain(draftId: string, ownerId: string, hostname: string, status: DomainStatus): Promise<void>;
+  setDomain(
+    draftId: string,
+    ownerId: string,
+    hostname: string,
+    status: DomainStatus,
+  ): Promise<void>;
   updateStatus(draftId: string, status: DomainStatus): Promise<void>;
   deleteDomain(draftId: string): Promise<void>;
 }
@@ -49,24 +53,29 @@ export class SqliteDomainStore implements DomainStore {
   async getDomain(draftId: string): Promise<DomainRow | null> {
     const row = this.db
       .prepare(`SELECT * FROM studio_domains WHERE draft_id = ?`)
-      .get(draftId) as DomainRow | undefined;
+      .get(draftId) as unknown as DomainRow | undefined;
     return row ?? null;
   }
 
   async getDomainsForOwner(ownerId: string): Promise<DomainRow[]> {
     return this.db
       .prepare(`SELECT * FROM studio_domains WHERE owner_id = ?`)
-      .all(ownerId) as DomainRow[];
+      .all(ownerId) as unknown as DomainRow[];
   }
 
   async getDomainByHostname(hostname: string): Promise<DomainRow | null> {
     const row = this.db
       .prepare(`SELECT * FROM studio_domains WHERE hostname = ?`)
-      .get(hostname) as DomainRow | undefined;
+      .get(hostname) as unknown as DomainRow | undefined;
     return row ?? null;
   }
 
-  async setDomain(draftId: string, ownerId: string, hostname: string, status: DomainStatus): Promise<void> {
+  async setDomain(
+    draftId: string,
+    ownerId: string,
+    hostname: string,
+    status: DomainStatus,
+  ): Promise<void> {
     const now = new Date().toISOString();
     this.db
       .prepare(
@@ -75,7 +84,7 @@ export class SqliteDomainStore implements DomainStore {
          ON CONFLICT(draft_id) DO UPDATE SET
            hostname = excluded.hostname,
            status = excluded.status,
-           updated_at = excluded.updated_at`
+           updated_at = excluded.updated_at`,
       )
       .run(draftId, ownerId, hostname, status, now, now);
   }
@@ -83,12 +92,16 @@ export class SqliteDomainStore implements DomainStore {
   async updateStatus(draftId: string, status: DomainStatus): Promise<void> {
     const now = new Date().toISOString();
     this.db
-      .prepare(`UPDATE studio_domains SET status = ?, updated_at = ? WHERE draft_id = ?`)
+      .prepare(
+        `UPDATE studio_domains SET status = ?, updated_at = ? WHERE draft_id = ?`,
+      )
       .run(status, now, draftId);
   }
 
   async deleteDomain(draftId: string): Promise<void> {
-    this.db.prepare(`DELETE FROM studio_domains WHERE draft_id = ?`).run(draftId);
+    this.db
+      .prepare(`DELETE FROM studio_domains WHERE draft_id = ?`)
+      .run(draftId);
   }
 }
 
@@ -100,7 +113,7 @@ export class PostgresDomainStore implements DomainStore {
       .from(studioDomains)
       .where(eq(studioDomains.draftId, draftId))
       .limit(1);
-    
+
     if (rows.length === 0) return null;
     const r = rows[0];
     return {
@@ -119,8 +132,8 @@ export class PostgresDomainStore implements DomainStore {
       .select()
       .from(studioDomains)
       .where(eq(studioDomains.ownerId, ownerId));
-    
-    return rows.map(r => ({
+
+    return rows.map((r) => ({
       draft_id: r.draftId,
       owner_id: r.ownerId,
       hostname: r.hostname,
@@ -137,7 +150,7 @@ export class PostgresDomainStore implements DomainStore {
       .from(studioDomains)
       .where(eq(studioDomains.hostname, hostname))
       .limit(1);
-    
+
     if (rows.length === 0) return null;
     const r = rows[0];
     return {
@@ -150,7 +163,12 @@ export class PostgresDomainStore implements DomainStore {
     };
   }
 
-  async setDomain(draftId: string, ownerId: string, hostname: string, status: DomainStatus): Promise<void> {
+  async setDomain(
+    draftId: string,
+    ownerId: string,
+    hostname: string,
+    status: DomainStatus,
+  ): Promise<void> {
     const db = await getDatabase();
     const now = new Date();
     await db
