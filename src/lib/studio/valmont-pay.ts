@@ -180,13 +180,16 @@ export async function verifyWebhookSignature(
   headers: WebhookSignatureHeaders,
 ): Promise<boolean> {
   const config = await resolvePaymentConfig();
-  if (!config.liveActive) {
+  if (config.mode === "test") {
     void body;
     void headers;
     return true;
   }
 
-  if (!config.webhookSecret) {
+  // A row explicitly set to Live stays fail-closed even if a key is later
+  // removed or the settings database is temporarily misconfigured. Never
+  // downgrade an explicitly-live webhook to unsigned test behaviour.
+  if (!config.liveActive || !config.webhookSecret) {
     // Fail closed: without a signing secret there is no way to tell a real
     // Valmont Pay callback from a forgery. The settings page warns about this
     // before Live mode is switched on.
@@ -195,7 +198,15 @@ export async function verifyWebhookSignature(
 
   const presented = [headers.valmont, headers.paystack]
     .map((value) => value?.trim())
-    .filter((value): value is string => Boolean(value));
+    .filter((value): value is string => Boolean(value))
+    .flatMap((value) => {
+      // Some webhook providers send the digest as `sha256=...` or
+      // `sha512=...`; Paystack sends the bare digest. Accept either form, but
+      // never discard an unrecognised prefix and accidentally broaden the
+      // accepted values.
+      const prefixed = value.match(/^(?:hmac-)?sha(?:256|512)=(.+)$/i);
+      return prefixed ? [prefixed[1]] : [value];
+    });
   if (presented.length === 0) return false;
 
   const candidates = candidateWebhookSignatures(body, config.webhookSecret);
