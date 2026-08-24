@@ -17,23 +17,8 @@
  * and no real money can move.
  */
 
-export type OrderStatusLabelKey =
-  | "pending"
-  | "paid"
-  | "payment_failed"
-  | "fulfilled"
-  | "cancelled"
-  | "cod_pending";
-
-/** Plain-language labels for every order status shown to a person. */
-export const STATUS_LABELS: Record<OrderStatusLabelKey, string> = {
-  pending: "Awaiting payment",
-  paid: "Paid",
-  payment_failed: "Payment failed",
-  fulfilled: "Fulfilled",
-  cancelled: "Cancelled",
-  cod_pending: "Cash on delivery",
-};
+export type { OrderStatus as OrderStatusLabelKey } from "./order-status";
+export { STATUS_LABELS } from "./order-status";
 
 /** A basket line as priced by the server (never trusted from the client). */
 export interface PricedLine {

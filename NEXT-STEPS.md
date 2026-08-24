@@ -87,11 +87,31 @@ them would start returning 400.
 
 ---
 
-## Website Studio Phase 3 — payments & checkout (this branch)
+## Website Studio Phase 4 — public site, orders, notifications
 
-**Status: implemented on this branch, awaiting review.** Phase 3 adds a real
-basket and checkout to a Studio shop, backed by Valmont Pay with a local
-test-mode simulator.
+**Status: implemented on this branch.** Phase 4 adds the customer-facing
+website, merchant order management, new-order alerts, product photos and
+visual polish on top of the Phase 3 checkout.
+
+What it adds:
+
+- A public shop at `/s/[draft-id]` (unguessable UUID, no login). Copy-share-
+  link on the dashboard and in the wizard. Open Graph title/description/image
+  for WhatsApp previews.
+- Order detail at `/studio/orders/[id]` with Preparing → Out for delivery →
+  Delivered (plus Cancelled / Refunded), filter tabs and count badges.
+- In-tab new-order ping and optional chime while Studio is open. Email via
+  Resend and WhatsApp/SMS via Twilio, Arkesel or Termii when those keys are
+  set; otherwise skipped.
+- Per-item product photos (same resize pipeline as logo/photos) and one-item-
+  per-line menu parsing with a live preview.
+- Customer-facing payment label “Mobile Money, Card and Bank transfer”.
+  Manual MoMo/card/bank boxes are hidden when Valmont Pay is on.
+
+## Website Studio Phase 3 — payments & checkout
+
+**Status: merged and in use.** Phase 3 adds a real basket and checkout to a
+Studio shop, backed by Valmont Pay with a local test-mode simulator.
 
 What it adds:
 

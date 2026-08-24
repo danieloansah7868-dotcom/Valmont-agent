@@ -322,7 +322,7 @@ const socialLink = z.object({ platform: z.string().max(40), url: httpsUrl });
 export const PAYMENT_METHODS = [
   {
     id: "valmont_pay",
-    label: "Valmont Pay",
+    label: "Mobile Money, Card and Bank transfer",
     description:
       "One checkout that accepts Mobile Money, cards and bank transfer. Money settles to your account.",
   },
@@ -353,6 +353,28 @@ export type PaymentMethodId = (typeof PAYMENT_METHODS)[number]["id"];
 export function isPaymentMethodId(value: string): value is PaymentMethodId {
   return PAYMENT_METHODS.some((method) => method.id === value);
 }
+
+/**
+ * Methods shown to a customer at checkout. When Valmont Pay is on, the
+ * manual Mobile Money / card / bank boxes are redundant — they are the
+ * same rails, just without the hosted page — so they are hidden.
+ */
+export function customerFacingPaymentMethods(
+  methods: readonly string[],
+): PaymentMethodId[] {
+  const enabled = methods.filter(isPaymentMethodId);
+  if (enabled.includes("valmont_pay")) {
+    return enabled.filter((id) => id === "valmont_pay" || id === "cod");
+  }
+  return enabled;
+}
+
+/** Manual methods that duplicate Valmont Pay and should stay out of the wizard. */
+export const REDUNDANT_WHEN_VALMONT_PAY: readonly PaymentMethodId[] = [
+  "momo",
+  "card",
+  "bank",
+];
 
 /**
  * A money amount typed by the owner. Accepts a number or a string (people type

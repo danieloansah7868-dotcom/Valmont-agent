@@ -19,11 +19,15 @@ import {
 } from "@/lib/studio/templates";
 import {
   PAYMENT_METHODS,
+  REDUNDANT_WHEN_VALMONT_PAY,
   siteBriefSchemaV1,
-  type CatalogItem,
+  type PaymentMethodId,
   type SiteBriefV1,
   type StudioDraft,
 } from "@/lib/studio/site-brief/schema";
+import { formatPricedItems, parsePricedItems } from "@/lib/studio/catalog";
+import { ShareLinkButton } from "./share-link-button";
+import { ProductImagesEditor } from "./product-images";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { evaluateSaveGate } from "@/lib/studio/save-gate";
 import {
@@ -43,49 +47,6 @@ const STEPS = [
   { number: 4, title: "Business details" },
   { number: 5, title: "Payments and delivery" },
 ] as const;
-
-/**
- * Parses priced-item text like "Jollof Rice - 45, Banku - 30" into catalogue
- * items. An entry with no "- price" part becomes an unpriced item. Existing
- * items are matched by name so their ids (and any images) are preserved.
- */
-function parsePricedItems(
-  text: string,
-  existing: CatalogItem[],
-): CatalogItem[] {
-  const byName = new Map(
-    existing.map((item) => [item.name.trim().toLowerCase(), item]),
-  );
-  return text
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((entry, index) => {
-      const match = /^(.*?)(?:\s*-\s*([0-9]+(?:\.[0-9]{1,2})?))?$/.exec(entry);
-      const rawName = (match?.[1] ?? entry).trim();
-      const priceText = match?.[2];
-      const prior = byName.get(rawName.toLowerCase());
-      const item: CatalogItem = {
-        id: prior?.id ?? `item-${Date.now()}-${index}`,
-        name: rawName,
-      };
-      if (priceText !== undefined) item.price = Number(priceText);
-      else if (prior?.price !== undefined) item.price = prior.price;
-      if (prior?.category) item.category = prior.category;
-      if (prior?.description) item.description = prior.description;
-      if (prior?.image) item.image = prior.image;
-      return item;
-    });
-}
-
-/** Renders catalogue items back to editable "Name - price" text. */
-function formatPricedItems(items: CatalogItem[]): string {
-  return items
-    .map((item) =>
-      item.price !== undefined ? `${item.name} - ${item.price}` : item.name,
-    )
-    .join(", ");
-}
 
 type SaveState =
   | { kind: "saved"; at: string }
@@ -457,6 +418,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         <h1 className="text-xl font-bold text-navy sm:text-2xl">
           {brief.businessName || "Untitled website"}
         </h1>
+        <ShareLinkButton draftId={id} compact />
         <span
           data-testid="save-state"
           role="status"
@@ -881,14 +843,41 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 hint="Separate each one with a comma."
               />
 
-              <TextField
+              <TextArea
                 id="products"
                 label="Products you sell"
                 value={formatPricedItems(brief.items)}
                 onChange={(value) =>
                   update({ items: parsePricedItems(value, brief.items) })
                 }
-                hint='Add a price with a dash, e.g. "Jollof Rice - 45, Banku - 30". Prices turn on the shop and basket in Step 5.'
+              />
+              <p className="text-xs text-slate-500">
+                One item per line works best, or separate with commas. Add a
+                price with a dash, e.g. Jollof Rice - 45.
+              </p>
+              {brief.items.length > 0 && (
+                <ul
+                  data-testid="parsed-items-preview"
+                  className="grid gap-1 rounded-lg border border-line bg-ivory-50 p-3 text-sm"
+                >
+                  {brief.items.map((item) => (
+                    <li
+                      key={item.id}
+                      className="flex items-center justify-between gap-3"
+                    >
+                      <span>{item.name}</span>
+                      <span className="text-xs font-semibold text-copper">
+                        {item.price !== undefined
+                          ? `GH₵${item.price}`
+                          : "No price — shown as information only"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <ProductImagesEditor
+                items={brief.items}
+                onChange={(items) => update({ items })}
               />
 
               <TextField
@@ -954,24 +943,43 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                     <legend className="text-sm font-semibold">
                       How can customers pay?
                     </legend>
-                    {PAYMENT_METHODS.map((method) => (
+                    {PAYMENT_METHODS.filter((method) => {
+                      if (
+                        brief.payments.methods.includes("valmont_pay") &&
+                        REDUNDANT_WHEN_VALMONT_PAY.includes(method.id)
+                      ) {
+                        return false;
+                      }
+                      return true;
+                    }).map((method) => (
                       <label key={method.id} className="flex items-start gap-2">
                         <input
                           type="checkbox"
                           className="mt-1"
                           checked={brief.payments.methods.includes(method.id)}
-                          onChange={(event) =>
+                          onChange={(event) => {
+                            let methods: PaymentMethodId[] = event.target
+                              .checked
+                              ? [...brief.payments.methods, method.id]
+                              : brief.payments.methods.filter(
+                                  (id) => id !== method.id,
+                                );
+                            if (
+                              method.id === "valmont_pay" &&
+                              event.target.checked
+                            ) {
+                              methods = methods.filter(
+                                (id) =>
+                                  !REDUNDANT_WHEN_VALMONT_PAY.includes(id),
+                              );
+                            }
                             update({
                               payments: {
                                 ...brief.payments,
-                                methods: event.target.checked
-                                  ? [...brief.payments.methods, method.id]
-                                  : brief.payments.methods.filter(
-                                      (id) => id !== method.id,
-                                    ),
+                                methods,
                               },
-                            })
-                          }
+                            });
+                          }}
                         />
                         <span>
                           <span className="block text-sm font-semibold">

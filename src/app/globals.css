@@ -122,256 +122,263 @@ a {
   text-wrap: balance;
 }
 
-/* ---------- surfaces ---------- */
+/* ---------- surfaces / buttons / forms / code / loading ----------
+ * These live in @layer components so Tailwind utilities (px-0, hidden,
+ * size-9, md:hidden, …) can override them. Unlayered component CSS in
+ * Tailwind v4 always wins, which crushed the icon-only header buttons.
+ */
+@layer components {
+  /* ---------- surfaces ---------- */
 
-.card {
-  border: 1px solid var(--color-line);
-  border-radius: 14px;
-  background: var(--color-paper);
-  box-shadow: 0 1px 2px rgb(9 21 52 / 0.04);
-}
-
-.card-hover {
-  transition:
-    border-color 160ms ease,
-    box-shadow 160ms ease,
-    transform 160ms ease;
-}
-
-.card-hover:hover {
-  border-color: var(--color-copper-300);
-  box-shadow: 0 10px 28px rgb(9 21 52 / 0.09);
-  transform: translateY(-1px);
-}
-
-.panel-navy {
-  border-radius: 14px;
-  background: linear-gradient(
-    155deg,
-    var(--color-navy) 0%,
-    var(--color-navy-700) 100%
-  );
-  color: var(--color-ivory);
-}
-
-/* ---------- buttons ---------- */
-
-.btn-primary,
-.btn-secondary,
-.btn-danger,
-.btn-quiet,
-.btn-inverse {
-  display: inline-flex;
-  min-height: 40px;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  border-radius: 9px;
-  padding: 0 15px;
-  font-size: 14px;
-  font-weight: 650;
-  line-height: 1;
-  text-align: center;
-  transition:
-    background-color 150ms ease,
-    border-color 150ms ease,
-    color 150ms ease,
-    box-shadow 150ms ease;
-  cursor: pointer;
-}
-
-/* Navy on orange reads 5.93:1; white on this orange is only 3.51:1 and fails AA. */
-.btn-primary {
-  border: 1px solid var(--color-copper);
-  background: var(--color-copper);
-  color: var(--color-navy);
-  font-weight: 650;
-  box-shadow: inset 0 1px rgb(255 255 255 / 0.22);
-}
-
-.btn-primary:hover {
-  border-color: var(--color-copper-600);
-  background: var(--color-copper-600);
-}
-
-.btn-secondary {
-  border: 1px solid var(--color-line-strong);
-  background: var(--color-paper);
-  color: var(--color-navy);
-}
-
-.btn-secondary:hover {
-  border-color: var(--color-copper);
-  background: var(--color-copper-50);
-  color: var(--color-copper-700);
-}
-
-.btn-inverse {
-  border: 1px solid rgb(236 233 222 / 0.34);
-  background: rgb(236 233 222 / 0.08);
-  color: var(--color-ivory);
-}
-
-.btn-inverse:hover {
-  border-color: var(--color-copper);
-  background: rgb(194 110 46 / 0.18);
-  color: #ffffff;
-}
-
-.btn-danger {
-  border: 1px solid #e0b7b3;
-  background: var(--color-paper);
-  color: var(--color-fail-strong);
-}
-
-.btn-danger:hover {
-  border-color: var(--color-fail);
-  background: var(--color-fail-soft);
-}
-
-.btn-quiet {
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--color-slate);
-}
-
-.btn-quiet:hover {
-  background: var(--color-ivory-100);
-  color: var(--color-navy);
-}
-
-.btn-primary:disabled,
-.btn-secondary:disabled,
-.btn-danger:disabled,
-.btn-quiet:disabled,
-.btn-inverse:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.link-brand {
-  color: var(--color-brandblue);
-  font-weight: 650;
-  text-underline-offset: 3px;
-}
-
-.link-brand:hover {
-  color: var(--color-copper-700);
-  text-decoration: underline;
-}
-
-/* ---------- forms ---------- */
-
-.label {
-  display: block;
-  margin-bottom: 7px;
-  color: var(--color-navy);
-  font-size: 13px;
-  font-weight: 650;
-}
-
-.input,
-.textarea,
-.select {
-  width: 100%;
-  border: 1px solid var(--color-line-strong);
-  border-radius: 9px;
-  background: var(--color-paper);
-  color: var(--color-navy);
-  font-size: 14px;
-  transition:
-    border-color 120ms ease,
-    box-shadow 120ms ease;
-}
-
-.input,
-.select {
-  min-height: 43px;
-  padding: 0 12px;
-}
-
-.textarea {
-  min-height: 150px;
-  resize: vertical;
-  padding: 11px 12px;
-  line-height: 1.55;
-}
-
-.input:focus,
-.textarea:focus,
-.select:focus {
-  border-color: var(--color-copper);
-  box-shadow: 0 0 0 3px rgb(194 110 46 / 0.18);
-  outline: none;
-}
-
-.input::placeholder,
-.textarea::placeholder {
-  color: var(--color-slate-400);
-}
-
-/* ---------- code, diff, timeline ---------- */
-
-.code-surface {
-  background: var(--color-navy-900);
-  color: #d9dde6;
-}
-
-.code-scroll {
-  scrollbar-color: #3a4666 var(--color-navy-900);
-  scrollbar-width: thin;
-}
-
-.diff-line-add {
-  background: rgb(31 122 84 / 0.24);
-  color: #b9ebd0;
-}
-
-.diff-line-remove {
-  background: rgb(179 57 47 / 0.24);
-  color: #f7c5c0;
-}
-
-.diff-line-meta {
-  color: var(--color-copper-300);
-}
-
-/* ---------- loading ---------- */
-
-.skeleton {
-  border-radius: 8px;
-  animation: valmont-pulse 1.6s ease-in-out infinite;
-  background: var(--color-ivory-200);
-}
-
-@keyframes valmont-pulse {
-  0%,
-  100% {
-    opacity: 0.5;
+  .card {
+    border: 1px solid var(--color-line);
+    border-radius: 14px;
+    background: var(--color-paper);
+    box-shadow: 0 1px 2px rgb(9 21 52 / 0.04);
   }
-  50% {
-    opacity: 1;
+
+  .card-hover {
+    transition:
+      border-color 160ms ease,
+      box-shadow 160ms ease,
+      transform 160ms ease;
   }
-}
 
-.spinner {
-  display: inline-block;
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgb(255 255 255 / 0.4);
-  border-top-color: #ffffff;
-  border-radius: 9999px;
-  animation: valmont-spin 700ms linear infinite;
-}
+  .card-hover:hover {
+    border-color: var(--color-copper-300);
+    box-shadow: 0 10px 28px rgb(9 21 52 / 0.09);
+    transform: translateY(-1px);
+  }
 
-.spinner-brand {
-  border-color: var(--color-copper-100);
-  border-top-color: var(--color-copper);
-}
+  .panel-navy {
+    border-radius: 14px;
+    background: linear-gradient(
+      155deg,
+      var(--color-navy) 0%,
+      var(--color-navy-700) 100%
+    );
+    color: var(--color-ivory);
+  }
 
-@keyframes valmont-spin {
-  to {
-    transform: rotate(360deg);
+  /* ---------- buttons ---------- */
+
+  .btn-primary,
+  .btn-secondary,
+  .btn-danger,
+  .btn-quiet,
+  .btn-inverse {
+    display: inline-flex;
+    min-height: 40px;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border-radius: 9px;
+    padding: 0 15px;
+    font-size: 14px;
+    font-weight: 650;
+    line-height: 1;
+    text-align: center;
+    transition:
+      background-color 150ms ease,
+      border-color 150ms ease,
+      color 150ms ease,
+      box-shadow 150ms ease;
+    cursor: pointer;
+  }
+
+  /* Navy on orange reads 5.93:1; white on this orange is only 3.51:1 and fails AA. */
+  .btn-primary {
+    border: 1px solid var(--color-copper);
+    background: var(--color-copper);
+    color: var(--color-navy);
+    font-weight: 650;
+    box-shadow: inset 0 1px rgb(255 255 255 / 0.22);
+  }
+
+  .btn-primary:hover {
+    border-color: var(--color-copper-600);
+    background: var(--color-copper-600);
+  }
+
+  .btn-secondary {
+    border: 1px solid var(--color-line-strong);
+    background: var(--color-paper);
+    color: var(--color-navy);
+  }
+
+  .btn-secondary:hover {
+    border-color: var(--color-copper);
+    background: var(--color-copper-50);
+    color: var(--color-copper-700);
+  }
+
+  .btn-inverse {
+    border: 1px solid rgb(236 233 222 / 0.34);
+    background: rgb(236 233 222 / 0.08);
+    color: var(--color-ivory);
+  }
+
+  .btn-inverse:hover {
+    border-color: var(--color-copper);
+    background: rgb(194 110 46 / 0.18);
+    color: #ffffff;
+  }
+
+  .btn-danger {
+    border: 1px solid #e0b7b3;
+    background: var(--color-paper);
+    color: var(--color-fail-strong);
+  }
+
+  .btn-danger:hover {
+    border-color: var(--color-fail);
+    background: var(--color-fail-soft);
+  }
+
+  .btn-quiet {
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--color-slate);
+  }
+
+  .btn-quiet:hover {
+    background: var(--color-ivory-100);
+    color: var(--color-navy);
+  }
+
+  .btn-primary:disabled,
+  .btn-secondary:disabled,
+  .btn-danger:disabled,
+  .btn-quiet:disabled,
+  .btn-inverse:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .link-brand {
+    color: var(--color-brandblue);
+    font-weight: 650;
+    text-underline-offset: 3px;
+  }
+
+  .link-brand:hover {
+    color: var(--color-copper-700);
+    text-decoration: underline;
+  }
+
+  /* ---------- forms ---------- */
+
+  .label {
+    display: block;
+    margin-bottom: 7px;
+    color: var(--color-navy);
+    font-size: 13px;
+    font-weight: 650;
+  }
+
+  .input,
+  .textarea,
+  .select {
+    width: 100%;
+    border: 1px solid var(--color-line-strong);
+    border-radius: 9px;
+    background: var(--color-paper);
+    color: var(--color-navy);
+    font-size: 14px;
+    transition:
+      border-color 120ms ease,
+      box-shadow 120ms ease;
+  }
+
+  .input,
+  .select {
+    min-height: 43px;
+    padding: 0 12px;
+  }
+
+  .textarea {
+    min-height: 150px;
+    resize: vertical;
+    padding: 11px 12px;
+    line-height: 1.55;
+  }
+
+  .input:focus,
+  .textarea:focus,
+  .select:focus {
+    border-color: var(--color-copper);
+    box-shadow: 0 0 0 3px rgb(194 110 46 / 0.18);
+    outline: none;
+  }
+
+  .input::placeholder,
+  .textarea::placeholder {
+    color: var(--color-slate-400);
+  }
+
+  /* ---------- code, diff, timeline ---------- */
+
+  .code-surface {
+    background: var(--color-navy-900);
+    color: #d9dde6;
+  }
+
+  .code-scroll {
+    scrollbar-color: #3a4666 var(--color-navy-900);
+    scrollbar-width: thin;
+  }
+
+  .diff-line-add {
+    background: rgb(31 122 84 / 0.24);
+    color: #b9ebd0;
+  }
+
+  .diff-line-remove {
+    background: rgb(179 57 47 / 0.24);
+    color: #f7c5c0;
+  }
+
+  .diff-line-meta {
+    color: var(--color-copper-300);
+  }
+
+  /* ---------- loading ---------- */
+
+  .skeleton {
+    border-radius: 8px;
+    animation: valmont-pulse 1.6s ease-in-out infinite;
+    background: var(--color-ivory-200);
+  }
+
+  @keyframes valmont-pulse {
+    0%,
+    100% {
+      opacity: 0.5;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgb(255 255 255 / 0.4);
+    border-top-color: #ffffff;
+    border-radius: 9999px;
+    animation: valmont-spin 700ms linear infinite;
+  }
+
+  .spinner-brand {
+    border-color: var(--color-copper-100);
+    border-top-color: var(--color-copper);
+  }
+
+  @keyframes valmont-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 }
 

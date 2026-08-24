@@ -9,6 +9,7 @@ import {
   MAX_PHOTOS,
   MAX_PHOTO_BYTES,
 } from "@/lib/studio/assets";
+import { dataUrlByteLength, resizeImage } from "./resize-image";
 
 /**
  * Client-side image upload. Files picked here are drawn onto a canvas so they
@@ -35,78 +36,6 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function loadImage(file: File): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () =>
-      reject(new Error("Could not read this file from your computer."));
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () =>
-        reject(
-          new Error(
-            "Could not read this image. It may be corrupt or in an unsupported format.",
-          ),
-        );
-      img.src = reader.result as string;
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
-async function resizeImage(
-  file: File,
-  maxSide: number,
-  preferPng: boolean,
-): Promise<{ dataUrl: string; width: number; height: number; mime: string }> {
-  const img = await loadImage(file);
-  const origW = img.naturalWidth;
-  const origH = img.naturalHeight;
-  let w = origW;
-  let h = origH;
-  if (Math.max(w, h) > maxSide) {
-    if (w >= h) {
-      h = Math.round((h * maxSide) / w);
-      w = maxSide;
-    } else {
-      w = Math.round((w * maxSide) / h);
-      h = maxSide;
-    }
-  }
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Canvas is not available in this browser.");
-  ctx.drawImage(img, 0, 0, w, h);
-
-  const sourceMime = file.type || "image/jpeg";
-  let chosenMime: string =
-    preferPng && sourceMime !== "image/jpeg" ? "image/png" : "image/jpeg";
-  let dataUrl: string;
-  if (sourceMime === "image/webp") {
-    const webp = canvas.toDataURL("image/webp", 0.82);
-    if (webp.startsWith("data:image/webp")) {
-      return { dataUrl: webp, width: w, height: h, mime: "image/webp" };
-    }
-  }
-  if (chosenMime === "image/png") {
-    dataUrl = canvas.toDataURL("image/png");
-  } else {
-    chosenMime = "image/jpeg";
-    dataUrl = canvas.toDataURL("image/jpeg", 0.82);
-  }
-  return { dataUrl, width: w, height: h, mime: chosenMime };
-}
-
-async function b64ByteLength(dataUrl: string): Promise<number> {
-  const comma = dataUrl.indexOf(",");
-  const b64 = dataUrl.slice(comma + 1);
-  const padding = b64.match(/=*$/)?.[0]?.length ?? 0;
-  return Math.round((b64.length * 3) / 4) - padding;
 }
 
 export function AssetUploader({
@@ -158,7 +87,7 @@ export function AssetUploader({
 
       const maxSide = kind === "logo" ? 600 : 1600;
       const resized = await resizeImage(file, maxSide, kind === "logo");
-      const approxSize = await b64ByteLength(resized.dataUrl);
+      const approxSize = await dataUrlByteLength(resized.dataUrl);
       const sizeLimit = kind === "logo" ? MAX_LOGO_BYTES : MAX_PHOTO_BYTES;
       if (approxSize > sizeLimit) {
         throw new Error(

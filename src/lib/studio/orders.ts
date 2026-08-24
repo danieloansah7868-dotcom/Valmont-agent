@@ -4,24 +4,19 @@ import { and, desc, eq, inArray } from "drizzle-orm";
 import { getDatabase } from "@/db";
 import { studioOrders } from "@/db/schema";
 import { getSqliteChatStore } from "@/lib/chat-store";
+import {
+  canTransition,
+  matchesFilter,
+  type OrderFilterId,
+  type OrderStatus,
+} from "./order-status";
 
-/**
- * The lifecycle of an order.
- *
- * - `pending`        — created, awaiting an online payment.
- * - `paid`           — payment confirmed by Valmont Pay (or the simulator).
- * - `payment_failed` — the payment attempt was declined or cancelled.
- * - `fulfilled`      — the merchant has delivered/handed over the order.
- * - `cancelled`      — the order was cancelled.
- * - `cod_pending`    — placed as cash on delivery; money is collected on arrival.
- */
-export type OrderStatus =
-  | "pending"
-  | "paid"
-  | "payment_failed"
-  | "fulfilled"
-  | "cancelled"
-  | "cod_pending";
+export type { OrderStatus } from "./order-status";
+
+export interface StatusEvent {
+  status: OrderStatus;
+  at: string;
+}
 
 /** A single purchased line, snapshotted at checkout time. */
 export interface OrderLine {
@@ -30,6 +25,8 @@ export interface OrderLine {
   /** Unit price in major currency units. */
   price: number;
   quantity: number;
+  /** Optional product photo snapshotted at checkout. */
+  image?: string;
 }
 
 /** What the checkout endpoint receives from the browser. */
@@ -64,9 +61,13 @@ export interface OrderRecord {
   paidAt?: string;
   fulfilledAt?: string;
   cancelledAt?: string;
+  preparingAt?: string;
+  outForDeliveryAt?: string;
+  refundedAt?: string;
   createdAt: string;
   updatedAt: string;
   merchantNote?: string;
+  statusHistory: StatusEvent[];
 }
 
 /** Fields required to open a new order row. Money is in major units. */
@@ -85,10 +86,70 @@ export interface NewOrderInput {
   customerEmail?: string;
   customerAddress?: string;
   paymentMethod: string;
+  merchantNote?: string;
+}
+
+export interface ListOrdersOptions {
+  limit?: number;
+  filter?: OrderFilterId;
 }
 
 const toMinor = (amount: number): number => Math.round(amount * 100);
 const toMajor = (minor: number): number => minor / 100;
+
+function parseHistory(
+  raw: string | StatusEvent[] | null | undefined,
+): StatusEvent[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(raw) as StatusEvent[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function appendHistory(
+  current: StatusEvent[],
+  status: OrderStatus,
+  at: string,
+): StatusEvent[] {
+  return [...current, { status, at }];
+}
+
+function timestampPatch(
+  status: OrderStatus,
+  at: string,
+): Partial<
+  Pick<
+    OrderRecord,
+    | "paidAt"
+    | "preparingAt"
+    | "outForDeliveryAt"
+    | "fulfilledAt"
+    | "cancelledAt"
+    | "refundedAt"
+  >
+> {
+  switch (status) {
+    case "paid":
+      return { paidAt: at };
+    case "preparing":
+      return { preparingAt: at };
+    case "out_for_delivery":
+      return { outForDeliveryAt: at };
+    case "delivered":
+    case "fulfilled":
+      return { fulfilledAt: at };
+    case "cancelled":
+      return { cancelledAt: at };
+    case "refunded":
+      return { refundedAt: at };
+    default:
+      return {};
+  }
+}
 
 export interface OrdersStore {
   create(input: NewOrderInput): Promise<OrderRecord>;
@@ -100,12 +161,27 @@ export interface OrdersStore {
    */
   getById(id: string): Promise<OrderRecord | null>;
   getForOwner(ownerId: string, id: string): Promise<OrderRecord | null>;
-  listForOwner(ownerId: string, limit?: number): Promise<OrderRecord[]>;
+  listForOwner(
+    ownerId: string,
+    options?: number | ListOrdersOptions,
+  ): Promise<OrderRecord[]>;
   markPaid(
     accessCode: string,
     paymentRef?: string,
   ): Promise<OrderRecord | null>;
   markFailed(accessCode: string): Promise<OrderRecord | null>;
+  updateStatus(
+    ownerId: string,
+    id: string,
+    status: OrderStatus,
+  ): Promise<OrderRecord | null>;
+}
+
+function normalizeListOptions(
+  options?: number | ListOrdersOptions,
+): Required<ListOrdersOptions> {
+  if (typeof options === "number") return { limit: options, filter: "all" };
+  return { limit: options?.limit ?? 10, filter: options?.filter ?? "all" };
 }
 
 // ---------------------------------------------------------------------------
@@ -132,9 +208,13 @@ interface OrderRow {
   paid_at: string | null;
   fulfilled_at: string | null;
   cancelled_at: string | null;
+  preparing_at: string | null;
+  out_for_delivery_at: string | null;
+  refunded_at: string | null;
   created_at: string;
   updated_at: string;
   merchant_note: string | null;
+  status_history_json: string | null;
 }
 
 function rowToOrder(row: OrderRow): OrderRecord {
@@ -158,10 +238,24 @@ function rowToOrder(row: OrderRow): OrderRecord {
     paidAt: row.paid_at ?? undefined,
     fulfilledAt: row.fulfilled_at ?? undefined,
     cancelledAt: row.cancelled_at ?? undefined,
+    preparingAt: row.preparing_at ?? undefined,
+    outForDeliveryAt: row.out_for_delivery_at ?? undefined,
+    refundedAt: row.refunded_at ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     merchantNote: row.merchant_note ?? undefined,
+    statusHistory: parseHistory(row.status_history_json),
   };
+}
+
+function ensureColumn(
+  db: DatabaseSync,
+  name: string,
+  definition: string,
+  existing: Set<string>,
+): void {
+  if (existing.has(name)) return;
+  db.exec(`ALTER TABLE studio_orders ADD COLUMN ${name} ${definition}`);
 }
 
 /**
@@ -192,11 +286,27 @@ export function ensureOrdersSchema(db: DatabaseSync): void {
       cancelled_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      merchant_note TEXT
+      merchant_note TEXT,
+      preparing_at TEXT,
+      out_for_delivery_at TEXT,
+      refunded_at TEXT,
+      status_history_json TEXT
     );
     CREATE INDEX IF NOT EXISTS studio_orders_owner_created ON studio_orders(owner_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS studio_orders_draft ON studio_orders(draft_id);
   `);
+
+  const existing = new Set(
+    (
+      db.prepare("PRAGMA table_info(studio_orders)").all() as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name),
+  );
+  ensureColumn(db, "preparing_at", "TEXT", existing);
+  ensureColumn(db, "out_for_delivery_at", "TEXT", existing);
+  ensureColumn(db, "refunded_at", "TEXT", existing);
+  ensureColumn(db, "status_history_json", "TEXT", existing);
 }
 
 export class SqliteOrdersStore implements OrdersStore {
@@ -209,14 +319,15 @@ export class SqliteOrdersStore implements OrdersStore {
   async create(input: NewOrderInput): Promise<OrderRecord> {
     const now = new Date().toISOString();
     const id = randomUUID();
+    const history = appendHistory([], input.status, now);
     this.db
       .prepare(
         `INSERT INTO studio_orders(
           id, owner_id, draft_id, access_code, status, currency,
           subtotal, delivery_fee, total, lines_json,
           customer_name, customer_phone, customer_email, customer_address,
-          payment_method, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          payment_method, merchant_note, created_at, updated_at, status_history_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -234,8 +345,10 @@ export class SqliteOrdersStore implements OrdersStore {
         input.customerEmail ?? null,
         input.customerAddress ?? null,
         input.paymentMethod,
+        input.merchantNote ?? null,
         now,
         now,
+        JSON.stringify(history),
       );
     const created = await this.getByAccessCode(input.accessCode);
     if (!created) throw new Error("Order could not be created");
@@ -263,42 +376,108 @@ export class SqliteOrdersStore implements OrdersStore {
     return row ? rowToOrder(row) : null;
   }
 
-  async listForOwner(ownerId: string, limit = 10): Promise<OrderRecord[]> {
+  async listForOwner(
+    ownerId: string,
+    options?: number | ListOrdersOptions,
+  ): Promise<OrderRecord[]> {
+    const { limit, filter } = normalizeListOptions(options);
     const rows = this.db
       .prepare(
         "SELECT * FROM studio_orders WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?",
       )
-      .all(ownerId, limit) as unknown as OrderRow[];
-    return rows.map(rowToOrder);
+      .all(ownerId, Math.max(limit, 200)) as unknown as OrderRow[];
+    const mapped = rows.map(rowToOrder);
+    const filtered =
+      filter === "all"
+        ? mapped
+        : mapped.filter((order) => matchesFilter(order.status, filter));
+    return filtered.slice(0, limit);
   }
 
   async markPaid(
     accessCode: string,
     paymentRef?: string,
   ): Promise<OrderRecord | null> {
+    const existing = await this.getByAccessCode(accessCode);
+    if (!existing) return null;
+    if (existing.status !== "pending" && existing.status !== "payment_failed") {
+      return existing;
+    }
     const now = new Date().toISOString();
-    // Only a pending/failed order moves to paid; a fulfilled or cancelled
-    // order is left untouched so a duplicate webhook cannot rewind it.
+    const history = appendHistory(existing.statusHistory, "paid", now);
     this.db
       .prepare(
         `UPDATE studio_orders
-            SET status = 'paid', payment_ref = ?, paid_at = ?, updated_at = ?
+            SET status = 'paid', payment_ref = ?, paid_at = ?, updated_at = ?,
+                status_history_json = ?
           WHERE access_code = ? AND status IN ('pending','payment_failed')`,
       )
-      .run(paymentRef ?? null, now, now, accessCode);
+      .run(paymentRef ?? null, now, now, JSON.stringify(history), accessCode);
     return this.getByAccessCode(accessCode);
   }
 
   async markFailed(accessCode: string): Promise<OrderRecord | null> {
+    const existing = await this.getByAccessCode(accessCode);
+    if (!existing) return null;
+    if (existing.status !== "pending") return existing;
     const now = new Date().toISOString();
+    const history = appendHistory(
+      existing.statusHistory,
+      "payment_failed",
+      now,
+    );
     this.db
       .prepare(
         `UPDATE studio_orders
-            SET status = 'payment_failed', updated_at = ?
+            SET status = 'payment_failed', updated_at = ?, status_history_json = ?
           WHERE access_code = ? AND status = 'pending'`,
       )
-      .run(now, accessCode);
+      .run(now, JSON.stringify(history), accessCode);
     return this.getByAccessCode(accessCode);
+  }
+
+  async updateStatus(
+    ownerId: string,
+    id: string,
+    status: OrderStatus,
+  ): Promise<OrderRecord | null> {
+    const existing = await this.getForOwner(ownerId, id);
+    if (!existing) return null;
+    if (existing.status === status) return existing;
+    if (!canTransition(existing.status, status)) {
+      const error = new Error(
+        `This order cannot move from ${existing.status} to ${status}.`,
+      );
+      (error as Error & { status: number }).status = 409;
+      throw error;
+    }
+    const now = new Date().toISOString();
+    const history = appendHistory(existing.statusHistory, status, now);
+    const stamps = timestampPatch(status, now);
+    this.db
+      .prepare(
+        `UPDATE studio_orders
+            SET status = ?, updated_at = ?, status_history_json = ?,
+                preparing_at = COALESCE(?, preparing_at),
+                out_for_delivery_at = COALESCE(?, out_for_delivery_at),
+                fulfilled_at = COALESCE(?, fulfilled_at),
+                cancelled_at = COALESCE(?, cancelled_at),
+                refunded_at = COALESCE(?, refunded_at)
+          WHERE id = ? AND owner_id = ?`,
+      )
+      .run(
+        status,
+        now,
+        JSON.stringify(history),
+        stamps.preparingAt ?? null,
+        stamps.outForDeliveryAt ?? null,
+        stamps.fulfilledAt ?? null,
+        stamps.cancelledAt ?? null,
+        stamps.refundedAt ?? null,
+        id,
+        ownerId,
+      );
+    return this.getForOwner(ownerId, id);
   }
 }
 
@@ -327,14 +506,19 @@ function pgRowToOrder(row: typeof studioOrders.$inferSelect): OrderRecord {
     paidAt: row.paidAt?.toISOString(),
     fulfilledAt: row.fulfilledAt?.toISOString(),
     cancelledAt: row.cancelledAt?.toISOString(),
+    preparingAt: row.preparingAt?.toISOString(),
+    outForDeliveryAt: row.outForDeliveryAt?.toISOString(),
+    refundedAt: row.refundedAt?.toISOString(),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     merchantNote: row.merchantNote ?? undefined,
+    statusHistory: parseHistory(row.statusHistory as StatusEvent[] | null),
   };
 }
 
 export class PostgresOrdersStore implements OrdersStore {
   async create(input: NewOrderInput): Promise<OrderRecord> {
+    const now = new Date();
     const [row] = await getDatabase()
       .insert(studioOrders)
       .values({
@@ -352,6 +536,8 @@ export class PostgresOrdersStore implements OrdersStore {
         customerEmail: input.customerEmail ?? null,
         customerAddress: input.customerAddress ?? null,
         paymentMethod: input.paymentMethod,
+        merchantNote: input.merchantNote ?? null,
+        statusHistory: appendHistory([], input.status, now.toISOString()),
       })
       .returning();
     return pgRowToOrder(row!);
@@ -384,29 +570,47 @@ export class PostgresOrdersStore implements OrdersStore {
     return row ? pgRowToOrder(row) : null;
   }
 
-  async listForOwner(ownerId: string, limit = 10): Promise<OrderRecord[]> {
+  async listForOwner(
+    ownerId: string,
+    options?: number | ListOrdersOptions,
+  ): Promise<OrderRecord[]> {
+    const { limit, filter } = normalizeListOptions(options);
     const rows = await getDatabase()
       .select()
       .from(studioOrders)
       .where(eq(studioOrders.ownerId, ownerId))
       .orderBy(desc(studioOrders.createdAt))
-      .limit(limit);
-    return rows.map(pgRowToOrder);
+      .limit(Math.max(limit, 200));
+    const mapped = rows.map(pgRowToOrder);
+    const filtered =
+      filter === "all"
+        ? mapped
+        : mapped.filter((order) => matchesFilter(order.status, filter));
+    return filtered.slice(0, limit);
   }
 
   async markPaid(
     accessCode: string,
     paymentRef?: string,
   ): Promise<OrderRecord | null> {
-    // Only a pending/failed order moves to paid; a fulfilled or cancelled
-    // order is left untouched so a duplicate webhook cannot rewind it.
+    const existing = await this.getByAccessCode(accessCode);
+    if (!existing) return null;
+    if (existing.status !== "pending" && existing.status !== "payment_failed") {
+      return existing;
+    }
+    const now = new Date();
     await getDatabase()
       .update(studioOrders)
       .set({
         status: "paid",
         paymentRef: paymentRef ?? null,
-        paidAt: new Date(),
-        updatedAt: new Date(),
+        paidAt: now,
+        updatedAt: now,
+        statusHistory: appendHistory(
+          existing.statusHistory,
+          "paid",
+          now.toISOString(),
+        ),
       })
       .where(
         and(
@@ -418,9 +622,21 @@ export class PostgresOrdersStore implements OrdersStore {
   }
 
   async markFailed(accessCode: string): Promise<OrderRecord | null> {
+    const existing = await this.getByAccessCode(accessCode);
+    if (!existing) return null;
+    if (existing.status !== "pending") return existing;
+    const now = new Date();
     await getDatabase()
       .update(studioOrders)
-      .set({ status: "payment_failed", updatedAt: new Date() })
+      .set({
+        status: "payment_failed",
+        updatedAt: now,
+        statusHistory: appendHistory(
+          existing.statusHistory,
+          "payment_failed",
+          now.toISOString(),
+        ),
+      })
       .where(
         and(
           eq(studioOrders.accessCode, accessCode),
@@ -428,6 +644,51 @@ export class PostgresOrdersStore implements OrdersStore {
         ),
       );
     return this.getByAccessCode(accessCode);
+  }
+
+  async updateStatus(
+    ownerId: string,
+    id: string,
+    status: OrderStatus,
+  ): Promise<OrderRecord | null> {
+    const existing = await this.getForOwner(ownerId, id);
+    if (!existing) return null;
+    if (existing.status === status) return existing;
+    if (!canTransition(existing.status, status)) {
+      const error = new Error(
+        `This order cannot move from ${existing.status} to ${status}.`,
+      );
+      (error as Error & { status: number }).status = 409;
+      throw error;
+    }
+    const now = new Date();
+    const stamps = timestampPatch(status, now.toISOString());
+    await getDatabase()
+      .update(studioOrders)
+      .set({
+        status,
+        updatedAt: now,
+        statusHistory: appendHistory(
+          existing.statusHistory,
+          status,
+          now.toISOString(),
+        ),
+        preparingAt: stamps.preparingAt
+          ? new Date(stamps.preparingAt)
+          : undefined,
+        outForDeliveryAt: stamps.outForDeliveryAt
+          ? new Date(stamps.outForDeliveryAt)
+          : undefined,
+        fulfilledAt: stamps.fulfilledAt
+          ? new Date(stamps.fulfilledAt)
+          : undefined,
+        cancelledAt: stamps.cancelledAt
+          ? new Date(stamps.cancelledAt)
+          : undefined,
+        refundedAt: stamps.refundedAt ? new Date(stamps.refundedAt) : undefined,
+      })
+      .where(and(eq(studioOrders.id, id), eq(studioOrders.ownerId, ownerId)));
+    return this.getForOwner(ownerId, id);
   }
 }
 

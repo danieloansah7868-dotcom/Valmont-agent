@@ -98,4 +98,49 @@ describe("SqliteOrdersStore", () => {
     const byId = await store.getById(created.id);
     expect(byId?.accessCode).toBe("code-abc");
   });
+
+  it("walks a paid order through preparing, out for delivery and delivered", async () => {
+    const created = await store.create(newOrder());
+    await store.markPaid("code-abc", "ref-1");
+    const preparing = await store.updateStatus(
+      "owner-1",
+      created.id,
+      "preparing",
+    );
+    expect(preparing?.status).toBe("preparing");
+    expect(preparing?.preparingAt).toBeTruthy();
+    const out = await store.updateStatus(
+      "owner-1",
+      created.id,
+      "out_for_delivery",
+    );
+    expect(out?.status).toBe("out_for_delivery");
+    const delivered = await store.updateStatus(
+      "owner-1",
+      created.id,
+      "delivered",
+    );
+    expect(delivered?.status).toBe("delivered");
+    expect(delivered?.statusHistory.map((event) => event.status)).toEqual([
+      "pending",
+      "paid",
+      "preparing",
+      "out_for_delivery",
+      "delivered",
+    ]);
+  });
+
+  it("refuses to start preparing an unpaid order", async () => {
+    const created = await store.create(newOrder());
+    await expect(
+      store.updateStatus("owner-1", created.id, "preparing"),
+    ).rejects.toThrow(/cannot move/);
+  });
+
+  it("keeps a customer note on the order", async () => {
+    const created = await store.create(
+      newOrder({ merchantNote: "No onions please" }),
+    );
+    expect(created.merchantNote).toBe("No onions please");
+  });
 });
