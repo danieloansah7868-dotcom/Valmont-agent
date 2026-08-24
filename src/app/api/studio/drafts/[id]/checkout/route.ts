@@ -206,7 +206,7 @@ export async function POST(
       orderId: order.id,
       accessCode: code,
       paymentLink,
-      live: isLiveConfigured(),
+      live: await isLiveConfigured(),
       status: order.status,
     });
   } catch (e) {

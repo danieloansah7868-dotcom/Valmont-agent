@@ -9,7 +9,7 @@ import {
   type SiteBriefV1,
 } from "@/lib/studio/site-brief/schema";
 import { getTheme } from "@/lib/studio/themes";
-import { computeTotals, formatMoney } from "@/lib/studio/valmont-pay";
+import { computeTotals, formatMoney } from "@/lib/studio/money";
 
 interface CheckoutResponse {
   orderId: string;

@@ -8,6 +8,7 @@ import { ShareLinkButton } from "@/components/studio/share-link-button";
 import { canonicalUserId } from "@/lib/user-identity";
 import { getOrdersStore, type OrderRecord } from "@/lib/studio/orders";
 import { formatMoney } from "@/lib/studio/valmont-pay";
+import { resolvePaymentConfig } from "@/lib/studio/payment-settings";
 import { STATUS_BADGE_CLASS, STATUS_LABELS } from "@/lib/studio/order-status";
 import { formatAccra } from "@/lib/studio/format";
 
@@ -16,6 +17,7 @@ export const dynamic = "force-dynamic";
 export default async function StudioPage() {
   const user = await requireSessionUser();
   const drafts = await getStudioDraftStore().list(user);
+  const paymentConfig = await resolvePaymentConfig();
 
   const hasShop = drafts.some((draft) => draft.brief.payments?.enabled);
   let orders: OrderRecord[] = [];
@@ -105,6 +107,44 @@ export default async function StudioPage() {
             })}
           </ul>
         )}
+      </section>
+
+      <section className="mt-8" aria-labelledby="payments-heading">
+        <h2 id="payments-heading" className="text-lg font-semibold text-navy">
+          Payments
+        </h2>
+        <div
+          className={`mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border p-4 ${
+            paymentConfig.liveActive
+              ? "border-red-300 bg-red-50"
+              : "border-line bg-white"
+          }`}
+          data-testid="payments-card"
+        >
+          <div>
+            <p className="text-sm font-semibold text-navy">
+              {paymentConfig.liveActive ? (
+                <span className="text-red-700">
+                  LIVE — real Mobile Money and card payments
+                </span>
+              ) : (
+                "Test mode — pretend payments only"
+              )}
+            </p>
+            <p className="mt-1 text-xs text-slate-600">
+              {paymentConfig.liveActive
+                ? "Customers are charged real money at checkout."
+                : "No real money moves. Connect Valmont Pay when you are ready for real payments."}
+            </p>
+          </div>
+          <Link
+            href="/studio/settings/payments"
+            className="btn-secondary min-h-11 px-4"
+            data-testid="payment-settings-link"
+          >
+            Payment settings
+          </Link>
+        </div>
       </section>
 
       {hasShop && (

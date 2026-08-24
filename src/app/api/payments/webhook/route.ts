@@ -36,7 +36,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Body too large" }, { status: 413 });
     }
     if (
-      !verifyWebhookSignature(raw, request.headers.get("x-valmont-signature"))
+      !(await verifyWebhookSignature(raw, {
+        valmont: request.headers.get("x-valmont-signature"),
+        paystack: request.headers.get("x-paystack-signature"),
+      }))
     ) {
       return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
     }

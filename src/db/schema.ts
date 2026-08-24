@@ -358,6 +358,25 @@ export const studioOrders = pgTable(
   ],
 );
 
+/**
+ * Studio payment settings — a single row (id always 1) holding the Valmont
+ * Pay account details saved on the Studio → Settings → Payments page. The
+ * secret fields are AES-256-GCM envelopes (see `encryptSessionValue`); the
+ * plaintext never leaves the server and is never included in backups or API
+ * responses.
+ */
+export const studioSettings = pgTable("studio_settings", {
+  id: integer("id").primaryKey(),
+  mode: text("mode").notNull().default("test"),
+  apiUrlEnc: text("api_url_enc"),
+  apiKeyEnc: text("api_key_enc"),
+  webhookSecretEnc: text("webhook_secret_enc"),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  updatedBy: text("updated_by"),
+});
+
 export const pullRequests = pgTable("pull_requests", {
   id: uuid("id").primaryKey().defaultRandom(),
   taskId: uuid("task_id")

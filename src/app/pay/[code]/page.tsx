@@ -56,8 +56,8 @@ export default async function PayPage({
   }
 
   // Live mode: hand off to the real hosted Valmont Pay page.
-  if (isLiveConfigured()) {
-    redirect(paymentUrlFor(order.accessCode));
+  if (await isLiveConfigured()) {
+    redirect(await paymentUrlFor(order.accessCode));
   }
 
   return (
