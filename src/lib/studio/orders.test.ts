@@ -93,6 +93,38 @@ describe("SqliteOrdersStore", () => {
     expect(await store.getForOwner("someone-else", created.id)).toBeNull();
   });
 
+  it("filters a business without crossing the owner boundary", async () => {
+    await store.create(
+      newOrder({ accessCode: "owner-1-a", draftId: "draft-a" }),
+    );
+    await store.create(
+      newOrder({ accessCode: "owner-1-b", draftId: "draft-b" }),
+    );
+    await store.create(
+      newOrder({
+        accessCode: "owner-2-a",
+        ownerId: "owner-2",
+        draftId: "draft-a",
+      }),
+    );
+
+    const ownerOneBusiness = await store.listForOwner("owner-1", {
+      draftId: "draft-a",
+      limit: 50,
+    });
+    expect(ownerOneBusiness.map((order) => order.accessCode)).toEqual([
+      "owner-1-a",
+    ]);
+
+    const ownerTwoBusiness = await store.listForOwner("owner-2", {
+      draftId: "draft-a",
+      limit: 50,
+    });
+    expect(ownerTwoBusiness.map((order) => order.accessCode)).toEqual([
+      "owner-2-a",
+    ]);
+  });
+
   it("finds an order by its id for the confirmation page", async () => {
     const created = await store.create(newOrder());
     const byId = await store.getById(created.id);

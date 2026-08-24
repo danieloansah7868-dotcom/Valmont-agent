@@ -6,6 +6,7 @@ import { assertOwnerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
 import {
   canManagePayments,
+  isSecurePaymentApiUrl,
   paymentSettingsStatus,
   resolvePaymentConfig,
   writePaymentSettings,
@@ -80,10 +81,12 @@ export async function PUT(request: NextRequest) {
             { status: 400 },
           );
         }
-        if (url.protocol !== "https:" && url.protocol !== "http:") {
+        if (!isSecurePaymentApiUrl(url.toString())) {
           return NextResponse.json(
             {
-              error: "The Valmont Pay website address must start with https://",
+              error:
+                "The Valmont Pay website address must be a valid https:// address. " +
+                "Real payment keys must never be sent over an insecure connection.",
             },
             { status: 400 },
           );
@@ -109,8 +112,8 @@ export async function PUT(request: NextRequest) {
         ...status,
         warning:
           "Live mode is saved, but real payments cannot start until BOTH " +
-          "the Valmont Pay website address and the secret key are set. " +
-          "Checkout stays in test mode until then.",
+          "a valid https:// Valmont Pay website address and the secret key are " +
+          "set. Checkout stays in test mode until then.",
       });
     }
 

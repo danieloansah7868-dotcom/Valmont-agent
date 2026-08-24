@@ -92,6 +92,8 @@ export interface NewOrderInput {
 export interface ListOrdersOptions {
   limit?: number;
   filter?: OrderFilterId;
+  /** Optional owner-scoped business (draft) filter. */
+  draftId?: string;
 }
 
 const toMinor = (amount: number): number => Math.round(amount * 100);
@@ -177,11 +179,23 @@ export interface OrdersStore {
   ): Promise<OrderRecord | null>;
 }
 
+interface NormalizedListOrdersOptions {
+  limit: number;
+  filter: OrderFilterId;
+  draftId?: string;
+}
+
 function normalizeListOptions(
   options?: number | ListOrdersOptions,
-): Required<ListOrdersOptions> {
-  if (typeof options === "number") return { limit: options, filter: "all" };
-  return { limit: options?.limit ?? 10, filter: options?.filter ?? "all" };
+): NormalizedListOrdersOptions {
+  if (typeof options === "number") {
+    return { limit: options, filter: "all", draftId: undefined };
+  }
+  return {
+    limit: options?.limit ?? 10,
+    filter: options?.filter ?? "all",
+    draftId: options?.draftId,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -380,12 +394,18 @@ export class SqliteOrdersStore implements OrdersStore {
     ownerId: string,
     options?: number | ListOrdersOptions,
   ): Promise<OrderRecord[]> {
-    const { limit, filter } = normalizeListOptions(options);
-    const rows = this.db
-      .prepare(
-        "SELECT * FROM studio_orders WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?",
-      )
-      .all(ownerId, Math.max(limit, 200)) as unknown as OrderRow[];
+    const { limit, filter, draftId } = normalizeListOptions(options);
+    const rows = draftId
+      ? (this.db
+          .prepare(
+            "SELECT * FROM studio_orders WHERE owner_id = ? AND draft_id = ? ORDER BY created_at DESC LIMIT ?",
+          )
+          .all(ownerId, draftId, Math.max(limit, 200)) as unknown as OrderRow[])
+      : (this.db
+          .prepare(
+            "SELECT * FROM studio_orders WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?",
+          )
+          .all(ownerId, Math.max(limit, 200)) as unknown as OrderRow[]);
     const mapped = rows.map(rowToOrder);
     const filtered =
       filter === "all"
@@ -574,11 +594,13 @@ export class PostgresOrdersStore implements OrdersStore {
     ownerId: string,
     options?: number | ListOrdersOptions,
   ): Promise<OrderRecord[]> {
-    const { limit, filter } = normalizeListOptions(options);
+    const { limit, filter, draftId } = normalizeListOptions(options);
+    const conditions = [eq(studioOrders.ownerId, ownerId)];
+    if (draftId) conditions.push(eq(studioOrders.draftId, draftId));
     const rows = await getDatabase()
       .select()
       .from(studioOrders)
-      .where(eq(studioOrders.ownerId, ownerId))
+      .where(and(...conditions))
       .orderBy(desc(studioOrders.createdAt))
       .limit(Math.max(limit, 200));
     const mapped = rows.map(pgRowToOrder);

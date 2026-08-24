@@ -113,13 +113,11 @@ describe("isLiveConfigured / paymentUrlFor", () => {
     await expect(paymentUrlFor("abc123")).resolves.toBe("/pay/abc123");
   });
 
-  it("is live only when both env vars are set (legacy env-only deployments)", async () => {
+  it("stays in test mode when env vars exist but Live was not explicitly selected", async () => {
     vi.stubEnv("VALMONT_PAY_API_URL", "https://pay.example.com");
     vi.stubEnv("VALMONT_PAY_API_KEY", "secret");
-    await expect(isLiveConfigured()).resolves.toBe(true);
-    await expect(paymentUrlFor("abc123")).resolves.toContain(
-      "access_code=abc123",
-    );
+    await expect(isLiveConfigured()).resolves.toBe(false);
+    await expect(paymentUrlFor("abc123")).resolves.toBe("/pay/abc123");
   });
 });
 

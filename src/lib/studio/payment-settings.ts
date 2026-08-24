@@ -19,9 +19,11 @@ import type { SessionUser } from "@/lib/auth";
  *  2. Test mode is the default. Live mode — real Mobile Money and card
  *     charges — requires an explicit mode switch AND both Valmont Pay keys.
  *  3. Environment variables (VALMONT_PAY_API_URL / VALMONT_PAY_API_KEY /
- *     VALMONT_PAY_WEBHOOK_SECRET) remain as a fallback so deployments made
- *     before this page existed keep working. A value saved on the settings
- *     page wins over the environment for that field.
+ *     VALMONT_PAY_WEBHOOK_SECRET) remain as a fallback for the values, so
+ *     deployments made before this page existed can still use their keys. The
+ *     explicit mode switch on this page is still required before any
+ *     deployment can take real payments. A value saved on the settings page
+ *     wins over the environment for that field.
  *  4. Only approved GitHub accounts ("payment managers") may change these
  *     settings. Everyone signed in can see the status.
  */
@@ -64,6 +66,7 @@ export interface ResolvedPaymentConfig {
   apiUrl?: string;
   apiKey?: string;
   webhookSecret?: string;
+  /** Both credentials exist and the API URL is safe for live requests. */
   keysPresent: boolean;
   liveActive: boolean;
 }
@@ -318,6 +321,15 @@ interface ResolvedField {
   source: SettingSource;
 }
 
+/** Live payment credentials must never be sent to an HTTP endpoint. */
+export function isSecurePaymentApiUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function resolveField(
   fromSettings: string | undefined,
   envValue: string | undefined,
@@ -337,9 +349,9 @@ function resolveField(
  * - With a saved settings row, the mode toggle is authoritative: Test mode
  *   keeps the local simulator even while real keys exist, exactly as Danny's
  *   handover requires.
- * - Without a settings row (an older deployment that only ever set the
- *   environment variables), behaviour is byte-for-byte what Phases 3–4 did:
- *   both env keys present means live, anything else means test.
+ * - Without a settings row, Test mode is the safe default. Environment keys
+ *   provide the values, but their presence can never silently opt a deployment
+ *   into real charges; Live must be selected and saved explicitly.
  */
 export async function resolvePaymentConfig(): Promise<ResolvedPaymentConfig> {
   const stored = await readPaymentSettings();
@@ -351,12 +363,13 @@ export async function resolvePaymentConfig(): Promise<ResolvedPaymentConfig> {
     process.env.VALMONT_PAY_WEBHOOK_SECRET,
   );
 
-  const keysPresent = Boolean(apiUrl.value && apiKey.value);
-  const mode: PaymentMode = stored
-    ? stored.mode
-    : keysPresent
-      ? "live"
-      : "test";
+  const keysPresent = Boolean(
+    apiUrl.value && apiKey.value && isSecurePaymentApiUrl(apiUrl.value),
+  );
+  // Never infer Live from credentials alone. A deployment may have inherited
+  // VALMONT_PAY_* values from before the settings page existed; the merchant
+  // must still explicitly select and save Live before real charges are allowed.
+  const mode: PaymentMode = stored?.mode ?? "test";
 
   return {
     mode,

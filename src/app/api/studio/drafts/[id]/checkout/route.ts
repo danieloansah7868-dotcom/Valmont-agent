@@ -9,7 +9,6 @@ import { getOrdersStore, type OrderLine } from "@/lib/studio/orders";
 import {
   computeTotals,
   createPaymentLink,
-  isLiveConfigured,
   type PricedLine,
 } from "@/lib/studio/valmont-pay";
 import { isPaymentMethodId } from "@/lib/studio/site-brief/schema";
@@ -191,7 +190,7 @@ export async function POST(
     }
 
     const origin = request.nextUrl.origin;
-    const { paymentLink } = await createPaymentLink({
+    const payment = await createPaymentLink({
       accessCode: code,
       amount: totals.total,
       currency: draft.brief.currency,
@@ -206,8 +205,8 @@ export async function POST(
     return NextResponse.json({
       orderId: order.id,
       accessCode: code,
-      paymentLink,
-      live: await isLiveConfigured(),
+      paymentLink: payment.paymentLink,
+      live: payment.live,
       status: order.status,
     });
   } catch (e) {

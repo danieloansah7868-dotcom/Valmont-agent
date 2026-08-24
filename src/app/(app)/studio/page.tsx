@@ -5,6 +5,7 @@ import { getDomainStore } from "@/lib/studio/domains";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { getCategory } from "@/lib/studio/categories";
 import { BackupControls } from "@/components/studio/backup-controls";
+import { BusinessSwitcher } from "@/components/studio/business-switcher";
 import { ShareLinkButton } from "@/components/studio/share-link-button";
 import { canonicalUserId } from "@/lib/user-identity";
 import { getOrdersStore, type OrderRecord } from "@/lib/studio/orders";
@@ -15,18 +16,37 @@ import { formatAccra } from "@/lib/studio/format";
 
 export const dynamic = "force-dynamic";
 
-export default async function StudioPage() {
+export default async function StudioPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ business?: string }>;
+}) {
   const user = await requireSessionUser();
+  const { business: requestedBusinessId } = await searchParams;
   const drafts = await getStudioDraftStore().list(user);
-  const domains = await getDomainStore().getDomainsForOwner(
-    canonicalUserId(user),
+  const ownerId = canonicalUserId(user);
+  const activeBusiness = drafts.find(
+    (draft) => draft.id === requestedBusinessId,
   );
+  const businesses = drafts.map((draft) => ({
+    id: draft.id,
+    name: draft.brief.businessName,
+  }));
+  const businessNames = new Map(
+    businesses.map((business) => [business.id, business.name]),
+  );
+  const domains = await getDomainStore().getDomainsForOwner(ownerId);
   const paymentConfig = await resolvePaymentConfig();
 
   const hasShop = drafts.some((draft) => draft.brief.payments?.enabled);
   let orders: OrderRecord[] = [];
   if (hasShop) {
-    orders = await getOrdersStore().listForOwner(canonicalUserId(user), 10);
+    orders = await getOrdersStore().listForOwner(
+      ownerId,
+      activeBusiness
+        ? { limit: 10, filter: "all", draftId: activeBusiness.id }
+        : 10,
+    );
   }
 
   return (
@@ -46,10 +66,79 @@ export default async function StudioPage() {
         Start new website
       </Link>
 
+      {drafts.length > 0 && (
+        <section
+          className="mt-8 rounded-xl border border-brandblue/20 bg-brandblue/5 p-4 sm:p-5"
+          aria-labelledby="business-switcher-heading"
+        >
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <p className="text-xs font-semibold tracking-wide text-brandblue uppercase">
+                Multi-business workspace
+              </p>
+              <h2
+                id="business-switcher-heading"
+                className="mt-1 text-lg font-semibold text-navy"
+              >
+                Switch business
+              </h2>
+              <p className="mt-1 max-w-xl text-sm text-slate-600">
+                Jump between your websites without searching through your
+                drafts. Your business list and orders are private to your
+                account.
+              </p>
+            </div>
+            <BusinessSwitcher
+              businesses={businesses}
+              selectedBusinessId={activeBusiness?.id}
+              basePath="/studio"
+            />
+          </div>
+          {activeBusiness ? (
+            <div className="mt-4 flex flex-col gap-3 rounded-lg border border-brandblue/20 bg-white p-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-xs font-semibold text-slate-600">
+                  Selected business
+                </p>
+                <p className="mt-1 font-semibold text-navy">
+                  {activeBusiness.brief.businessName}
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Link
+                  href={`/studio/drafts/${activeBusiness.id}`}
+                  className="btn-secondary min-h-10 text-sm"
+                >
+                  Open website
+                </Link>
+                <Link
+                  href={`/studio/orders?business=${encodeURIComponent(activeBusiness.id)}`}
+                  className="btn-primary min-h-10 text-sm"
+                >
+                  View its orders
+                </Link>
+              </div>
+            </div>
+          ) : (
+            <p className="mt-4 rounded-lg border border-line bg-white p-3 text-sm text-slate-600">
+              Choose a business above to focus its website and orders, or keep
+              “All businesses” selected to see your workspace together.
+            </p>
+          )}
+        </section>
+      )}
+
       <section className="mt-8" aria-labelledby="your-drafts">
-        <h2 id="your-drafts" className="text-lg font-semibold text-navy">
-          Your drafts
-        </h2>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 id="your-drafts" className="text-lg font-semibold text-navy">
+            Your drafts
+          </h2>
+          {activeBusiness && (
+            <span className="rounded-full bg-brandblue/10 px-2.5 py-1 text-xs font-semibold text-brandblue">
+              Selected {activeBusiness.brief.businessName}
+            </span>
+          )}
+        </div>
         {drafts.length === 0 ? (
           <p className="mt-2 text-sm text-slate-600">
             You have no drafts yet. Use “Start new website” above to make your
@@ -64,7 +153,11 @@ export default async function StudioPage() {
               return (
                 <li
                   key={draft.id}
-                  className="rounded-xl border border-line bg-white p-4"
+                  className={`rounded-xl border bg-white p-4 ${
+                    activeBusiness?.id === draft.id
+                      ? "border-brandblue ring-2 ring-brandblue/10"
+                      : "border-line"
+                  }`}
                 >
                   <Link
                     href={`/studio/drafts/${draft.id}`}
@@ -160,11 +253,27 @@ export default async function StudioPage() {
       {hasShop && (
         <section className="mt-8" aria-labelledby="orders-heading">
           <div className="flex flex-wrap items-end justify-between gap-2">
-            <h2 id="orders-heading" className="text-lg font-semibold text-navy">
-              Recent orders
-            </h2>
+            <div>
+              <h2
+                id="orders-heading"
+                className="text-lg font-semibold text-navy"
+              >
+                {activeBusiness
+                  ? `${activeBusiness.brief.businessName} orders`
+                  : "Recent orders"}
+              </h2>
+              <p className="mt-1 text-xs text-slate-600">
+                {activeBusiness
+                  ? "Recent orders for the selected business."
+                  : "Recent orders from all your businesses."}
+              </p>
+            </div>
             <Link
-              href="/studio/orders"
+              href={
+                activeBusiness
+                  ? `/studio/orders?business=${encodeURIComponent(activeBusiness.id)}`
+                  : "/studio/orders"
+              }
               className="text-sm font-semibold text-brandblue underline"
             >
               View all orders
@@ -184,6 +293,10 @@ export default async function StudioPage() {
                     className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-line bg-white p-3 hover:border-copper"
                   >
                     <div className="min-w-0">
+                      <p className="text-xs font-semibold text-brandblue">
+                        {businessNames.get(order.draftId) ??
+                          "Business no longer in Studio"}
+                      </p>
                       <p className="text-sm font-semibold text-navy">
                         {order.customerName} · {order.id.slice(0, 8)}
                       </p>

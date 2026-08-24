@@ -9,6 +9,7 @@ import {
   canManagePayments,
   DEFAULT_PAYMENT_ADMIN_LOGINS,
   getPaymentSettingsStore,
+  isSecurePaymentApiUrl,
   paymentAdminLogins,
   paymentSettingsStatus,
   readPaymentSettings,
@@ -109,12 +110,13 @@ describe("resolvePaymentConfig", () => {
     expect(config.keysPresent).toBe(false);
   });
 
-  it("keeps the Phase 3 behaviour: env keys with no saved row means live", async () => {
+  it("does not infer Live from environment keys without an explicit switch", async () => {
     vi.stubEnv("VALMONT_PAY_API_URL", "https://pay.example.com");
     vi.stubEnv("VALMONT_PAY_API_KEY", "env-key");
     const config = await resolvePaymentConfig();
-    expect(config.mode).toBe("live");
-    expect(config.liveActive).toBe(true);
+    expect(config.mode).toBe("test");
+    expect(config.keysPresent).toBe(true);
+    expect(config.liveActive).toBe(false);
   });
 
   it("settings-page values win over environment values", async () => {
@@ -165,6 +167,26 @@ describe("resolvePaymentConfig", () => {
     });
     const config = await resolvePaymentConfig();
     expect(config.liveActive).toBe(true);
+  });
+
+  it("does not activate Live when the API URL is insecure", async () => {
+    await writePaymentSettings({
+      mode: "live",
+      apiUrl: "http://pay.example.com",
+      apiKey: "saved-key",
+      updatedBy: "danieloansah7868-dotcom",
+    });
+    const config = await resolvePaymentConfig();
+    expect(config.keysPresent).toBe(false);
+    expect(config.liveActive).toBe(false);
+  });
+});
+
+describe("isSecurePaymentApiUrl", () => {
+  it("accepts HTTPS and rejects HTTP or malformed values", () => {
+    expect(isSecurePaymentApiUrl("https://pay.example.com")).toBe(true);
+    expect(isSecurePaymentApiUrl("http://pay.example.com")).toBe(false);
+    expect(isSecurePaymentApiUrl("not a URL")).toBe(false);
   });
 });
 
@@ -227,6 +249,9 @@ describe("verifyWebhookSignature", () => {
     await expect(
       verifyWebhookSignature(body, { valmont: base64 }),
     ).resolves.toBe(true);
+    await expect(
+      verifyWebhookSignature(body, { valmont: `sha256=${hex}` }),
+    ).resolves.toBe(true);
   });
 
   it("refuses a wrong signature in live mode", async () => {
@@ -255,6 +280,16 @@ describe("verifyWebhookSignature", () => {
     await expect(
       verifyWebhookSignature(body, { paystack: signature }),
     ).resolves.toBe(false);
+  });
+
+  it("does not fall back to unsigned test behaviour when Live is incomplete", async () => {
+    await writePaymentSettings({
+      mode: "live",
+      apiUrl: "https://pay.example.com",
+      webhookSecret: "whsec_abc",
+      updatedBy: "danieloansah7868-dotcom",
+    });
+    await expect(verifyWebhookSignature(body, {})).resolves.toBe(false);
   });
 });
 

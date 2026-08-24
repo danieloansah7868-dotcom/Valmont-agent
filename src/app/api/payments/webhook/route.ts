@@ -6,13 +6,20 @@ import { verifyWebhookSignature } from "@/lib/studio/valmont-pay";
 
 const WEBHOOK_BODY_LIMIT_BYTES = 50_000;
 
-const webhookSchema = z.object({
-  // "success" marks the order paid; anything else marks it failed. The local
-  // simulator sends exactly these two.
-  event: z.enum(["payment.success", "payment.failed"]).optional(),
-  status: z.enum(["success", "failed", "paid"]).optional(),
-  reference: z.string().max(200).optional(),
-});
+const webhookSchema = z
+  .object({
+    // "success" marks the order paid; "failed" marks it failed. The local
+    // simulator sends exactly these two, while Valmont Pay may send the event
+    // form. A body with neither outcome must never silently mark an order
+    // failed.
+    event: z.enum(["payment.success", "payment.failed"]).optional(),
+    status: z.enum(["success", "failed", "paid"]).optional(),
+    reference: z.string().max(200).optional(),
+  })
+  .refine(
+    (value) => value.event !== undefined || value.status !== undefined,
+    "Webhook body is missing a payment outcome",
+  );
 
 /**
  * Payment confirmation webhook. Valmont Pay (or, in test mode, the local
@@ -32,7 +39,7 @@ export async function POST(request: NextRequest) {
     }
 
     const raw = await request.text();
-    if (raw.length > WEBHOOK_BODY_LIMIT_BYTES) {
+    if (Buffer.byteLength(raw, "utf8") > WEBHOOK_BODY_LIMIT_BYTES) {
       return NextResponse.json({ error: "Body too large" }, { status: 413 });
     }
     if (

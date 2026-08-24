@@ -1284,7 +1284,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               </>
             )}
           </section>
-          
+
           <CustomDomainCard draftId={id} />
 
           <div className="mt-4">

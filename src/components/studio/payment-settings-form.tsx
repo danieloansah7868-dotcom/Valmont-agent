@@ -406,8 +406,8 @@ export function PaymentSettingsForm({
       </button>
       {liveNeedsKeys && (
         <p className="mt-2 text-xs text-slate-600">
-          Tip: Live mode will only take real payments once both the API website
-          address and the secret key show SET.
+          Tip: Live mode will only take real payments once a valid https:// API
+          website address and the secret key both show SET.
         </p>
       )}
     </section>

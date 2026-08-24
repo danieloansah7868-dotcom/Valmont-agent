@@ -386,9 +386,7 @@ export const studioDomains = pgTable(
       .notNull()
       .defaultNow(),
   },
-  (table) => [
-    index("studio_domains_owner_idx").on(table.ownerId),
-  ],
+  (table) => [index("studio_domains_owner_idx").on(table.ownerId)],
 );
 
 export const studioSettings = pgTable("studio_settings", {
