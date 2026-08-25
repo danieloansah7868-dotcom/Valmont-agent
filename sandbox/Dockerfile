@@ -1,39 +1,41 @@
-# syntax=docker/dockerfile:1.7
-# Valmont task sandbox image — see compose.sandbox.yaml and
-# src/lib/workspace-docker.ts.
+# Valmont sandbox image — the inert base for DockerWorkspaceProvider.
 #
-# The image is inert and credential-free. The provider starts one container
-# per coding task and execs git/node/npm into it as the unprivileged `node`
-# user. Runtime hardening (read-only rootfs, dropped capabilities,
-# no-new-privileges, default seccomp profile, default-deny network, and
-# CPU/memory/PID/storage quotas) is applied by the provider at `docker create`
-# time and mirrored in compose.sandbox.yaml for the runtime smoke test.
+# The container runs as the unprivileged `node` user from CREATE time
+# (`docker create --user 1000:1000 --init`; compose.sandbox.yaml mirrors
+# that as `user:` + `init: true`). There is deliberately no in-container
+# user bootstrap here: under `--cap-drop ALL` a root entrypoint cannot
+# chown, and `setpriv` cannot clear supplementary groups or drop
+# privileges either — any design that needs one of those cannot run in
+# this container at all. Ownership of the workspace is therefore
+# established by WHO extracts into it (the provider stages source and
+# files with `tar` run as the unprivileged user), not by a later chown.
+#
+# Everything else the provider needs is a standard toolchain:
+# bash, git, tar, and coreutils. No agent runtimes are installed.
+
 FROM node:22.13-bookworm-slim
 
-LABEL org.opencontainers.image.title="valmont-sandbox" \
-      org.opencontainers.image.description="Ephemeral per-task sandbox for Valmont Agent workspace execution"
+# Non-root user the container runs as (uid/gid 1000 in the base image).
+# git is required by the provider's baseline/diff operations; ca-certs is
+# standard for package managers.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-ENV NEXT_TELEMETRY_DISABLED=1 \
-    HOME=/workspace/.home \
+# /workspace is a per-task size-capped tmpfs the provider mounts at create
+# time (owned by 1000:1000 via the mount's uid=/gid= options); the layer
+# copy below is hidden by that mount and exists so the image builds and
+# runs standalone. Package-manager scratch ($HOME, TMPDIR) lives on the
+# task tmpfs, not on the read-only root.
+RUN mkdir -p /workspace/.home /workspace/.tmp && \
+    chown -R node:node /workspace
+ENV HOME=/workspace/.home \
     TMPDIR=/workspace/.tmp
 
-# git for workspace baselines and diffs; ca-certificates for dependency
-# access when a narrowly proxied egress route is configured. The runtime
-# mounts a per-task, size-limited tmpfs at /workspace (the only writable
-# storage, kernel-enforced cap, destroyed with the container); the image's
-# /workspace only provides the mount point. Package-manager scratch ($HOME,
-# TMPDIR) lives on that tmpfs, not on the host. `.home`/`.tmp` are excluded
-# from the workspace git baseline.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && npm cache clean --force \
-    && mkdir -p /workspace/.home /workspace/.tmp \
-    && chown -R node:node /workspace
-
-# Fixed bootstrap (no external input): the tmpfs mount point is root-owned
-# at runtime, so fix ownership of /workspace and its scratch directories,
-# then drop to the unprivileged user. Every task-code exec performed by the
-# provider passes `--user node` explicitly; this process never accepts
-# untrusted input.
-CMD ["sh", "-c", "chown node:node /workspace && mkdir -p /workspace/.home /workspace/.tmp && chown node:node /workspace/.home /workspace/.tmp && exec setpriv --reuid=node --regid=node --clear-groups sleep infinity"]
+# Inert command; the provider never depends on the image entrypoint doing
+# anything (validation commands are exec'd explicitly, and --init gives
+# the container a zombie-reaping PID 1).
+CMD ["sleep", "infinity"]

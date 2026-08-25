@@ -1,38 +1,56 @@
-# Valmont task sandbox — one ephemeral instance per coding task.
+# Runtime smoke-test target for the Docker sandbox provider.
+# Mirrors the provider's create-time flags exactly.
 #
-# This file is the runtime smoke-test target for the agent-isolation project.
-# The flags below mirror DockerWorkspaceProvider (src/lib/workspace-docker.ts)
-# exactly; if one side changes, change the other.
+# Run from the repository root after building the image:
+#   docker build -t valmont-sandbox:local -f sandbox/Dockerfile sandbox
+#   docker compose -f compose.sandbox.yaml up --no-start
+#   docker compose -f compose.sandbox.yaml start
 #
-#   docker compose -f compose.sandbox.yaml up --build -d
-#   docker compose -f compose.sandbox.yaml exec -u node sandbox node -e "console.log('ok', process.env.HOME)"
+# Then, from another shell:
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox npm --version
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox node --version
 #   docker compose -f compose.sandbox.yaml exec -u node sandbox git --version
-#   docker compose -f compose.sandbox.yaml down
 #
-# The container is credential-free by construction: no env, no host mounts,
-# no Docker socket, no network. The only writable storage is the per-task,
-# size-limited /workspace tmpfs (kernel-enforced cap, destroyed with the
-# container; with no swap, residency counts against the memory limit). The
-# image's fixed bootstrap drops to the unprivileged `node` user; pass
-# `-u node` to every manual exec, as the provider does.
-name: valmont-sandbox
-
+# Validate the reaper script and its permissions:
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox \
+#     node /workspace/.valmont/validation-reap.mjs not-a-number
+#   # expect: "validation-reap: expected a positive integer epoch-ms boundary"
+#   # exit code 2
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox \
+#     node /workspace/.valmont/validation-reap.mjs 9999999999999
+#   # expect: no output, exit code 0 (nothing started at/after that boundary)
+#
+#   docker compose -f compose.sandbox.yaml down
 services:
   sandbox:
     build:
-      context: ./sandbox
-    image: valmont-sandbox:local
+      context: .
+      dockerfile: sandbox/Dockerfile
+    container_name: valmont-sandbox-smoke
+    # Run as the unprivileged user from CREATE time (matches the
+    # provider's `docker create --user 1000:1000`). No in-container
+    # chown/setpriv bootstrap is possible under cap_drop: ALL, so this
+    # must happen here.
+    user: "1000:1000"
+    # tini as PID 1 reaps zombie children of the validation runs (the
+    # image command itself never waits).
+    init: true
     read_only: true
-    cap_drop: [ALL]
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
       - seccomp=default
-    cpus: "2"
+    network_mode: "none"
+    cpus: 2
     mem_limit: 2g
     memswap_limit: 2g
     pids_limit: 256
-    network_mode: "none"
+    # Per-task storage limit, mirrored as a size-capped tmpfs (the kernel
+    # enforces it with ENOSPC). uid=/gid= own the tmpfs root with the
+    # sandbox user, so task code and the provider's `tar` extraction can
+    # write into it without any in-container chown.
     tmpfs:
-      - /workspace:rw,nosuid,nodev,size=2g
+      - /workspace:rw,nosuid,nodev,size=2g,uid=1000,gid=1000
     restart: "no"
     stop_timeout: 5

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { cp, lstat, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { isSensitivePath } from "@/lib/retrieval";
@@ -25,25 +26,39 @@ import {
  *   — no host filesystem, no application container, no Docker socket, no
  *   cloud credentials, and no persistent named volume to leak;
  * - read-only root filesystem; package-manager scratch (`$HOME`, `TMPDIR`)
- *   lives on the task tmpfs, not on the host;
- * - no added capabilities, no-new-privileges, and the default seccomp
- *   profile; every `docker exec` of task code runs as the unprivileged image
- *   user (the image's fixed bootstrap drops to that user before sleeping);
- * - controlled root setup operations only: `docker cp` is a root-privileged
- *   CLI operation that lands root-owned files (it has no `--chown` support),
- *   so after each copy one fixed-argv `chown` exec runs as root to restore
- *   the unprivileged owner; every file operation (read, write, delete)
- *   first verifies each path component with fixed-argv `stat` — a
- *   task-created symlink (ancestor or final target) or a non-directory
- *   ancestor is rejected before `cat`/`rm`/`docker cp` can follow it, and
- *   missing write parents are created with `mkdir -p` pointed only at the
- *   first missing ancestor, whose path above is already verified
- *   symlink-free — so setup can never follow a symlink or escape /workspace.
- *   Arbitrary task code never runs as root;
- * - CPU, memory (with no swap), PID, and per-task storage quotas, plus a
- *   per-command wall-clock timeout (`timeout --signal=KILL` inside the
- *   container) with a CLI-level fallback kill. Note: with no swap, tmpfs
- *   residency counts against the memory quota, so size
+ *   lives on the task tmpfs (staged in by the provider), not on the host;
+ * - the container runs as the unprivileged user from the start:
+ *   `docker create --user <uid>:<gid>` plus `--init` (the runtime's tiny
+ *   init reaps zombie children — `sleep infinity` would not), with
+ *   `--cap-drop ALL`, no-new-privileges, and the default seccomp profile.
+ *   The consequence is enforced by construction: no in-container process —
+ *   task code or provider setup exec — holds any capability, so every
+ *   in-container operation must be capability-free (DAC/ownership-based).
+ *   Ownership is therefore established at creation time instead of with a
+ *   root `chown` (which `--cap-drop ALL` makes impossible): source and file
+ *   content are extracted with `tar` run AS the unprivileged user (the
+ *   extracted tree, and any parents it creates, are that user's), and the
+ *   reaper artifacts land root-owned via `docker cp` (a root-privileged
+ *   CLI operation on the daemon side, which needs no in-container
+ *   capability);
+ * - every file operation (read, write, delete) first verifies each path
+ *   component with fixed-argv `stat` — a task-created symlink (ancestor or
+ *   final target) or a non-directory ancestor is rejected before
+ *   `cat`/`rm`/`tar` can follow it; a `stat` failure other than ENOENT
+ *   (permission, I/O) fails the operation instead of being treated as
+ *   "missing"; missing write parents are created by the `tar` extraction
+ *   itself (as the unprivileged user), whose input archive is built
+ *   host-side from the filtered staging tree — so setup can never follow a
+ *   symlink or escape /workspace. Root setup execs are limited to the fixed
+ *   `.valmont` paths (rm/mkdir/stat); arbitrary task code never runs as
+ *   root;
+ * - CPU, memory (with no swap), PID, and per-task storage quotas (the
+ *   tmpfs mount is owned by the unprivileged user via its `uid=`/`gid=`
+ *   mount options), plus a per-command wall-clock timeout
+ *   (`timeout --signal=KILL` inside the container; exit 124 — or 137,
+ *   128+SIGKILL, when the wrapper reports the killed child's status — maps
+ *   to `timed_out`) with a CLI-level fallback kill. Note: with no swap,
+ *   tmpfs residency counts against the memory quota, so size
  *   `VALMONT_SANDBOX_MEMORY_BYTES` and `VALMONT_SANDBOX_STORAGE_BYTES`
  *   together for larger tasks;
  * - every provider operation for a task is serialized by an in-provider
@@ -51,23 +66,27 @@ import {
  *   within one of them — can ever overlap on the same container; operations
  *   record activity when they are enqueued, so work that is merely waiting
  *   in the queue still counts as task activity for the TTL reaper;
- * - validation cleanup: after every validation run, a fixed root exec of
- *   the provider-staged reaper script (`node
- *   /workspace/.valmont/validation-reap.mjs <start-time>`) SIGKILLs every
- *   process that started during the validation, so no validation process or
- *   background child can outlive the validation and later race the workspace
- *   paths. The cleanup is fail-closed: the script exits non-zero if it
- *   cannot compute start times, cannot inspect or signal a bounded process,
- *   or its confirmation scan still finds a live one, and the provider
- *   reports the validation as an error in that case. (PID namespaces are
- *   deliberately not used: seccomp=default allows `unshare` only with the
- *   bare `--user` flag, so no namespace-based teardown is possible under the
- *   default profile.);
- * - the reaper script is staged into a root-only `0700` directory
- *   (`0600` root-owned script) that is created fresh at creation — any
- *   `.valmont` entry supplied by the source repository is removed first —
- *   and its final ownership, mode, and type are verified with fixed-argv
- *   `stat` before the provider continues;
+ * - validation cleanup: after every validation run, a fixed exec of the
+ *   provider-staged reaper script, AS THE UNPRIVILEGED USER (`node
+ *   /workspace/.valmont/validation-reap.mjs <start-time>`), SIGKILLs every
+ *   process that started during the validation — the validation tree is
+ *   the same uid, so no `CAP_KILL` is needed under `--cap-drop ALL` — so
+ *   no validation process or background child can outlive the validation
+ *   and later race the workspace paths. The cleanup is fail-closed: the
+ *   script exits non-zero if it cannot compute start times, cannot inspect
+ *   or signal a bounded process, or its confirmation scan still finds a
+ *   live one, and the provider reports the validation as an error in that
+ *   case. (PID namespaces are deliberately not used: seccomp=default allows
+ *   `unshare` only with the bare `--user` flag, so no namespace-based
+ *   teardown is possible under the default profile.);
+ * - the reaper script is staged root-owned `0644` into a root-only `0700`
+ *   directory that is created fresh at creation — any `.valmont` entry
+ *   supplied by the source repository is removed first — and its final
+ *   ownership, mode, and type are verified with fixed-argv `stat` before
+ *   the provider continues. The unprivileged user can READ the script
+ *   (other-read) but has no write path to the file or its directory — no
+ *   modify, replace, unlink, or symlink shadowing — so task code, which is
+ *   that same uid, cannot tamper with the cleanup (kernel-enforced DAC);
  * - default-deny network (`--network none`), which also blocks the cloud
  *   metadata endpoint;
  * - no environment variables are passed into the container, so GitHub, model,
@@ -81,15 +100,28 @@ import {
  * - the container is the containment boundary. Every exec is a direct argv
  *   (never a shell), and host-side paths are only ever fixed temp files.
  *
- * The sandbox image (sandbox/Dockerfile) is inert: it drops to the
- * unprivileged user and then runs `sleep infinity`. compose.sandbox.yaml
- * mirrors these flags exactly and is the runtime smoke-test target.
+ * The sandbox image (sandbox/Dockerfile) is inert: its command is simply
+ * `sleep infinity`, and the container runs as the unprivileged user from
+ * create time (`--user`, set by the provider and mirrored in
+ * compose.sandbox.yaml) — there is no in-container user switch and
+ * therefore nothing to escalate or drop. compose.sandbox.yaml mirrors
+ * these flags exactly and is the runtime smoke-test target.
  * Selection in `createWorkspaceProvider()` is deliberately a follow-up
  * commit: enable it only after that smoke test has passed.
  */
 export interface DockerWorkspaceOptions {
   image: string;
+  /**
+   * The unprivileged user task code runs as (exec `--user`). Must NOT be
+   * root: root task code could rewrite the root-owned reaper script and
+   * defeat the validation cleanup. Rejects `root` and any form whose uid
+   * is 0.
+   */
   user?: string;
+  /** Numeric uid the container runs as at create time (`--user uid:gid`). Must match `user` in the image; must be > 0. */
+  uid?: number;
+  /** Numeric gid the container runs as at create time; also the tmpfs mount owner. Must be > 0. */
+  gid?: number;
   timeoutMs?: number;
   outputLimitBytes?: number;
   cpuLimit?: number;
@@ -104,8 +136,14 @@ export interface DockerWorkspaceOptions {
 }
 
 export interface DockerSpawnOptions {
-  stdio: ["ignore", "pipe", "pipe"];
+  stdio: ["pipe", "pipe", "pipe"] | ["ignore", "pipe", "pipe"];
   env: NodeJS.ProcessEnv;
+  /**
+   * When set, the file is streamed into the child's stdin (the child's
+   * stdin is piped; otherwise it is ignored). The node spawn implementation
+   * ignores the extra property.
+   */
+  stdinPath?: string;
 }
 
 export type DockerSpawn = (
@@ -148,14 +186,18 @@ const GIT_EXCLUDES = [
 ];
 
 /**
- * Validation reaper, staged by the provider into the root-only
- * `/workspace/.valmont/` directory at creation and run as root (fixed argv,
- * no shell) after every validation run. It SIGKILLs every process in the
- * container that started at or after the given epoch-ms boundary — i.e.
- * everything the validation spawned, including background grandchildren —
- * so no validation process can outlive the validation and later race the
- * workspace paths. Kernel `/proc` start times are used, which are immutable
- * per process and immune to reparenting.
+ * Validation reaper, staged by the provider into a root-owned directory
+ * (`/workspace/.valmont/`) at creation and run AS THE UNPRIVILEGED USER
+ * (fixed argv, no shell) after every validation run. It SIGKILLs every
+ * process in the container that started at or after the given epoch-ms
+ * boundary — i.e. everything the validation spawned, including background
+ * grandchildren — so no validation process can outlive the validation and
+ * later race the workspace paths. It signals as the same uid as the
+ * validation tree, so no `CAP_KILL` is needed (which `--cap-drop ALL`
+ * would not grant anyway); it can read the script (root-owned `0644`) but
+ * has no write path to it or its root-only `0700` directory, so it cannot
+ * tamper with its own cleanup. Kernel `/proc` start times are used, which
+ * are immutable per process and immune to reparenting.
  *
  * Fail-closed contract (the provider treats any non-zero exit as a failed
  * cleanup): exit 2 = bad argument; exit 1 = the boot time is unreadable
@@ -286,6 +328,8 @@ process.exit(0);
 export class DockerWorkspaceProvider implements WorkspaceProvider {
   private readonly image: string;
   private readonly user: string;
+  private readonly uid: number;
+  private readonly gid: number;
   private readonly timeoutMs: number;
   private readonly outputLimitBytes: number;
   private readonly cpuLimit: number;
@@ -317,7 +361,36 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   constructor(options: DockerWorkspaceOptions) {
     this.image = options.image;
-    this.user = options.user ?? "node";
+    const user = options.user ?? "node";
+    // Root task code would defeat the isolation boundary (it could rewrite
+    // the root-owned reaper script, read any root-owned file, ...). Reject
+    // it by name and by explicit uid 0.
+    const userUid = user.split(":")[0]?.trim();
+    // An empty/absent uid portion parses as 0 (root) as far as the kernel
+    // is concerned, so it is rejected along with `root` and any explicit 0.
+    if (
+      userUid === undefined ||
+      userUid === "" ||
+      userUid === "root" ||
+      Number(userUid) === 0
+    ) {
+      throw new Error(
+        `The sandbox user must be unprivileged (root is not allowed): ${user}`,
+      );
+    }
+    this.user = user;
+    this.uid = options.uid ?? 1000;
+    this.gid = options.gid ?? 1000;
+    if (!Number.isInteger(this.uid) || this.uid <= 0) {
+      throw new Error(
+        `The sandbox uid must be a positive integer: ${this.uid}`,
+      );
+    }
+    if (!Number.isInteger(this.gid) || this.gid <= 0) {
+      throw new Error(
+        `The sandbox gid must be a positive integer: ${this.gid}`,
+      );
+    }
     this.timeoutMs = options.timeoutMs ?? 180_000;
     this.outputLimitBytes = options.outputLimitBytes ?? 256_000;
     this.cpuLimit = options.cpuLimit ?? 2;
@@ -351,6 +424,8 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     return new DockerWorkspaceProvider({
       image: env.VALMONT_SANDBOX_IMAGE?.trim() || "valmont-sandbox:local",
       user: env.VALMONT_SANDBOX_USER?.trim() || "node",
+      uid: positive(env.VALMONT_SANDBOX_UID, 1000),
+      gid: positive(env.VALMONT_SANDBOX_GID, 1000),
       timeoutMs: Math.max(
         1_000,
         positive(env.VALMONT_COMMAND_TIMEOUT_MS, 180_000),
@@ -385,6 +460,14 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       "create",
       "--name",
       name,
+      // The container runs as the unprivileged user from the start (no
+      // in-container setpriv/chown bootstrap — none of those would succeed
+      // under --cap-drop ALL, which this container keeps by design).
+      "--user",
+      `${this.uid}:${this.gid}`,
+      // tini (injected by the runtime) reaps zombie children of the
+      // validation runs; the entrypoint itself (sleep) never waits().
+      "--init",
       "--read-only",
       "--cap-drop",
       "ALL",
@@ -404,9 +487,12 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       String(this.pidsLimit),
       // Per-task storage limit: a size-capped tmpfs the kernel enforces
       // (ENOSPC) that is destroyed with the container. No `noexec`: task
-      // commands execute repository tooling from /workspace.
+      // commands execute repository tooling from /workspace. uid=/gid=
+      // make the tmpfs root owned by the unprivileged user, so task code
+      // can create top-level entries and the tar extraction (as that user)
+      // can write into it without any in-container chown.
       "--tmpfs",
-      `/workspace:rw,nosuid,nodev,size=${this.storageLimitBytes}`,
+      `/workspace:rw,nosuid,nodev,size=${this.storageLimitBytes},uid=${this.uid},gid=${this.gid}`,
       "--label",
       "valmont.managed=true",
       "--label",
@@ -442,7 +528,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       await this.installValidationReaper(taskId, name);
       await this.gitBaseline(taskId, name);
     } catch (error) {
-      await this.cleanup(taskId);
+      // Best-effort: the original setup error wins; if the removal
+      // itself fails, the TTL reaper (and operator inspection) is the
+      // backstop.
+      await this.cleanup(taskId).catch(() => undefined);
       throw error;
     }
     return { id: taskId, root: "/workspace" };
@@ -550,36 +639,52 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     const absolute = this.safeContainerPath(relativePath);
     await this.prepareWriteParents(workspace, absolute);
     const scratch = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-file-"));
-    const temporary = path.join(scratch, "file");
+    const archive = `${scratch}.tar`;
     try {
-      await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 });
-      const result = await this.docker(
-        ["cp", temporary, `${this.containerName(workspace.id)}:${absolute}`],
-        30_000,
-        this.outputLimitBytes,
-      );
-      if (result.code !== 0) {
-        throw new Error("Could not write workspace file");
-      }
-      // docker cp lands everything root-owned; fix the new file and its
-      // ancestors with one controlled root chown (fixed argv, setup-only —
-      // arbitrary task code never runs as root).
-      const segments = absolute.split("/").filter(Boolean);
-      const chownPaths: string[] = [];
-      for (let i = 1; i < segments.length; i += 1) {
-        chownPaths.push(`/${segments.slice(0, i).join("/")}`);
-      }
-      const chowned = await this.execIn(
-        workspace,
-        ["chown", `${this.user}:${this.user}`, ...chownPaths, absolute],
+      // The content file is staged under its workspace-relative path so
+      // the tar member IS that path (no symlinks, no host paths in the
+      // archive).
+      const target = path.join(scratch, relativePath);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, content, { encoding: "utf8", mode: 0o600 });
+      // Extract in the container AS the unprivileged user: the file AND
+      // any parents the extraction creates are that user's (no
+      // in-container chown is possible under --cap-drop ALL, so none is
+      // attempted).
+      const archived = await this.docker(
+        ["-cf", archive, "-C", scratch, relativePath],
         30_000,
         20_000,
-        "root",
+        "tar",
       );
-      if (chowned.code !== 0) {
-        throw new Error("Could not fix workspace file ownership");
+      if (archived.code !== 0) {
+        throw new Error("Could not stage workspace file");
+      }
+      const extracted = await this.docker(
+        [
+          "exec",
+          "-i",
+          "--user",
+          this.user,
+          "--workdir",
+          "/workspace",
+          this.containerName(workspace.id),
+          "tar",
+          "-xf",
+          "-",
+          "-C",
+          "/workspace",
+        ],
+        30_000,
+        this.outputLimitBytes,
+        "docker",
+        archive,
+      );
+      if (extracted.code !== 0) {
+        throw new Error("Could not write workspace file");
       }
     } finally {
+      await rm(archive, { force: true });
       await rm(scratch, { recursive: true, force: true });
     }
   }
@@ -721,12 +826,19 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     // grandchildren — so no process it spawned can survive the validation
     // and later race the workspace paths between a stat and its use.
     // Runs under the per-task queue, so nothing else is in flight.
+    //
+    // Runs AS THE UNPRIVILEGED USER (the default), not root: the validation
+    // tree is the same uid, so SIGKILL needs no CAP_KILL under --cap-drop
+    // ALL; root, by contrast, could not signal it at all without that
+    // capability. The script is root-owned 0644 inside a root-only 0700
+    // directory: this uid can read it but has no write path to it or the
+    // directory, so task code (the same uid) cannot tamper with the
+    // cleanup.
     const cleaned = await this.execIn(
       workspace,
       ["node", "/workspace/.valmont/validation-reap.mjs", String(started)],
       30_000,
       20_000,
-      "root",
     );
     if (cleaned.code !== 0) {
       throw new Error("Could not complete validation cleanup");
@@ -745,7 +857,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     return {
       command: normalized,
       status:
-        result.code === 124
+        // 124: GNU timeout's own "timed out" status. 137 (128+SIGKILL):
+        // the wrapper reporting the killed child's status — the only
+        // signal we send is KILL, so this is a timeout as well.
+        result.code === 124 || result.code === 137
           ? "timed_out"
           : result.code === 0
             ? "passed"
@@ -828,8 +943,9 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   /**
    * Stage the validation reaper script into a root-only directory. Every
-   * step is a fixed-argv root exec (no shell), and the result is verified
-   * before the provider continues:
+   * step is a fixed-argv docker operation (execs as root on the fixed
+   * path, or a daemon-side `docker cp`; no shell anywhere), and the result
+   * is verified before the provider continues:
    *
    * 1. `rm -rf -- /workspace/.valmont` — a source repository may itself
    *    supply a `.valmont` entry (directory, file, or symlink; symlinks are
@@ -839,13 +955,17 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    *    directory it creates itself — it would not reset permissions on an
    *    existing one) and no task-owned or task-pointing entry can survive
    *    to redirect the root-only script to a task-writable location.
-   * 2. `mkdir -m 0700` — task code can neither read nor delete the script.
-   * 3. `docker cp` of the host temp file (mode 0600, preserved by the
-   *    copy) — the script lands root-owned `0600`. Called after the staging
-   *    `chown -R`, so nothing re-owns it.
-   * 4. `stat` verification — the directory must be `0 0 700` and the script
-   *    `0 0 600 regular file`; any other observation fails creation.
+   * 2. `mkdir -m 0700` — the task user (the same uid the reaper runs as)
+   *    has no permission to read, list, write, or unlink inside it.
+   * 3. `docker cp` of the host temp file (mode 0644, preserved by the
+   *    copy) — the script lands root-owned `0644`: other-READ so the
+   *    unprivileged reaper can read it, but no write path for that uid —
+   *    no modify, replace, or shadowing.
+   * 4. `stat` verification — the directory must be `0 0 700` and the
+   *    script `0 0 644 regular file`; any other observation fails
+   *    creation.
    *
+   * All steps are capability-free (root DAC ops under --cap-drop ALL).
    * Runs before the git baseline so `.valmont/` is git-excluded.
    */
   private async installValidationReaper(
@@ -881,7 +1001,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     try {
       await writeFile(scriptPath, VALIDATION_REAPER_SCRIPT, {
         encoding: "utf8",
-        mode: 0o600,
+        mode: 0o644,
       });
       const copied = await this.docker(
         ["cp", scriptPath, `${name}:/workspace/.valmont/validation-reap.mjs`],
@@ -916,7 +1036,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     );
     if (
       checkedScript.code !== 0 ||
-      checkedScript.stdout.trim() !== "0 0 600 regular file"
+      checkedScript.stdout.trim() !== "0 0 644 regular file"
     ) {
       throw new Error("Could not verify the validation reaper script");
     }
@@ -924,8 +1044,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   private async stageSource(taskId: string, sourceRoot: string): Promise<void> {
     const name = this.containerName(taskId);
-    const handle: WorkspaceHandle = { id: taskId, root: "/workspace" };
     const staging = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-src-"));
+    // The archive lives NEXT TO staging, never inside it, so it cannot
+    // archive itself.
+    const archive = `${staging}.tar`;
     try {
       const resolvedSource = path.resolve(sourceRoot);
       if (
@@ -941,34 +1063,62 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         filter: async (source) => {
           const relative = path.relative(resolvedSource, source);
           if (relative && isSensitivePath(relative)) return false;
+          // Regular files and directories only: no symlinks (the container
+          // must not receive task-supplied links for the in-container
+          // `tar` to follow), no FIFOs/devices/sockets (tar members with
+          // no in-container use).
           const info = await lstat(source);
-          return !info.isSymbolicLink();
+          return info.isFile() || info.isDirectory();
         },
       });
-      const copied = await this.docker(
-        ["cp", `${staging}/.`, `${name}:/workspace/`],
+      // Package-manager scratch ($HOME, TMPDIR) lives on the task tmpfs;
+      // the image-layer copies are hidden under the mount, so stage fresh
+      // ones as part of the workspace.
+      await mkdir(path.join(staging, ".home"), { recursive: true });
+      await mkdir(path.join(staging, ".tmp"), { recursive: true });
+      // Ownership is fixed by WHO extracts, not by a later chown: archive
+      // on the host, then extract in the container AS the unprivileged
+      // user — the extracted tree (and every parent the extraction creates)
+      // is that user's. No in-container chown is possible under
+      // --cap-drop ALL, so none is attempted.
+      const archived = await this.docker(
+        ["-cf", archive, "-C", staging, "."],
         300_000,
-        this.outputLimitBytes,
+        20_000,
+        "tar",
       );
-      if (copied.code !== 0) {
+      if (archived.code !== 0) {
         throw new Error(
-          `Could not stage workspace source: ${copied.stderr.trim() || copied.code}`,
+          `Could not archive workspace source: ${archived.stderr.trim() || archived.code}`,
         );
       }
-      // docker cp (root-privileged CLI, no --chown support) lands root-owned
-      // files; one controlled root chown with a fixed argv restores the
-      // unprivileged owner before any task code runs.
-      const chowned = await this.execIn(
-        handle,
-        ["chown", "-R", `${this.user}:${this.user}`, "/workspace"],
-        60_000,
-        20_000,
-        "root",
+      const extracted = await this.docker(
+        [
+          "exec",
+          "-i",
+          "--user",
+          this.user,
+          "--workdir",
+          "/workspace",
+          name,
+          "tar",
+          "-xf",
+          "-",
+          "-C",
+          "/workspace",
+        ],
+        300_000,
+        this.outputLimitBytes,
+        "docker",
+        archive,
       );
-      if (chowned.code !== 0) {
-        throw new Error("Could not fix staged workspace ownership");
+      if (extracted.code !== 0) {
+        throw new Error(
+          `Could not stage workspace source: ${extracted.stderr.trim() || extracted.code}`,
+        );
       }
     } finally {
+      await rm(archive, { force: true });
       await rm(staging, { recursive: true, force: true });
     }
   }
@@ -984,32 +1134,57 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     if (initialized.code !== 0) {
       throw new Error("Could not initialise workspace git");
     }
+    // git init ran as the unprivileged user, so .git is already that
+    // user's; the exclude file is staged with the same capability-free
+    // mechanism as file writes — a host-built archive extracted as the
+    // unprivileged user (no docker cp, no in-container chown).
     const scratch = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-file-"));
-    const excludePath = path.join(scratch, "exclude");
+    const archive = `${scratch}.tar`;
     try {
-      await writeFile(excludePath, GIT_EXCLUDES.join("\n"), {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-      const copied = await this.docker(
-        ["cp", excludePath, `${name}:/workspace/.git/info/exclude`],
-        30_000,
-        this.outputLimitBytes,
+      const excludeDir = path.join(scratch, ".git", "info");
+      await mkdir(excludeDir, { recursive: true });
+      await writeFile(
+        path.join(excludeDir, "exclude"),
+        GIT_EXCLUDES.join("\n"),
+        {
+          encoding: "utf8",
+          mode: 0o600,
+        },
       );
-      if (copied.code !== 0) {
-        throw new Error("Could not configure workspace git exclusions");
-      }
-      const chowned = await this.execIn(
-        handle,
-        ["chown", `${this.user}:${this.user}`, "/workspace/.git/info/exclude"],
+      const archived = await this.docker(
+        ["-cf", archive, "-C", scratch, ".git/info/exclude"],
         30_000,
         20_000,
-        "root",
+        "tar",
       );
-      if (chowned.code !== 0) {
-        throw new Error("Could not fix git exclude ownership");
+      if (archived.code !== 0) {
+        throw new Error("Could not configure workspace git exclusions");
+      }
+      const extracted = await this.docker(
+        [
+          "exec",
+          "-i",
+          "--user",
+          this.user,
+          "--workdir",
+          "/workspace",
+          name,
+          "tar",
+          "-xf",
+          "-",
+          "-C",
+          "/workspace",
+        ],
+        30_000,
+        this.outputLimitBytes,
+        "docker",
+        archive,
+      );
+      if (extracted.code !== 0) {
+        throw new Error("Could not configure workspace git exclusions");
       }
     } finally {
+      await rm(archive, { force: true });
       await rm(scratch, { recursive: true, force: true });
     }
     const staged = await this.execIn(
@@ -1057,8 +1232,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * The type of a single in-container path component as seen by root. GNU
    * `stat` without `-L` reports the component itself, so a task-created
    * symlink comes back as `symbolic link` rather than its target's type.
-   * Returns `null` when the component is missing (root cannot hit EACCES
-   * inside the container, so a non-zero exit means ENOENT).
+   * Returns `null` ONLY when the component is genuinely missing (ENOENT
+   * in stat's error output). Any other failure — permission (e.g. a
+   * task-created mode-000 directory), I/O, a stat that failed for an
+   * unrecognised reason — THROWS: a path that could not be verified must
+   * never be treated as "missing" and used anyway.
    */
   private async statComponentKind(
     workspace: WorkspaceHandle,
@@ -1071,7 +1249,12 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       20_000,
       "root",
     );
-    if (checked.code !== 0) return null;
+    if (checked.code !== 0) {
+      if (!/no such file or directory/i.test(checked.stderr)) {
+        throw new Error("Workspace path verification failed");
+      }
+      return null;
+    }
     return checked.stdout.trim();
   }
 
@@ -1115,16 +1298,16 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /**
-   * Verify every write destination ancestor and create any that are
-   * missing, so `docker cp` never fails on a non-existent parent directory.
-   * Every check and creation is a fixed-argv root exec (no shell): each
-   * existing ancestor must be a real directory — a task-created symlink or
-   * a regular file is rejected — `mkdir -p` is only ever pointed at the
-   * first missing ancestor, whose whole path is already verified
-   * symlink-free, so setup can neither follow a symlink nor escape
-   * /workspace. The final target is checked last: an existing symlink
-   * would be followed by `docker cp` (overwriting whatever it points to),
-   * so it is rejected before the copy.
+   * Verify every EXISTING write destination ancestor (fixed-argv root
+   * `stat`, no shell): a task-created symlink or a non-directory ancestor
+   * is rejected before the `tar` extraction can follow or use it. Missing
+   * ancestors are NOT created here — the in-container `tar` extraction
+   * creates them itself, as the unprivileged user, and its archive
+   * contains only the verified relative path (no symlinks, no host paths)
+   * — so setup can neither follow a symlink nor escape /workspace. The
+   * final target is checked last: an existing symlink would be followed by
+   * the extraction (overwriting whatever it points to), so it is rejected
+   * before the write.
    */
   private async prepareWriteParents(
     workspace: WorkspaceHandle,
@@ -1139,26 +1322,17 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         throw new Error("Symlink path components are blocked");
       }
       if (kind === null) {
-        // Missing: nothing below it can exist, so create from here down in
-        // one step; all ancestors above are verified real directories.
-        const created = await this.execIn(
-          workspace,
-          ["mkdir", "-p", ancestor],
-          15_000,
-          20_000,
-          "root",
-        );
-        if (created.code !== 0) {
-          throw new Error("Could not create workspace parent directories");
-        }
+        // Missing: nothing below it can exist; the tar extraction creates
+        // it (and the rest) as the unprivileged user.
         return;
       }
       if (kind !== "directory") {
         throw new Error("Invalid workspace path");
       }
     }
-    // All ancestors are verified real directories; reject an existing
-    // symlink (or non-file) final target before docker cp follows it.
+    // All existing ancestors are verified real directories; reject an
+    // existing symlink (or directory) final target before the extraction
+    // overwrites or follows it.
     const targetKind = await this.statComponentKind(workspace, absolute);
     if (targetKind === "symbolic link") {
       throw new Error("Symlink path components are blocked");
@@ -1209,7 +1383,22 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   private async cleanup(taskId: string): Promise<void> {
-    await this.docker(["rm", "-f", this.containerName(taskId)], 30_000, 20_000);
+    const removed = await this.docker(
+      ["rm", "-f", this.containerName(taskId)],
+      30_000,
+      20_000,
+    );
+    // Check the result: reporting a removal as successful while the
+    // container still exists would leak a quota-bound container (and, for
+    // destroy(), lie about the workspace being gone). A not-found result
+    // is fine — there is nothing to remove.
+    if (removed.code !== 0 && !/no such container/i.test(removed.stderr)) {
+      throw new Error(
+        `Could not remove sandbox container: ${
+          removed.stderr.trim() || removed.code
+        }`,
+      );
+    }
   }
 
   private async reapExpired(): Promise<void> {
@@ -1234,7 +1423,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         if (!id || !task) continue;
         if (!TASK_ID.test(task)) {
           // A managed container whose label is not a valid task identifier
-          // has no queue to go through; remove it directly.
+          // has no queue to go through; remove it directly. Its result is
+          // not reported anywhere — a failed removal simply leaves the
+          // container for the next interval — and the loop must NOT fall
+          // through to the task-queue logic below, which assumes a valid
+          // task label (and would record activity under an invalid key).
           await this.docker(["rm", "-f", id], 30_000, 20_000);
           continue;
         }
@@ -1285,8 +1478,23 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
             // costs at most one reaper interval; the operation that queued
             // is what the container now exists for.
             if (this.taskLocks.get(task) !== myTail) return;
-            await this.docker(["rm", "-f", id], 30_000, 20_000);
-            this.taskActivity.delete(task);
+            const removed = await this.docker(["rm", "-f", id], 30_000, 20_000);
+            // A failed removal must NOT drop the activity record: the
+            // container is still here, and deleting the record would make
+            // it look abandoned on its age alone at the next interval —
+            // while an operation may have just queued. Leave both for the
+            // next pass.
+            if (
+              removed.code === 0 ||
+              /no such container/i.test(removed.stderr)
+            ) {
+              // The op could have enqueued while the removal was in
+              // flight; deleting its fresh activity would resurrect the
+              // exact race the tail gate closes.
+              if (this.taskLocks.get(task) === myTail) {
+                this.taskActivity.delete(task);
+              }
+            }
           },
           false,
         );
@@ -1300,12 +1508,33 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     args: readonly string[],
     timeoutMs: number,
     limitBytes: number,
+    command: string = "docker",
+    stdinPath?: string,
   ): Promise<DockerRunResult> {
     return new Promise((resolve, reject) => {
-      const child = this.spawnImpl("docker", args, {
-        stdio: ["ignore", "pipe", "pipe"],
+      const child = this.spawnImpl(command, args, {
+        stdio:
+          stdinPath !== undefined
+            ? ["pipe", "pipe", "pipe"]
+            : ["ignore", "pipe", "pipe"],
         env: process.env,
+        stdinPath,
       });
+      if (stdinPath !== undefined) {
+        // Stream the host-side archive into the container over the exec's
+        // stdin — the only channel: no host path is ever visible inside.
+        const ws = child.stdin;
+        if (ws) {
+          const stream = createReadStream(stdinPath);
+          stream.on("data", (chunk) => {
+            if (!ws.write(chunk)) stream.pause();
+          });
+          ws.on("drain", () => stream.resume());
+          ws.on("error", () => stream.destroy());
+          stream.on("error", () => ws.destroy());
+          stream.on("end", () => ws.end());
+        }
+      }
       const stdoutState = { value: "", bytes: 0 };
       const stderrState = { value: "", bytes: 0 };
       let stdoutTruncated = false;
@@ -1335,7 +1564,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       child.on("error", (error: Error) => {
         clearTimeout(timer);
         reject(
-          new Error(`docker ${args[0] ?? "run"} failed: ${error.message}`),
+          new Error(`${command} ${args[0] ?? "run"} failed: ${error.message}`),
         );
       });
       child.on("close", (code: number | null) => {
