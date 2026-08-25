@@ -18,19 +18,27 @@ import {
  * ("Critical sandbox boundary") and docs/SECURITY.md:
  *
  * - one short-lived container per task (`valmont-sandbox-<taskId>`), destroyed
- *   with `destroy(taskId)`; a background reaper removes containers (and their
- *   volumes) older than the configured TTL;
- * - the only mount is the task's own named volume (`valmont-workspace-<taskId>`)
- *   at `/workspace` — no host filesystem, no application container, no Docker
- *   socket, no cloud credentials;
+ *   with `destroy(taskId)`; a background reaper removes containers older than
+ *   the configured TTL;
+ * - the only writable storage is a per-task, size-limited tmpfs at
+ *   `/workspace` (kernel-enforced `ENOSPC` cap; destroyed with the container)
+ *   — no host filesystem, no application container, no Docker socket, no
+ *   cloud credentials, and no persistent named volume to leak;
  * - read-only root filesystem; package-manager scratch (`$HOME`, `TMPDIR`)
- *   lives on the task volume, not on the host;
+ *   lives on the task tmpfs, not on the host;
  * - no added capabilities, no-new-privileges, and the default seccomp
  *   profile; every `docker exec` of task code runs as the unprivileged image
  *   user (the image's fixed bootstrap drops to that user before sleeping);
- * - CPU, memory (with no swap), and PID quotas, plus a per-command
- *   wall-clock timeout (`timeout --signal=KILL` inside the container) with a
- *   CLI-level fallback kill;
+ * - controlled root setup operations only: `docker cp` is a root-privileged
+ *   CLI operation that lands root-owned files (it has no `--chown` support),
+ *   so after each copy one fixed-argv `chown` exec runs as root to restore
+ *   the unprivileged owner. Arbitrary task code never runs as root;
+ * - CPU, memory (with no swap), PID, and per-task storage quotas, plus a
+ *   per-command wall-clock timeout (`timeout --signal=KILL` inside the
+ *   container) with a CLI-level fallback kill. Note: with no swap, tmpfs
+ *   residency counts against the memory quota, so size
+ *   `VALMONT_SANDBOX_MEMORY_BYTES` and `VALMONT_SANDBOX_STORAGE_BYTES`
+ *   together for larger tasks;
  * - default-deny network (`--network none`), which also blocks the cloud
  *   metadata endpoint;
  * - no environment variables are passed into the container, so GitHub, model,
@@ -58,6 +66,7 @@ export interface DockerWorkspaceOptions {
   cpuLimit?: number;
   memoryLimitBytes?: number;
   pidsLimit?: number;
+  storageLimitBytes?: number;
   ttlMs?: number;
   reapIntervalMs?: number;
   allowedCommands?: Record<string, readonly [string, ...string[]]>;
@@ -116,6 +125,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   private readonly cpuLimit: number;
   private readonly memoryLimitBytes: number;
   private readonly pidsLimit: number;
+  private readonly storageLimitBytes: number;
   private readonly ttlMs: number;
   private readonly allowedCommands: Record<
     string,
@@ -132,6 +142,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     this.cpuLimit = options.cpuLimit ?? 2;
     this.memoryLimitBytes = options.memoryLimitBytes ?? 2_147_483_648;
     this.pidsLimit = options.pidsLimit ?? 256;
+    this.storageLimitBytes = options.storageLimitBytes ?? 2_147_483_648;
     this.ttlMs = options.ttlMs ?? 3_600_000;
     this.allowedCommands = options.allowedCommands ?? DEFAULT_ALLOWED_COMMANDS;
     this.spawnImpl = options.spawnOverride ?? nodeSpawn;
@@ -169,6 +180,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         2_147_483_648,
       ),
       pidsLimit: positive(env.VALMONT_SANDBOX_PIDS_LIMIT, 256),
+      storageLimitBytes: positive(
+        env.VALMONT_SANDBOX_STORAGE_BYTES,
+        2_147_483_648,
+      ),
       ttlMs: positive(env.VALMONT_SANDBOX_TTL_MS, 3_600_000),
       reapIntervalMs: positive(env.VALMONT_SANDBOX_REAP_INTERVAL_MS, 600_000),
     });
@@ -177,7 +192,6 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   async create(taskId: string, sourceRoot: string): Promise<WorkspaceHandle> {
     if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
     const name = this.containerName(taskId);
-    const volume = this.volumeName(taskId);
     await this.cleanup(taskId);
     const createArgs = [
       "create",
@@ -200,8 +214,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       String(this.memoryLimitBytes),
       "--pids-limit",
       String(this.pidsLimit),
-      "-v",
-      `${volume}:/workspace`,
+      // Per-task storage limit: a size-capped tmpfs the kernel enforces
+      // (ENOSPC) that is destroyed with the container. No `noexec`: task
+      // commands execute repository tooling from /workspace.
+      "--tmpfs",
+      `/workspace:rw,nosuid,nodev,size=${this.storageLimitBytes}`,
       "--label",
       "valmont.managed=true",
       "--label",
@@ -233,7 +250,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
           `Could not start sandbox container: ${started.stderr.trim() || started.code}`,
         );
       }
-      await this.stageSource(name, sourceRoot);
+      await this.stageSource(taskId, sourceRoot);
       await this.gitBaseline(taskId, name);
     } catch (error) {
       await this.cleanup(taskId);
@@ -311,18 +328,30 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     try {
       await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 });
       const result = await this.docker(
-        [
-          "cp",
-          "--chown",
-          `${this.user}:${this.user}`,
-          temporary,
-          `${this.containerName(workspace.id)}:${absolute}`,
-        ],
+        ["cp", temporary, `${this.containerName(workspace.id)}:${absolute}`],
         30_000,
         this.outputLimitBytes,
       );
       if (result.code !== 0) {
         throw new Error("Could not write workspace file");
+      }
+      // docker cp creates missing parents and lands everything root-owned;
+      // fix the new file and its ancestors with one controlled root chown
+      // (fixed argv, setup-only — arbitrary task code never runs as root).
+      const segments = absolute.split("/").filter(Boolean);
+      const chownPaths: string[] = [];
+      for (let i = 1; i < segments.length; i += 1) {
+        chownPaths.push(`/${segments.slice(0, i).join("/")}`);
+      }
+      const chowned = await this.execIn(
+        workspace,
+        ["chown", `${this.user}:${this.user}`, ...chownPaths, absolute],
+        30_000,
+        20_000,
+        "root",
+      );
+      if (chowned.code !== 0) {
+        throw new Error("Could not fix workspace file ownership");
       }
     } finally {
       await rm(scratch, { recursive: true, force: true });
@@ -452,8 +481,9 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /**
-   * Destroy the task container and its named volume. Call when a task reaches
-   * a terminal state; the reaper is the backstop for abandoned tasks.
+   * Destroy the task container; its tmpfs workspace is removed with it. Call
+   * when a task reaches a terminal state; the reaper is the backstop for
+   * abandoned tasks.
    */
   async destroy(taskId: string): Promise<void> {
     if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
@@ -472,11 +502,9 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     return `valmont-sandbox-${taskId}`;
   }
 
-  private volumeName(taskId: string): string {
-    return `valmont-workspace-${taskId}`;
-  }
-
-  private async stageSource(name: string, sourceRoot: string): Promise<void> {
+  private async stageSource(taskId: string, sourceRoot: string): Promise<void> {
+    const name = this.containerName(taskId);
+    const handle: WorkspaceHandle = { id: taskId, root: "/workspace" };
     const staging = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-src-"));
     try {
       const resolvedSource = path.resolve(sourceRoot);
@@ -498,13 +526,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         },
       });
       const copied = await this.docker(
-        [
-          "cp",
-          "--chown",
-          `${this.user}:${this.user}`,
-          `${staging}/.`,
-          `${name}:/workspace/`,
-        ],
+        ["cp", `${staging}/.`, `${name}:/workspace/`],
         300_000,
         this.outputLimitBytes,
       );
@@ -512,6 +534,19 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         throw new Error(
           `Could not stage workspace source: ${copied.stderr.trim() || copied.code}`,
         );
+      }
+      // docker cp (root-privileged CLI, no --chown support) lands root-owned
+      // files; one controlled root chown with a fixed argv restores the
+      // unprivileged owner before any task code runs.
+      const chowned = await this.execIn(
+        handle,
+        ["chown", "-R", `${this.user}:${this.user}`, "/workspace"],
+        60_000,
+        20_000,
+        "root",
+      );
+      if (chowned.code !== 0) {
+        throw new Error("Could not fix staged workspace ownership");
       }
     } finally {
       await rm(staging, { recursive: true, force: true });
@@ -543,6 +578,16 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       );
       if (copied.code !== 0) {
         throw new Error("Could not configure workspace git exclusions");
+      }
+      const chowned = await this.execIn(
+        handle,
+        ["chown", `${this.user}:${this.user}`, "/workspace/.git/info/exclude"],
+        30_000,
+        20_000,
+        "root",
+      );
+      if (chowned.code !== 0) {
+        throw new Error("Could not fix git exclude ownership");
       }
     } finally {
       await rm(scratch, { recursive: true, force: true });
@@ -611,12 +656,13 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     argv: readonly string[],
     timeoutMs: number,
     limitBytes: number,
+    user: string = this.user,
   ): Promise<DockerRunResult> {
     return this.docker(
       [
         "exec",
         "--user",
-        this.user,
+        user,
         "--workdir",
         "/workspace",
         this.containerName(workspace.id),
@@ -629,11 +675,6 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   private async cleanup(taskId: string): Promise<void> {
     await this.docker(["rm", "-f", this.containerName(taskId)], 30_000, 20_000);
-    await this.docker(
-      ["volume", "rm", this.volumeName(taskId)],
-      30_000,
-      20_000,
-    );
   }
 
   private async reapExpired(): Promise<void> {
@@ -644,15 +685,13 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         "--filter",
         "label=valmont.managed=true",
         "--format",
-        '{{.ID}}\t{{.Label "valmont.task"}}',
+        "{{.ID}}",
       ],
       30_000,
       this.outputLimitBytes,
     );
     if (listed.code !== 0) return;
-    for (const line of listed.stdout.split(/\r?\n/).filter(Boolean)) {
-      const [id, taskId] = line.split("\t");
-      if (!id) continue;
+    for (const id of listed.stdout.split(/\r?\n/).filter(Boolean)) {
       const inspected = await this.docker(
         ["inspect", "--format", "{{.Created}}", id],
         15_000,
@@ -666,13 +705,6 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       if (!Number.isFinite(created)) continue;
       if (Date.now() - created <= this.ttlMs) continue;
       await this.docker(["rm", "-f", id], 30_000, 20_000);
-      if (taskId && TASK_ID.test(taskId)) {
-        await this.docker(
-          ["volume", "rm", this.volumeName(taskId)],
-          30_000,
-          20_000,
-        );
-      }
     }
   }
 

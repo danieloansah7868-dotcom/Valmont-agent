@@ -83,7 +83,6 @@ function callFor(
 
 const TASK = "task-1";
 const NAME = `valmont-sandbox-${TASK}`;
-const VOLUME = `valmont-workspace-${TASK}`;
 const HANDLE = { id: TASK, root: "/workspace" };
 
 async function makeSource(root: string): Promise<string> {
@@ -126,10 +125,16 @@ describe("DockerWorkspaceProvider", () => {
     expect(create[create.indexOf("--memory") + 1]).toBe("2147483648");
     expect(create[create.indexOf("--memory-swap") + 1]).toBe("2147483648");
     expect(create[create.indexOf("--pids-limit") + 1]).toBe("256");
-    // The only mount is the task's own named volume.
-    expect(create).toContain(`${VOLUME}:/workspace`);
-    const volumeFlags = create.filter((flag) => flag === "-v");
-    expect(volumeFlags).toHaveLength(1);
+    // The only writable storage is the per-task size-limited tmpfs: the
+    // kernel enforces the cap (ENOSPC) and it dies with the container.
+    const tmpfsFlags = create.filter((flag) => flag === "--tmpfs");
+    expect(tmpfsFlags).toHaveLength(1);
+    expect(create[create.indexOf("--tmpfs") + 1]).toBe(
+      "/workspace:rw,nosuid,nodev,size=2147483648",
+    );
+    expect(create).not.toContain("-v");
+    // No named volumes anywhere in the lifecycle.
+    expect(fake.calls.some((argv) => argv[0] === "volume")).toBe(false);
     // Labels for the TTL reaper; the image is the final create argument.
     expect(create).toContain("valmont.managed=true");
     expect(create).toContain(`valmont.task=${TASK}`);
@@ -138,18 +143,86 @@ describe("DockerWorkspaceProvider", () => {
     expect(create).not.toContain("-e");
     expect(create).not.toContain("--env");
 
-    // The git baseline (and every other exec) runs as the unprivileged user.
+    // Task execs run as the unprivileged user; root is limited to the fixed
+    // chown setup ops that follow each docker cp.
     const execs = fake.calls.filter((argv) => argv[0] === "exec");
     expect(execs.length).toBeGreaterThanOrEqual(3);
     for (const exec of execs) {
-      expect(exec.slice(1, 3)).toEqual(["--user", "node"]);
+      if (exec[6] === "chown") {
+        expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
+      } else {
+        expect(exec.slice(1, 3)).toEqual(["--user", "node"]);
+      }
     }
+    // Staging: docker cp (no --chown support) lands root-owned files, then
+    // one controlled root chown -R fixes ownership before any task code runs.
+    const stagingCp = fake.calls.findIndex((argv) => argv[0] === "cp");
+    const stagingChown = fake.calls.findIndex(
+      (argv) =>
+        argv[0] === "exec" && argv.includes("chown") && argv.includes("-R"),
+    );
+    expect(stagingCp).toBeGreaterThan(-1);
+    expect(stagingChown).toBeGreaterThan(stagingCp);
+    expect(fake.calls[stagingChown]).toEqual([
+      "exec",
+      "--user",
+      "root",
+      "--workdir",
+      "/workspace",
+      NAME,
+      "chown",
+      "-R",
+      "node:node",
+      "/workspace",
+    ]);
+    // The git exclude copy also gets a root chown of the fixed path.
+    expect(
+      fake.calls.some(
+        (argv) =>
+          argv[0] === "exec" &&
+          argv.slice(6).join(" ") ===
+            "chown node:node /workspace/.git/info/exclude",
+      ),
+    ).toBe(true);
     expect(
       fake.calls.some((argv) => argv[0] === "exec" && argv.includes("commit")),
     ).toBe(true);
   });
 
-  it("destroys the container and volume when the git baseline fails", async () => {
+  it("runs arbitrary task code only as the unprivileged user", async () => {
+    const fake = new FakeDocker();
+    const provider = makeProvider(fake);
+    const source = await makeSource("valmont-src-");
+    await provider.create(TASK, source);
+    await provider.writeFile(HANDLE, "src/new.txt", "x");
+    await provider.runValidation(HANDLE, "npm test");
+    const execs = fake.calls.filter((argv) => argv[0] === "exec");
+    expect(execs.length).toBeGreaterThan(0);
+    for (const exec of execs) {
+      const command = exec.slice(6);
+      if (command[0] === "chown") {
+        // Controlled setup op: root, fixed binary, fixed unprivileged owner.
+        // The only permitted flag is -R (recursive staging), and every token
+        // must come from the fixed vocabulary — no untrusted content.
+        expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
+        expect(command.slice(1).includes("node:node")).toBe(true);
+        expect(
+          command.every(
+            (token) =>
+              token === "chown" ||
+              token === "-R" ||
+              token === "node:node" ||
+              token.startsWith("/workspace"),
+          ),
+        ).toBe(true);
+      } else {
+        // Arbitrary task code (git, cat, rm, timeout+validation): never root.
+        expect(exec.slice(1, 3)).toEqual(["--user", "node"]);
+      }
+    }
+  });
+
+  it("destroys the container when the git baseline fails", async () => {
     const fake = new FakeDocker().onMatch((argv) =>
       argv[0] === "exec" && argv.includes("commit")
         ? { code: 128, stderr: "boom" }
@@ -164,12 +237,7 @@ describe("DockerWorkspaceProvider", () => {
           argv[0] === "rm" && argv.includes("-f") && argv.includes(NAME),
       ),
     ).toBe(true);
-    expect(
-      fake.calls.some(
-        (argv) =>
-          argv[0] === "volume" && argv[1] === "rm" && argv.includes(VOLUME),
-      ),
-    ).toBe(true);
+    expect(fake.calls.some((argv) => argv[0] === "volume")).toBe(false);
   });
 
   it("opens a running workspace and reports unavailable ones", async () => {
@@ -245,18 +313,35 @@ describe("DockerWorkspaceProvider", () => {
     expect(fake.calls).toHaveLength(0);
   });
 
-  it("writes files through docker cp with ownership transfer", async () => {
+  it("copies files via docker cp and fixes ownership with a root chown", async () => {
     const fake = new FakeDocker();
     await makeProvider(fake).writeFile(HANDLE, "src/a.txt", "hello");
-    const cpCall = callFor(
-      fake,
-      (argv) => argv[0] === "cp" && argv.includes("--chown"),
-    );
-    expect(cpCall[1]).toBe("--chown");
-    expect(cpCall[2]).toBe("node:node");
+    // docker cp has no --chown support: the copy must not carry one.
+    const cpCall = callFor(fake, (argv) => argv[0] === "cp");
+    expect(cpCall).not.toContain("--chown");
     expect(cpCall.at(-1)).toBe(`${NAME}:/workspace/src/a.txt`);
     // The host-side temp file is removed after the copy.
-    await expect(access(cpCall[3])).rejects.toThrow();
+    await expect(access(cpCall[1])).rejects.toThrow();
+    // A controlled root chown fixes the file and its (newly created) parent
+    // directories, so writes work when parents do not exist yet and task
+    // code (node) can read them afterwards.
+    const chownCall = callFor(
+      fake,
+      (argv) => argv[0] === "exec" && argv[6] === "chown",
+    );
+    expect(chownCall).toEqual([
+      "exec",
+      "--user",
+      "root",
+      "--workdir",
+      "/workspace",
+      NAME,
+      "chown",
+      "node:node",
+      "/workspace",
+      "/workspace/src",
+      "/workspace/src/a.txt",
+    ]);
   });
 
   it("deletes files with a direct rm argv", async () => {
@@ -330,10 +415,11 @@ describe("DockerWorkspaceProvider", () => {
     }
   });
 
-  it("destroy removes the container and volume", async () => {
+  it("destroy removes the container and its workspace storage", async () => {
     const fake = new FakeDocker();
     await makeProvider(fake).destroy(TASK);
+    // The tmpfs workspace dies with the container; there is no volume.
     expect(fake.calls).toContainEqual(["rm", "-f", NAME]);
-    expect(fake.calls).toContainEqual(["volume", "rm", VOLUME]);
+    expect(fake.calls).toHaveLength(1);
   });
 });

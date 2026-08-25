@@ -7,12 +7,14 @@
 #   docker compose -f compose.sandbox.yaml up --build -d
 #   docker compose -f compose.sandbox.yaml exec -u node sandbox node -e "console.log('ok', process.env.HOME)"
 #   docker compose -f compose.sandbox.yaml exec -u node sandbox git --version
-#   docker compose -f compose.sandbox.yaml down -v
+#   docker compose -f compose.sandbox.yaml down
 #
 # The container is credential-free by construction: no env, no host mounts,
-# no Docker socket, no network. The image's fixed bootstrap drops to the
-# unprivileged `node` user; pass `-u node` to every manual exec, as the
-# provider does.
+# no Docker socket, no network. The only writable storage is the per-task,
+# size-limited /workspace tmpfs (kernel-enforced cap, destroyed with the
+# container; with no swap, residency counts against the memory limit). The
+# image's fixed bootstrap drops to the unprivileged `node` user; pass
+# `-u node` to every manual exec, as the provider does.
 name: valmont-sandbox
 
 services:
@@ -30,10 +32,7 @@ services:
     memswap_limit: 2g
     pids_limit: 256
     network_mode: "none"
-    volumes:
-      - valmont-workspace-smoke:/workspace
+    tmpfs:
+      - /workspace:rw,nosuid,nodev,size=2g
     restart: "no"
     stop_timeout: 5
-
-volumes:
-  valmont-workspace-smoke:
