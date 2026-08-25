@@ -37,9 +37,13 @@ class FakeDocker {
       args[7] === "-c" &&
       args[8] === "%F"
     ) {
-      // Default: the verified ancestors are real directories; tests override
-      // via onMatch to simulate missing or symlinked path components.
-      result = { code: 0, stdout: "directory\n" };
+      // Default: a plausible healthy workspace — directory components are
+      // real directories, and a component that looks like a file (a dot in
+      // its name) is a regular file. Tests override via onMatch to simulate
+      // missing, symlinked, or otherwise unsafe path components.
+      const target = args[args.length - 1] ?? "";
+      const kind = target.includes(".") ? "regular file" : "directory";
+      result = { code: 0, stdout: `${kind}\n` };
     }
     for (const handler of this.handlers) {
       const scripted = handler(args);
@@ -301,7 +305,9 @@ describe("DockerWorkspaceProvider", () => {
     );
     const content = await makeProvider(fake).readFile(HANDLE, "notes.md");
     expect(content).toBe(redactSecrets(raw));
-    expect(callFor(fake, (argv) => argv[0] === "exec")).toEqual([
+    expect(
+      callFor(fake, (argv) => argv[0] === "exec" && argv[6] === "cat"),
+    ).toEqual([
       "exec",
       "--user",
       "node",
@@ -316,7 +322,9 @@ describe("DockerWorkspaceProvider", () => {
 
   it("treats over-limit file reads as errors", async () => {
     const fake = new FakeDocker().onMatch((argv) =>
-      argv[0] === "exec" ? { code: 0, stdout: "x".repeat(1000) } : undefined,
+      argv[0] === "exec" && argv.includes("cat")
+        ? { code: 0, stdout: "x".repeat(1000) }
+        : undefined,
     );
     const provider = makeProvider(fake, { outputLimitBytes: 64 });
     await expect(provider.readFile(HANDLE, "big.txt")).rejects.toThrow(
@@ -475,10 +483,133 @@ describe("DockerWorkspaceProvider", () => {
     expect(fileAncestor.calls.some((argv) => argv[0] === "cp")).toBe(false);
   });
 
+  it("readFile rejects symlinked components before any read happens", async () => {
+    // A task-created symlink as the final target must not be followed.
+    const targetLink = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/link.txt"
+      ) {
+        return { code: 0, stdout: "symbolic link\n" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(targetLink).readFile(HANDLE, "link.txt"),
+    ).rejects.toThrow("Symlink path components are blocked");
+    expect(targetLink.calls.some((argv) => argv[6] === "cat")).toBe(false);
+
+    // ... and so must a symlinked ancestor (the /etc-leak vector).
+    const ancestorLink = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/leaky"
+      ) {
+        return { code: 0, stdout: "symbolic link\n" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(ancestorLink).readFile(HANDLE, "leaky/notes.txt"),
+    ).rejects.toThrow("Symlink path components are blocked");
+    expect(ancestorLink.calls.some((argv) => argv[6] === "cat")).toBe(false);
+
+    // A missing target keeps the not-found semantics without running cat.
+    const missing = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/gone.txt"
+      ) {
+        return {
+          code: 1,
+          stderr:
+            "cannot statx '/workspace/gone.txt': No such file or directory",
+        };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(missing).readFile(HANDLE, "gone.txt"),
+    ).rejects.toThrow("Could not read workspace file");
+    expect(missing.calls.some((argv) => argv[6] === "cat")).toBe(false);
+  });
+
+  it("readFileForCommit rejects symlinked components so no foreign content is committed", async () => {
+    const fake = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/leaky"
+      ) {
+        return { code: 0, stdout: "symbolic link\n" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(fake).readFileForCommit(HANDLE, "leaky/notes.txt"),
+    ).rejects.toThrow("Symlink path components are blocked");
+    expect(fake.calls.some((argv) => argv[6] === "cat")).toBe(false);
+  });
+
+  it("deleteFile rejects symlinked components before any delete happens", async () => {
+    const ancestorLink = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/leaky"
+      ) {
+        return { code: 0, stdout: "symbolic link\n" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(ancestorLink).deleteFile(HANDLE, "leaky/a.txt"),
+    ).rejects.toThrow("Symlink path components are blocked");
+    expect(ancestorLink.calls.some((argv) => argv[6] === "rm")).toBe(false);
+
+    const targetLink = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/link.txt"
+      ) {
+        return { code: 0, stdout: "symbolic link\n" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(targetLink).deleteFile(HANDLE, "link.txt"),
+    ).rejects.toThrow("Symlink path components are blocked");
+    expect(targetLink.calls.some((argv) => argv[6] === "rm")).toBe(false);
+  });
+
+  it("writeFile rejects an existing symlink as its final target", async () => {
+    const fake = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/link.txt"
+      ) {
+        return { code: 0, stdout: "symbolic link\n" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(fake).writeFile(HANDLE, "link.txt", "x"),
+    ).rejects.toThrow("Symlink path components are blocked");
+    expect(fake.calls.some((argv) => argv[0] === "cp")).toBe(false);
+    expect(fake.calls.some((argv) => argv[6] === "chown")).toBe(false);
+  });
+
   it("deletes files with a direct rm argv", async () => {
     const fake = new FakeDocker();
     await makeProvider(fake).deleteFile(HANDLE, "src/a.txt");
-    expect(callFor(fake, (argv) => argv[0] === "exec")).toEqual([
+    expect(
+      callFor(fake, (argv) => argv[0] === "exec" && argv[6] === "rm"),
+    ).toEqual([
       "exec",
       "--user",
       "node",

@@ -32,11 +32,14 @@ import {
  * - controlled root setup operations only: `docker cp` is a root-privileged
  *   CLI operation that lands root-owned files (it has no `--chown` support),
  *   so after each copy one fixed-argv `chown` exec runs as root to restore
- *   the unprivileged owner; on write, every destination ancestor is verified
- *   with fixed-argv `stat` (symlinks and non-directories are rejected) and
- *   missing parent directories are created with `mkdir -p` — the check never
- *   follows a task-created symlink and never escapes /workspace. Arbitrary
- *   task code never runs as root;
+ *   the unprivileged owner; every file operation (read, write, delete)
+ *   first verifies each path component with fixed-argv `stat` — a
+ *   task-created symlink (ancestor or final target) or a non-directory
+ *   ancestor is rejected before `cat`/`rm`/`docker cp` can follow it, and
+ *   missing write parents are created with `mkdir -p` pointed only at the
+ *   first missing ancestor, whose path above is already verified
+ *   symlink-free — so setup can never follow a symlink or escape /workspace.
+ *   Arbitrary task code never runs as root;
  * - CPU, memory (with no swap), PID, and per-task storage quotas, plus a
  *   per-command wall-clock timeout (`timeout --signal=KILL` inside the
  *   container) with a CLI-level fallback kill. Note: with no swap, tmpfs
@@ -281,6 +284,8 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
   ): Promise<string> {
     const absolute = this.safeContainerPath(relativePath);
+    const target = await this.verifyPathComponents(workspace, absolute);
+    if (target === null) throw new Error("Could not read workspace file");
     const result = await this.execIn(
       workspace,
       ["cat", "--", absolute],
@@ -299,6 +304,8 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
   ): Promise<string> {
     const absolute = this.safeContainerPath(relativePath);
+    const target = await this.verifyPathComponents(workspace, absolute);
+    if (target === null) throw new Error("Could not read workspace file");
     const result = await this.execIn(
       workspace,
       ["cat", "--", absolute],
@@ -368,6 +375,8 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
   ): Promise<void> {
     const absolute = this.safeContainerPath(relativePath);
+    const target = await this.verifyPathComponents(workspace, absolute);
+    if (target === null) throw new Error("Could not delete workspace file");
     const result = await this.execIn(
       workspace,
       ["rm", "--", absolute],
@@ -639,13 +648,76 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /**
-   * Verify every destination ancestor and create any that are missing, so
-   * `docker cp` never fails on a non-existent parent directory. Every check
-   * and creation is a fixed-argv root exec (no shell): each existing
-   * ancestor must be a real directory — a task-created symlink or a regular
-   * file is rejected — and `mkdir -p` is only ever pointed at the first
-   * missing ancestor, whose whole path is already verified symlink-free, so
-   * setup can neither follow a symlink nor escape /workspace.
+   * The type of a single in-container path component as seen by root. GNU
+   * `stat` without `-L` reports the component itself, so a task-created
+   * symlink comes back as `symbolic link` rather than its target's type.
+   * Returns `null` when the component is missing (root cannot hit EACCES
+   * inside the container, so a non-zero exit means ENOENT).
+   */
+  private async statComponentKind(
+    workspace: WorkspaceHandle,
+    componentPath: string,
+  ): Promise<string | null> {
+    const checked = await this.execIn(
+      workspace,
+      ["stat", "-c", "%F", componentPath],
+      15_000,
+      20_000,
+      "root",
+    );
+    if (checked.code !== 0) return null;
+    return checked.stdout.trim();
+  }
+
+  /**
+   * Verify every component — ancestors AND the final target — of a
+   * validated container path before `cat`/`rm` is allowed to touch it:
+   * task-created symlinks (which would let a lexical path resolve outside
+   * the intended directory, e.g. to /etc or another task file) are
+   * rejected, as are non-directory ancestors and non-file targets. The
+   * verification runs back-to-back with the operation while no other exec
+   * is in flight (the provider serializes operations; task code only runs
+   * via `runValidation` in between), so nothing can swap in a symlink
+   * between the check and its use. Returns the final target's kind, or
+   * `null` when the target does not exist, so callers keep their
+   * not-found semantics.
+   */
+  private async verifyPathComponents(
+    workspace: WorkspaceHandle,
+    absolute: string,
+  ): Promise<string | null> {
+    const components = absolute.split("/").filter(Boolean);
+    let targetKind: string | null = null;
+    for (let i = 0; i < components.length; i += 1) {
+      const component = `/${components.slice(0, i + 1).join("/")}`;
+      const kind = await this.statComponentKind(workspace, component);
+      const isTarget = i === components.length - 1;
+      if (kind === "symbolic link") {
+        throw new Error("Symlink path components are blocked");
+      }
+      if (isTarget) {
+        targetKind = kind;
+        if (kind !== null && kind !== "regular file") {
+          throw new Error("Invalid workspace path");
+        }
+      } else if (kind !== "directory") {
+        throw new Error("Invalid workspace path");
+      }
+    }
+    return targetKind;
+  }
+
+  /**
+   * Verify every write destination ancestor and create any that are
+   * missing, so `docker cp` never fails on a non-existent parent directory.
+   * Every check and creation is a fixed-argv root exec (no shell): each
+   * existing ancestor must be a real directory — a task-created symlink or
+   * a regular file is rejected — `mkdir -p` is only ever pointed at the
+   * first missing ancestor, whose whole path is already verified
+   * symlink-free, so setup can neither follow a symlink nor escape
+   * /workspace. The final target is checked last: an existing symlink
+   * would be followed by `docker cp` (overwriting whatever it points to),
+   * so it is rejected before the copy.
    */
   private async prepareWriteParents(
     workspace: WorkspaceHandle,
@@ -655,14 +727,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     const directoryComponents = components.slice(0, -1);
     for (let i = 0; i < directoryComponents.length; i += 1) {
       const ancestor = `/${directoryComponents.slice(0, i + 1).join("/")}`;
-      const checked = await this.execIn(
-        workspace,
-        ["stat", "-c", "%F", ancestor],
-        15_000,
-        20_000,
-        "root",
-      );
-      if (checked.code !== 0) {
+      const kind = await this.statComponentKind(workspace, ancestor);
+      if (kind === "symbolic link") {
+        throw new Error("Symlink path components are blocked");
+      }
+      if (kind === null) {
         // Missing: nothing below it can exist, so create from here down in
         // one step; all ancestors above are verified real directories.
         const created = await this.execIn(
@@ -677,13 +746,18 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         }
         return;
       }
-      const kind = checked.stdout.trim();
-      if (kind === "symbolic link") {
-        throw new Error("Symlink path components are blocked");
-      }
       if (kind !== "directory") {
         throw new Error("Invalid workspace path");
       }
+    }
+    // All ancestors are verified real directories; reject an existing
+    // symlink (or non-file) final target before docker cp follows it.
+    const targetKind = await this.statComponentKind(workspace, absolute);
+    if (targetKind === "symbolic link") {
+      throw new Error("Symlink path components are blocked");
+    }
+    if (targetKind !== null && targetKind !== "regular file") {
+      throw new Error("Invalid workspace path");
     }
   }
 
