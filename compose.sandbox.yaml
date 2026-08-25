@@ -1,0 +1,39 @@
+# Valmont task sandbox — one ephemeral instance per coding task.
+#
+# This file is the runtime smoke-test target for the agent-isolation project.
+# The flags below mirror DockerWorkspaceProvider (src/lib/workspace-docker.ts)
+# exactly; if one side changes, change the other.
+#
+#   docker compose -f compose.sandbox.yaml up --build -d
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox node -e "console.log('ok', process.env.HOME)"
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox git --version
+#   docker compose -f compose.sandbox.yaml down -v
+#
+# The container is credential-free by construction: no env, no host mounts,
+# no Docker socket, no network. The image's fixed bootstrap drops to the
+# unprivileged `node` user; pass `-u node` to every manual exec, as the
+# provider does.
+name: valmont-sandbox
+
+services:
+  sandbox:
+    build:
+      context: ./sandbox
+    image: valmont-sandbox:local
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=default
+    cpus: "2"
+    mem_limit: 2g
+    memswap_limit: 2g
+    pids_limit: 256
+    network_mode: "none"
+    volumes:
+      - valmont-workspace-smoke:/workspace
+    restart: "no"
+    stop_timeout: 5
+
+volumes:
+  valmont-workspace-smoke:
