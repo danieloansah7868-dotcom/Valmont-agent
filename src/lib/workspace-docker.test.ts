@@ -177,7 +177,9 @@ describe("DockerWorkspaceProvider", () => {
     const execs = fake.calls.filter((argv) => argv[0] === "exec");
     expect(execs.length).toBeGreaterThanOrEqual(3);
     for (const exec of execs) {
-      if (exec[6] === "chown") {
+      // Root is limited to the fixed-argv setup ops (chown, and the
+      // root-only reaper directory at creation); everything else is node.
+      if (exec[6] === "chown" || exec[6] === "mkdir") {
         expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
       } else {
         expect(exec.slice(1, 3)).toEqual(["--user", "node"]);
@@ -213,6 +215,40 @@ describe("DockerWorkspaceProvider", () => {
             "chown node:node /workspace/.git/info/exclude",
       ),
     ).toBe(true);
+    // The validation reaper is staged into a root-only directory AFTER the
+    // staging chown (so it stays root-owned 0600, unreadable and undeletable
+    // by task code) and before the git baseline (.valmont/ is git-excluded).
+    const mkdirValmont = fake.calls.findIndex(
+      (argv) => argv[0] === "exec" && argv[6] === "mkdir",
+    );
+    const cpReaper = fake.calls.findIndex(
+      (argv) =>
+        argv[0] === "cp" &&
+        argv.at(-1) === `${NAME}:/workspace/.valmont/validation-reap.mjs`,
+    );
+    expect(fake.calls[mkdirValmont]).toEqual([
+      "exec",
+      "--user",
+      "root",
+      "--workdir",
+      "/workspace",
+      NAME,
+      "mkdir",
+      "-m",
+      "0700",
+      "/workspace/.valmont",
+    ]);
+    expect(cpReaper).toBeGreaterThan(mkdirValmont);
+    expect(cpReaper).toBeGreaterThan(stagingChown);
+    // No chown ever re-owns the reaper script or its directory.
+    expect(
+      fake.calls.some(
+        (argv) =>
+          argv[0] === "exec" &&
+          argv.includes("chown") &&
+          argv.some((token) => token.includes("/workspace/.valmont")),
+      ),
+    ).toBe(false);
     expect(
       fake.calls.some((argv) => argv[0] === "exec" && argv.includes("commit")),
     ).toBe(true);
@@ -245,15 +281,29 @@ describe("DockerWorkspaceProvider", () => {
           ),
         ).toBe(true);
       } else if (command[0] === "mkdir") {
-        // Write-path setup: create missing parents only, as root.
+        // Setup: either create missing write parents (-p) or the root-only
+        // reaper directory (-m 0700). Always root, always a fixed
+        // /workspace path — no untrusted content.
         expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
-        expect(command.slice(1, 2)).toEqual(["-p"]);
-        expect(command[2].startsWith("/workspace")).toBe(true);
+        const tokens = command.slice(1);
+        if (tokens[0] === "-p") {
+          expect(tokens[1].startsWith("/workspace")).toBe(true);
+        } else {
+          expect(tokens).toEqual(["-m", "0700", "/workspace/.valmont"]);
+        }
       } else if (command[0] === "stat") {
         // Write-path setup: verify ancestors are real directories, as root.
         expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
         expect(command.slice(1, 3)).toEqual(["-c", "%F"]);
         expect(command[3].startsWith("/workspace")).toBe(true);
+      } else if (
+        command[0] === "node" &&
+        command[1] === "/workspace/.valmont/validation-reap.mjs"
+      ) {
+        // Post-validation cleanup: root, fixed script path, and a numeric
+        // start-time boundary — nothing else may ever run as root.
+        expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
+        expect(Number.isInteger(Number(command[2]))).toBe(true);
       } else {
         // Arbitrary task code (git, cat, rm, timeout+validation): never root.
         expect(exec.slice(1, 3)).toEqual(["--user", "node"]);
@@ -288,6 +338,102 @@ describe("DockerWorkspaceProvider", () => {
     // The queue is per task: different tasks are not serialized against
     // each other.
     expect(fake.maxInFlight).toBeGreaterThan(1);
+  });
+
+  it("reaps an abandoned container through the task queue", async () => {
+    const OLD = "2020-01-01T00:00:00.000Z";
+    const fake = new FakeDocker().onMatch((argv) => {
+      if (argv[0] === "ps") {
+        return { code: 0, stdout: "cid-abandoned\ttask-old\n" };
+      }
+      if (argv[0] === "inspect" && argv.includes("{{.Created}}")) {
+        return { code: 0, stdout: `${OLD}\n` };
+      }
+      if (argv[0] === "inspect" && argv.includes("{{.State.Running}}")) {
+        return { code: 0, stdout: "true\n" };
+      }
+      return undefined;
+    });
+    const provider = makeProvider(fake, { ttlMs: 60_000 });
+    // No recorded activity for this task (e.g. the provider process
+    // restarted): the container's age is the only signal, and it is far
+    // older than the TTL.
+    await (
+      provider as unknown as { reapExpired: () => Promise<void> }
+    ).reapExpired();
+    expect(fake.calls).toContainEqual(["rm", "-f", "cid-abandoned"]);
+  });
+
+  it("does not reap a container whose task still has fresh activity", async () => {
+    const OLD = "2020-01-01T00:00:00.000Z";
+    const fake = new FakeDocker().onMatch((argv) => {
+      if (argv[0] === "ps") return { code: 0, stdout: `cid-live\t${TASK}\n` };
+      if (argv[0] === "inspect" && argv.includes("{{.Created}}")) {
+        return { code: 0, stdout: `${OLD}\n` };
+      }
+      if (argv[0] === "inspect" && argv.includes("{{.State.Running}}")) {
+        return { code: 0, stdout: "true\n" };
+      }
+      return undefined;
+    });
+    const provider = makeProvider(fake, { ttlMs: 60_000 });
+    const source = await makeSource("valmont-src-");
+    await provider.create(TASK, source); // records fresh activity
+    await (
+      provider as unknown as { reapExpired: () => Promise<void> }
+    ).reapExpired();
+    // Old by age but active by its last operation: the reaper must not have
+    // removed its container (create's own startup cleanup is unrelated).
+    expect(
+      fake.calls.some(
+        (argv) =>
+          argv[0] === "rm" && argv[1] === "-f" && argv[2] === "cid-live",
+      ),
+    ).toBe(false);
+  });
+
+  it("waits on the per-task lock and re-checks activity before removal", async () => {
+    const OLD = "2020-01-01T00:00:00.000Z";
+    const fake = new FakeDocker().onMatch((argv) => {
+      if (argv[0] === "ps") return { code: 0, stdout: `cid-locked\t${TASK}\n` };
+      if (argv[0] === "inspect" && argv.includes("{{.Created}}")) {
+        return { code: 0, stdout: `${OLD}\n` };
+      }
+      if (argv[0] === "inspect" && argv.includes("{{.State.Running}}")) {
+        return { code: 0, stdout: "true\n" };
+      }
+      return undefined;
+    });
+    const provider = makeProvider(fake, { ttlMs: 60_000 });
+    const state = provider as unknown as {
+      taskLocks: Map<string, Promise<unknown>>;
+      taskActivity: Map<string, number>;
+    };
+    let releaseGate: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    // A task the outer check calls abandoned (stale activity record), while
+    // an operation still holds its queue slot (simulated with a manual gate).
+    state.taskActivity.set(TASK, Date.now() - 120_000);
+    state.taskLocks.set(TASK, gate);
+    const reaping = (
+      provider as unknown as { reapExpired: () => Promise<void> }
+    ).reapExpired();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // The outer check fired, but removal must not bypass the per-task lock:
+    // no rm while the gate (the in-flight operation) is held.
+    expect(
+      fake.calls.some((argv) => argv[0] === "rm" && argv[2] === "cid-locked"),
+    ).toBe(false);
+    // The operation recorded fresh activity at start; by the time the
+    // reaper acquires the lock, the in-lock re-check must abort the removal.
+    state.taskActivity.set(TASK, Date.now());
+    releaseGate();
+    await reaping;
+    expect(
+      fake.calls.some((argv) => argv[0] === "rm" && argv[2] === "cid-locked"),
+    ).toBe(false);
   });
 
   it("destroys the container when the git baseline fails", async () => {
@@ -696,37 +842,69 @@ describe("DockerWorkspaceProvider", () => {
       [1, "failed"],
       [124, "timed_out"],
     ] as const) {
-      const fake = new FakeDocker().onMatch((argv) =>
-        argv[0] === "exec"
-          ? { code, stderr: code === 0 ? "" : "failure" }
-          : undefined,
-      );
+      const fake = new FakeDocker().onMatch((argv) => {
+        if (argv[0] !== "exec") return undefined;
+        // The post-validation reaper exec must succeed for the run to be
+        // reported at all.
+        if (argv[6] === "node") return { code: 0, stderr: "" };
+        return { code, stderr: code === 0 ? "" : "failure" };
+      });
       const result = await makeProvider(fake).runValidation(HANDLE, "npm test");
       expect(result.status).toBe(status);
       expect(result.command).toBe("npm test");
       expect(result.exitCode).toBe(code);
-      // Validation runs in a fresh user+PID namespace: the timeout wrapper
-      // is the namespace's PID 1, so the kernel kills every remaining
-      // member (including background children) when it exits.
-      expect(callFor(fake, (argv) => argv[0] === "exec")).toEqual([
+      // Exact validation argv: direct argv under the wall-clock timeout,
+      // no shell, and no namespace syscalls (seccomp=default forbids them).
+      const timeoutCall = callFor(
+        fake,
+        (argv) => argv[0] === "exec" && argv[6] === "timeout",
+      );
+      expect(timeoutCall).toEqual([
         "exec",
         "--user",
         "node",
         "--workdir",
         "/workspace",
         NAME,
-        "unshare",
-        "--user",
-        "--map-root-user",
-        "--pid",
-        "--fork",
         "timeout",
         "--signal=KILL",
         "180",
         "npm",
         "test",
       ]);
+      // After every validation run — pass, fail, or timeout — a fixed root
+      // exec of the staged reaper kills everything the validation started.
+      const reap = callFor(
+        fake,
+        (argv) => argv[0] === "exec" && argv[6] === "node",
+      );
+      expect(reap.slice(0, 7)).toEqual([
+        "exec",
+        "--user",
+        "root",
+        "--workdir",
+        "/workspace",
+        NAME,
+        "node",
+      ]);
+      expect(reap[7]).toBe("/workspace/.valmont/validation-reap.mjs");
+      expect(Number.isInteger(Number(reap[8]))).toBe(true);
+      expect(fake.calls.indexOf(reap)).toBeGreaterThan(
+        fake.calls.indexOf(timeoutCall),
+      );
     }
+  });
+
+  it("treats a failed validation cleanup as a failed validation", async () => {
+    const fake = new FakeDocker().onMatch((argv) => {
+      if (argv[0] === "exec" && argv[6] === "node") {
+        return { code: 1, stderr: "a validation process could not be killed" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(fake).runValidation(HANDLE, "npm test"),
+    ).rejects.toThrow("Could not complete validation cleanup");
   });
 
   it("destroy removes the container and its workspace storage", async () => {

@@ -42,18 +42,21 @@ import {
  *   Arbitrary task code never runs as root;
  * - CPU, memory (with no swap), PID, and per-task storage quotas, plus a
  *   per-command wall-clock timeout (`timeout --signal=KILL` inside the
- *   validation's PID namespace) with a CLI-level fallback kill. Note: with
- *   no swap, tmpfs residency counts against the memory quota, so size
+ *   container) with a CLI-level fallback kill. Note: with no swap, tmpfs
+ *   residency counts against the memory quota, so size
  *   `VALMONT_SANDBOX_MEMORY_BYTES` and `VALMONT_SANDBOX_STORAGE_BYTES`
  *   together for larger tasks;
  * - every provider operation for a task is serialized by an in-provider
  *   per-task queue, so no two operations — and no stat-then-use sequence
  *   within one of them — can ever overlap on the same container;
- * - validation commands additionally run in a fresh `user`+`PID` namespace
- *   (`unshare --user --map-root-user --pid --fork` around the timeout
- *   wrapper): when that wrapper exits, the kernel kills every remaining
- *   process in the namespace, so no validation process or background child
- *   can outlive the validation and later race the workspace paths;
+ * - validation cleanup: after every validation run, a fixed root exec of
+ *   the provider-staged reaper script (`node
+ *   /workspace/.valmont/validation-reap.mjs <start-time>`) SIGKILLs every
+ *   process that started during the validation, so no validation process or
+ *   background child can outlive the validation and later race the workspace
+ *   paths. (PID namespaces are deliberately not used: seccomp=default allows
+ *   `unshare` only with the bare `--user` flag, so no namespace-based
+ *   teardown is possible under the default profile.);
  * - default-deny network (`--network none`), which also blocks the cloud
  *   metadata endpoint;
  * - no environment variables are passed into the container, so GitHub, model,
@@ -120,6 +123,7 @@ const GIT_EXCLUDES = [
   ".npm/",
   ".home/",
   ".tmp/",
+  ".valmont/",
   ".next/",
   "node_modules/",
   "coverage/",
@@ -131,6 +135,60 @@ const GIT_EXCLUDES = [
   "*.pem",
   "*.key",
 ];
+
+/**
+ * Validation reaper, staged by the provider into the root-only
+ * `/workspace/.valmont/` directory at creation and run as root (fixed argv,
+ * no shell) after every validation run: it SIGKILLs every process in the
+ * container that started at or after the given epoch-ms boundary — i.e.
+ * everything the validation spawned, including background grandchildren —
+ * so no validation process can outlive the validation and later race the
+ * workspace paths. Kernel `/proc` start times are used, which are immutable
+ * per process and immune to reparenting. Exit codes: 0 success, 1 a
+ * validation process survived and could not be killed (fail closed), 2 bad
+ * argument; the provider treats any non-zero outcome as a failed cleanup.
+ */
+const VALIDATION_REAPER_SCRIPT = `import { readFileSync, readdirSync } from "node:fs";
+const boundary = Number(process.argv[2]);
+if (!Number.isFinite(boundary) || boundary <= 0) process.exit(2);
+let bootMs = 0;
+for (const line of readFileSync("/proc/stat", "utf8").split("\\n")) {
+  if (line.startsWith("btime ")) {
+    const seconds = Number(line.slice(6).trim());
+    if (Number.isFinite(seconds)) bootMs = seconds * 1000;
+  }
+}
+let failed = 0;
+if (bootMs > 0) {
+  const HZ = 100; // USER_HZ on Linux
+  const self = process.pid;
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (pid === self || pid === 1) continue;
+    let stat;
+    try {
+      stat = readFileSync("/proc/" + entry + "/stat", "utf8");
+    } catch {
+      continue;
+    }
+    const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+    const starttime = Number(fields[19]); // stat field 22: jiffies since boot
+    if (!Number.isFinite(starttime)) continue;
+    if (bootMs + (starttime / HZ) * 1000 >= boundary) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        // ESRCH: already gone. Anything else means a validation process
+        // survived and could not be killed — fail closed so the provider
+        // aborts instead of leaving a survivor in place.
+        if (!error || error.code !== "ESRCH") failed++;
+      }
+    }
+  }
+}
+process.exit(failed > 0 ? 1 : 0);
+`;
 
 export class DockerWorkspaceProvider implements WorkspaceProvider {
   private readonly image: string;
@@ -148,12 +206,19 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   >;
   private readonly spawnImpl: DockerSpawn;
   private reaperTimer?: NodeJS.Timeout;
+  private reaperRunning = false;
   /**
    * Per-task operation queues: every provider operation for a task runs
    * strictly one at a time (FIFO), so one operation's stat-then-use
    * sequence can never interleave with another operation on the same task.
    */
   private readonly taskLocks = new Map<string, Promise<void>>();
+  /**
+   * Last provider-operation timestamp per task. A task is "abandoned" (and
+   * eligible for reaping) only when it has had no operation for longer than
+   * the TTL — a long-running but still-active task is never reaped.
+   */
+  private readonly taskActivity = new Map<string, number>();
 
   constructor(options: DockerWorkspaceOptions) {
     this.image = options.image;
@@ -279,6 +344,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         );
       }
       await this.stageSource(taskId, sourceRoot);
+      await this.installValidationReaper(taskId, name);
       await this.gitBaseline(taskId, name);
     } catch (error) {
       await this.cleanup(taskId);
@@ -549,29 +615,27 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     }
     const started = Date.now();
     const timeoutSeconds = Math.max(1, Math.floor(this.timeoutMs / 1000));
-    // Run the command in a fresh user+PID namespace. The timeout wrapper
-    // becomes the namespace's PID 1, so when it exits — normal completion,
-    // timeout-kill, or otherwise — the kernel SIGKILLs every remaining
-    // member, including background children the command spawned: no
-    // validation process can outlive the validation and later race the
-    // workspace paths. A task process cannot escape the namespace
-    // (all capabilities are dropped and no-new-privileges is set).
     const result = await this.execIn(
       workspace,
-      [
-        "unshare",
-        "--user",
-        "--map-root-user",
-        "--pid",
-        "--fork",
-        "timeout",
-        "--signal=KILL",
-        String(timeoutSeconds),
-        ...executable,
-      ],
+      ["timeout", "--signal=KILL", String(timeoutSeconds), ...executable],
       this.timeoutMs + 15_000,
       this.outputLimitBytes,
     );
+    // Validation cleanup (kernel start-time based, see the script): kill
+    // everything the validation started — direct children AND background
+    // grandchildren — so no process it spawned can survive the validation
+    // and later race the workspace paths between a stat and its use.
+    // Runs under the per-task queue, so nothing else is in flight.
+    const cleaned = await this.execIn(
+      workspace,
+      ["node", "/workspace/.valmont/validation-reap.mjs", String(started)],
+      30_000,
+      20_000,
+      "root",
+    );
+    if (cleaned.code !== 0) {
+      throw new Error("Could not complete validation cleanup");
+    }
     if (result.timedOut) {
       // CLI-level fallback: the in-container timeout did not report in time.
       return {
@@ -621,7 +685,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * strictly serialized per task (FIFO); a failed operation releases the
    * queue for the next one.
    */
-  private withTaskLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+  private withTaskLock<T>(
+    taskId: string,
+    fn: () => Promise<T>,
+    recordActivity: boolean = true,
+  ): Promise<T> {
     const previous = this.taskLocks.get(taskId) ?? Promise.resolve();
     let release: () => void = () => undefined;
     const current = previous
@@ -635,10 +703,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     this.taskLocks.set(taskId, current);
     // Wait for the PREVIOUS operation (not `current`, whose gate only this
     // operation releases) to finish, then run; release when done.
+    // Wait for the PREVIOUS operation (not `current`, whose gate only this
+    // operation releases) to finish, then run; release when done. Starting
+    // an operation is itself activity, so the TTL reaper cannot claim this
+    // task as abandoned while an operation is in flight or queued.
     return previous
       .catch(() => undefined)
       .then(async () => {
         try {
+          if (recordActivity) this.taskActivity.set(taskId, Date.now());
           return await fn();
         } finally {
           release();
@@ -651,6 +724,49 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   private containerName(taskId: string): string {
     return `valmont-sandbox-${taskId}`;
+  }
+
+  /**
+   * Stage the validation reaper script into a root-only directory. Runs as
+   * root with fixed argv: the directory is `0700 root:root` (task code can
+   * neither read nor delete the script) and the script lands root-owned
+   * `0600` (docker cp preserves the host temp file's mode). Called after
+   * the staging `chown -R` so nothing re-owns it, and before the git
+   * baseline so `.valmont/` is git-excluded.
+   */
+  private async installValidationReaper(
+    taskId: string,
+    name: string,
+  ): Promise<void> {
+    const handle: WorkspaceHandle = { id: taskId, root: "/workspace" };
+    const made = await this.execIn(
+      handle,
+      ["mkdir", "-m", "0700", "/workspace/.valmont"],
+      15_000,
+      20_000,
+      "root",
+    );
+    if (made.code !== 0) {
+      throw new Error("Could not create the validation reaper directory");
+    }
+    const scratch = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-file-"));
+    const scriptPath = path.join(scratch, "validation-reap.mjs");
+    try {
+      await writeFile(scriptPath, VALIDATION_REAPER_SCRIPT, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      const copied = await this.docker(
+        ["cp", scriptPath, `${name}:/workspace/.valmont/validation-reap.mjs`],
+        30_000,
+        this.outputLimitBytes,
+      );
+      if (copied.code !== 0) {
+        throw new Error("Could not stage the validation reaper");
+      }
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
   }
 
   private async stageSource(taskId: string, sourceRoot: string): Promise<void> {
@@ -814,11 +930,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * rejected, as are non-directory ancestors and non-file targets. The
    * verification runs back-to-back with the operation under the per-task
    * operation queue (no other provider operation can interleave) and no
-   * validation process survives its run (the kernel tears down the
-   * validation's PID namespace when the timeout wrapper exits), so nothing
-   * can swap in a symlink between the check and its use. Returns the final
-   * target's kind, or `null` when the target does not exist, so callers
-   * keep their not-found semantics.
+   * validation process survives its run (the post-validation reaper exec
+   * SIGKILLs everything the validation started), so nothing can swap in a
+   * symlink between the check and its use. Returns the final target's
+   * kind, or `null` when the target does not exist, so callers keep their
+   * not-found semantics.
    */
   private async verifyPathComponents(
     workspace: WorkspaceHandle,
@@ -944,33 +1060,75 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   private async reapExpired(): Promise<void> {
-    const listed = await this.docker(
-      [
-        "ps",
-        "-a",
-        "--filter",
-        "label=valmont.managed=true",
-        "--format",
-        "{{.ID}}",
-      ],
-      30_000,
-      this.outputLimitBytes,
-    );
-    if (listed.code !== 0) return;
-    for (const id of listed.stdout.split(/\r?\n/).filter(Boolean)) {
-      const inspected = await this.docker(
-        ["inspect", "--format", "{{.Created}}", id],
-        15_000,
-        20_000,
+    if (this.reaperRunning) return;
+    this.reaperRunning = true;
+    try {
+      const listed = await this.docker(
+        [
+          "ps",
+          "-a",
+          "--filter",
+          "label=valmont.managed=true",
+          "--format",
+          '{{.ID}}\t{{.Label "valmont.task"}}',
+        ],
+        30_000,
+        this.outputLimitBytes,
       );
-      if (inspected.code !== 0) continue;
-      const normalized = inspected.stdout
-        .trim()
-        .replace(/(\.\d{1,3})\d*Z$/, "$1Z");
-      const created = Date.parse(normalized);
-      if (!Number.isFinite(created)) continue;
-      if (Date.now() - created <= this.ttlMs) continue;
-      await this.docker(["rm", "-f", id], 30_000, 20_000);
+      if (listed.code !== 0) return;
+      for (const line of listed.stdout.split(/\r?\n/).filter(Boolean)) {
+        const [id, task] = line.split("\t");
+        if (!id || !task) continue;
+        if (!TASK_ID.test(task)) {
+          // A managed container whose label is not a valid task identifier
+          // has no queue to go through; remove it directly.
+          await this.docker(["rm", "-f", id], 30_000, 20_000);
+          continue;
+        }
+        const inspected = await this.docker(
+          ["inspect", "--format", "{{.Created}}", id],
+          15_000,
+          20_000,
+        );
+        if (inspected.code !== 0) continue;
+        const normalized = inspected.stdout
+          .trim()
+          .replace(/(\.\d{1,3})\d*Z$/, "$1Z");
+        const created = Date.parse(normalized);
+        if (!Number.isFinite(created)) continue;
+        const lastActivity = this.taskActivity.get(task);
+        // Abandoned = no provider operation for longer than the TTL. When
+        // no activity is recorded (e.g. the provider process restarted),
+        // fall back to the container's age — the only signal available.
+        const reference = lastActivity ?? created;
+        if (Date.now() - reference <= this.ttlMs) continue;
+        // Removal goes through the per-task queue and re-checks activity
+        // inside it, so it can never run while an operation is in flight
+        // (and never sees its own removal as task activity).
+        await this.withTaskLock(
+          task,
+          async () => {
+            const fresh = this.taskActivity.get(task);
+            if (fresh !== undefined && Date.now() - fresh <= this.ttlMs) {
+              return;
+            }
+            const still = await this.docker(
+              ["inspect", "--format", "{{.State.Running}}", id],
+              15_000,
+              20_000,
+            );
+            if (still.code !== 0) {
+              this.taskActivity.delete(task);
+              return;
+            }
+            await this.docker(["rm", "-f", id], 30_000, 20_000);
+            this.taskActivity.delete(task);
+          },
+          false,
+        );
+      }
+    } finally {
+      this.reaperRunning = false;
     }
   }
 
