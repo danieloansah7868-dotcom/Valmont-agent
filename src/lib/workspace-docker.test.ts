@@ -43,6 +43,10 @@ interface FakeState {
   rmErrors: Map<string, string>;
   cpDestinations: string[];
   cpFailures: number;
+  /** Forced inspect failure (code 1) for a container's Running check. */
+  inspectErrors: Map<string, string>;
+  /** Simulate the host CLI failing to spawn an exec command (keyed by cmd). */
+  spawnFail: Map<string, string>;
   onRm?: (name: string) => void;
   onInspect?: (name: string, format: string) => void;
   onExec?: (
@@ -65,6 +69,8 @@ function makeState(): FakeState {
     rmErrors: new Map(),
     cpDestinations: [],
     cpFailures: 0,
+    inspectErrors: new Map(),
+    spawnFail: new Map(),
   };
   // Baseline: the two mounts exist with exactly the create-time flags'
   // result, and /workspace is a directory. Unregistered paths are missing.
@@ -132,6 +138,25 @@ function makeChild(stdout: string, stderr: string, code: number): ChildProcess {
   return child as unknown as ChildProcess;
 }
 
+/** A child whose spawn fails: the provider's docker() REJECTS for these. */
+function makeErrorChild(message: string): ChildProcess {
+  const listeners: Record<string, Array<(...args: unknown[]) => void>> = {};
+  const child = {
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    stdin: new PassThrough(),
+    kill: () => true,
+    on: (event: string, fn: (...args: unknown[]) => void) => {
+      (listeners[event] ??= []).push(fn);
+      return child;
+    },
+  };
+  setImmediate(() => {
+    for (const fn of listeners["error"] ?? []) fn(new Error(message));
+  });
+  return child as unknown as ChildProcess;
+}
+
 function makeSpawn(state: FakeState): DockerSpawn {
   return (command, args, options) => {
     state.calls.push({ command, args, stdinPath: options.stdinPath });
@@ -175,8 +200,14 @@ function makeSpawn(state: FakeState): DockerSpawn {
         const name = args[args.length - 1];
         state.onInspect?.(name, format);
         if (format === "{{.State.Running}}") {
-          if (state.containers.has(name)) stdout = "true\n";
-          else {
+          const forced = state.inspectErrors.get(name);
+          if (forced !== undefined) {
+            // Transient daemon-side failure (the container may be alive).
+            code = 1;
+            stderr = forced;
+          } else if (state.containers.has(name)) {
+            stdout = "true\n";
+          } else {
             code = 1;
             stderr = `Error: No such object: ${name}\n`;
           }
@@ -212,6 +243,11 @@ function makeSpawn(state: FakeState): DockerSpawn {
         } else {
           const cmd = args.slice(args.indexOf(name) + 1);
           const user = args[args.indexOf("--user") + 1];
+          const failedSpawn = state.spawnFail.get(cmd[0]);
+          if (failedSpawn !== undefined) {
+            // The host-side CLI could not spawn: the provider rejects.
+            return makeErrorChild(failedSpawn);
+          }
           const override = state.onExec?.(name, cmd, user);
           const result = override ?? defaultExec(state, cmd);
           code = result.code;
@@ -280,6 +316,7 @@ interface Internals {
   reapExpired(): Promise<void>;
   taskActivity: Map<string, number>;
   taskLocks: Map<string, Promise<void>>;
+  quarantinedTasks: Set<string>;
 }
 
 const internals = (p: DockerWorkspaceProvider) => p as unknown as Internals;
@@ -368,6 +405,8 @@ describe("DockerWorkspaceProvider", () => {
     expect(tmpfs).toEqual([
       "/workspace:rw,nosuid,nodev,size=2147483648,uid=1000,gid=1000",
       "/reap:rw,nosuid,nodev,mode=0701,size=1m",
+      // Docker's default /dev/shm, declared explicitly and bounded.
+      "/dev/shm:rw,nosuid,nodev,mode=777,size=64m",
     ]);
     expect(args).toContain("--label");
     expect(args).toContain("valmont.managed=true");
@@ -1008,5 +1047,207 @@ describe("DockerWorkspaceProvider", () => {
     // No queue or activity bookkeeping was created under the invalid label.
     expect(internals(provider).taskActivity.has("bad*label")).toBe(false);
     expect(internals(provider).taskLocks.has("bad*label")).toBe(false);
+  });
+
+  it("quarantines the task and destroys the container when validation cleanup fails", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("task1", src);
+    state.onExec = (_n, cmd) =>
+      cmd[0] === "node"
+        ? {
+            code: 1,
+            stdout: "",
+            stderr:
+              "validation-reap: survivor pid 42 (state R) started during the validation\n",
+          }
+        : undefined;
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      "Could not complete validation cleanup",
+    );
+    // The untrusted container is destroyed and its activity dropped (it
+    // pins nothing now).
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(internals(provider).quarantinedTasks.has("task1")).toBe(true);
+    // Every later operation rejects with the quarantine error — a
+    // survivor must never race later path verification.
+    await expect(provider.readFile(ws, "a.txt")).rejects.toThrow(
+      "Task workspace is quarantined",
+    );
+    await expect(provider.open("task1")).rejects.toThrow(
+      "Task workspace is quarantined",
+    );
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      "Task workspace is quarantined",
+    );
+    // Explicit teardown clears the quarantine; the id is then simply
+    // "unavailable" (no container).
+    await provider.destroy("task1");
+    expect(internals(provider).quarantinedTasks.has("task1")).toBe(false);
+    await expect(provider.open("task1")).rejects.toThrow(
+      "Task workspace is unavailable",
+    );
+  });
+
+  it("a quarantine persists while the destroy itself is failing", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("task1", src);
+    state.onExec = (_n, cmd) =>
+      cmd[0] === "node"
+        ? { code: 1, stdout: "", stderr: "survivor\n" }
+        : undefined;
+    // The quarantine's immediate destroy also fails: the container stays.
+    state.rmErrors.set(
+      "valmont-sandbox-task1",
+      "Error: rm: device or resource busy\n",
+    );
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      "Could not complete validation cleanup",
+    );
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
+    // The live-but-untrusted container must NOT be usable — the
+    // quarantine is stricter than "unavailable".
+    await expect(provider.readFile(ws, "a.txt")).rejects.toThrow(
+      "Task workspace is quarantined",
+    );
+    state.rmErrors.delete("valmont-sandbox-task1");
+    await provider.destroy("task1");
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(internals(provider).quarantinedTasks.has("task1")).toBe(false);
+  });
+
+  it("create() replaces a quarantined task", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("task1", src);
+    state.onExec = (_n, cmd) =>
+      cmd[0] === "node"
+        ? { code: 1, stdout: "", stderr: "survivor\n" }
+        : undefined;
+    state.rmErrors.set("valmont-sandbox-task1", "Error: rm: busy\n");
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      "Could not complete validation cleanup",
+    );
+    expect(internals(provider).quarantinedTasks.has("task1")).toBe(true);
+    // Replacement: the create-time cleanup now succeeds (the removal
+    // error is cleared), the quarantine no longer applies, and the new
+    // workspace works.
+    state.rmErrors.delete("valmont-sandbox-task1");
+    state.onExec = undefined;
+    const ws2 = await provider.create("task1", src);
+    expect(internals(provider).quarantinedTasks.has("task1")).toBe(false);
+    state.statResults.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "regular file\n",
+      stderr: "",
+    });
+    state.fileContents.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "x\n",
+      stderr: "",
+    });
+    expect(await provider.readFile(ws2, "a.txt")).toBe("x\n");
+  });
+
+  it("a validation exec on a gone container is a lifecycle error, not a quarantine", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("task1", src);
+    await provider.destroy("task1");
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      "Task workspace is unavailable",
+    );
+    // No quarantine: nothing survived — the container was simply gone.
+    expect(internals(provider).quarantinedTasks.has("task1")).toBe(false);
+    await expect(provider.open("task1")).rejects.toThrow(
+      "Task workspace is unavailable",
+    );
+  });
+
+  it("quarantines when the reaper exec cannot even start", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("task1", src);
+    // The host CLI fails to spawn the reaper (e.g. client killed, daemon
+    // exec possibly still running): cleanup did not complete.
+    state.spawnFail.set("node", "spawn docker ENOENT");
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      "Could not complete validation cleanup",
+    );
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(internals(provider).quarantinedTasks.has("task1")).toBe(true);
+    await expect(provider.open("task1")).rejects.toThrow(
+      "Task workspace is quarantined",
+    );
+  });
+
+  it("rejects dot-dot relative paths (host-side scratch escape)", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("task1", src);
+    const callsBefore = state.calls.length;
+    // "workspace/../a.txt" canonicalizes to /workspace/a.txt (a legal
+    // container path) but would stage OUTSIDE the operation scratch at
+    // <scratch-parent>/workspace/a.txt — the host-side escape.
+    await expect(
+      provider.writeFile(ws, "workspace/../a.txt", "y"),
+    ).rejects.toThrow("Invalid workspace path");
+    await expect(provider.writeFile(ws, "../escape.txt", "y")).rejects.toThrow(
+      "Invalid workspace path",
+    );
+    await expect(provider.writeFile(ws, "a/../../b.txt", "y")).rejects.toThrow(
+      "Invalid workspace path",
+    );
+    // Nothing was staged for the rejected attempts: no host tar, no
+    // docker call, no file anywhere outside the (never created) scratch.
+    expect(state.calls.length).toBe(callsBefore);
+    // Plain nested paths still work (the fix is not over-broad).
+    await provider.writeFile(ws, "sub/deep.txt", "y");
+    const hostTar = state.calls.filter((c) => c.command === "tar").pop()!;
+    expect(hostTar.args[hostTar.args.indexOf("--") + 1]).toBe("sub/deep.txt");
+  });
+
+  it("a transient in-lock inspect failure preserves the activity record", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    await provider.create("task1", src);
+    await sleep(500);
+    state.psLines = ["valmont-sandbox-task1\ttask1"];
+    state.inspectErrors.set(
+      "valmont-sandbox-task1",
+      "Error: daemon: request timeout\n",
+    );
+    await internals(provider).reapExpired();
+    // The inspect failure was transient (not "no such object"): the
+    // container is still here and the activity record is PRESERVED — an
+    // operation may have enqueued while the inspect awaited, and the next
+    // interval must not reap a live container on its old creation time.
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
+    expect(internals(provider).taskActivity.has("task1")).toBe(true);
+    state.inspectErrors.delete("valmont-sandbox-task1");
+    await internals(provider).reapExpired();
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(internals(provider).taskActivity.has("task1")).toBe(false);
+  });
+
+  it("drops the record when the container is truly gone (no such object)", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    await provider.create("task1", src);
+    await sleep(500);
+    // Removed outside this provider (operator or another process).
+    state.containers.delete("valmont-sandbox-task1");
+    state.psLines = ["valmont-sandbox-task1\ttask1"];
+    await internals(provider).reapExpired();
+    expect(internals(provider).taskActivity.has("task1")).toBe(false);
   });
 });

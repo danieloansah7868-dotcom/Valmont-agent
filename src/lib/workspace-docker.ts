@@ -87,6 +87,14 @@ import {
  *   namespaces are deliberately not used: seccomp=default allows `unshare`
  *   only with the bare `--user` flag, so no namespace-based teardown is
  *   possible under the default profile.);
+ * - a validation whose cleanup FAILS quarantines the task: the container
+ *   is destroyed immediately (best-effort — the flag persists even if
+ *   the removal itself fails) and every later operation on that task
+ *   rejects with "Task workspace is quarantined" until an explicit
+ *   `destroy()` (or a `create()` replacement) succeeds. Rationale: a
+ *   surviving validation process would keep racing later path
+ *   verification and file operations, and it predates any NEXT
+ *   validation boundary, so no later cleanup would ever reach it;
  * - the reaper script lives on a SECOND, root-owned `0701` tmpfs mounted
  *   at `/reap` (a separate mount point on the read-only rootfs), not in
  *   the task-writable workspace: the unprivileged user can traverse
@@ -183,6 +191,18 @@ interface DockerRunResult {
 }
 
 const TASK_ID = /^[a-zA-Z0-9_-]{3,80}$/;
+
+/** The documented lifecycle error for a task whose container is gone. */
+const WORKSPACE_UNAVAILABLE = "Task workspace is unavailable";
+
+/**
+ * Quarantined tasks reject every operation until explicit teardown. The
+ * container (and everything in it) is untrusted after a failed validation
+ * cleanup, so this is stricter than "unavailable": it persists even while
+ * a removal of the container is still failing.
+ */
+const QUARANTINE_ERROR =
+  "Task workspace is quarantined (validation cleanup failed); destroy the task";
 
 const GIT_EXCLUDES = [
   ".env*",
@@ -376,6 +396,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * backlog-heavy but still-active task is never reaped.
    */
   private readonly taskActivity = new Map<string, number>();
+  /**
+   * Quarantined tasks: a validation cleanup failed (a survivor process may
+   * be racing the workspace and can evade later cleanups — it predates the
+   * next boundary), so the workspace is untrusted. Every operation rejects
+   * with "Task workspace is quarantined" until an explicit destroy() — or
+   * a create() that fully replaces the container — succeeds. The flag
+   * persists even if the immediate best-effort removal fails.
+   */
+  private readonly quarantinedTasks = new Set<string>();
 
   constructor(options: DockerWorkspaceOptions) {
     this.image = options.image;
@@ -467,6 +496,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   ): Promise<WorkspaceHandle> {
     const name = this.containerName(taskId);
     await this.cleanup(taskId);
+    // The old container (if any) is gone, so a previous quarantine —
+    // which trusted nothing about it — no longer applies: create() is
+    // the documented way to replace a quarantined workspace.
+    this.quarantinedTasks.delete(taskId);
     const createArgs = [
       "create",
       "--name",
@@ -513,6 +546,13 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       // /workspace). size: only the script lives there.
       "--tmpfs",
       "/reap:rw,nosuid,nodev,mode=0701,size=1m",
+      // Docker's /dev/shm is itself a writable tmpfs (64 MiB default).
+      // Declare it explicitly — bounded, per-container, destroyed with
+      // the task — so the writable-storage model is exactly these three
+      // tmpfs mounts, and the smoke test can verify the size (df -m
+      // /dev/shm → 64).
+      "--tmpfs",
+      "/dev/shm:rw,nosuid,nodev,mode=777,size=64m",
       "--label",
       "valmont.managed=true",
       "--label",
@@ -563,13 +603,14 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   private async openCore(taskId: string): Promise<WorkspaceHandle> {
+    this.assertNotQuarantined(taskId);
     const inspected = await this.docker(
       ["inspect", "--format", "{{.State.Running}}", this.containerName(taskId)],
       15_000,
       20_000,
     );
     if (inspected.code !== 0 || inspected.stdout.trim() !== "true") {
-      throw new Error("Task workspace is unavailable");
+      throw new Error(WORKSPACE_UNAVAILABLE);
     }
     return { id: taskId, root: "/workspace" };
   }
@@ -587,6 +628,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     relativePath: string,
   ): Promise<string> {
+    this.assertNotQuarantined(workspace.id);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(workspace, absolute);
     if (target === null) throw new Error("Could not read workspace file");
@@ -616,6 +658,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     relativePath: string,
   ): Promise<string> {
+    this.assertNotQuarantined(workspace.id);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(workspace, absolute);
     if (target === null) throw new Error("Could not read workspace file");
@@ -653,6 +696,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
     content: string,
   ): Promise<void> {
+    this.assertNotQuarantined(workspace.id);
     if (isSensitivePath(relativePath)) {
       throw new Error("Writing sensitive paths is blocked");
     }
@@ -663,8 +707,14 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     try {
       // The content file is staged under its workspace-relative path so
       // the tar member IS that path (no symlinks, no host paths in the
-      // archive).
-      const target = path.join(scratch, relativePath);
+      // archive). safeContainerPath already rejected absolute paths,
+      // NUL/newline bytes, and `..` components; this guard is the
+      // host-side containment check that refuses to stage anything
+      // outside the scratch directory regardless.
+      const target = path.resolve(scratch, relativePath);
+      if (target === scratch || !target.startsWith(`${scratch}${path.sep}`)) {
+        throw new Error("Invalid workspace path");
+      }
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, content, { encoding: "utf8", mode: 0o600 });
       // Extract in the container AS the unprivileged user: the file AND
@@ -725,6 +775,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     relativePath: string,
   ): Promise<void> {
+    this.assertNotQuarantined(workspace.id);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(workspace, absolute);
     if (target === null) throw new Error("Could not delete workspace file");
@@ -746,6 +797,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   private async listChangedFilesCore(
     workspace: WorkspaceHandle,
   ): Promise<ChangedFile[]> {
+    this.assertNotQuarantined(workspace.id);
     await this.markUntrackedForDiff(workspace);
     const result = await this.execIn(
       workspace,
@@ -783,6 +835,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   private async gitDiffCore(workspace: WorkspaceHandle): Promise<string> {
+    this.assertNotQuarantined(workspace.id);
     await this.markUntrackedForDiff(workspace);
     const result = await this.execIn(
       workspace,
@@ -801,6 +854,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   private async gitStatusCore(workspace: WorkspaceHandle): Promise<string> {
+    this.assertNotQuarantined(workspace.id);
     const result = await this.execIn(
       workspace,
       ["git", "status", "--short", "--untracked-files=all"],
@@ -826,6 +880,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     command: string,
   ): Promise<CommandResult> {
+    this.assertNotQuarantined(workspace.id);
     const normalized = command.trim().replace(/\s+/g, " ");
     const executable = this.allowedCommands[normalized];
     if (!executable) {
@@ -838,12 +893,29 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     }
     const started = Date.now();
     const timeoutSeconds = Math.max(1, Math.floor(this.timeoutMs / 1000));
-    const result = await this.execIn(
-      workspace,
-      ["timeout", "--signal=KILL", String(timeoutSeconds), ...executable],
-      this.timeoutMs + 15_000,
-      this.outputLimitBytes,
-    );
+    let result: DockerRunResult;
+    try {
+      result = await this.execIn(
+        workspace,
+        ["timeout", "--signal=KILL", String(timeoutSeconds), ...executable],
+        this.timeoutMs + 15_000,
+        this.outputLimitBytes,
+      );
+    } catch (error) {
+      // The exec failed to report. If the container is gone, there is
+      // nothing to clean up (keep the documented lifecycle error).
+      // Otherwise the host-side docker CLI failed for an unknown reason
+      // while the exec may have started — a daemon-side process can
+      // survive a client disconnect, so the CLI timeout/kill alone does
+      // not prove the command stopped — and the cleanup is attempted;
+      // if it cannot complete, the task is quarantined (see below).
+      if (!(
+        error instanceof Error && error.message === WORKSPACE_UNAVAILABLE
+      )) {
+        await this.runReaperOrQuarantine(workspace.id, started);
+      }
+      throw error;
+    }
     // Validation cleanup (kernel start-time based, see the script): kill
     // everything the validation started — direct children AND background
     // grandchildren — so no process it spawned can survive the validation
@@ -858,15 +930,12 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     // write path to it or the mount, and the mount point cannot be
     // renamed, replaced, or shadowed — so task code (the same uid) cannot
     // tamper with the cleanup.
-    const cleaned = await this.execIn(
-      workspace,
-      ["node", "/reap/validation-reap.mjs", String(started)],
-      30_000,
-      20_000,
-    );
-    if (cleaned.code !== 0) {
-      throw new Error("Could not complete validation cleanup");
-    }
+    //
+    // If the cleanup CANNOT complete, the task is quarantined: a survivor
+    // would keep racing later path verification, and it predates any
+    // future validation boundary, so no later cleanup would ever reach
+    // it.
+    await this.runReaperOrQuarantine(workspace.id, started);
     if (result.timedOut) {
       // CLI-level fallback: the in-container timeout did not report in time.
       return {
@@ -897,13 +966,79 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /**
+   * Run the post-validation reaper, quarantining the task when the
+   * cleanup cannot complete. Quarantine is essential: a surviving
+   * validation process (a) would keep racing later path verification and
+   * file operations, and (b) predates any future validation boundary, so
+   * no later cleanup would ever reach it. A reaper exec that REJECTS
+   * (the host-side CLI could not spawn it, or its client was killed and
+   * the daemon-side exec may still be running) means the cleanup did not
+   * complete and is treated exactly like a non-zero exit.
+   */
+  private async runReaperOrQuarantine(
+    taskId: string,
+    started: number,
+  ): Promise<void> {
+    const handle: WorkspaceHandle = { id: taskId, root: "/workspace" };
+    let cleaned: DockerRunResult;
+    try {
+      cleaned = await this.execIn(
+        handle,
+        ["node", "/reap/validation-reap.mjs", String(started)],
+        30_000,
+        20_000,
+      );
+    } catch {
+      await this.quarantineTask(taskId);
+      throw new Error("Could not complete validation cleanup");
+    }
+    if (cleaned.code !== 0) {
+      await this.quarantineTask(taskId);
+      throw new Error("Could not complete validation cleanup");
+    }
+  }
+
+  /**
+   * Quarantine a task after a failed validation cleanup: mark it so every
+   * later operation rejects with the quarantine error (see
+   * quarantinedTasks), and destroy the container immediately —
+   * best-effort: if the removal itself fails, the flag persists
+   * (operations still reject) and the TTL reaper / operator is the
+   * backstop for the container.
+   */
+  private async quarantineTask(taskId: string): Promise<void> {
+    this.quarantinedTasks.add(taskId);
+    try {
+      await this.cleanup(taskId);
+      // The container is gone: the activity record no longer pins
+      // anything (same policy as a successful TTL removal).
+      this.taskActivity.delete(taskId);
+    } catch {
+      // The removal failed: keep the flag (operations still reject) and
+      // the record (the container is still here).
+    }
+  }
+
+  private assertNotQuarantined(taskId: string): void {
+    if (this.quarantinedTasks.has(taskId)) {
+      throw new Error(QUARANTINE_ERROR);
+    }
+  }
+
+  /**
    * Destroy the task container; its tmpfs workspace is removed with it. Call
    * when a task reaches a terminal state; the reaper is the backstop for
-   * abandoned tasks.
+   * abandoned tasks. Also the explicit teardown that clears a quarantine
+   * (see quarantinedTasks) — the flag persists if the removal fails.
    */
   async destroy(taskId: string): Promise<void> {
     if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
-    return this.withTaskLock(taskId, () => this.cleanup(taskId));
+    return this.withTaskLock(taskId, async () => {
+      await this.cleanup(taskId);
+      // The removal was checked (cleanup throws on a failed rm): the
+      // task's container is gone, so its quarantine is over too.
+      this.quarantinedTasks.delete(taskId);
+    });
   }
 
   /** Stop the background TTL reaper (the timer is unref'd and never keeps the process alive). */
@@ -1376,6 +1511,16 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     ) {
       throw new Error("Invalid workspace path");
     }
+    // No `..` components. The RAW relative path is also used host-side to
+    // stage files (writeFile), and a `..` there escapes the operation
+    // scratch directory even though the CONTAINER path resolves inside
+    // /workspace (e.g. `../workspace/x` canonicalizes to
+    // `/workspace/x` yet stages at `<tmp-parent>/workspace/x`). Rejecting
+    // them keeps host staging, the tar member, and the container path in
+    // lockstep for every operation.
+    if (relativePath.split("/").includes("..")) {
+      throw new Error("Invalid workspace path");
+    }
     const absolute = path.posix.resolve("/workspace", relativePath);
     if (absolute !== "/workspace" && !absolute.startsWith("/workspace/")) {
       throw new Error("Invalid workspace path");
@@ -1413,7 +1558,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     // successful TTL removal is in flight — the container it wanted no
     // longer exists, and the task can be re-created with create().
     if (result.code !== 0 && /no such container/i.test(result.stderr)) {
-      throw new Error("Task workspace is unavailable");
+      throw new Error(WORKSPACE_UNAVAILABLE);
     }
     return result;
   }
@@ -1508,7 +1653,20 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
               20_000,
             );
             if (still.code !== 0) {
-              this.taskActivity.delete(task);
+              // Only "the container really does not exist" (the daemon
+              // reports no such object) may drop the activity record. On
+              // a TRANSIENT inspect failure the container may be alive
+              // and an operation may have enqueued while this inspect
+              // was awaiting (recording fresh activity) — deleting the
+              // record would let the next interval reap a live container
+              // on its old creation time alone. In the gone case the
+              // race outcome is the same as a successful removal: an
+              // operation that enqueued during the inspect now fails
+              // cleanly with "Task workspace is unavailable", so the
+              // record (and its fresh activity) is dropped.
+              if (/no such object/i.test(still.stderr)) {
+                this.taskActivity.delete(task);
+              }
               return;
             }
             // Final gate, checked synchronously immediately before the
