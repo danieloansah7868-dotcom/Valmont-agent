@@ -11,14 +11,20 @@
 #   docker compose -f compose.sandbox.yaml exec -u node sandbox node --version
 #   docker compose -f compose.sandbox.yaml exec -u node sandbox git --version
 #
-# Validate the reaper script and its permissions:
+# Verify the two tmpfs mounts and their ownership/mode (run as the
+# unprivileged user — proving it can traverse the root-owned 0701 /reap
+# mount):
 #   docker compose -f compose.sandbox.yaml exec -u node sandbox \
-#     node /workspace/.valmont/validation-reap.mjs not-a-number
-#   # expect: "validation-reap: expected a positive integer epoch-ms boundary"
-#   # exit code 2
+#     stat -c '%u %g %a' /reap
+#   # expect: 0 0 701
 #   docker compose -f compose.sandbox.yaml exec -u node sandbox \
-#     node /workspace/.valmont/validation-reap.mjs 9999999999999
-#   # expect: no output, exit code 0 (nothing started at/after that boundary)
+#     stat -c '%u %g %a' /workspace
+#   # expect: 1000 1000 1777
+#
+# The reaper SCRIPT itself is not in this smoke container: the provider
+# stages it (onto /reap) in each container IT creates and verifies its
+# ownership/mode/type at create time, so its behaviour is covered by the
+# provider's create-time checks rather than this smoke target.
 #
 #   docker compose -f compose.sandbox.yaml down
 services:
@@ -50,7 +56,12 @@ services:
     # enforces it with ENOSPC). uid=/gid= own the tmpfs root with the
     # sandbox user, so task code and the provider's `tar` extraction can
     # write into it without any in-container chown.
+    #
+    # /reap: the provider's second tmpfs — root-owned 0701 (traversable
+    # and readable by the sandbox user, writable by no one), the mount
+    # point the provider stages the validation reaper script onto.
     tmpfs:
       - /workspace:rw,nosuid,nodev,size=2g,uid=1000,gid=1000
+      - /reap:rw,nosuid,nodev,mode=0701,size=1m
     restart: "no"
     stop_timeout: 5

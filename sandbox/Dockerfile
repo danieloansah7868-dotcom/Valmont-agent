@@ -30,7 +30,16 @@ RUN apt-get update \
 # copy below is hidden by that mount and exists so the image builds and
 # runs standalone. Package-manager scratch ($HOME, TMPDIR) lives on the
 # task tmpfs, not on the read-only root.
-RUN mkdir -p /workspace/.home /workspace/.tmp && \
+#
+# /reap is the MOUNT POINT for the provider's second tmpfs (root-owned
+# 0701, mounted at create time): the validation-reap.mjs script lives
+# there, outside the task-writable workspace, so task code can traverse
+# and read it but cannot write, rename, or replace it (a mount point
+# cannot be renamed away, and unmounting needs CAP_SYS_ADMIN). The layer
+# copy is hidden by the mount; it is root-owned because it must only ever
+# be observed as the mount (root-owned 0701), never as a writable
+# directory.
+RUN mkdir -p /workspace/.home /workspace/.tmp /reap && \
     chown -R node:node /workspace
 ENV HOME=/workspace/.home \
     TMPDIR=/workspace/.tmp
