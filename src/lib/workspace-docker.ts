@@ -42,10 +42,18 @@ import {
  *   Arbitrary task code never runs as root;
  * - CPU, memory (with no swap), PID, and per-task storage quotas, plus a
  *   per-command wall-clock timeout (`timeout --signal=KILL` inside the
- *   container) with a CLI-level fallback kill. Note: with no swap, tmpfs
- *   residency counts against the memory quota, so size
+ *   validation's PID namespace) with a CLI-level fallback kill. Note: with
+ *   no swap, tmpfs residency counts against the memory quota, so size
  *   `VALMONT_SANDBOX_MEMORY_BYTES` and `VALMONT_SANDBOX_STORAGE_BYTES`
  *   together for larger tasks;
+ * - every provider operation for a task is serialized by an in-provider
+ *   per-task queue, so no two operations — and no stat-then-use sequence
+ *   within one of them — can ever overlap on the same container;
+ * - validation commands additionally run in a fresh `user`+`PID` namespace
+ *   (`unshare --user --map-root-user --pid --fork` around the timeout
+ *   wrapper): when that wrapper exits, the kernel kills every remaining
+ *   process in the namespace, so no validation process or background child
+ *   can outlive the validation and later race the workspace paths;
  * - default-deny network (`--network none`), which also blocks the cloud
  *   metadata endpoint;
  * - no environment variables are passed into the container, so GitHub, model,
@@ -140,6 +148,12 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   >;
   private readonly spawnImpl: DockerSpawn;
   private reaperTimer?: NodeJS.Timeout;
+  /**
+   * Per-task operation queues: every provider operation for a task runs
+   * strictly one at a time (FIFO), so one operation's stat-then-use
+   * sequence can never interleave with another operation on the same task.
+   */
+  private readonly taskLocks = new Map<string, Promise<void>>();
 
   constructor(options: DockerWorkspaceOptions) {
     this.image = options.image;
@@ -198,6 +212,13 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   async create(taskId: string, sourceRoot: string): Promise<WorkspaceHandle> {
     if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
+    return this.withTaskLock(taskId, () => this.createCore(taskId, sourceRoot));
+  }
+
+  private async createCore(
+    taskId: string,
+    sourceRoot: string,
+  ): Promise<WorkspaceHandle> {
     const name = this.containerName(taskId);
     await this.cleanup(taskId);
     const createArgs = [
@@ -268,6 +289,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   async open(taskId: string): Promise<WorkspaceHandle> {
     if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
+    return this.withTaskLock(taskId, () => this.openCore(taskId));
+  }
+
+  private async openCore(taskId: string): Promise<WorkspaceHandle> {
     const inspected = await this.docker(
       ["inspect", "--format", "{{.State.Running}}", this.containerName(taskId)],
       15_000,
@@ -280,6 +305,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   async readFile(
+    workspace: WorkspaceHandle,
+    relativePath: string,
+  ): Promise<string> {
+    return this.withTaskLock(workspace.id, () =>
+      this.readFileCore(workspace, relativePath),
+    );
+  }
+
+  private async readFileCore(
     workspace: WorkspaceHandle,
     relativePath: string,
   ): Promise<string> {
@@ -300,6 +334,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   async readFileForCommit(
+    workspace: WorkspaceHandle,
+    relativePath: string,
+  ): Promise<string> {
+    return this.withTaskLock(workspace.id, () =>
+      this.readFileForCommitCore(workspace, relativePath),
+    );
+  }
+
+  private async readFileForCommitCore(
     workspace: WorkspaceHandle,
     relativePath: string,
   ): Promise<string> {
@@ -326,6 +369,16 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   async writeFile(
+    workspace: WorkspaceHandle,
+    relativePath: string,
+    content: string,
+  ): Promise<void> {
+    return this.withTaskLock(workspace.id, () =>
+      this.writeFileCore(workspace, relativePath, content),
+    );
+  }
+
+  private async writeFileCore(
     workspace: WorkspaceHandle,
     relativePath: string,
     content: string,
@@ -374,6 +427,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     relativePath: string,
   ): Promise<void> {
+    return this.withTaskLock(workspace.id, () =>
+      this.deleteFileCore(workspace, relativePath),
+    );
+  }
+
+  private async deleteFileCore(
+    workspace: WorkspaceHandle,
+    relativePath: string,
+  ): Promise<void> {
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(workspace, absolute);
     if (target === null) throw new Error("Could not delete workspace file");
@@ -387,6 +449,14 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   async listChangedFiles(workspace: WorkspaceHandle): Promise<ChangedFile[]> {
+    return this.withTaskLock(workspace.id, () =>
+      this.listChangedFilesCore(workspace),
+    );
+  }
+
+  private async listChangedFilesCore(
+    workspace: WorkspaceHandle,
+  ): Promise<ChangedFile[]> {
     await this.markUntrackedForDiff(workspace);
     const result = await this.execIn(
       workspace,
@@ -420,6 +490,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   async gitDiff(workspace: WorkspaceHandle): Promise<string> {
+    return this.withTaskLock(workspace.id, () => this.gitDiffCore(workspace));
+  }
+
+  private async gitDiffCore(workspace: WorkspaceHandle): Promise<string> {
     await this.markUntrackedForDiff(workspace);
     const result = await this.execIn(
       workspace,
@@ -434,6 +508,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   async gitStatus(workspace: WorkspaceHandle): Promise<string> {
+    return this.withTaskLock(workspace.id, () => this.gitStatusCore(workspace));
+  }
+
+  private async gitStatusCore(workspace: WorkspaceHandle): Promise<string> {
     const result = await this.execIn(
       workspace,
       ["git", "status", "--short", "--untracked-files=all"],
@@ -450,6 +528,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     command: string,
   ): Promise<CommandResult> {
+    return this.withTaskLock(workspace.id, () =>
+      this.runValidationCore(workspace, command),
+    );
+  }
+
+  private async runValidationCore(
+    workspace: WorkspaceHandle,
+    command: string,
+  ): Promise<CommandResult> {
     const normalized = command.trim().replace(/\s+/g, " ");
     const executable = this.allowedCommands[normalized];
     if (!executable) {
@@ -462,9 +549,26 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     }
     const started = Date.now();
     const timeoutSeconds = Math.max(1, Math.floor(this.timeoutMs / 1000));
+    // Run the command in a fresh user+PID namespace. The timeout wrapper
+    // becomes the namespace's PID 1, so when it exits — normal completion,
+    // timeout-kill, or otherwise — the kernel SIGKILLs every remaining
+    // member, including background children the command spawned: no
+    // validation process can outlive the validation and later race the
+    // workspace paths. A task process cannot escape the namespace
+    // (all capabilities are dropped and no-new-privileges is set).
     const result = await this.execIn(
       workspace,
-      ["timeout", "--signal=KILL", String(timeoutSeconds), ...executable],
+      [
+        "unshare",
+        "--user",
+        "--map-root-user",
+        "--pid",
+        "--fork",
+        "timeout",
+        "--signal=KILL",
+        String(timeoutSeconds),
+        ...executable,
+      ],
       this.timeoutMs + 15_000,
       this.outputLimitBytes,
     );
@@ -501,7 +605,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    */
   async destroy(taskId: string): Promise<void> {
     if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
-    await this.cleanup(taskId);
+    return this.withTaskLock(taskId, () => this.cleanup(taskId));
   }
 
   /** Stop the background TTL reaper (the timer is unref'd and never keeps the process alive). */
@@ -510,6 +614,39 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       clearInterval(this.reaperTimer);
       this.reaperTimer = undefined;
     }
+  }
+
+  /**
+   * Run `fn` as the next queued operation for `taskId`. Operations are
+   * strictly serialized per task (FIFO); a failed operation releases the
+   * queue for the next one.
+   */
+  private withTaskLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.taskLocks.get(taskId) ?? Promise.resolve();
+    let release: () => void = () => undefined;
+    const current = previous
+      .catch(() => undefined)
+      .then(
+        () =>
+          new Promise<void>((resolve) => {
+            release = resolve;
+          }),
+      );
+    this.taskLocks.set(taskId, current);
+    // Wait for the PREVIOUS operation (not `current`, whose gate only this
+    // operation releases) to finish, then run; release when done.
+    return previous
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          return await fn();
+        } finally {
+          release();
+          if (this.taskLocks.get(taskId) === current) {
+            this.taskLocks.delete(taskId);
+          }
+        }
+      });
   }
 
   private containerName(taskId: string): string {
@@ -675,12 +812,13 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * task-created symlinks (which would let a lexical path resolve outside
    * the intended directory, e.g. to /etc or another task file) are
    * rejected, as are non-directory ancestors and non-file targets. The
-   * verification runs back-to-back with the operation while no other exec
-   * is in flight (the provider serializes operations; task code only runs
-   * via `runValidation` in between), so nothing can swap in a symlink
-   * between the check and its use. Returns the final target's kind, or
-   * `null` when the target does not exist, so callers keep their
-   * not-found semantics.
+   * verification runs back-to-back with the operation under the per-task
+   * operation queue (no other provider operation can interleave) and no
+   * validation process survives its run (the kernel tears down the
+   * validation's PID namespace when the timeout wrapper exits), so nothing
+   * can swap in a symlink between the check and its use. Returns the final
+   * target's kind, or `null` when the target does not exist, so callers
+   * keep their not-found semantics.
    */
   private async verifyPathComponents(
     workspace: WorkspaceHandle,

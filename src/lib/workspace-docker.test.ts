@@ -22,6 +22,15 @@ type Handler = (argv: readonly string[]) => Scripted | undefined;
 class FakeDocker {
   readonly calls: string[][] = [];
   private readonly handlers: Handler[] = [];
+  /** Simulated CLI latency, so overlapping operations would interleave. */
+  private readonly delayMs: number;
+  private inFlightCount = 0;
+  /** Highest number of concurrently in-flight docker invocations. */
+  maxInFlight = 0;
+
+  constructor(delayMs = 0) {
+    this.delayMs = delayMs;
+  }
 
   onMatch(handler: Handler): this {
     this.handlers.push(handler);
@@ -55,9 +64,15 @@ class FakeDocker {
     const proc = new EventEmitter();
     const stdout = new EventEmitter();
     const stderr = new EventEmitter();
-    setImmediate(() => {
+    this.inFlightCount += 1;
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlightCount);
+    setImmediate(async () => {
+      if (this.delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+      }
       stdout.emit("data", Buffer.from(result.stdout ?? ""));
       stderr.emit("data", Buffer.from(result.stderr ?? ""));
+      this.inFlightCount -= 1;
       proc.emit("close", result.code, null);
     });
     const child = {
@@ -244,6 +259,35 @@ describe("DockerWorkspaceProvider", () => {
         expect(exec.slice(1, 3)).toEqual(["--user", "node"]);
       }
     }
+  });
+
+  it("serializes overlapping operations for the same task", async () => {
+    const fake = new FakeDocker(5);
+    const provider = makeProvider(fake);
+    const source = await makeSource("valmont-src-");
+    await provider.create(TASK, source);
+    await Promise.all([
+      provider.readFile(HANDLE, "notes.md"),
+      provider.writeFile(HANDLE, "src/x.txt", "x"),
+      provider.deleteFile(HANDLE, "notes.md"),
+      provider.runValidation(HANDLE, "npm test"),
+    ]);
+    // Per-task serialization: no docker invocation from one operation can
+    // overlap a docker invocation from another operation on the same task.
+    expect(fake.maxInFlight).toBe(1);
+  });
+
+  it("lets operations for different tasks proceed concurrently", async () => {
+    const fake = new FakeDocker(5);
+    const provider = makeProvider(fake);
+    const source = await makeSource("valmont-src-");
+    await Promise.all([
+      provider.create("task-a", source),
+      provider.create("task-b", source),
+    ]);
+    // The queue is per task: different tasks are not serialized against
+    // each other.
+    expect(fake.maxInFlight).toBeGreaterThan(1);
   });
 
   it("destroys the container when the git baseline fails", async () => {
@@ -661,6 +705,9 @@ describe("DockerWorkspaceProvider", () => {
       expect(result.status).toBe(status);
       expect(result.command).toBe("npm test");
       expect(result.exitCode).toBe(code);
+      // Validation runs in a fresh user+PID namespace: the timeout wrapper
+      // is the namespace's PID 1, so the kernel kills every remaining
+      // member (including background children) when it exits.
       expect(callFor(fake, (argv) => argv[0] === "exec")).toEqual([
         "exec",
         "--user",
@@ -668,6 +715,11 @@ describe("DockerWorkspaceProvider", () => {
         "--workdir",
         "/workspace",
         NAME,
+        "unshare",
+        "--user",
+        "--map-root-user",
+        "--pid",
+        "--fork",
         "timeout",
         "--signal=KILL",
         "180",
