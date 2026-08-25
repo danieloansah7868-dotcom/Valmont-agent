@@ -31,6 +31,16 @@ class FakeDocker {
   spawn(_command: string, args: readonly string[]) {
     this.calls.push([...args]);
     let result: Scripted = { code: 0, stdout: "", stderr: "" };
+    if (
+      args[0] === "exec" &&
+      args[6] === "stat" &&
+      args[7] === "-c" &&
+      args[8] === "%F"
+    ) {
+      // Default: the verified ancestors are real directories; tests override
+      // via onMatch to simulate missing or symlinked path components.
+      result = { code: 0, stdout: "directory\n" };
+    }
     for (const handler of this.handlers) {
       const scripted = handler(args);
       if (scripted) {
@@ -215,6 +225,16 @@ describe("DockerWorkspaceProvider", () => {
               token.startsWith("/workspace"),
           ),
         ).toBe(true);
+      } else if (command[0] === "mkdir") {
+        // Write-path setup: create missing parents only, as root.
+        expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
+        expect(command.slice(1, 2)).toEqual(["-p"]);
+        expect(command[2].startsWith("/workspace")).toBe(true);
+      } else if (command[0] === "stat") {
+        // Write-path setup: verify ancestors are real directories, as root.
+        expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
+        expect(command.slice(1, 3)).toEqual(["-c", "%F"]);
+        expect(command[3].startsWith("/workspace")).toBe(true);
       } else {
         // Arbitrary task code (git, cat, rm, timeout+validation): never root.
         expect(exec.slice(1, 3)).toEqual(["--user", "node"]);
@@ -320,6 +340,12 @@ describe("DockerWorkspaceProvider", () => {
     const cpCall = callFor(fake, (argv) => argv[0] === "cp");
     expect(cpCall).not.toContain("--chown");
     expect(cpCall.at(-1)).toBe(`${NAME}:/workspace/src/a.txt`);
+    // The ancestor verification (stat) runs before the copy.
+    const statIdx = fake.calls.findIndex(
+      (argv) => argv[0] === "exec" && argv[6] === "stat",
+    );
+    expect(statIdx).toBeGreaterThan(-1);
+    expect(statIdx).toBeLessThan(fake.calls.indexOf(cpCall));
     // The host-side temp file is removed after the copy.
     await expect(access(cpCall[1])).rejects.toThrow();
     // A controlled root chown fixes the file and its (newly created) parent
@@ -342,6 +368,111 @@ describe("DockerWorkspaceProvider", () => {
       "/workspace/src",
       "/workspace/src/a.txt",
     ]);
+  });
+
+  it("creates missing parent directories before the copy for nested writes", async () => {
+    const fake = new FakeDocker().onMatch((argv) => {
+      // /workspace/src does not exist yet; everything above it does.
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/src"
+      ) {
+        return {
+          code: 1,
+          stderr: "cannot statx '/workspace/src': No such file or directory",
+        };
+      }
+      return undefined;
+    });
+    const provider = makeProvider(fake);
+    await provider.writeFile(HANDLE, "src/nested/a.txt", "nested");
+
+    const statMissing = fake.calls.findIndex(
+      (argv) =>
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/src",
+    );
+    const mkdir = fake.calls.findIndex(
+      (argv) => argv[0] === "exec" && argv[6] === "mkdir",
+    );
+    const cpIdx = fake.calls.findIndex((argv) => argv[0] === "cp");
+    // Parent setup happens before docker cp — in that order.
+    expect(statMissing).toBeGreaterThan(-1);
+    expect(mkdir).toBeGreaterThan(statMissing);
+    expect(cpIdx).toBeGreaterThan(mkdir);
+
+    // Fixed-argv root setup only; mkdir -p targets the first missing ancestor.
+    expect(fake.calls[mkdir]).toEqual([
+      "exec",
+      "--user",
+      "root",
+      "--workdir",
+      "/workspace",
+      NAME,
+      "mkdir",
+      "-p",
+      "/workspace/src",
+    ]);
+    const cpCall = callFor(fake, (argv) => argv[0] === "cp");
+    expect(cpCall).not.toContain("--chown");
+    expect(cpCall.at(-1)).toBe(`${NAME}:/workspace/src/nested/a.txt`);
+
+    // The created ancestors and the file land node-owned via the root chown.
+    const chownCall = callFor(
+      fake,
+      (argv) => argv[0] === "exec" && argv[6] === "chown",
+    );
+    expect(chownCall).toEqual([
+      "exec",
+      "--user",
+      "root",
+      "--workdir",
+      "/workspace",
+      NAME,
+      "chown",
+      "node:node",
+      "/workspace",
+      "/workspace/src",
+      "/workspace/src/nested",
+      "/workspace/src/nested/a.txt",
+    ]);
+  });
+
+  it("rejects symlinked or file ancestors before any copy happens", async () => {
+    const symlinked = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/evil"
+      ) {
+        return { code: 0, stdout: "symbolic link\n" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(symlinked).writeFile(HANDLE, "evil/a.txt", "x"),
+    ).rejects.toThrow("Symlink path components are blocked");
+    expect(symlinked.calls.some((argv) => argv[0] === "cp")).toBe(false);
+    expect(
+      symlinked.calls.some((argv) => argv[0] === "exec" && argv[6] === "mkdir"),
+    ).toBe(false);
+
+    const fileAncestor = new FakeDocker().onMatch((argv) => {
+      if (
+        argv[0] === "exec" &&
+        argv[6] === "stat" &&
+        argv.at(-1) === "/workspace/blob"
+      ) {
+        return { code: 0, stdout: "regular file\n" };
+      }
+      return undefined;
+    });
+    await expect(
+      makeProvider(fileAncestor).writeFile(HANDLE, "blob/a.txt", "x"),
+    ).rejects.toThrow("Invalid workspace path");
+    expect(fileAncestor.calls.some((argv) => argv[0] === "cp")).toBe(false);
   });
 
   it("deletes files with a direct rm argv", async () => {

@@ -32,7 +32,11 @@ import {
  * - controlled root setup operations only: `docker cp` is a root-privileged
  *   CLI operation that lands root-owned files (it has no `--chown` support),
  *   so after each copy one fixed-argv `chown` exec runs as root to restore
- *   the unprivileged owner. Arbitrary task code never runs as root;
+ *   the unprivileged owner; on write, every destination ancestor is verified
+ *   with fixed-argv `stat` (symlinks and non-directories are rejected) and
+ *   missing parent directories are created with `mkdir -p` — the check never
+ *   follows a task-created symlink and never escapes /workspace. Arbitrary
+ *   task code never runs as root;
  * - CPU, memory (with no swap), PID, and per-task storage quotas, plus a
  *   per-command wall-clock timeout (`timeout --signal=KILL` inside the
  *   container) with a CLI-level fallback kill. Note: with no swap, tmpfs
@@ -323,6 +327,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       throw new Error("Writing sensitive paths is blocked");
     }
     const absolute = this.safeContainerPath(relativePath);
+    await this.prepareWriteParents(workspace, absolute);
     const scratch = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-file-"));
     const temporary = path.join(scratch, "file");
     try {
@@ -335,9 +340,9 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       if (result.code !== 0) {
         throw new Error("Could not write workspace file");
       }
-      // docker cp creates missing parents and lands everything root-owned;
-      // fix the new file and its ancestors with one controlled root chown
-      // (fixed argv, setup-only — arbitrary task code never runs as root).
+      // docker cp lands everything root-owned; fix the new file and its
+      // ancestors with one controlled root chown (fixed argv, setup-only —
+      // arbitrary task code never runs as root).
       const segments = absolute.split("/").filter(Boolean);
       const chownPaths: string[] = [];
       for (let i = 1; i < segments.length; i += 1) {
@@ -631,6 +636,55 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       20_000,
     );
     if (result.code !== 0) throw new Error("Could not prepare workspace diff");
+  }
+
+  /**
+   * Verify every destination ancestor and create any that are missing, so
+   * `docker cp` never fails on a non-existent parent directory. Every check
+   * and creation is a fixed-argv root exec (no shell): each existing
+   * ancestor must be a real directory — a task-created symlink or a regular
+   * file is rejected — and `mkdir -p` is only ever pointed at the first
+   * missing ancestor, whose whole path is already verified symlink-free, so
+   * setup can neither follow a symlink nor escape /workspace.
+   */
+  private async prepareWriteParents(
+    workspace: WorkspaceHandle,
+    absolute: string,
+  ): Promise<void> {
+    const components = absolute.split("/").filter(Boolean);
+    const directoryComponents = components.slice(0, -1);
+    for (let i = 0; i < directoryComponents.length; i += 1) {
+      const ancestor = `/${directoryComponents.slice(0, i + 1).join("/")}`;
+      const checked = await this.execIn(
+        workspace,
+        ["stat", "-c", "%F", ancestor],
+        15_000,
+        20_000,
+        "root",
+      );
+      if (checked.code !== 0) {
+        // Missing: nothing below it can exist, so create from here down in
+        // one step; all ancestors above are verified real directories.
+        const created = await this.execIn(
+          workspace,
+          ["mkdir", "-p", ancestor],
+          15_000,
+          20_000,
+          "root",
+        );
+        if (created.code !== 0) {
+          throw new Error("Could not create workspace parent directories");
+        }
+        return;
+      }
+      const kind = checked.stdout.trim();
+      if (kind === "symbolic link") {
+        throw new Error("Symlink path components are blocked");
+      }
+      if (kind !== "directory") {
+        throw new Error("Invalid workspace path");
+      }
+    }
   }
 
   private safeContainerPath(relativePath: string): string {
