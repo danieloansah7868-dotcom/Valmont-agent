@@ -48,15 +48,26 @@ import {
  *   together for larger tasks;
  * - every provider operation for a task is serialized by an in-provider
  *   per-task queue, so no two operations — and no stat-then-use sequence
- *   within one of them — can ever overlap on the same container;
+ *   within one of them — can ever overlap on the same container; operations
+ *   record activity when they are enqueued, so work that is merely waiting
+ *   in the queue still counts as task activity for the TTL reaper;
  * - validation cleanup: after every validation run, a fixed root exec of
  *   the provider-staged reaper script (`node
  *   /workspace/.valmont/validation-reap.mjs <start-time>`) SIGKILLs every
  *   process that started during the validation, so no validation process or
  *   background child can outlive the validation and later race the workspace
- *   paths. (PID namespaces are deliberately not used: seccomp=default allows
- *   `unshare` only with the bare `--user` flag, so no namespace-based
- *   teardown is possible under the default profile.);
+ *   paths. The cleanup is fail-closed: the script exits non-zero if it
+ *   cannot compute start times, cannot inspect or signal a bounded process,
+ *   or its confirmation scan still finds a live one, and the provider
+ *   reports the validation as an error in that case. (PID namespaces are
+ *   deliberately not used: seccomp=default allows `unshare` only with the
+ *   bare `--user` flag, so no namespace-based teardown is possible under the
+ *   default profile.);
+ * - the reaper script is staged into a root-only `0700` directory
+ *   (`0600` root-owned script) that is created fresh at creation — any
+ *   `.valmont` entry supplied by the source repository is removed first —
+ *   and its final ownership, mode, and type are verified with fixed-argv
+ *   `stat` before the provider continues;
  * - default-deny network (`--network none`), which also blocks the cloud
  *   metadata endpoint;
  * - no environment variables are passed into the container, so GitHub, model,
@@ -139,29 +150,66 @@ const GIT_EXCLUDES = [
 /**
  * Validation reaper, staged by the provider into the root-only
  * `/workspace/.valmont/` directory at creation and run as root (fixed argv,
- * no shell) after every validation run: it SIGKILLs every process in the
+ * no shell) after every validation run. It SIGKILLs every process in the
  * container that started at or after the given epoch-ms boundary — i.e.
  * everything the validation spawned, including background grandchildren —
  * so no validation process can outlive the validation and later race the
  * workspace paths. Kernel `/proc` start times are used, which are immutable
- * per process and immune to reparenting. Exit codes: 0 success, 1 a
- * validation process survived and could not be killed (fail closed), 2 bad
- * argument; the provider treats any non-zero outcome as a failed cleanup.
+ * per process and immune to reparenting.
+ *
+ * Fail-closed contract (the provider treats any non-zero exit as a failed
+ * cleanup): exit 2 = bad argument; exit 1 = the boot time is unreadable
+ * (start times would be uncomputable), a pid could not be inspected or
+ * signalled (anything but ESRCH), a start time was unparsable, or the
+ * confirmation scan still finds a non-zombie process that started at or
+ * after the boundary. A delivered signal is NOT treated as proof of
+ * termination: kill rounds rescan until a round finds nothing new (a
+ * killed process may have forked a child just before dying), and a final
+ * confirmation scan requires every bounded process to be gone or a zombie
+ * (dead — no execution, memory, or file descriptors; only a pid slot
+ * remains until its parent reaps it). Exit 0 only when that holds.
  */
 const VALIDATION_REAPER_SCRIPT = `import { readFileSync, readdirSync } from "node:fs";
+
+const fail = (code, message) => {
+  process.stderr.write("validation-reap: " + message + "\\n");
+  process.exit(code);
+};
+
 const boundary = Number(process.argv[2]);
-if (!Number.isFinite(boundary) || boundary <= 0) process.exit(2);
+if (!Number.isInteger(boundary) || boundary <= 0) {
+  fail(2, "expected a positive integer epoch-ms boundary");
+}
+
+// The boot time converts /proc start times (jiffies since boot) to epoch
+// milliseconds. Without it no start time is computable — fail closed
+// rather than silently skip the cleanup.
+let statFile;
+try {
+  statFile = readFileSync("/proc/stat", "utf8");
+} catch {
+  fail(1, "cannot read /proc/stat; refusing to run cleanup");
+}
 let bootMs = 0;
-for (const line of readFileSync("/proc/stat", "utf8").split("\\n")) {
+for (const line of statFile.split("\\n")) {
   if (line.startsWith("btime ")) {
-    const seconds = Number(line.slice(6).trim());
-    if (Number.isFinite(seconds)) bootMs = seconds * 1000;
+    bootMs = Number(line.slice(6).trim()) * 1000;
+    break;
   }
 }
-let failed = 0;
-if (bootMs > 0) {
-  const HZ = 100; // USER_HZ on Linux
-  const self = process.pid;
+if (!Number.isFinite(bootMs) || bootMs <= 0) {
+  fail(1, "boot time unavailable; refusing to run cleanup");
+}
+
+const HZ = 100; // USER_HZ on Linux
+const self = process.pid;
+
+// Every process that started at or after the boundary, with its current
+// state. A pid that vanishes between the listing and the read is gone
+// (ENOENT only); any other read error means we cannot reason about it —
+// fail closed.
+const scan = () => {
+  const targets = [];
   for (const entry of readdirSync("/proc")) {
     if (!/^\\d+$/.test(entry)) continue;
     const pid = Number(entry);
@@ -169,25 +217,70 @@ if (bootMs > 0) {
     let stat;
     try {
       stat = readFileSync("/proc/" + entry + "/stat", "utf8");
-    } catch {
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") {
+        fail(1, "cannot read /proc/" + entry + "/stat; not assuming it is safe");
+      }
       continue;
     }
+    // Field 2 (comm) is parenthesised and may contain spaces or parens,
+    // so split after the last ')'. fields[0] is state (stat field 3);
+    // fields[19] is starttime (stat field 22: jiffies since boot).
     const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
-    const starttime = Number(fields[19]); // stat field 22: jiffies since boot
-    if (!Number.isFinite(starttime)) continue;
+    const starttime = Number(fields[19]);
+    if (!Number.isFinite(starttime)) {
+      fail(1, "unparsable start time for pid " + pid);
+    }
     if (bootMs + (starttime / HZ) * 1000 >= boundary) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch (error) {
-        // ESRCH: already gone. Anything else means a validation process
-        // survived and could not be killed — fail closed so the provider
-        // aborts instead of leaving a survivor in place.
-        if (!error || error.code !== "ESRCH") failed++;
+      targets.push({ pid, state: fields[0] });
+    }
+  }
+  return targets;
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Kill rounds: a process we kill may have forked a child just before
+// dying, so rescan until a round finds nothing new. Bounded — if a
+// survivor is still alive at the end, the confirmation below fails.
+for (let round = 0; round < 10; round++) {
+  const targets = scan();
+  if (targets.length === 0) break;
+  for (const { pid } of targets) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (error) {
+      // ESRCH: gone between scan and signal. Anything else (EPERM, ...)
+      // means a validation process survived and could not be killed —
+      // fail closed so the provider aborts instead of leaving it in place.
+      if (!error || error.code !== "ESRCH") {
+        fail(
+          1,
+          "cannot signal pid " +
+            pid +
+            " (" +
+            ((error && error.code) || String(error)) +
+            ")",
+        );
       }
     }
   }
+  await sleep(150);
 }
-process.exit(failed > 0 ? 1 : 0);
+
+// Confirmation: a delivered signal is not proof of termination. Every
+// process that started at or after the boundary must now be gone or a
+// zombie (dead — holding no execution, memory, or file descriptors; only
+// a pid slot until its parent reaps it). Anything still alive fails.
+for (const { pid, state } of scan()) {
+  if (state !== "Z") {
+    fail(
+      1,
+      "survivor pid " + pid + " (state " + state + ") started during the validation",
+    );
+  }
+}
+process.exit(0);
 `;
 
 export class DockerWorkspaceProvider implements WorkspaceProvider {
@@ -214,9 +307,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    */
   private readonly taskLocks = new Map<string, Promise<void>>();
   /**
-   * Last provider-operation timestamp per task. A task is "abandoned" (and
-   * eligible for reaping) only when it has had no operation for longer than
-   * the TTL — a long-running but still-active task is never reaped.
+   * Last provider-operation timestamp per task, recorded when the operation
+   * is ENQUEUED (not when it starts executing): a task is "abandoned" (and
+   * eligible for reaping) only when it has had neither an in-flight nor a
+   * queued operation for longer than the TTL — a long-running or
+   * backlog-heavy but still-active task is never reaped.
    */
   private readonly taskActivity = new Map<string, number>();
 
@@ -684,12 +779,22 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * Run `fn` as the next queued operation for `taskId`. Operations are
    * strictly serialized per task (FIFO); a failed operation releases the
    * queue for the next one.
+   *
+   * Activity is recorded when the operation is ENQUEUED, not when it starts
+   * executing: a queued-but-waiting operation already proves the task is in
+   * use, so the TTL reaper can never claim the task as abandoned while work
+   * is queued for it. (The reaper's own removal passes `recordActivity =
+   * false` and records nothing.) `fn` receives this operation's queue-tail
+   * token: the tail stored in `taskLocks` changes on every enqueue, so a
+   * holder can detect — synchronously, at the moment of a destructive
+   * call — that an operation enqueued after it took the lock.
    */
   private withTaskLock<T>(
     taskId: string,
-    fn: () => Promise<T>,
+    fn: (myTail: Promise<void>) => Promise<T>,
     recordActivity: boolean = true,
   ): Promise<T> {
+    if (recordActivity) this.taskActivity.set(taskId, Date.now());
     const previous = this.taskLocks.get(taskId) ?? Promise.resolve();
     let release: () => void = () => undefined;
     const current = previous
@@ -703,16 +808,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     this.taskLocks.set(taskId, current);
     // Wait for the PREVIOUS operation (not `current`, whose gate only this
     // operation releases) to finish, then run; release when done.
-    // Wait for the PREVIOUS operation (not `current`, whose gate only this
-    // operation releases) to finish, then run; release when done. Starting
-    // an operation is itself activity, so the TTL reaper cannot claim this
-    // task as abandoned while an operation is in flight or queued.
     return previous
       .catch(() => undefined)
       .then(async () => {
         try {
-          if (recordActivity) this.taskActivity.set(taskId, Date.now());
-          return await fn();
+          return await fn(current);
         } finally {
           release();
           if (this.taskLocks.get(taskId) === current) {
@@ -727,18 +827,45 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /**
-   * Stage the validation reaper script into a root-only directory. Runs as
-   * root with fixed argv: the directory is `0700 root:root` (task code can
-   * neither read nor delete the script) and the script lands root-owned
-   * `0600` (docker cp preserves the host temp file's mode). Called after
-   * the staging `chown -R` so nothing re-owns it, and before the git
-   * baseline so `.valmont/` is git-excluded.
+   * Stage the validation reaper script into a root-only directory. Every
+   * step is a fixed-argv root exec (no shell), and the result is verified
+   * before the provider continues:
+   *
+   * 1. `rm -rf -- /workspace/.valmont` — a source repository may itself
+   *    supply a `.valmont` entry (directory, file, or symlink; symlinks are
+   *    already dropped host-side by staging, a plain directory is not). It
+   *    is removed before anything is created, so `mkdir -m 0700` below
+   *    always creates the directory fresh (its mode applies only to a
+   *    directory it creates itself — it would not reset permissions on an
+   *    existing one) and no task-owned or task-pointing entry can survive
+   *    to redirect the root-only script to a task-writable location.
+   * 2. `mkdir -m 0700` — task code can neither read nor delete the script.
+   * 3. `docker cp` of the host temp file (mode 0600, preserved by the
+   *    copy) — the script lands root-owned `0600`. Called after the staging
+   *    `chown -R`, so nothing re-owns it.
+   * 4. `stat` verification — the directory must be `0 0 700` and the script
+   *    `0 0 600 regular file`; any other observation fails creation.
+   *
+   * Runs before the git baseline so `.valmont/` is git-excluded.
    */
   private async installValidationReaper(
     taskId: string,
     name: string,
   ): Promise<void> {
     const handle: WorkspaceHandle = { id: taskId, root: "/workspace" };
+    // Remove anything the source repository supplied at this path (a plain
+    // `rm -rf` on the fixed path removes a symlink itself, never follows
+    // it, and cannot touch any other path).
+    const cleared = await this.execIn(
+      handle,
+      ["rm", "-rf", "--", "/workspace/.valmont"],
+      15_000,
+      20_000,
+      "root",
+    );
+    if (cleared.code !== 0) {
+      throw new Error("Could not clear the validation reaper directory");
+    }
     const made = await this.execIn(
       handle,
       ["mkdir", "-m", "0700", "/workspace/.valmont"],
@@ -766,6 +893,32 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       }
     } finally {
       await rm(scratch, { recursive: true, force: true });
+    }
+    // Verify the staged result as root (fixed argv): the provider refuses
+    // to continue if the reaper directory or script is not exactly what
+    // the steps above produced.
+    const checkedDir = await this.execIn(
+      handle,
+      ["stat", "-c", "%u %g %a", "/workspace/.valmont"],
+      15_000,
+      20_000,
+      "root",
+    );
+    if (checkedDir.code !== 0 || checkedDir.stdout.trim() !== "0 0 700") {
+      throw new Error("Could not verify the validation reaper directory");
+    }
+    const checkedScript = await this.execIn(
+      handle,
+      ["stat", "-c", "%u %g %a %F", "/workspace/.valmont/validation-reap.mjs"],
+      15_000,
+      20_000,
+      "root",
+    );
+    if (
+      checkedScript.code !== 0 ||
+      checkedScript.stdout.trim() !== "0 0 600 regular file"
+    ) {
+      throw new Error("Could not verify the validation reaper script");
     }
   }
 
@@ -1107,7 +1260,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         // (and never sees its own removal as task activity).
         await this.withTaskLock(
           task,
-          async () => {
+          async (myTail) => {
             const fresh = this.taskActivity.get(task);
             if (fresh !== undefined && Date.now() - fresh <= this.ttlMs) {
               return;
@@ -1121,6 +1274,17 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
               this.taskActivity.delete(task);
               return;
             }
+            // Final gate, checked synchronously immediately before the
+            // destructive call. The existence check above awaited, so an
+            // operation could have enqueued in that window — and it could
+            // still enqueue at any earlier point before this check. The
+            // queue tail changes on every enqueue, so an unchanged tail
+            // proves no operation has queued since this removal took the
+            // lock; and this check and the rm run back-to-back with no
+            // await between them, so nothing can interleave. Deferring
+            // costs at most one reaper interval; the operation that queued
+            // is what the container now exists for.
+            if (this.taskLocks.get(task) !== myTail) return;
             await this.docker(["rm", "-f", id], 30_000, 20_000);
             this.taskActivity.delete(task);
           },

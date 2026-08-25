@@ -40,19 +40,22 @@ class FakeDocker {
   spawn(_command: string, args: readonly string[]) {
     this.calls.push([...args]);
     let result: Scripted = { code: 0, stdout: "", stderr: "" };
-    if (
-      args[0] === "exec" &&
-      args[6] === "stat" &&
-      args[7] === "-c" &&
-      args[8] === "%F"
-    ) {
+    if (args[0] === "exec" && args[6] === "stat" && args[7] === "-c") {
       // Default: a plausible healthy workspace — directory components are
       // real directories, and a component that looks like a file (a dot in
       // its name) is a regular file. Tests override via onMatch to simulate
       // missing, symlinked, or otherwise unsafe path components.
       const target = args[args.length - 1] ?? "";
       const kind = target.includes(".") ? "regular file" : "directory";
-      result = { code: 0, stdout: `${kind}\n` };
+      if (args[8] === "%u %g %a") {
+        // Reaper-staging verification: a fresh root-only directory.
+        result = { code: 0, stdout: "0 0 700\n" };
+      } else if (args[8] === "%u %g %a %F") {
+        // Reaper-staging verification: the root-owned script.
+        result = { code: 0, stdout: "0 0 600 regular file\n" };
+      } else {
+        result = { code: 0, stdout: `${kind}\n` };
+      }
     }
     for (const handler of this.handlers) {
       const scripted = handler(args);
@@ -177,9 +180,17 @@ describe("DockerWorkspaceProvider", () => {
     const execs = fake.calls.filter((argv) => argv[0] === "exec");
     expect(execs.length).toBeGreaterThanOrEqual(3);
     for (const exec of execs) {
-      // Root is limited to the fixed-argv setup ops (chown, and the
-      // root-only reaper directory at creation); everything else is node.
-      if (exec[6] === "chown" || exec[6] === "mkdir") {
+      // Root is limited to fixed-argv setup ops (chown, mkdir, and the
+      // reaper staging's rm/stat on the fixed /workspace/.valmont paths);
+      // everything else is node.
+      if (
+        exec[6] === "chown" ||
+        exec[6] === "mkdir" ||
+        (exec[6] === "rm" && exec.at(-1) === "/workspace/.valmont") ||
+        (exec[6] === "stat" && exec.at(-1) === "/workspace/.valmont") ||
+        (exec[6] === "stat" &&
+          exec.at(-1) === "/workspace/.valmont/validation-reap.mjs")
+      ) {
         expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
       } else {
         expect(exec.slice(1, 3)).toEqual(["--user", "node"]);
@@ -240,6 +251,35 @@ describe("DockerWorkspaceProvider", () => {
     ]);
     expect(cpReaper).toBeGreaterThan(mkdirValmont);
     expect(cpReaper).toBeGreaterThan(stagingChown);
+    // A source repository may supply its own `.valmont` entry — it is
+    // removed (root, exact fixed argv) before the directory is created:
+    // `mkdir -m` only applies its mode to a directory it creates itself,
+    // and a supplied symlink would redirect the root-only script into
+    // task-writable territory.
+    const rmValmont = fake.calls.findIndex(
+      (argv) =>
+        argv[0] === "exec" &&
+        argv.slice(6).join(" ") === "rm -rf -- /workspace/.valmont",
+    );
+    expect(rmValmont).toBeGreaterThan(-1);
+    expect(stagingChown).toBeLessThan(rmValmont);
+    expect(rmValmont).toBeLessThan(mkdirValmont);
+    // The staged result is verified (root, fixed argv) before the provider
+    // continues: the directory and the script must be exactly what the
+    // steps above produce.
+    const statDir = fake.calls.findIndex(
+      (argv) =>
+        argv[0] === "exec" &&
+        argv.slice(6).join(" ") === "stat -c %u %g %a /workspace/.valmont",
+    );
+    const statScript = fake.calls.findIndex(
+      (argv) =>
+        argv[0] === "exec" &&
+        argv.slice(6).join(" ") ===
+          "stat -c %u %g %a %F /workspace/.valmont/validation-reap.mjs",
+    );
+    expect(statDir).toBeGreaterThan(cpReaper);
+    expect(statScript).toBeGreaterThan(statDir);
     // No chown ever re-owns the reaper script or its directory.
     expect(
       fake.calls.some(
@@ -291,11 +331,26 @@ describe("DockerWorkspaceProvider", () => {
         } else {
           expect(tokens).toEqual(["-m", "0700", "/workspace/.valmont"]);
         }
-      } else if (command[0] === "stat") {
-        // Write-path setup: verify ancestors are real directories, as root.
+      } else if (
+        command[0] === "rm" &&
+        command.slice(1).join(" ") === "-rf -- /workspace/.valmont"
+      ) {
+        // Source-supplied .valmont removal: root, exact fixed argv, fixed
+        // path — nothing else may ever be removed by root.
         expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
-        expect(command.slice(1, 3)).toEqual(["-c", "%F"]);
-        expect(command[3].startsWith("/workspace")).toBe(true);
+      } else if (command[0] === "stat") {
+        // Root setup: path-component verification (-c %F) or the
+        // reaper-staging verification (fixed format, fixed path).
+        expect(exec.slice(1, 3)).toEqual(["--user", "root"]);
+        expect(command.slice(1, 2)).toEqual(["-c"]);
+        if (command[2] === "%u %g %a") {
+          expect(command[3]).toBe("/workspace/.valmont");
+        } else if (command[2] === "%u %g %a %F") {
+          expect(command[3]).toBe("/workspace/.valmont/validation-reap.mjs");
+        } else {
+          expect(command[2]).toBe("%F");
+          expect(command[3].startsWith("/workspace")).toBe(true);
+        }
       } else if (
         command[0] === "node" &&
         command[1] === "/workspace/.valmont/validation-reap.mjs"
@@ -433,6 +488,44 @@ describe("DockerWorkspaceProvider", () => {
     await reaping;
     expect(
       fake.calls.some((argv) => argv[0] === "rm" && argv[2] === "cid-locked"),
+    ).toBe(false);
+  });
+
+  it("defers removal when an operation queues while the reaper holds the lock", async () => {
+    const OLD = "2020-01-01T00:00:00.000Z";
+    let queueLateOperation: () => void = () => undefined;
+    const fake = new FakeDocker().onMatch((argv) => {
+      if (argv[0] === "ps") return { code: 0, stdout: `cid-race\t${TASK}\n` };
+      if (argv[0] === "inspect" && argv.includes("{{.Created}}")) {
+        return { code: 0, stdout: `${OLD}\n` };
+      }
+      if (argv[0] === "inspect" && argv.includes("{{.State.Running}}")) {
+        // A new operation enqueues exactly while the reaper is inside its
+        // locked existence check: its withTaskLock call records activity
+        // and changes the task's queue tail.
+        queueLateOperation();
+        return { code: 0, stdout: "true\n" };
+      }
+      return undefined;
+    });
+    const provider = makeProvider(fake, { ttlMs: 60_000 });
+    queueLateOperation = () => {
+      void provider.writeFile(HANDLE, "late.txt", "late");
+    };
+    const state = provider as unknown as { taskActivity: Map<string, number> };
+    // Stale at the outer check — from here on only the queue-tail gate
+    // protects the container.
+    state.taskActivity.set(TASK, Date.now() - 120_000);
+    await (
+      provider as unknown as { reapExpired: () => Promise<void> }
+    ).reapExpired();
+    // The reaper must have deferred: the newly queued operation is what
+    // the container exists for, so no rm may have run.
+    expect(
+      fake.calls.some(
+        (argv) =>
+          argv[0] === "rm" && argv[1] === "-f" && argv[2] === "cid-race",
+      ),
     ).toBe(false);
   });
 
