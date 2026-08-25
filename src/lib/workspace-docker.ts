@@ -20,7 +20,11 @@ import {
  *
  * - one short-lived container per task (`valmont-sandbox-<taskId>`), destroyed
  *   with `destroy(taskId)`; a background reaper removes containers older than
- *   the configured TTL;
+ *   the configured TTL. The reaper's `docker ps` listing is never processed
+ *   partially — a truncated listing is skipped for the next interval (the
+ *   truncated suffix would hold the OLDEST containers, i.e. the reaping
+ *   candidates), and a failed in-lock existence inspect drops the activity
+ *   record only when the daemon reports "no such object";
  * - the only writable storage is a per-task, size-limited tmpfs at
  *   `/workspace` (kernel-enforced `ENOSPC` cap; destroyed with the container)
  *   plus a tiny root-owned `0701` tmpfs at `/reap` (the reaper script's
@@ -83,18 +87,31 @@ import {
  *   the workspace paths. The cleanup is fail-closed: the script exits
  *   non-zero if it cannot compute start times, cannot inspect or signal a
  *   bounded process, or its confirmation scan still finds a live one, and
- *   the provider reports the validation as an error in that case. (PID
- *   namespaces are deliberately not used: seccomp=default allows `unshare`
- *   only with the bare `--user` flag, so no namespace-based teardown is
- *   possible under the default profile.);
+ *   the provider reports the validation as an error in that case. The kill
+ *   decision compares against the boundary MINUS a 2 s margin: the host
+ *   captures the boundary before the exec starts, `btime` is
+ *   second-truncated, and start times are jiffy-quantized, so a
+ *   reconstructed start can appear up to ~1 s early — a child spawned
+ *   immediately after the boundary can never be missed (see the script
+ *   for the over-kill trade-off and the HZ assumption). (PID namespaces
+ *   are deliberately not used: seccomp=default allows `unshare` only with
+ *   the bare `--user` flag, so no namespace-based teardown is possible
+ *   under the default profile.);
  * - a validation whose cleanup FAILS quarantines the task: the container
- *   is destroyed immediately (best-effort — the flag persists even if
- *   the removal itself fails) and every later operation on that task
- *   rejects with "Task workspace is quarantined" until an explicit
- *   `destroy()` (or a `create()` replacement) succeeds. Rationale: a
- *   surviving validation process would keep racing later path
- *   verification and file operations, and it predates any NEXT
- *   validation boundary, so no later cleanup would ever reach it;
+ *   is destroyed immediately (best-effort). If the removal succeeds the
+ *   task's in-memory flag simply goes with it; if it FAILS, the flag
+ *   persists AND a durable `valmont.quarantined` label is set on the
+ *   surviving container — `open()` checks that label on EVERY inspect,
+ *   so no provider instance (including one that restarted, or a second
+ *   one) can ever hand out the untrusted container. Every later
+ *   operation rejects with "Task workspace is quarantined" until an
+ *   explicit `destroy()` (or a `create()` replacement) succeeds.
+ *   Rationale: a surviving validation process would keep racing later
+ *   path verification and file operations, and it predates any NEXT
+ *   validation boundary, so no later cleanup would ever reach it. A
+ *   failed create() setup that cannot remove its half-initialized
+ *   container is quarantined the same way (the quarantine is cleared
+ *   only when the replacement setup completes successfully);
  * - the reaper script lives on a SECOND, root-owned `0701` tmpfs mounted
  *   at `/reap` (a separate mount point on the read-only rootfs), not in
  *   the task-writable workspace: the unprivileged user can traverse
@@ -155,6 +172,14 @@ export interface DockerWorkspaceOptions {
   storageLimitBytes?: number;
   ttlMs?: number;
   reapIntervalMs?: number;
+  /**
+   * Output cap (bytes) for the TTL reaper's `docker ps` listing
+   * (default 4 MiB — thousands of ~100-byte lines). A listing that
+   * exceeds the cap is SKIPPED, never partially processed (see
+   * reapExpired), so a small value can disable reaping but can never
+   * make it skip the oldest containers.
+   */
+  psListLimitBytes?: number;
   allowedCommands?: Record<string, readonly [string, ...string[]]>;
   /** Test seam: replace the `docker` CLI invocation. */
   spawnOverride?: DockerSpawn;
@@ -204,6 +229,14 @@ const WORKSPACE_UNAVAILABLE = "Task workspace is unavailable";
 const QUARANTINE_ERROR =
   "Task workspace is quarantined (validation cleanup failed); destroy the task";
 
+/**
+ * Durable quarantine marker (a container label set by
+ * `quarantinedTasks`'s owner when the container could not be removed).
+ * Exported so the unit tests can drive the combined inspect.
+ */
+export const QUARANTINE_INSPECT_FORMAT =
+  '{{.State.Running}}|{{index .Config.Labels "valmont.quarantined"}}';
+
 const GIT_EXCLUDES = [
   ".env*",
   ".npm/",
@@ -248,13 +281,22 @@ const GIT_EXCLUDES = [
  * confirmation scan requires every bounded process to be gone or a zombie
  * (dead — no execution, memory, or file descriptors; only a pid slot
  * remains until its parent reaps it). Exit 0 only when that holds.
+ *
+ * `VALMONT_REAPER_PROC_DIR` is a TEST SEAM only: it redirects the /proc
+ * reads so unit tests can run the script against a synthetic /proc tree.
+ * The provider never sets it — the reaper exec passes no environment at
+ * all — so in production the reads always target the real /proc, and a
+ * task process cannot influence the provider's reaper invocation.
  */
-const VALIDATION_REAPER_SCRIPT = `import { readFileSync, readdirSync } from "node:fs";
+export const VALIDATION_REAPER_SCRIPT = `import { readFileSync, readdirSync } from "node:fs";
 
 const fail = (code, message) => {
   process.stderr.write("validation-reap: " + message + "\\n");
   process.exit(code);
 };
+
+// Test seam (never set by the provider; see the doc above).
+const PROC = process.env.VALMONT_REAPER_PROC_DIR || "/proc";
 
 const boundary = Number(process.argv[2]);
 if (!Number.isInteger(boundary) || boundary <= 0) {
@@ -266,7 +308,7 @@ if (!Number.isInteger(boundary) || boundary <= 0) {
 // rather than silently skip the cleanup.
 let statFile;
 try {
-  statFile = readFileSync("/proc/stat", "utf8");
+  statFile = readFileSync(PROC + "/stat", "utf8");
 } catch {
   fail(1, "cannot read /proc/stat; refusing to run cleanup");
 }
@@ -281,22 +323,40 @@ if (!Number.isFinite(bootMs) || bootMs <= 0) {
   fail(1, "boot time unavailable; refusing to run cleanup");
 }
 
-const HZ = 100; // USER_HZ on Linux
+// Boundary margin (ms). The host captured \`boundary\` (wall clock)
+// BEFORE the validation exec even started, but the kernel quantizes
+// process start times to jiffies and /proc/stat's \`btime\` is truncated
+// to whole seconds, so a process's RECONSTRUCTED start time can appear
+// up to ~1 s (btime truncation) + one jiffy earlier than its true
+// start. A child spawned immediately after the boundary must therefore
+// be matched with a margin larger than that reconstruction error —
+// over-killing pre-boundary processes by a few seconds is safe (in a
+// healthy task the only long-lived pre-boundary process is the
+// boot-time entrypoint, and it is only reached when a validation starts
+// within seconds of container start, which the multi-step create()
+// makes practically impossible); MISSING a survivor is not.
+//
+// HZ is the SMALLEST standard Linux USER_HZ: on faster kernels
+// (250/1000 Hz) this over-estimates every reconstructed age, which can
+// only over-kill (as above), never under-estimate and miss a survivor.
+const MARGIN_MS = 2000;
+const limit = boundary - MARGIN_MS;
+const HZ = 100; // see above
 const self = process.pid;
 
-// Every process that started at or after the boundary, with its current
-// state. A pid that vanishes between the listing and the read is gone
-// (ENOENT only); any other read error means we cannot reason about it —
-// fail closed.
+// Every process whose RECONSTRUCTED start time is at or after the
+// margin-adjusted limit, with its current state. A pid that vanishes
+// between the listing and the read is gone (ENOENT only); any other
+// read error means we cannot reason about it — fail closed.
 const scan = () => {
   const targets = [];
-  for (const entry of readdirSync("/proc")) {
+  for (const entry of readdirSync(PROC)) {
     if (!/^\\d+$/.test(entry)) continue;
     const pid = Number(entry);
     if (pid === self || pid === 1) continue;
     let stat;
     try {
-      stat = readFileSync("/proc/" + entry + "/stat", "utf8");
+      stat = readFileSync(PROC + "/" + entry + "/stat", "utf8");
     } catch (error) {
       if (!error || error.code !== "ENOENT") {
         fail(1, "cannot read /proc/" + entry + "/stat; not assuming it is safe");
@@ -311,7 +371,10 @@ const scan = () => {
     if (!Number.isFinite(starttime)) {
       fail(1, "unparsable start time for pid " + pid);
     }
-    if (bootMs + (starttime / HZ) * 1000 >= boundary) {
+    // Compare against the margin-adjusted limit, never the raw
+    // boundary (see MARGIN_MS above): a survivor started just after
+    // the boundary reconstructs up to ~1 s early.
+    if (bootMs + (starttime / HZ) * 1000 >= limit) {
       targets.push({ pid, state: fields[0] });
     }
   }
@@ -375,6 +438,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   private readonly pidsLimit: number;
   private readonly storageLimitBytes: number;
   private readonly ttlMs: number;
+  private readonly psListLimitBytes: number;
   private readonly allowedCommands: Record<
     string,
     readonly [string, ...string[]]
@@ -435,6 +499,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     this.pidsLimit = options.pidsLimit ?? 256;
     this.storageLimitBytes = options.storageLimitBytes ?? 2_147_483_648;
     this.ttlMs = options.ttlMs ?? 3_600_000;
+    this.psListLimitBytes = options.psListLimitBytes ?? 4_194_304;
     this.allowedCommands = options.allowedCommands ?? DEFAULT_ALLOWED_COMMANDS;
     this.spawnImpl = options.spawnOverride ?? nodeSpawn;
     const reapIntervalMs = options.reapIntervalMs ?? 600_000;
@@ -495,11 +560,12 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     sourceRoot: string,
   ): Promise<WorkspaceHandle> {
     const name = this.containerName(taskId);
+    // Note: a previous quarantine is NOT cleared here. Setup (start,
+    // source staging, reaper installation, git baseline) must complete
+    // first — if it fails and the container cannot be removed, the
+    // container is half-initialized and MUST be quarantined, not left
+    // reusable for a later open().
     await this.cleanup(taskId);
-    // The old container (if any) is gone, so a previous quarantine —
-    // which trusted nothing about it — no longer applies: create() is
-    // the documented way to replace a quarantined workspace.
-    this.quarantinedTasks.delete(taskId);
     const createArgs = [
       "create",
       "--name",
@@ -588,12 +654,25 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       await this.installValidationReaper(taskId, name);
       await this.gitBaseline(taskId, name);
     } catch (error) {
-      // Best-effort: the original setup error wins; if the removal
-      // itself fails, the TTL reaper (and operator inspection) is the
-      // backstop.
-      await this.cleanup(taskId).catch(() => undefined);
+      // Setup failed. If the container cannot be removed it is
+      // half-initialized and must NOT be reusable (a later open() would
+      // hand out a workspace missing the reaper/baseline/git setup) —
+      // quarantine it (in-memory flag + durable container label + one
+      // more best-effort removal). If the removal succeeds there is
+      // nothing left to quarantine. The original setup error wins.
+      const removed = await this.cleanup(taskId).then(
+        () => true,
+        () => false,
+      );
+      if (!removed) {
+        await this.quarantineTask(taskId);
+      }
       throw error;
     }
+    // Setup completed fully: a previous quarantine (which trusted
+    // nothing about the OLD container) no longer applies — the new
+    // container has no label and the flag is cleared only now.
+    this.quarantinedTasks.delete(taskId);
     return { id: taskId, root: "/workspace" };
   }
 
@@ -604,12 +683,32 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   private async openCore(taskId: string): Promise<WorkspaceHandle> {
     this.assertNotQuarantined(taskId);
+    // One inspect for BOTH facts: whether the container is running, and
+    // whether it carries the durable quarantine label (set when a
+    // cleanup failed and the container could not be removed). The label
+    // is the cross-instance source of truth — an in-memory flag is
+    // forgotten by a provider restart or a second instance, and must
+    // never allow reusing a quarantined container.
     const inspected = await this.docker(
-      ["inspect", "--format", "{{.State.Running}}", this.containerName(taskId)],
+      [
+        "inspect",
+        "--format",
+        QUARANTINE_INSPECT_FORMAT,
+        this.containerName(taskId),
+      ],
       15_000,
       20_000,
     );
-    if (inspected.code !== 0 || inspected.stdout.trim() !== "true") {
+    if (inspected.code !== 0) {
+      throw new Error(WORKSPACE_UNAVAILABLE);
+    }
+    const [running, label] = inspected.stdout.trim().split("|");
+    if (label !== undefined && label !== "<no value>") {
+      // Another (or a previous) instance quarantined this container.
+      this.quarantinedTasks.add(taskId);
+      throw new Error(QUARANTINE_ERROR);
+    }
+    if (running !== "true") {
       throw new Error(WORKSPACE_UNAVAILABLE);
     }
     return { id: taskId, root: "/workspace" };
@@ -1008,14 +1107,36 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    */
   private async quarantineTask(taskId: string): Promise<void> {
     this.quarantinedTasks.add(taskId);
-    try {
-      await this.cleanup(taskId);
+    const removed = await this.cleanup(taskId).then(
+      () => true,
+      () => false,
+    );
+    if (removed) {
       // The container is gone: the activity record no longer pins
-      // anything (same policy as a successful TTL removal).
+      // anything (same policy as a successful TTL removal). No durable
+      // marker is needed — there is no container left to misuse.
       this.taskActivity.delete(taskId);
-    } catch {
-      // The removal failed: keep the flag (operations still reject) and
-      // the record (the container is still here).
+      return;
+    }
+    // The container SURVIVED: the in-memory flag alone would be forgotten
+    // by a provider restart or a different provider instance, whose
+    // open() would hand out this live, untrusted container. Mark it
+    // durably on the container itself (checked by open() regardless of
+    // instance) so no instance can ever reuse it.
+    const labeled = await this.docker(
+      [
+        "update",
+        "--label",
+        "valmont.quarantined=true",
+        this.containerName(taskId),
+      ],
+      30_000,
+      20_000,
+    );
+    if (labeled.code !== 0) {
+      // Both the removal and the marker failed: this instance keeps the
+      // in-memory flag, and the TTL reaper (same instance) remains the
+      // backstop for the container. Nothing more can be done from here.
     }
   }
 
@@ -1563,6 +1684,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     return result;
   }
 
+  /** Remove the task container (checked: a failed rm throws). */
   private async cleanup(taskId: string): Promise<void> {
     const removed = await this.docker(
       ["rm", "-f", this.containerName(taskId)],
@@ -1596,9 +1718,21 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
           '{{.ID}}\t{{.Label "valmont.task"}}',
         ],
         30_000,
-        this.outputLimitBytes,
+        this.psListLimitBytes,
       );
       if (listed.code !== 0) return;
+      if (listed.stdoutTruncated) {
+        // A partial listing must NEVER be treated as complete:
+        // `docker ps -a` lists the NEWEST containers first, so the
+        // truncated suffix holds the OLDEST ones — exactly the
+        // candidates most in need of reaping. Skip this interval and
+        // retry with the full listing; if the container count
+        // persistently exceeds the cap, that is itself visible
+        // (containers piling up) and the cap must be raised —
+        // partially reaping would look healthy while skipping the
+        // oldest containers indefinitely.
+        return;
+      }
       for (const line of listed.stdout.split(/\r?\n/).filter(Boolean)) {
         const [id, task] = line.split("\t");
         if (!id || !task) continue;
