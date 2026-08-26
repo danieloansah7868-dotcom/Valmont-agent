@@ -9,10 +9,11 @@ import type { SiteBriefV1, StudioDraft } from "./site-brief/schema";
  * key above all — are stripped, and the brief is normalized so a pre-Phase-3
  * draft still exposes an `items`/`payments` shape.
  *
- * Checkout is public (a customer is never signed in), so these readers are
- * deliberately owner-agnostic. Security rests on the draft id being an
- * unguessable UUID and on the server re-pricing every basket against this
- * catalogue, never trusting a client-sent price.
+ * Checkout is public and remains available to guests. A signed-in customer may
+ * be attached by the checkout endpoint after its session is verified, but these
+ * readers remain deliberately owner-agnostic. Security rests on the draft id
+ * being an unguessable UUID and on the server re-pricing every basket against
+ * this catalogue, never trusting a client-sent price.
  */
 export type PublicBrief = SiteBriefV1;
 
