@@ -100,18 +100,22 @@ import {
  * - a validation whose cleanup FAILS quarantines the task: the container
  *   is destroyed immediately (best-effort). If the removal succeeds the
  *   task's in-memory flag simply goes with it; if it FAILS, the flag
- *   persists AND a durable `valmont.quarantined` label is set on the
- *   surviving container — `open()` checks that label on EVERY inspect,
- *   so no provider instance (including one that restarted, or a second
- *   one) can ever hand out the untrusted container. Every later
- *   operation rejects with "Task workspace is quarantined" until an
- *   explicit `destroy()` (or a `create()` replacement) succeeds.
- *   Rationale: a surviving validation process would keep racing later
- *   path verification and file operations, and it predates any NEXT
- *   validation boundary, so no later cleanup would ever reach it. A
- *   failed create() setup that cannot remove its half-initialized
- *   container is quarantined the same way (the quarantine is cleared
- *   only when the replacement setup completes successfully);
+ *   persists AND the surviving container is RENAMED to
+ *   `valmont-sandbox-<taskId>-quarantined` — the durable quarantine
+ *   marker, held by the Docker daemon (container labels are immutable
+ *   after creation, so a rename is the only supported persistent
+ *   marker): `open()` probes that name on every task-name miss, so no
+ *   provider instance (including one that restarted, or a second one)
+ *   can ever hand out the untrusted container. Every later operation
+ *   rejects with "Task workspace is quarantined" until an explicit
+ *   `destroy()` (or a `create()` replacement) succeeds — both remove the
+ *   container under either name. Rationale: a surviving validation
+ *   process would keep racing later path verification and file
+ *   operations, and it predates any NEXT validation boundary, so no
+ *   later cleanup would ever reach it. A failed create() setup that
+ *   cannot remove its half-initialized container is quarantined the same
+ *   way (the quarantine is cleared only when the replacement setup
+ *   completes successfully);
  * - the reaper script lives on a SECOND, root-owned `0701` tmpfs mounted
  *   at `/reap` (a separate mount point on the read-only rootfs), not in
  *   the task-writable workspace: the unprivileged user can traverse
@@ -230,12 +234,17 @@ const QUARANTINE_ERROR =
   "Task workspace is quarantined (validation cleanup failed); destroy the task";
 
 /**
- * Durable quarantine marker (a container label set by
- * `quarantinedTasks`'s owner when the container could not be removed).
- * Exported so the unit tests can drive the combined inspect.
+ * Suffix of the durable quarantine marker: a surviving (unremovable)
+ * quarantined container is RENAMED to `<name>-quarantined`. Container
+ * labels are immutable after creation in Docker (there is no supported
+ * way to add one later — `docker container update` has no `--label`),
+ * so a rename is the durable, daemon-side, cross-instance marker: the
+ * container is no longer reachable by its task name, and every provider
+ * instance probes for the renamed name in open() (see openCore). The
+ * creation-time labels survive the rename, so the TTL reaper (any
+ * instance) still lists and reaps the container by its managed label.
  */
-export const QUARANTINE_INSPECT_FORMAT =
-  '{{.State.Running}}|{{index .Config.Labels "valmont.quarantined"}}';
+const QUARANTINED_SUFFIX = "-quarantined";
 
 const GIT_EXCLUDES = [
   ".env*",
@@ -270,17 +279,41 @@ const GIT_EXCLUDES = [
  * cleanup. Kernel `/proc` start times are used, which are immutable per
  * process and immune to reparenting.
  *
+ * Start-time precision: the boundary is the host's wall clock (epoch ms)
+ * captured just before the validation exec. Process start times are
+ * jiffies since boot; instead of converting them through /proc/stat's
+ * second-truncated `btime` (which can shift a reconstructed start by up
+ * to ~1 s), the script derives a SUB-SECOND boot epoch from the kernel's
+ * own monotonic uptime: bootMs = Date.now() - /proc/uptime, read in that
+ * order so the estimate errs early (a later-appearing start can only
+ * over-kill, never miss). The jiffies-to-ms conversion uses the real
+ * USER_HZ from `getconf CLK_TCK` (a wrong or missing HZ would mis-scale
+ * every start time, so it is fail-closed). The total reconstruction
+ * error is bounded to ~2 ticks (20 ms at the slowest standard HZ=100)
+ * plus the two-read gap, so the kill decision uses a 100 ms error budget
+ * (CLEANUP_EPSILON_MS) instead of a second-scale margin. The only
+ * process that could legitimately start inside that budget is the
+ * container's main process (entrypoint) when a validation starts ~100 ms
+ * after container start — and it is EXCLUDED EXPLICITLY, with pid 1:
+ * the main process is pid 1's oldest child (it started at container
+ * start, before every provider operation), while a validation descendant
+ * reparented to pid 1 started strictly later and is therefore never the
+ * oldest child and never excluded. Killing the main process would stop
+ * the container (tini exits when it does), so no timing argument —
+ * however good — is the guard against that; the exclusion is.
+ *
  * Fail-closed contract (the provider treats any non-zero exit as a failed
- * cleanup): exit 2 = bad argument; exit 1 = the boot time is unreadable
- * (start times would be uncomputable), a pid could not be inspected or
- * signalled (anything but ESRCH), a start time was unparsable, or the
- * confirmation scan still finds a non-zombie process that started at or
- * after the boundary. A delivered signal is NOT treated as proof of
- * termination: kill rounds rescan until a round finds nothing new (a
- * killed process may have forked a child just before dying), and a final
- * confirmation scan requires every bounded process to be gone or a zombie
- * (dead — no execution, memory, or file descriptors; only a pid slot
- * remains until its parent reaps it). Exit 0 only when that holds.
+ * cleanup): exit 2 = bad argument; exit 1 = USER_HZ or the uptime/boot
+ * time is unreadable or inconsistent (start times would be uncomputable),
+ * a pid could not be inspected or signalled (anything but ESRCH), a start
+ * time was unparsable, or the confirmation scan still finds a non-zombie
+ * process that started within the error budget after the boundary. A
+ * delivered signal is NOT treated as proof of termination: kill rounds
+ * rescan until a round finds nothing new (a killed process may have
+ * forked a child just before dying), and a final confirmation scan
+ * requires every bounded process to be gone or a zombie (dead — no
+ * execution, memory, or file descriptors; only a pid slot remains until
+ * its parent reaps it). Exit 0 only when that holds.
  *
  * `VALMONT_REAPER_PROC_DIR` is a TEST SEAM only: it redirects the /proc
  * reads so unit tests can run the script against a synthetic /proc tree.
@@ -289,6 +322,7 @@ const GIT_EXCLUDES = [
  * task process cannot influence the provider's reaper invocation.
  */
 export const VALIDATION_REAPER_SCRIPT = `import { readFileSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
 const fail = (code, message) => {
   process.stderr.write("validation-reap: " + message + "\\n");
@@ -303,79 +337,154 @@ if (!Number.isInteger(boundary) || boundary <= 0) {
   fail(2, "expected a positive integer epoch-ms boundary");
 }
 
-// The boot time converts /proc start times (jiffies since boot) to epoch
-// milliseconds. Without it no start time is computable — fail closed
-// rather than silently skip the cleanup.
+// USER_HZ (jiffies per second): the jiffies-to-ms conversion factor for
+// process start times. A wrong or missing HZ would mis-scale every
+// start time, so it is fail-closed.
+let hz;
+try {
+  hz = Number(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8" }).trim());
+} catch {
+  hz = NaN;
+}
+if (!Number.isInteger(hz) || hz <= 0) {
+  fail(
+    1,
+    "cannot determine USER_HZ (getconf CLK_TCK); refusing to run cleanup",
+  );
+}
+
+// Sub-second boot epoch. /proc/stat's btime is truncated to whole
+// seconds, so boot times are NOT reconstructed from it (that can shift
+// a start time by up to ~1 s). Instead the boot time comes from the
+// kernel's own monotonic uptime (seconds at 1/100 s resolution, same
+// kernel that stamps process start times):
+//   bootMs = wall clock - uptime
+// with the WALL clock read FIRST: the estimate then errs EARLY, and an
+// early boot estimate makes processes appear OLDER — which can only
+// over-kill, never miss. (See the doc above for the error budget and
+// the explicit exclusion of the pre-validation process set.)
+const wallMs = Date.now();
+let uptimeSec;
+try {
+  uptimeSec = Number(readFileSync(PROC + "/uptime", "utf8").split(" ")[0]);
+} catch {
+  uptimeSec = NaN;
+}
+if (!Number.isFinite(uptimeSec) || uptimeSec < 0) {
+  fail(1, "cannot read /proc/uptime; refusing to run cleanup");
+}
+const bootMs = wallMs - uptimeSec * 1000;
+
+// Cross-check the uptime-derived boot time against the kernel's btime
+// (whole seconds): the true boot is in [btime, btime + 1 s) and the
+// estimate's error is at most a couple of ticks, so the estimate must
+// sit just inside that second. Anything else means the two sources
+// disagree — neither can be trusted, so fail closed.
 let statFile;
 try {
   statFile = readFileSync(PROC + "/stat", "utf8");
 } catch {
   fail(1, "cannot read /proc/stat; refusing to run cleanup");
 }
-let bootMs = 0;
+let btimeSec = 0;
 for (const line of statFile.split("\\n")) {
   if (line.startsWith("btime ")) {
-    bootMs = Number(line.slice(6).trim()) * 1000;
+    btimeSec = Number(line.slice(6).trim());
     break;
   }
 }
-if (!Number.isFinite(bootMs) || bootMs <= 0) {
+if (!Number.isFinite(btimeSec) || btimeSec <= 0) {
   fail(1, "boot time unavailable; refusing to run cleanup");
 }
+const btimeMs = btimeSec * 1000;
+if (bootMs < btimeMs - 100 || bootMs >= btimeMs + 1100) {
+  fail(
+    1,
+    "uptime-derived boot time inconsistent with btime; refusing to run cleanup",
+  );
+}
 
-// Boundary margin (ms). The host captured \`boundary\` (wall clock)
-// BEFORE the validation exec even started, but the kernel quantizes
-// process start times to jiffies and /proc/stat's \`btime\` is truncated
-// to whole seconds, so a process's RECONSTRUCTED start time can appear
-// up to ~1 s (btime truncation) + one jiffy earlier than its true
-// start. A child spawned immediately after the boundary must therefore
-// be matched with a margin larger than that reconstruction error —
-// over-killing pre-boundary processes by a few seconds is safe (in a
-// healthy task the only long-lived pre-boundary process is the
-// boot-time entrypoint, and it is only reached when a validation starts
-// within seconds of container start, which the multi-step create()
-// makes practically impossible); MISSING a survivor is not.
-//
-// HZ is the SMALLEST standard Linux USER_HZ: on faster kernels
-// (250/1000 Hz) this over-estimates every reconstructed age, which can
-// only over-kill (as above), never under-estimate and miss a survivor.
-const MARGIN_MS = 2000;
-const limit = boundary - MARGIN_MS;
-const HZ = 100; // see above
+// Error budget (ms) for the kill decision. The reconstructed start
+// time bootMs + jiffies*1000/HZ is off from a process's true start by
+// at most ~2 ticks (20 ms at the slowest standard HZ=100) plus the
+// wall/uptime read gap. 100 ms covers that with headroom: a validation
+// process spawned at or after the boundary is NEVER missed. The only
+// legitimate process that could start within the budget (the
+// container's main process, if a validation starts ~100 ms after
+// container start) is excluded EXPLICITLY below — the pre-validation
+// process set is not guarded by the budget alone.
+const EPSILON_MS = 100;
+const limit = boundary - EPSILON_MS;
 const self = process.pid;
 
-// Every process whose RECONSTRUCTED start time is at or after the
-// margin-adjusted limit, with its current state. A pid that vanishes
-// between the listing and the read is gone (ENOENT only); any other
-// read error means we cannot reason about it — fail closed.
-const scan = () => {
-  const targets = [];
+// Read one pid's stat. Returns null for a pid that is gone (ENOENT
+// only); any other read error means we cannot reason about it — fail
+// closed.
+const readStat = (pid) => {
+  let stat;
+  try {
+    stat = readFileSync(PROC + "/" + pid + "/stat", "utf8");
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") {
+      fail(1, "cannot read /proc/" + pid + "/stat; not assuming it is safe");
+    }
+    return null;
+  }
+  // Field 2 (comm) is parenthesised and may contain spaces or parens,
+  // so split after the last ')'. fields[0] is state (stat field 3),
+  // fields[1] is ppid (stat field 4); fields[19] is starttime (stat
+  // field 22: jiffies since boot).
+  const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+  const starttime = Number(fields[19]);
+  if (!Number.isFinite(starttime)) {
+    fail(1, "unparsable start time for pid " + pid);
+  }
+  return { pid, state: fields[0], ppid: Number(fields[1]), starttime };
+};
+
+// Every live process (except self and pid 1), freshly read.
+const collect = () => {
+  const procs = [];
   for (const entry of readdirSync(PROC)) {
     if (!/^\\d+$/.test(entry)) continue;
     const pid = Number(entry);
     if (pid === self || pid === 1) continue;
-    let stat;
-    try {
-      stat = readFileSync(PROC + "/" + entry + "/stat", "utf8");
-    } catch (error) {
-      if (!error || error.code !== "ENOENT") {
-        fail(1, "cannot read /proc/" + entry + "/stat; not assuming it is safe");
-      }
-      continue;
+    const parsed = readStat(pid);
+    if (parsed !== null) procs.push(parsed);
+  }
+  return procs;
+};
+
+// The container's MAIN process, excluded explicitly with pid 1 (see
+// the doc above): pid 1's child with the SMALLEST start time — it
+// started when the container started, before every provider operation,
+// so it is by definition pre-validation. A validation descendant
+// reparented to pid 1 started strictly later (pids are never reused
+// within a namespace), so it is never the oldest child and is never
+// excluded — it is still killed.
+const mainPidOf = (procs) => {
+  let main;
+  let oldest = Infinity;
+  for (const p of procs) {
+    if (p.ppid === 1 && p.starttime < oldest) {
+      oldest = p.starttime;
+      main = p.pid;
     }
-    // Field 2 (comm) is parenthesised and may contain spaces or parens,
-    // so split after the last ')'. fields[0] is state (stat field 3);
-    // fields[19] is starttime (stat field 22: jiffies since boot).
-    const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
-    const starttime = Number(fields[19]);
-    if (!Number.isFinite(starttime)) {
-      fail(1, "unparsable start time for pid " + pid);
-    }
-    // Compare against the margin-adjusted limit, never the raw
-    // boundary (see MARGIN_MS above): a survivor started just after
-    // the boundary reconstructs up to ~1 s early.
-    if (bootMs + (starttime / HZ) * 1000 >= limit) {
-      targets.push({ pid, state: fields[0] });
+  }
+  return main;
+};
+
+// Every process whose RECONSTRUCTED start time is within EPSILON_MS
+// after the boundary, EXCEPT the excluded pre-validation set, with its
+// current state.
+const scan = () => {
+  const procs = collect();
+  const mainPid = mainPidOf(procs);
+  const targets = [];
+  for (const p of procs) {
+    if (p.pid === mainPid) continue;
+    if (bootMs + (p.starttime / hz) * 1000 >= limit) {
+      targets.push({ pid: p.pid, state: p.state });
     }
   }
   return targets;
@@ -565,7 +674,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     // first — if it fails and the container cannot be removed, the
     // container is half-initialized and MUST be quarantined, not left
     // reusable for a later open().
-    await this.cleanup(taskId);
+    // cleanupAll also removes a surviving QUARANTINED container renamed
+    // by a previous quarantine — a replacement must not leave it behind
+    // (it holds quota) and must start from a clean name.
+    await this.cleanupAll(taskId);
     const createArgs = [
       "create",
       "--name",
@@ -683,32 +795,35 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   private async openCore(taskId: string): Promise<WorkspaceHandle> {
     this.assertNotQuarantined(taskId);
-    // One inspect for BOTH facts: whether the container is running, and
-    // whether it carries the durable quarantine label (set when a
-    // cleanup failed and the container could not be removed). The label
-    // is the cross-instance source of truth — an in-memory flag is
-    // forgotten by a provider restart or a second instance, and must
-    // never allow reusing a quarantined container.
     const inspected = await this.docker(
-      [
-        "inspect",
-        "--format",
-        QUARANTINE_INSPECT_FORMAT,
-        this.containerName(taskId),
-      ],
+      ["inspect", "--format", "{{.State.Running}}", this.containerName(taskId)],
       15_000,
       20_000,
     );
     if (inspected.code !== 0) {
+      // No container under the task name. Before reporting "unavailable",
+      // probe the durable quarantine marker: a surviving unremovable
+      // container was RENAMED to <name>-quarantined (see
+      // quarantineTask) — that state is in the daemon, so this instance
+      // sees it even after a restart, and even when it is a SECOND
+      // instance with no in-memory state.
+      const quarantined = await this.docker(
+        [
+          "inspect",
+          "--format",
+          "{{.State.Running}}",
+          this.quarantinedContainerName(taskId),
+        ],
+        15_000,
+        20_000,
+      );
+      if (quarantined.code === 0) {
+        this.quarantinedTasks.add(taskId);
+        throw new Error(QUARANTINE_ERROR);
+      }
       throw new Error(WORKSPACE_UNAVAILABLE);
     }
-    const [running, label] = inspected.stdout.trim().split("|");
-    if (label !== undefined && label !== "<no value>") {
-      // Another (or a previous) instance quarantined this container.
-      this.quarantinedTasks.add(taskId);
-      throw new Error(QUARANTINE_ERROR);
-    }
-    if (running !== "true") {
+    if (inspected.stdout.trim() !== "true") {
       throw new Error(WORKSPACE_UNAVAILABLE);
     }
     return { id: taskId, root: "/workspace" };
@@ -1107,7 +1222,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    */
   private async quarantineTask(taskId: string): Promise<void> {
     this.quarantinedTasks.add(taskId);
-    const removed = await this.cleanup(taskId).then(
+    const removed = await this.cleanupAll(taskId).then(
       () => true,
       () => false,
     );
@@ -1119,24 +1234,36 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       return;
     }
     // The container SURVIVED: the in-memory flag alone would be forgotten
-    // by a provider restart or a different provider instance, whose
-    // open() would hand out this live, untrusted container. Mark it
-    // durably on the container itself (checked by open() regardless of
-    // instance) so no instance can ever reuse it.
-    const labeled = await this.docker(
+    // by a provider restart or a second provider instance, whose open()
+    // would hand out this live, untrusted container. So the quarantine is
+    // made DURABLE in the daemon: the container is renamed to
+    // <name>-quarantined (see QUARANTINED_SUFFIX). A rename is a supported
+    // Docker operation on a running OR stopped container, the new name
+    // lives in the daemon (surviving restarts and instance changes), and
+    // the container is no longer reachable by its task name — every
+    // instance's open() probes for the renamed name and rejects (see
+    // openCore). The creation-time labels survive the rename, so the TTL
+    // reaper (any instance) still lists and reaps it by its managed label.
+    const renamed = await this.docker(
       [
-        "update",
-        "--label",
-        "valmont.quarantined=true",
+        "rename",
         this.containerName(taskId),
+        this.quarantinedContainerName(taskId),
       ],
       30_000,
       20_000,
     );
-    if (labeled.code !== 0) {
-      // Both the removal and the marker failed: this instance keeps the
-      // in-memory flag, and the TTL reaper (same instance) remains the
-      // backstop for the container. Nothing more can be done from here.
+    if (renamed.code !== 0 && !/no such container/i.test(renamed.stderr)) {
+      // The rename failed for a reason other than "the original name is
+      // already gone" (which is the success case: the container was
+      // already renamed by a prior quarantine, or nothing remains). The
+      // in-memory flag still blocks THIS instance, but the container is
+      // still under its task name and a fresh instance could open it.
+      // There is no other durable daemon-side marker available (labels
+      // are immutable after creation, so a rename is the only one), so
+      // this is logged-loudly-by-absence: the TTL reaper on this
+      // instance remains the backstop. The flag is never cleared, so at
+      // least this instance keeps rejecting.
     }
   }
 
@@ -1151,12 +1278,14 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * when a task reaches a terminal state; the reaper is the backstop for
    * abandoned tasks. Also the explicit teardown that clears a quarantine
    * (see quarantinedTasks) — the flag persists if the removal fails.
+   * cleanupAll removes the container under EITHER name, so a quarantined
+   * (renamed) container is actually destroyed here, not orphaned.
    */
   async destroy(taskId: string): Promise<void> {
     if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
     return this.withTaskLock(taskId, async () => {
-      await this.cleanup(taskId);
-      // The removal was checked (cleanup throws on a failed rm): the
+      await this.cleanupAll(taskId);
+      // The removal was checked (cleanupAll throws on a failed rm): the
       // task's container is gone, so its quarantine is over too.
       this.quarantinedTasks.delete(taskId);
     });
@@ -1223,6 +1352,14 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   private containerName(taskId: string): string {
     return `valmont-sandbox-${taskId}`;
+  }
+
+  /**
+   * The name a SURVIVING quarantined container is renamed to (see
+   * quarantineTask): the durable, cross-instance quarantine marker.
+   */
+  private quarantinedContainerName(taskId: string): string {
+    return `${this.containerName(taskId)}${QUARANTINED_SUFFIX}`;
   }
 
   /**
@@ -1685,6 +1822,9 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /** Remove the task container (checked: a failed rm throws). */
+  /**
+   * Remove the task container (checked: a failed rm throws).
+   */
   private async cleanup(taskId: string): Promise<void> {
     const removed = await this.docker(
       ["rm", "-f", this.containerName(taskId)],
@@ -1698,6 +1838,35 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     if (removed.code !== 0 && !/no such container/i.test(removed.stderr)) {
       throw new Error(
         `Could not remove sandbox container: ${
+          removed.stderr.trim() || removed.code
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Remove the task container under EITHER name it may hold: the normal
+   * name, or the durable quarantine name a surviving unremovable
+   * container was renamed to (see quarantineTask). destroy() and
+   * create()'s replacement both go through this, so a quarantined
+   * container is actually removed — not just orphaned — by its task.
+   * Throws if either removal fails for a reason other than not-found.
+   */
+  private async cleanupAll(taskId: string): Promise<void> {
+    await this.cleanup(taskId);
+    await this.removeQuarantinedContainer(taskId);
+  }
+
+  /** Remove a surviving quarantined container (checked; not-found is fine). */
+  private async removeQuarantinedContainer(taskId: string): Promise<void> {
+    const removed = await this.docker(
+      ["rm", "-f", this.quarantinedContainerName(taskId)],
+      30_000,
+      20_000,
+    );
+    if (removed.code !== 0 && !/no such container/i.test(removed.stderr)) {
+      throw new Error(
+        `Could not remove quarantined sandbox container: ${
           removed.stderr.trim() || removed.code
         }`,
       );

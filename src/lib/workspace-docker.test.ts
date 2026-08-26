@@ -1,5 +1,9 @@
 import { PassThrough } from "node:stream";
-import { execFile as execFileCb, spawn } from "node:child_process";
+import {
+  execFile as execFileCb,
+  execFileSync,
+  spawn,
+} from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { mkdir, rm, mkdtemp, writeFile as fsWriteFile } from "node:fs/promises";
@@ -8,7 +12,6 @@ import path from "node:path";
 import { afterEach, afterAll, describe, expect, it } from "vitest";
 import {
   DockerWorkspaceProvider,
-  QUARANTINE_INSPECT_FORMAT,
   VALIDATION_REAPER_SCRIPT,
   type DockerSpawn,
   type DockerWorkspaceOptions,
@@ -44,8 +47,6 @@ interface FakeState {
   fileContents: Map<string, ExecResult>;
   psLines: string[];
   rmErrors: Map<string, string>;
-  /** Container labels (cleared on create/rm exactly like the daemon). */
-  labels: Map<string, Record<string, string>>;
   cpDestinations: string[];
   cpFailures: number;
   /** Forced inspect failure (code 1) for a container's Running check. */
@@ -72,7 +73,6 @@ function makeState(): FakeState {
     fileContents: new Map(),
     psLines: [],
     rmErrors: new Map(),
-    labels: new Map(),
     cpDestinations: [],
     cpFailures: 0,
     inspectErrors: new Map(),
@@ -175,7 +175,6 @@ function makeSpawn(state: FakeState): DockerSpawn {
         const name = args[args.indexOf("--name") + 1];
         state.containers.add(name);
         state.createdAt.set(name, OLD_CREATED);
-        state.labels.delete(name); // a fresh container has no labels
         stdout = "fakecontainerid\n";
       } else if (sub === "start") {
         const name = args[1];
@@ -197,24 +196,32 @@ function makeSpawn(state: FakeState): DockerSpawn {
         } else if (state.containers.has(name)) {
           state.containers.delete(name);
           state.createdAt.delete(name);
-          state.labels.delete(name); // the daemon drops labels with it
           stdout = `${name}\n`;
         } else {
           code = 1;
           stderr = `Error: No such container: ${name}\n`;
         }
-      } else if (sub === "update") {
-        const name = args[args.length - 1];
-        const labelArg = args[args.indexOf("--label") + 1];
-        if (!state.containers.has(name)) {
+      } else if (sub === "rename") {
+        // `docker rename <old> <new>`: a metadata operation that works
+        // on a running OR stopped container (real Docker semantics —
+        // it is the provider's durable quarantine marker). The
+        // container's other state (creation time, labels) moves with
+        // the new name.
+        const [oldName, newName] = args.slice(1);
+        if (!state.containers.has(oldName)) {
           code = 1;
-          stderr = `Error: No such container: ${name}\n`;
+          stderr = `Error: No such container: ${oldName}\n`;
+        } else if (state.containers.has(newName)) {
+          code = 1;
+          stderr = `Error: renaming container: ${newName} already in use\n`;
         } else {
-          const [key, value] = labelArg.split("=");
-          const current = state.labels.get(name) ?? {};
-          current[key] = value;
-          state.labels.set(name, current);
-          stdout = `${name}\n`;
+          state.containers.delete(oldName);
+          state.containers.add(newName);
+          const created = state.createdAt.get(oldName);
+          if (created !== undefined) {
+            state.createdAt.delete(oldName);
+            state.createdAt.set(newName, created);
+          }
         }
       } else if (sub === "inspect") {
         const format = args[args.indexOf("--format") + 1];
@@ -231,17 +238,6 @@ function makeSpawn(state: FakeState): DockerSpawn {
           } else {
             code = 1;
             stderr = `Error: No such object: ${name}\n`;
-          }
-        } else if (format === QUARANTINE_INSPECT_FORMAT) {
-          // open()'s combined probe: running state + durable quarantine
-          // label ("<no value>" when the label is absent, like go
-          // templates for a missing map key).
-          if (!state.containers.has(name)) {
-            code = 1;
-            stderr = `Error: No such object: ${name}\n`;
-          } else {
-            const label = state.labels.get(name)?.["valmont.quarantined"];
-            stdout = `true|${label ?? "<no value>"}\n`;
           }
         } else if (format === "{{.Created}}") {
           const created = state.createdAt.get(name);
@@ -1139,15 +1135,24 @@ describe("DockerWorkspaceProvider", () => {
     await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
       "Could not complete validation cleanup",
     );
-    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
+    // The container survived the failed rm — and was renamed: the
+    // durable quarantine marker.
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      true,
+    );
     // The live-but-untrusted container must NOT be usable — the
     // quarantine is stricter than "unavailable".
     await expect(provider.readFile(ws, "a.txt")).rejects.toThrow(
       "Task workspace is quarantined",
     );
-    state.rmErrors.delete("valmont-sandbox-task1");
+    // The transient removal failure clears: destroy() removes the
+    // renamed container and the quarantine.
+    state.rmErrors.clear();
     await provider.destroy("task1");
-    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      false,
+    );
     expect(internals(provider).quarantinedTasks.has("task1")).toBe(false);
   });
 
@@ -1165,9 +1170,13 @@ describe("DockerWorkspaceProvider", () => {
       "Could not complete validation cleanup",
     );
     expect(internals(provider).quarantinedTasks.has("task1")).toBe(true);
+    // The surviving container was renamed — the durable marker.
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      true,
+    );
     // Replacement: the create-time cleanup now succeeds (the removal
-    // error is cleared), the quarantine no longer applies, and the new
-    // workspace works.
+    // error is cleared, and cleanupAll removes the renamed container),
+    // the quarantine no longer applies, and the new workspace works.
     state.rmErrors.delete("valmont-sandbox-task1");
     state.onExec = undefined;
     const ws2 = await provider.create("task1", src);
@@ -1331,12 +1340,16 @@ describe("DockerWorkspaceProvider", () => {
     await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
       "Could not complete validation cleanup",
     );
-    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
-    expect(state.labels.get("valmont-sandbox-task1")).toEqual({
-      "valmont.quarantined": "true",
-    });
+    // The container survived — and was RENAMED: the durable quarantine
+    // marker. (Real Docker labels are immutable after creation, so a
+    // rename is the only supported persistent marker; the fake daemon
+    // implements rename with real semantics.)
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      true,
+    );
     // A FRESH provider instance (restart or second instance) has no
-    // in-memory flag — the durable container label must do the work.
+    // in-memory flag — the daemon-side rename must do the work.
     const fresh = makeProvider(state);
     expect(internals(fresh).quarantinedTasks.has("task1")).toBe(false);
     await expect(fresh.open("task1")).rejects.toThrow(
@@ -1345,6 +1358,14 @@ describe("DockerWorkspaceProvider", () => {
     // ...and open() adopts the flag so this instance rejects afterwards
     // without another inspect.
     expect(internals(fresh).quarantinedTasks.has("task1")).toBe(true);
+    // An explicit destroy() removes the renamed container and clears
+    // the quarantine (the transient removal failure has cleared).
+    state.rmErrors.clear();
+    await fresh.destroy("task1");
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      false,
+    );
+    expect(internals(fresh).quarantinedTasks.has("task1")).toBe(false);
   });
 
   it("a failed create() quarantines its unremovable half-initialized container; a successful replacement clears it", async () => {
@@ -1353,15 +1374,19 @@ describe("DockerWorkspaceProvider", () => {
     const src = await makeSource({ "a.txt": "x" });
     // Reaper staging fails AND removal fails: create() leaves a
     // half-initialized container (no reaper, no git baseline) that
-    // CANNOT be removed. Only the SECOND removal (the catch-path
-    // cleanup) is forced to fail — the first one (pre-cleanup, where
-    // the container does not exist yet) must succeed with "no such
-    // container", as in production.
+    // CANNOT be removed. Only the SECOND removal of the ORIGINAL name
+    // (the catch-path cleanup) is forced to fail — the first one
+    // (pre-cleanup, where the container does not exist yet) must
+    // succeed with "no such container", as in production. The
+    // quarantined-name removals (part of every cleanupAll) must never
+    // be forced.
     state.cpFailures = 1;
-    let rmCount = 0;
+    const ORIGINAL = "valmont-sandbox-task1";
+    let originalRmCount = 0;
     state.onRm = (name) => {
-      rmCount += 1;
-      if (rmCount >= 2) {
+      if (name !== ORIGINAL) return;
+      originalRmCount += 1;
+      if (originalRmCount >= 2) {
         state.rmErrors.set(
           name,
           "Error: removing container: device or resource busy\n",
@@ -1371,25 +1396,31 @@ describe("DockerWorkspaceProvider", () => {
     await expect(provider.create("task1", src)).rejects.toThrow(
       "Could not stage the validation reaper",
     );
-    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
-    expect(state.labels.get("valmont-sandbox-task1")).toEqual({
-      "valmont.quarantined": "true",
-    });
+    // The half-initialized container survived — and was renamed: the
+    // durable quarantine marker.
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      true,
+    );
     // The quarantine is in effect on this instance...
     expect(internals(provider).quarantinedTasks.has("task1")).toBe(true);
     await expect(provider.open("task1")).rejects.toThrow(
       "Task workspace is quarantined",
     );
-    // ...and (via the label) on any fresh instance.
+    // ...and (via the daemon-side rename) on any fresh instance.
     await expect(makeProvider(state).open("task1")).rejects.toThrow(
       "Task workspace is quarantined",
     );
     // A replacement whose setup completes fully clears the quarantine:
-    // its cleanup removes the labeled container, and the flag is
-    // dropped only after the new setup succeeds.
+    // its pre-cleanup removes the renamed container (a replacement must
+    // not orphan it), and the flag is dropped only after the new setup
+    // succeeds.
     state.onRm = undefined; // the removals work now
-    state.rmErrors.delete("valmont-sandbox-task1");
+    state.rmErrors.clear();
     const ws = await provider.create("task1", src);
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      false,
+    );
     expect(internals(provider).quarantinedTasks.has("task1")).toBe(false);
     expect(await provider.open("task1")).toEqual({
       id: "task1",
@@ -1410,15 +1441,15 @@ describe("DockerWorkspaceProvider", () => {
 });
 
 describe("validation reaper script (run directly against a synthetic /proc)", () => {
-  // The script compares RECONSTRUCTED start times
-  // (bootMs + jiffies * 1000 / HZ) against the boundary MINUS a 2 s
-  // margin. BOOT_MS is the second-truncated `btime` the script reads;
-  // the fabricated jiffy counts stand in for a kernel whose real boot
-  // was up to a second later — the btime/jiffy quantization error the
-  // margin must absorb (a survivor started just after the boundary can
-  // reconstruct up to ~1 s BEFORE it).
-  const BOOT_MS = 1_700_000_000_000;
-  const BOUNDARY = BOOT_MS + 1_000_000;
+  // The script derives a SUB-SECOND boot epoch (wall clock −
+  // /proc/uptime, using the real USER_HZ from `getconf CLK_TCK`) and
+  // compares each process's reconstructed start time against the
+  // boundary minus a 100 ms error budget. The synthetic /proc below
+  // mimics the real kernel domain: its `uptime` and per-pid jiffy
+  // counts are consistent with the REAL wall clock at test-run time,
+  // so the reconstruction math runs against real values (this machine's
+  // HZ — the same one the script will read).
+  const HZ = Number(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8" }));
 
   const dirs: string[] = [];
   const children: ChildProcess[] = [];
@@ -1438,21 +1469,70 @@ describe("validation reaper script (run directly against a synthetic /proc)", ()
     return scriptPromise;
   }
 
-  /** Write a synthetic /proc: /proc/stat (with btime) + per-pid stats. */
+  /**
+   * A synthetic `uptime` + `btime` consistent with the real wall clock.
+   * The uptime is chosen so the test's boot estimate (Date.now() −
+   * uptime) sits ~500 ms into its second: the script's own estimate is
+   * the test's plus its startup delay (typically well under 300 ms),
+   * and the script's btime consistency window is
+   * [btimeMs − 100, btimeMs + 1100) — centered on the second, that
+   * passes with headroom.
+   */
+  function makeTiming(): {
+    bootMs: number;
+    btimeSec: number;
+    uptimeText: string;
+  } {
+    const nowMs = Date.now();
+    const nominalUptimeCsec = 100_000; // 1000 s
+    let bootMs = nowMs - nominalUptimeCsec * 10;
+    const frac = ((bootMs % 1000) + 1000) % 1000;
+    const deltaUptimeCsec = Math.round((frac - 500) / 10);
+    const uptimeCsec = nominalUptimeCsec - deltaUptimeCsec;
+    bootMs = nowMs - uptimeCsec * 10; // integer ms
+    const btimeSec = Math.floor(bootMs / 1000);
+    return {
+      bootMs,
+      btimeSec,
+      uptimeText: `${uptimeCsec / 100} 0.00\n`,
+    };
+  }
+
+  /** Jiffies the kernel would record for a process started at startMs. */
+  function jiffiesFor(bootMs: number, startMs: number): number {
+    return Math.round(((startMs - bootMs) / 1000) * HZ);
+  }
+
+  /**
+   * Write a synthetic /proc: /proc/stat (with btime), /proc/uptime, and
+   * per-pid stats. `ppid` is stat field 4 — the script uses it to find
+   * the container's main process (pid 1's oldest child).
+   */
   function writeProc(
     dir: string,
-    procs: Array<{ pid: number; state: string; startJiffies: number }>,
+    timing: ReturnType<typeof makeTiming>,
+    procs: Array<{
+      pid: number;
+      state: string;
+      ppid: number;
+      startJiffies: number;
+    }>,
   ): void {
     writeFileSync(
       path.join(dir, "stat"),
-      `cpu  0 0 0 0 0 0 0 0 0 0\nbtime ${BOOT_MS / 1000}\n`,
+      `cpu  0 0 0 0 0 0 0 0 0 0\nbtime ${timing.btimeSec}\n`,
     );
+    writeFileSync(path.join(dir, "uptime"), timing.uptimeText);
     for (const p of procs) {
       mkdirSync(path.join(dir, String(p.pid)), { recursive: true });
-      // Fields after the parenthesised comm: state(0) ... starttime(19).
+      // Fields after the parenthesised comm: state(0) ppid(1) pgrp(2)
+      // session(3) tty(4) tpgid(5) flags(6) minflt(7) cminflt(8)
+      // majflt(9) cmajflt(10) utime(11) stime(12) cutime(13)
+      // cstime(14) priority(15) nice(16) num_threads(17)
+      // itrealvalue(18) starttime(19).
       const rest = [
         p.state,
-        0,
+        p.ppid,
         0,
         0,
         -1,
@@ -1546,45 +1626,46 @@ describe("validation reaper script (run directly against a synthetic /proc)", ()
     }
   });
 
-  it("kills a survivor whose reconstructed start falls BEFORE the boundary (the 909 ms regression)", async () => {
+  it("kills a survivor started just after the boundary", async () => {
     const child = spawnLongLivedChild();
     const pid = child.pid!;
     const procDir = await mkdtemp(path.join(tmpdir(), "valmont-reaper-proc-"));
     dirs.push(procDir);
-    // True start: 50 ms AFTER the host boundary. But the kernel's btime
-    // is second-truncated (real boot was 850 ms later) and start times
-    // are jiffy-quantized (HZ=100), so the script reconstructs this
-    // start at BOUNDARY − 800 ms — before the boundary. Without the
-    // margin the old comparison (reconstructed >= boundary) would MISS
-    // this survivor; with it, the survivor is matched and killed.
-    const startJiffies = Math.floor((BOUNDARY + 50 - BOOT_MS - 850) / 10);
-    writeProc(procDir, [{ pid, state: "S", startJiffies }]);
+    const boundary = Date.now() - 5000; // the validation started 5 s ago
+    const timing = makeTiming();
+    // The survivor started 50 ms AFTER the boundary — inside any sane
+    // error budget, so it must be killed. (Under the old
+    // second-truncated btime reconstruction a survivor like this could
+    // appear up to ~1 s early and be missed; the uptime-derived boot
+    // time removes that whole error class.)
+    const startJiffies = jiffiesFor(timing.bootMs, boundary + 50);
+    writeProc(procDir, timing, [{ pid, state: "S", ppid: 7, startJiffies }]);
     const file = await scriptPath();
-    const { code, stderr } = await runScript(BOUNDARY, procDir, file);
+    const { code, stderr } = await runScript(boundary, procDir, file);
     // The real child is dead: the signal was delivered (same uid). The
     // exit is 1 because the SYNTHETIC stat file is static — the
     // confirmation scan still "sees" state S — which independently
-    // proves the process was treated as a bounded survivor (the pre-
-    // margin code exits 0 with the child still alive).
+    // proves the process was treated as a bounded survivor (a missed
+    // survivor would exit 0 with the child still alive).
     expect(code).toBe(1);
     expect(stderr).toContain(`survivor pid ${pid}`);
     await waitExit(child);
     expect(child.signalCode).toBe("SIGKILL");
   });
 
-  it("does not kill a pre-boundary process outside the margin", async () => {
+  it("does not kill a process that started well before the boundary", async () => {
     const child = spawnLongLivedChild();
     const pid = child.pid!;
     const procDir = await mkdtemp(path.join(tmpdir(), "valmont-reaper-proc-"));
     dirs.push(procDir);
-    // Reconstructed start: BOUNDARY − 10 s — outside the 2 s margin.
-    // (The only healthy long-lived process this old is the boot-time
-    // entrypoint; over-killing by a few seconds is the documented,
-    // near-impossible trade the margin makes.)
-    const startJiffies = Math.floor((BOUNDARY - BOOT_MS - 10_000) / 10);
-    writeProc(procDir, [{ pid, state: "S", startJiffies }]);
+    const boundary = Date.now() - 5000;
+    const timing = makeTiming();
+    // Reconstructed start: boundary − 10 s — far outside the 100 ms
+    // error budget.
+    const startJiffies = jiffiesFor(timing.bootMs, boundary - 10_000);
+    writeProc(procDir, timing, [{ pid, state: "S", ppid: 7, startJiffies }]);
     const file = await scriptPath();
-    const { code, stderr } = await runScript(BOUNDARY, procDir, file);
+    const { code, stderr } = await runScript(boundary, procDir, file);
     expect(code).toBe(0);
     expect(stderr).not.toContain("survivor");
     // The kill rounds (if any had targeted it) are long past.
@@ -1593,17 +1674,88 @@ describe("validation reaper script (run directly against a synthetic /proc)", ()
     expect(child.signalCode).toBe(null);
   });
 
+  it("does not kill the container's main process inside the old 2 s margin (the entrypoint regression)", async () => {
+    const child = spawnLongLivedChild();
+    const pid = child.pid!;
+    const procDir = await mkdtemp(path.join(tmpdir(), "valmont-reaper-proc-"));
+    dirs.push(procDir);
+    const boundary = Date.now() - 5000;
+    const timing = makeTiming();
+    // Reconstructed start: boundary − 1.5 s — INSIDE the old 2 s
+    // margin. Under the old code this process (a container's main
+    // process when a validation starts soon after container start) was
+    // killed — and killing it stops the container (tini exits when its
+    // child does), turning a valid validation into a cleanup failure.
+    // Under the new code it is both outside the 100 ms error budget and
+    // explicitly excluded as pid 1's oldest child.
+    const startJiffies = jiffiesFor(timing.bootMs, boundary - 1500);
+    writeProc(procDir, timing, [{ pid, state: "S", ppid: 1, startJiffies }]);
+    const file = await scriptPath();
+    const { code, stderr } = await runScript(boundary, procDir, file);
+    expect(code).toBe(0);
+    expect(stderr).not.toContain("survivor");
+    await sleep(400);
+    expect(child.exitCode).toBe(null);
+    expect(child.signalCode).toBe(null);
+  });
+
+  it("excludes the main process even INSIDE the error budget", async () => {
+    const child = spawnLongLivedChild();
+    const pid = child.pid!;
+    const procDir = await mkdtemp(path.join(tmpdir(), "valmont-reaper-proc-"));
+    dirs.push(procDir);
+    const boundary = Date.now() - 5000;
+    const timing = makeTiming();
+    // Reconstructed start: boundary − 50 ms — INSIDE the 100 ms error
+    // budget, so pure timing would kill it. The explicit exclusion of
+    // pid 1's oldest child (the container's main process, which is by
+    // definition pre-validation) is what protects it: this is the
+    // validation-starts-~100-ms-after-container-start case.
+    const startJiffies = jiffiesFor(timing.bootMs, boundary - 50);
+    writeProc(procDir, timing, [{ pid, state: "S", ppid: 1, startJiffies }]);
+    const file = await scriptPath();
+    const { code, stderr } = await runScript(boundary, procDir, file);
+    expect(code).toBe(0);
+    expect(stderr).not.toContain("survivor");
+    await sleep(400);
+    expect(child.exitCode).toBe(null);
+    expect(child.signalCode).toBe(null);
+  });
+
+  it("still kills a non-main process inside the error budget (the exclusion is specific)", async () => {
+    const child = spawnLongLivedChild();
+    const pid = child.pid!;
+    const procDir = await mkdtemp(path.join(tmpdir(), "valmont-reaper-proc-"));
+    dirs.push(procDir);
+    const boundary = Date.now() - 5000;
+    const timing = makeTiming();
+    // The same young start as the previous test, but NOT a child of pid
+    // 1: a process this young that is not the container's main process
+    // is by definition part of the validation — it must be killed.
+    // (The exclusion never widens to "young processes in general".)
+    const startJiffies = jiffiesFor(timing.bootMs, boundary - 50);
+    writeProc(procDir, timing, [{ pid, state: "S", ppid: 7, startJiffies }]);
+    const file = await scriptPath();
+    const { code, stderr } = await runScript(boundary, procDir, file);
+    expect(code).toBe(1);
+    expect(stderr).toContain(`survivor pid ${pid}`);
+    await waitExit(child);
+    expect(child.signalCode).toBe("SIGKILL");
+  });
+
   it("accepts a zombie survivor (dead: no execution, memory, or descriptors)", async () => {
     const pid = freePid();
     const procDir = await mkdtemp(path.join(tmpdir(), "valmont-reaper-proc-"));
     dirs.push(procDir);
+    const boundary = Date.now() - 5000;
+    const timing = makeTiming();
     // Started after the boundary, but already a zombie: the PID slot
     // persists until its parent reaps it, so the confirmation must
     // accept state Z.
-    const startJiffies = Math.floor((BOUNDARY + 100 - BOOT_MS) / 10);
-    writeProc(procDir, [{ pid, state: "Z", startJiffies }]);
+    const startJiffies = jiffiesFor(timing.bootMs, boundary + 100);
+    writeProc(procDir, timing, [{ pid, state: "Z", ppid: 7, startJiffies }]);
     const file = await scriptPath();
-    const { code, stderr } = await runScript(BOUNDARY, procDir, file);
+    const { code, stderr } = await runScript(boundary, procDir, file);
     expect(code).toBe(0);
     expect(stderr).not.toContain("survivor");
   });
@@ -1611,9 +1763,23 @@ describe("validation reaper script (run directly against a synthetic /proc)", ()
   it("fails closed (exit 2) on a non-integer boundary", async () => {
     const procDir = await mkdtemp(path.join(tmpdir(), "valmont-reaper-proc-"));
     dirs.push(procDir);
-    writeProc(procDir, []);
+    writeProc(procDir, makeTiming(), []);
     const file = await scriptPath();
     const { code } = await runScript(Number.NaN, procDir, file);
     expect(code).toBe(2);
+  });
+
+  it("fails closed (exit 1) when /proc/uptime is unreadable", async () => {
+    const procDir = await mkdtemp(path.join(tmpdir(), "valmont-reaper-proc-"));
+    dirs.push(procDir);
+    // /proc/stat (with btime) is present, /proc/uptime is not: start
+    // times would be uncomputable.
+    writeFileSync(
+      path.join(procDir, "stat"),
+      `cpu  0 0 0 0 0 0 0 0 0 0\nbtime 1700000000\n`,
+    );
+    const file = await scriptPath();
+    const { code } = await runScript(Date.now() - 5000, procDir, file);
+    expect(code).toBe(1);
   });
 });
