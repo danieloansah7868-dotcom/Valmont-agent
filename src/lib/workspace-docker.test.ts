@@ -5,7 +5,13 @@ import {
   spawn,
 } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, rm, mkdtemp, writeFile as fsWriteFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -40,6 +46,15 @@ interface ExecResult {
 interface FakeState {
   containers: Set<string>;
   createdAt: Map<string, string>;
+  /**
+   * Per-container labels, parsed from the create `--label` args —
+   * modelled with REAL Docker semantics: set at creation, immutable
+   * afterwards (carried across rename, dropped on rm). `docker ps` and
+   * the combined inspect render missing labels as "<no value>".
+   */
+  labels: Map<string, Record<string, string>>;
+  /** Stopped containers (stop adds, start removes, rm drops). */
+  stopped: Set<string>;
   calls: { command: string; args: readonly string[]; stdinPath?: string }[];
   hostTarMembers: string[];
   stagedTopLevel: string[];
@@ -47,6 +62,28 @@ interface FakeState {
   fileContents: Map<string, ExecResult>;
   psLines: string[];
   rmErrors: Map<string, string>;
+  /**
+   * Forced `docker rename <old> ...` failure (keyed by the OLD name).
+   * The container keeps its original name — exactly what the real
+   * daemon does on a rename error (other than "no such container").
+   */
+  renameErrors: Map<string, string>;
+  /** Forced `docker stop <name>` failure. */
+  stopErrors: Map<string, string>;
+  /**
+   * Forced `docker create --name <name>` failure (keyed by name) that
+   * MODELS A CLI-LEVEL FAILURE AFTER THE DAEMON ACCEPTED THE CONTAINER
+   * (a timeout/CLI error mid-create): the container IS registered (the
+   * daemon holds it) but the call reports code 1 — the uncertain
+   * side-effect the provider must treat as a possible leak.
+   */
+  createErrors: Map<string, string>;
+  /**
+   * Artificial latency (ms) for exec commands, keyed by cmd[0]: the
+   * child's streams end after the delay instead of immediately, so a
+   * provider operation genuinely OUTLIVES its enqueue timestamp.
+   */
+  execDelays: Map<string, number>;
   cpDestinations: string[];
   cpFailures: number;
   /** Forced inspect failure (code 1) for a container's Running check. */
@@ -66,6 +103,8 @@ function makeState(): FakeState {
   const state: FakeState = {
     containers: new Set(),
     createdAt: new Map(),
+    labels: new Map(),
+    stopped: new Set(),
     calls: [],
     hostTarMembers: [],
     stagedTopLevel: [],
@@ -73,6 +112,10 @@ function makeState(): FakeState {
     fileContents: new Map(),
     psLines: [],
     rmErrors: new Map(),
+    renameErrors: new Map(),
+    stopErrors: new Map(),
+    createErrors: new Map(),
+    execDelays: new Map(),
     cpDestinations: [],
     cpFailures: 0,
     inspectErrors: new Map(),
@@ -122,7 +165,12 @@ function defaultExec(state: FakeState, cmd: string[]): ExecResult {
   return { code: 0, stdout: "", stderr: "" };
 }
 
-function makeChild(stdout: string, stderr: string, code: number): ChildProcess {
+function makeChild(
+  stdout: string,
+  stderr: string,
+  code: number,
+  delayMs?: number,
+): ChildProcess {
   const stdoutStream = new PassThrough();
   const stderrStream = new PassThrough();
   const listeners: Record<string, Array<(...args: unknown[]) => void>> = {};
@@ -136,11 +184,19 @@ function makeChild(stdout: string, stderr: string, code: number): ChildProcess {
       return child;
     },
   };
-  setImmediate(() => {
+  const finish = () => {
     stdoutStream.end(stdout);
     stderrStream.end(stderr);
     for (const fn of listeners["close"] ?? []) fn(code, null);
-  });
+  };
+  // An optional delay models a command that genuinely takes time
+  // (the provider's operation outlives its enqueue timestamp); without
+  // it the child finishes on the next immediate, as before.
+  if (delayMs !== undefined && delayMs > 0) {
+    setTimeout(finish, delayMs);
+  } else {
+    setImmediate(finish);
+  }
   return child as unknown as ChildProcess;
 }
 
@@ -169,19 +225,44 @@ function makeSpawn(state: FakeState): DockerSpawn {
     let code = 0;
     let stdout = "";
     let stderr = "";
+    let delay: number | undefined;
     if (command === "docker") {
       const sub = args[0];
       if (sub === "create") {
         const name = args[args.indexOf("--name") + 1];
+        // Labels are SET AT CREATION (real Docker: immutable after) and
+        // are the source for every later ps/inspect label render.
+        const labelMap: Record<string, string> = {};
+        for (let i = 0; i < args.length; i++) {
+          if (args[i] === "--label" && i + 1 < args.length) {
+            const eq = args[i + 1].indexOf("=");
+            if (eq > 0) {
+              labelMap[args[i + 1].slice(0, eq)] = args[i + 1].slice(eq + 1);
+            }
+          }
+        }
+        // createErrors models a CLI-level failure AFTER the daemon
+        // accepted the container (timeout mid-create): the container is
+        // registered (the daemon holds it, half-initialized) but the
+        // call reports an error — the uncertain side effect the
+        // provider must treat as a possible leak.
         state.containers.add(name);
         state.createdAt.set(name, OLD_CREATED);
-        stdout = "fakecontainerid\n";
+        state.labels.set(name, labelMap);
+        const forcedCreate = state.createErrors.get(name);
+        if (forcedCreate !== undefined) {
+          code = 1;
+          stderr = forcedCreate;
+        } else {
+          stdout = "fakecontainerid\n";
+        }
       } else if (sub === "start") {
         const name = args[1];
         if (!state.containers.has(name)) {
           code = 1;
           stderr = `Error: No such container: ${name}\n`;
         } else {
+          state.stopped.delete(name);
           stdout = `${name}\n`;
         }
       } else if (sub === "rm") {
@@ -196,6 +277,8 @@ function makeSpawn(state: FakeState): DockerSpawn {
         } else if (state.containers.has(name)) {
           state.containers.delete(name);
           state.createdAt.delete(name);
+          state.labels.delete(name);
+          state.stopped.delete(name);
           stdout = `${name}\n`;
         } else {
           code = 1;
@@ -206,9 +289,15 @@ function makeSpawn(state: FakeState): DockerSpawn {
         // on a running OR stopped container (real Docker semantics —
         // it is the provider's durable quarantine marker). The
         // container's other state (creation time, labels) moves with
-        // the new name.
+        // the new name; a failure other than "no such container" leaves
+        // the original name in place (the provider's stop fallback
+        // then makes the quarantine fail closed).
         const [oldName, newName] = args.slice(1);
-        if (!state.containers.has(oldName)) {
+        const forcedRename = state.renameErrors.get(oldName);
+        if (forcedRename !== undefined) {
+          code = 1;
+          stderr = forcedRename;
+        } else if (!state.containers.has(oldName)) {
           code = 1;
           stderr = `Error: No such container: ${oldName}\n`;
         } else if (state.containers.has(newName)) {
@@ -222,6 +311,27 @@ function makeSpawn(state: FakeState): DockerSpawn {
             state.createdAt.delete(oldName);
             state.createdAt.set(newName, created);
           }
+          const carriedLabels = state.labels.get(oldName);
+          if (carriedLabels !== undefined) {
+            state.labels.delete(oldName);
+            state.labels.set(newName, carriedLabels);
+          }
+        }
+      } else if (sub === "stop") {
+        // `docker stop <name>`: a real, supported operation; a stopped
+        // container reports Running=false (the provider's fail-closed
+        // quarantine fallback) and still accepts `rm -f`.
+        const name = args[1];
+        const forcedStop = state.stopErrors.get(name);
+        if (forcedStop !== undefined) {
+          code = 1;
+          stderr = forcedStop;
+        } else if (!state.containers.has(name)) {
+          code = 1;
+          stderr = `Error: No such container: ${name}\n`;
+        } else {
+          state.stopped.add(name);
+          stdout = `${name}\n`;
         }
       } else if (sub === "inspect") {
         const format = args[args.indexOf("--format") + 1];
@@ -234,10 +344,35 @@ function makeSpawn(state: FakeState): DockerSpawn {
             code = 1;
             stderr = forced;
           } else if (state.containers.has(name)) {
-            stdout = "true\n";
+            // A STOPPED container exists but is not running — exactly
+            // what `docker inspect --format '{{.State.Running}}'`
+            // reports, and what makes the quarantine stop fallback
+            // fail closed for every instance.
+            stdout = state.stopped.has(name) ? "false\n" : "true\n";
           } else {
             code = 1;
             stderr = `Error: No such object: ${name}\n`;
+          }
+        } else if (
+          format ===
+          '{{.State.Running}}|{{index .Config.Labels "valmont.task"}}|{{index .Config.Labels "valmont.instance"}}'
+        ) {
+          // The combined open/create/destroy probe. Missing labels
+          // render as "<no value>" (Go template behavior, mirrored
+          // exactly — the provider treats that as "no label").
+          const forced = state.inspectErrors.get(name);
+          if (forced !== undefined) {
+            code = 1;
+            stderr = forced;
+          } else if (!state.containers.has(name)) {
+            code = 1;
+            stderr = `Error: No such object: ${name}\n`;
+          } else {
+            const labels = state.labels.get(name) ?? {};
+            const running = state.stopped.has(name) ? "false" : "true";
+            stdout = `${running}|${labels["valmont.task"] ?? "<no value>"}|${
+              labels["valmont.instance"] ?? "<no value>"
+            }\n`;
           }
         } else if (format === "{{.Created}}") {
           const created = state.createdAt.get(name);
@@ -248,8 +383,22 @@ function makeSpawn(state: FakeState): DockerSpawn {
           }
         }
       } else if (sub === "ps") {
-        stdout =
-          state.psLines.length === 0 ? "" : `${state.psLines.join("\n")}\n`;
+        // With no injected lines, DERIVE the listing from container
+        // state (id, task label, instance label, name with the leading
+        // "/" that `docker ps` renders) — so a container that was
+        // created, renamed, or stopped shows up exactly as the real
+        // daemon would list it. Injected lines override (tests that
+        // pin a specific listing).
+        const lines =
+          state.psLines.length > 0
+            ? state.psLines
+            : [...state.containers].map((n) => {
+                const labels = state.labels.get(n) ?? {};
+                return `${n}\t${labels["valmont.task"] ?? "<no value>"}\t${
+                  labels["valmont.instance"] ?? "<no value>"
+                }\t/${n}`;
+              });
+        stdout = lines.length === 0 ? "" : `${lines.join("\n")}\n`;
       } else if (sub === "cp") {
         const dest = args[2];
         const name = dest.split(":")[0];
@@ -268,6 +417,11 @@ function makeSpawn(state: FakeState): DockerSpawn {
         if (!name || !state.containers.has(name)) {
           code = 1;
           stderr = `Error: No such container: ${name ?? "unknown"}\n`;
+        } else if (state.stopped.has(name)) {
+          // Real Docker refuses exec into a stopped container: no
+          // operation can race a quarantined (stopped) container.
+          code = 1;
+          stderr = `Error: container ${name} is not running\n`;
         } else {
           const cmd = args.slice(args.indexOf(name) + 1);
           const user = args[args.indexOf("--user") + 1];
@@ -276,6 +430,7 @@ function makeSpawn(state: FakeState): DockerSpawn {
             // The host-side CLI could not spawn: the provider rejects.
             return makeErrorChild(failedSpawn);
           }
+          delay = state.execDelays.get(cmd[0]);
           const override = state.onExec?.(name, cmd, user);
           const result = override ?? defaultExec(state, cmd);
           code = result.code;
@@ -306,22 +461,49 @@ function makeSpawn(state: FakeState): DockerSpawn {
         }
       }
     }
-    return makeChild(stdout, stderr, code);
+    return makeChild(stdout, stderr, code, delay);
   };
 }
+
+/**
+ * Every provider gets its OWN lease directory (tracked for cleanup), so
+ * two provider instances in the same test never share lease files unless
+ * a test EXPLICITLY points them at a shared dir (the cross-instance
+ * tests do, via `extra.leaseDir`).
+ */
+const leaseDirs: string[] = [];
 
 function makeProvider(
   state: FakeState,
   extra: Partial<DockerWorkspaceOptions> = {},
 ): DockerWorkspaceProvider {
+  const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+  leaseDirs.push(leaseDir);
   return new DockerWorkspaceProvider({
     image: "test:latest",
     // Generous so activity recorded at enqueue time is still fresh after
     // the (multi-ms) create sequence; stale tests sleep past it.
     ttlMs: 400,
     spawnOverride: makeSpawn(state),
+    leaseDir,
     ...extra,
   });
+}
+
+/**
+ * Seed a container the way a REAL daemon would hold one: registered
+ * (created at OLD_CREATED) with the given creation-time labels.
+ * Unlabeled (no argument) = the legacy case (created before the
+ * instance-label mechanism).
+ */
+function seedContainer(
+  state: FakeState,
+  name: string,
+  labels: Record<string, string> = {},
+): void {
+  state.containers.add(name);
+  state.createdAt.set(name, OLD_CREATED);
+  state.labels.set(name, { ...labels });
 }
 
 const sourceDirs: string[] = [];
@@ -369,6 +551,16 @@ const taskExecs = (state: FakeState) =>
 afterEach(async () => {
   for (const dir of sourceDirs.splice(0)) {
     await rm(dir, { recursive: true, force: true });
+  }
+  // Lease writes are best-effort fire-and-forget: one may still be in
+  // flight when the test ends, so retry the cleanup (ENOTEMPTY).
+  for (const dir of leaseDirs.splice(0)) {
+    await rm(dir, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25,
+    });
   }
 });
 
@@ -439,6 +631,13 @@ describe("DockerWorkspaceProvider", () => {
     expect(args).toContain("--label");
     expect(args).toContain("valmont.managed=true");
     expect(args).toContain("valmont.task=task1");
+    // The instance-ownership stamp: present at creation, immutable
+    // after, and readable by every instance (including this one after a
+    // restart) when resolving who owns the container.
+    expect(args).toContain(`valmont.instance=${provider.instanceId}`);
+    expect(
+      state.labels.get("valmont-sandbox-task1")?.["valmont.instance"],
+    ).toBe(provider.instanceId);
     expect(args[args.length - 1]).toBe("test:latest");
   });
 
@@ -1437,6 +1636,329 @@ describe("DockerWorkspaceProvider", () => {
       stderr: "",
     });
     expect(await provider.readFile(ws, "a.txt")).toBe("x");
+  });
+
+  it("rejects task ids ending in the reserved quarantine suffix at every entry point", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    // `foo-quarantined` passes TASK_ID alone, but it must be rejected:
+    // task `foo`'s QUARANTINED container name
+    // (valmont-sandbox-foo-quarantined) would be byte-identical to task
+    // `foo-quarantined`'s NORMAL container name — without the
+    // reservation, open("foo-quarantined") could be handed `foo`'s
+    // quarantined container.
+    await expect(provider.create("foo-quarantined", src)).rejects.toThrow(
+      "Invalid task identifier",
+    );
+    await expect(provider.open("foo-quarantined")).rejects.toThrow(
+      "Invalid task identifier",
+    );
+    await expect(provider.destroy("foo-quarantined")).rejects.toThrow(
+      "Invalid task identifier",
+    );
+    // All before touching docker...
+    expect(state.calls).toHaveLength(0);
+    // ...and task `foo`'s surviving quarantined container (renamed to
+    // exactly this name) is unreachable as task `foo-quarantined`.
+    seedContainer(state, "valmont-sandbox-foo-quarantined", {
+      "valmont.task": "foo",
+      "valmont.instance": provider.instanceId,
+    });
+    await expect(provider.open("foo-quarantined")).rejects.toThrow(
+      "Invalid task identifier",
+    );
+    expect(state.calls).toHaveLength(0);
+  });
+
+  it("open/create/destroy verify the task label: a foreign container under the task name is never used", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    // A container that exists under task1's normal name but was created
+    // for ANOTHER task (the rename "name already in use" scenario, or a
+    // pre-fix name collision): the name matches, the label does not.
+    seedContainer(state, "valmont-sandbox-task1", {
+      "valmont.task": "other-task",
+      "valmont.instance": provider.instanceId,
+    });
+    await expect(provider.open("task1")).rejects.toThrow(
+      "Task workspace is unavailable",
+    );
+    const src = await makeSource({ "a.txt": "x" });
+    await expect(provider.create("task1", src)).rejects.toThrow(
+      "Task workspace is unavailable",
+    );
+    await expect(provider.destroy("task1")).rejects.toThrow(
+      "Task workspace is unavailable",
+    );
+    // The foreign container was never touched: no rm, still present.
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
+    expect(
+      state.calls.filter((c) => c.command === "docker" && c.args[0] === "rm"),
+    ).toHaveLength(0);
+  });
+
+  it("a docker create that leaked a container (CLI failure after daemon accept) is quarantined", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    // The daemon ACCEPTED the container but the CLI reports failure (a
+    // timeout mid-create): the container exists, half-initialized, under
+    // the normal name — and it cannot be removed. The rm failure is
+    // forced only while the (leaked) container EXISTS: the pre-cleanup
+    // rm (before create, where nothing exists yet) must succeed with
+    // "no such container", as in production.
+    state.createErrors.set(
+      "valmont-sandbox-task1",
+      "Error: creating container: request timeout\n",
+    );
+    state.onRm = (name) => {
+      if (name === "valmont-sandbox-task1" && state.containers.has(name)) {
+        state.rmErrors.set(
+          name,
+          "Error: removing container: device or resource busy\n",
+        );
+      }
+    };
+    await expect(provider.create("task1", src)).rejects.toThrow(
+      "Could not create sandbox container",
+    );
+    // The leaked container was renamed: the durable quarantine marker.
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      true,
+    );
+    expect(internals(provider).quarantinedTasks.has("task1")).toBe(true);
+    // No instance — this one or a fresh one — can open the leaked
+    // half-initialized container.
+    await expect(provider.open("task1")).rejects.toThrow(
+      "Task workspace is quarantined",
+    );
+    await expect(makeProvider(state).open("task1")).rejects.toThrow(
+      "Task workspace is quarantined",
+    );
+  });
+
+  it("a non-not-found rename failure falls back to a checked stop (fail closed across instances)", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("task1", src);
+    // The reaper cannot start, the container cannot be removed, and the
+    // quarantine RENAME fails for a non-not-found reason: the container
+    // keeps its normal name — an in-memory flag alone would fail open.
+    state.spawnFail.set("node", "spawn docker ENOENT");
+    state.rmErrors.set(
+      "valmont-sandbox-task1",
+      "Error: removing container: device or resource busy\n",
+    );
+    state.renameErrors.set(
+      "valmont-sandbox-task1",
+      "Error: renaming container: daemon error\n",
+    );
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      "Could not complete validation cleanup",
+    );
+    // The fallback stop ran and was checked: the container is STOPPED —
+    // a durable, daemon-side "do not use" state (labels are immutable,
+    // so stop is the second supported marker).
+    expect(state.stopped.has("valmont-sandbox-task1")).toBe(true);
+    const stopCall = state.calls.find(
+      (c) => c.command === "docker" && c.args[0] === "stop",
+    );
+    expect(stopCall?.args).toEqual(["stop", "valmont-sandbox-task1"]);
+    // A fresh instance (no in-memory flag) gets no handle: the
+    // container is owned by the other instance and is not running —
+    // fail closed.
+    const fresh = makeProvider(state);
+    await expect(fresh.open("task1")).rejects.toThrow(
+      "Task workspace is owned by another provider instance",
+    );
+    // ...but a stopped container has no possible live user (no
+    // operation can run in it), so the fresh instance may still
+    // destroy it — that is how this state gets cleaned up
+    // cross-instance.
+    state.rmErrors.clear();
+    await fresh.destroy("task1");
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+  });
+
+  it("two instances sharing a daemon: operations are owner-only and the reaper honors fresh leases", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const a = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      leaseTtlMs: 300,
+    });
+    const b = makeProvider(state, {
+      instanceId: "instance-b",
+      leaseDir,
+      leaseTtlMs: 300,
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    await a.create("task1", src);
+    // Instance B cannot operate on A's RUNNING container: open,
+    // create-replace, and destroy are all rejected, and the container
+    // survives all three attempts.
+    await expect(b.open("task1")).rejects.toThrow(
+      "Task workspace is owned by another provider instance",
+    );
+    await expect(b.create("task1", src)).rejects.toThrow(
+      "Task workspace is owned by another provider instance",
+    );
+    await expect(b.destroy("task1")).rejects.toThrow(
+      "Task workspace is owned by another provider instance",
+    );
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
+    // B's reaper sees the container (OLD_CREATED — older than any TTL)
+    // but A's lease is FRESH: reaping it would destroy A's live
+    // workspace, so B skips it.
+    await internals(b).reapExpired();
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
+    // A dies: its lease stops being refreshed and goes stale. B's
+    // reaper may now remove the container by age (the owner is
+    // provably gone) and cleans up the dead owner's stale lease file.
+    await sleep(400);
+    await internals(b).reapExpired();
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+    expect(existsSync(path.join(leaseDir, "task1.lease"))).toBe(false);
+  });
+
+  it("a quarantined container is reaped by age by ANY instance, even a live owner", async () => {
+    const state = makeState();
+    const a = makeProvider(state, { instanceId: "instance-a" });
+    const b = makeProvider(state, { instanceId: "instance-b" });
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await a.create("task1", src);
+    // A quarantines: the reaper cannot start AND the container cannot
+    // be removed, so it survives, renamed to the durable marker.
+    state.spawnFail.set("node", "spawn docker ENOENT");
+    state.rmErrors.set(
+      "valmont-sandbox-task1",
+      "Error: removing container: device or resource busy\n",
+    );
+    await expect(a.runValidation(ws, "npm test")).rejects.toThrow(
+      "Could not complete validation cleanup",
+    );
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      true,
+    );
+    // A's lease is FRESH (A is alive and just operated on the task) —
+    // yet B's reaper removes the QUARANTINED container anyway: it is
+    // unusable by definition (every operation rejects it), so no live
+    // user can be racing its removal.
+    await internals(b).reapExpired();
+    expect(state.containers.has("valmont-sandbox-task1-quarantined")).toBe(
+      false,
+    );
+    // B never touched A's lease file.
+    expect(existsSync(path.join(a.leaseDir, "task1.lease"))).toBe(true);
+  });
+
+  it("adopts an unlabeled (legacy) container, claims it via the lease, and peer reapers respect the claim", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const a = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      leaseTtlMs: 300,
+    });
+    const b = makeProvider(state, {
+      instanceId: "instance-b",
+      leaseDir,
+      leaseTtlMs: 300,
+    });
+    // A legacy container: managed, but no instance label (created
+    // before the mechanism). No live instance can own it, so A adopts
+    // it on open and claims it via the lease...
+    seedContainer(state, "valmont-sandbox-task1", {
+      "valmont.task": "task1",
+    });
+    const handle = await a.open("task1");
+    expect(handle).toEqual({ id: "task1", root: "/workspace" });
+    expect(existsSync(path.join(leaseDir, "task1.lease"))).toBe(true);
+    // ...and while the claim is fresh, B's reaper skips it (by age it
+    // is long overdue: OLD_CREATED).
+    await internals(b).reapExpired();
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
+    // A dies: the claim goes stale, and B reaps the orphan by age.
+    await sleep(400);
+    await internals(b).reapExpired();
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(false);
+  });
+
+  it("a corrupt (torn) foreign lease fails closed: the container is left alone until the lease is resolved", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      leaseTtlMs: 300,
+    });
+    // A foreign instance's container (OLD_CREATED — older than any
+    // TTL)...
+    seedContainer(state, "valmont-sandbox-task2", {
+      "valmont.task": "task2",
+      "valmont.instance": "instance-b",
+    });
+    // ...with a TORN lease file (a write that crashed mid-way): the
+    // owner may still be alive, and "cannot prove death" fails closed.
+    writeFileSync(
+      path.join(leaseDir, "task2.lease"),
+      '{"instanceId": "instance-b", "update',
+    );
+    await internals(provider).reapExpired();
+    expect(state.containers.has("valmont-sandbox-task2")).toBe(true);
+    // Once the lease is a VALID STALE one, the owner is provably gone:
+    // the container is reaped by age.
+    writeFileSync(
+      path.join(leaseDir, "task2.lease"),
+      JSON.stringify({
+        instanceId: "instance-b",
+        updatedAt: Date.now() - 10_000,
+        containerName: "valmont-sandbox-task2",
+      }),
+    );
+    await internals(provider).reapExpired();
+    expect(state.containers.has("valmont-sandbox-task2")).toBe(false);
+  });
+
+  it("a long operation's completion refreshes activity: the reaper behind it defers, not removes", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("task1", src);
+    await sleep(500); // let the create's activity go stale (ttl 400)
+    state.psLines = ["valmont-sandbox-task1\ttask1"];
+    state.statResults.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "regular file\n",
+      stderr: "",
+    });
+    state.fileContents.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "x\n",
+      stderr: "",
+    });
+    // The read genuinely takes 3000 ms — far past the 400 ms TTL — so
+    // its ENQUEUE timestamp is stale for most of the operation.
+    state.execDelays.set("cat", 3000);
+    const readPromise = provider.readFile(ws, "a.txt");
+    await sleep(800); // enqueue activity is now stale; the op is running
+    // The reaper's ps-time check sees the STALE enqueue timestamp and
+    // proceeds to the per-task lock, where it waits behind the
+    // in-flight read. When the read COMPLETES it refreshes the
+    // activity — the reaper's in-lock check must now see the task as
+    // freshly used and defer. (Without the completion refresh it would
+    // remove the container the moment the read finished.)
+    await internals(provider).reapExpired();
+    await readPromise;
+    expect(state.containers.has("valmont-sandbox-task1")).toBe(true);
+    expect(internals(provider).taskActivity.has("task1")).toBe(true);
   });
 });
 

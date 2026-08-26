@@ -1,5 +1,15 @@
+import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { cp, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -76,8 +86,65 @@ import {
  * - every provider operation for a task is serialized by an in-provider
  *   per-task queue, so no two operations — and no stat-then-use sequence
  *   within one of them — can ever overlap on the same container; operations
- *   record activity when they are enqueued, so work that is merely waiting
- *   in the queue still counts as task activity for the TTL reaper;
+ *   record activity when they are enqueued AND refresh it when they
+ *   COMPLETE, so work that is merely waiting in the queue still counts as
+ *   task activity for the TTL reaper, and a long-running operation (one
+ *   that outlives its own enqueue timestamp) cannot be reaped the moment
+ *   it finishes — the reaper waits behind it for the per-task lock, and by
+ *   the time it runs the completion has refreshed the activity;
+ * - cross-instance ownership: a per-task lock and an activity timestamp are
+ *   PROCESS-LOCAL, so two provider instances sharing one Docker daemon
+ *   could otherwise operate on, or TTL-reap, the same task concurrently
+ *   (e.g. a second instance starts a legitimate `docker exec` while the
+ *   first instance's validation reaper is still SIGKILLing "survivors" of
+ *   it, or one instance's reaper removes a task the other is actively
+ *   using). The provider therefore assigns every instance an identity
+ *   (`instanceId`, default a per-process random UUID; configure it for a
+ *   stable identity across restarts) and stamps every container it creates
+ *   with the creation-time label `valmont.instance=<id>` (labels are set at
+ *   creation and immutable after — a supported mechanism, no rename or
+ *   label-update needed). Every open/create/destroy then RESOLVES OWNERSHIP
+ *   of the existing container before acting: the instance named by the
+ *   label is the owner; an unlabeled container has no live owner (every
+ *   live instance stamps the label, so an unlabeled container predates
+ *   this mechanism or its creator is gone) and is taken over; a container
+ *   labeled with ANOTHER instance is operable only when that instance is
+ *   provably dead. Concretely: OPERATIONS (open/create/destroy) are
+ *   OWNER-ONLY — a foreign-labeled container is rejected with the
+ *   ownership error, full stop (no lease consultation), so two instances
+ *   can never operate on the same container concurrently. An unlabeled
+ *   container (no live label-owner possible) IS adopted by the first
+ *   instance that opens/creates it, claimed via a lease file. REAPING is
+ *   SHARED, gated by a host-side LEASE: with `leaseDir` set, each
+ *   instance writes a `<taskId>.lease` file (JSON: instanceId,
+ *   updatedAt, containerName) on create, on adoption, on every operation
+ *   enqueue/completion, and on every reaper sweep of a task it owns; the
+ *   reaper refreshes it even for idle owned tasks, so the lease is a
+ *   liveness signal for the INSTANCE, not the task. The reaper then:
+ *   skips a foreign container whose owner's lease is fresh (the owner's
+ *   own reaper handles it — reaping it here would destroy another
+ *   instance's live workspace); reaps a foreign container whose lease is
+ *   stale or absent by the container's AGE (the owner is provably gone —
+ *   it would have refreshed on every operation and every sweep — and no
+ *   activity record is shared across instances, so age is the only
+ *   signal); and reaps quarantined-name containers by age regardless of
+ *   owner (they are unusable by definition). Lease files are ALWAYS
+ *   enabled (default `<os tmpdir>/valmont-sandbox-leases`; `leaseDir`
+ *   overrides): without them the default config would either let one
+ *   instance's reaper remove a task another live instance is using, or
+ *   orphan every container after a restart — both are worse than a few
+ *   hundred bytes of lease files. Lease file I/O is best-effort: a
+ *   failed write never fails an operation (degraded liveness
+ *   detection), and a corrupt/torn lease file is treated as "cannot
+ *   prove death" (strict — the task is left alone), never as "dead";
+ * - the quarantine marker name space is disjoint from the task name space:
+ *   task identifiers ending in `-quarantined` are REJECTED at every public
+ *   entry (see isValidTaskId), so a task's quarantine name can never equal
+ *   another task's normal container name. In addition, open() verifies the
+ *   container's `valmont.task` LABEL matches the requested task before
+ *   handing out a handle — the NAME alone is never trusted (a rename that
+ *   failed with "name already in use" can leave a foreign container under
+ *   a name this instance expects to be its own);
  * - validation cleanup: after every validation run, a fixed exec of the
  *   provider-staged reaper script, AS THE UNPRIVILEGED USER (`node
  *   /reap/validation-reap.mjs <start-time>`), SIGKILLs every process that
@@ -106,7 +173,17 @@ import {
  *   after creation, so a rename is the only supported persistent
  *   marker): `open()` probes that name on every task-name miss, so no
  *   provider instance (including one that restarted, or a second one)
- *   can ever hand out the untrusted container. Every later operation
+ *   can ever hand out the untrusted container. If the RENAME itself fails
+ *   for a reason other than "no such container" (the container then keeps
+ *   its normal name), the provider does NOT fail open on an in-memory
+ *   flag alone — it additionally STOPs the container (a supported,
+ *   checked operation): a stopped container reports `Running=false`, so
+ *   EVERY instance's open() rejects it without ever trusting process-
+ *   local state, and destroy()/the reaper can still `rm -f` it later.
+ *   Only if BOTH the rename and the stop fail (a daemon broken enough to
+ *   refuse both) does the provider fall back to the flag plus the TTL
+ *   reaper as the backstop — documented as the residual of an
+ *   unrecoverable daemon. Every later operation
  *   rejects with "Task workspace is quarantined" until an explicit
  *   `destroy()` (or a `create()` replacement) succeeds — both remove the
  *   container under either name. Rationale: a surviving validation
@@ -115,7 +192,13 @@ import {
  *   later cleanup would ever reach it. A failed create() setup that
  *   cannot remove its half-initialized container is quarantined the same
  *   way (the quarantine is cleared only when the replacement setup
- *   completes successfully);
+ *   completes successfully). `docker create` itself is INSIDE that setup
+ *   coverage: a CLI-level failure or timeout on create is an UNCERTAIN
+ *   side effect (the daemon may have accepted the container), so the
+ *   create call and every subsequent setup step share one try block whose
+ *   catch removes the container if it can and QUARANTINES it if it
+ *   cannot — a half-initialized container under the normal name must
+ *   never be openable, by this instance or any other;
  * - the reaper script lives on a SECOND, root-owned `0701` tmpfs mounted
  *   at `/reap` (a separate mount point on the read-only rootfs), not in
  *   the task-writable workspace: the unprivileged user can traverse
@@ -177,6 +260,41 @@ export interface DockerWorkspaceOptions {
   ttlMs?: number;
   reapIntervalMs?: number;
   /**
+   * This provider instance's identity (default: a random UUID per
+   * process). Every container this instance creates is stamped with the
+   * creation-time label `valmont.instance=<id>`, and open/create/destroy
+   * resolve task ownership by that label plus the host-side leases below
+   * (see the class documentation), so two instances sharing one daemon
+   * cannot operate on the same task concurrently. Set a STABLE value for
+   * a deployment that restarts (the same identity resumes its own tasks;
+   * different live instances must use different values).
+   */
+  instanceId?: string;
+  /**
+   * Host-side directory holding per-task lease files
+   * (`<taskId>.lease`, JSON `{instanceId, updatedAt, containerName}`).
+   * A lease is a liveness claim: while another instance's lease for a
+   * task is younger than `leaseTtlMs`, this instance's reaper skips the
+   * task (the owner's own reaper handles it) and a corrupt lease fails
+   * closed to "skip" as well; a stale or absent lease proves the owner
+   * is gone, so the task is reaped by the container's age. Operations
+   * (open/create/destroy) are owner-only regardless of the lease.
+   * Default: `<os tmpdir>/valmont-sandbox-leases` — lease files are
+   * ALWAYS enabled (see the constructor: without them the default
+   * config is either cross-instance unsafe or leaks containers across
+   * restarts). Point several provider processes on one host at a shared
+   * directory (the default already is, on a single host). Lease file
+   * I/O is best-effort and never fails an operation.
+   */
+  leaseDir?: string;
+  /**
+   * How long a lease counts as alive (default 10 minutes; should exceed
+   * several reaper intervals). The owner refreshes its lease on create,
+   * on takeover, and on every operation enqueue and completion, so a
+   * task with any recent work keeps a fresh lease.
+   */
+  leaseTtlMs?: number;
+  /**
    * Output cap (bytes) for the TTL reaper's `docker ps` listing
    * (default 4 MiB — thousands of ~100-byte lines). A listing that
    * exceeds the cap is SKIPPED, never partially processed (see
@@ -225,6 +343,22 @@ const TASK_ID = /^[a-zA-Z0-9_-]{3,80}$/;
 const WORKSPACE_UNAVAILABLE = "Task workspace is unavailable";
 
 /**
+ * The error for a task whose container exists but is OWNED by another live
+ * provider instance (see the instance-ownership section of the class
+ * documentation): open/create/destroy by a non-owner are rejected while the
+ * owner's lease is fresh, so two instances can never operate on — or reap —
+ * the same task concurrently.
+ */
+const WORKSPACE_OWNED = "Task workspace is owned by another provider instance";
+
+/**
+ * What a Go `{{index .Labels "..."}}` template renders for a MISSING label —
+ * the fake daemon mirrors it, and the provider treats it (and the empty
+ * string) as "no label of that kind".
+ */
+const NO_LABEL = "<no value>";
+
+/**
  * Quarantined tasks reject every operation until explicit teardown. The
  * container (and everything in it) is untrusted after a failed validation
  * cleanup, so this is stricter than "unavailable": it persists even while
@@ -245,6 +379,26 @@ const QUARANTINE_ERROR =
  * instance) still lists and reaps the container by its managed label.
  */
 const QUARANTINED_SUFFIX = "-quarantined";
+
+/**
+ * Task identifiers are validated against TASK_ID AND must not end with the
+ * quarantine suffix. The reservation is what makes the two container-name
+ * spaces DISJOINT: the normal name of task `<id>` is
+ * `valmont-sandbox-<id>`, and the durable quarantine name of task `<id>` is
+ * `valmont-sandbox-<id>-quarantined` (see QUARANTINED_SUFFIX). Without the
+ * reservation, `foo-quarantined` is itself a valid TASK_ID, so task
+ * `foo-quarantined`'s NORMAL container name would be byte-identical to
+ * task `foo`'s QUARANTINED marker name — `open("foo-quarantined")` could be
+ * handed `foo`'s quarantined container, and `cleanupAll("foo")` could
+ * remove `foo-quarantined`'s live container. Rejecting any identifier that
+ * ends in the suffix guarantees a normal name never ends in it, so no
+ * normal name can ever equal a quarantine name (and vice versa). This is
+ * enforced at every public entry point, so a quarantined task can never be
+ * re-created under the reserved identifier.
+ */
+function isValidTaskId(taskId: string): boolean {
+  return TASK_ID.test(taskId) && !taskId.endsWith(QUARANTINED_SUFFIX);
+}
 
 const GIT_EXCLUDES = [
   ".env*",
@@ -553,6 +707,16 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     readonly [string, ...string[]]
   >;
   private readonly spawnImpl: DockerSpawn;
+  /**
+   * This instance's identity (see the `instanceId` option): stamped on
+   * every container this instance creates and compared against the
+   * `valmont.instance` label when resolving task ownership.
+   */
+  readonly instanceId: string;
+  /** Host-side lease directory (see the `leaseDir` option); always set. */
+  readonly leaseDir: string;
+  /** Lease liveness window (see the `leaseTtlMs` option). */
+  readonly leaseTtlMs: number;
   private reaperTimer?: NodeJS.Timeout;
   private reaperRunning = false;
   /**
@@ -562,11 +726,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    */
   private readonly taskLocks = new Map<string, Promise<void>>();
   /**
-   * Last provider-operation timestamp per task, recorded when the operation
-   * is ENQUEUED (not when it starts executing): a task is "abandoned" (and
-   * eligible for reaping) only when it has had neither an in-flight nor a
-   * queued operation for longer than the TTL — a long-running or
-   * backlog-heavy but still-active task is never reaped.
+   * Last provider-operation timestamp per task, recorded when an operation
+   * is ENQUEUED and REFRESHED when it COMPLETES (not when it starts
+   * executing): a task is "abandoned" (and eligible for reaping) only when
+   * it has had neither an in-flight nor a queued operation for longer than
+   * the TTL — a long-running or backlog-heavy but still-active task is
+   * never reaped, and a long operation that outlives its own enqueue
+   * timestamp cannot be reaped the moment it finishes (the reaper waits
+   * behind it for the per-task lock, and the completion refresh makes the
+   * in-lock activity check see the task as freshly used).
    */
   private readonly taskActivity = new Map<string, number>();
   /**
@@ -611,6 +779,17 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     this.psListLimitBytes = options.psListLimitBytes ?? 4_194_304;
     this.allowedCommands = options.allowedCommands ?? DEFAULT_ALLOWED_COMMANDS;
     this.spawnImpl = options.spawnOverride ?? nodeSpawn;
+    this.instanceId = options.instanceId ?? randomUUID();
+    // Lease files are ALWAYS enabled: without cross-instance liveness
+    // information the default config would either let one instance's
+    // reaper remove a task another live instance is using (foreign
+    // containers reaped by age) or orphan every container after a
+    // restart (foreign containers never reaped). The default directory
+    // lives in the OS temp dir (writable, per-host); a deployment with
+    // several provider processes on one host shares it automatically.
+    this.leaseDir =
+      options.leaseDir ?? path.join(tmpdir(), "valmont-sandbox-leases");
+    this.leaseTtlMs = options.leaseTtlMs ?? 600_000;
     const reapIntervalMs = options.reapIntervalMs ?? 600_000;
     if (reapIntervalMs > 0 && this.ttlMs > 0) {
       this.reaperTimer = setInterval(() => {
@@ -660,7 +839,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   async create(taskId: string, sourceRoot: string): Promise<WorkspaceHandle> {
-    if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
+    if (!isValidTaskId(taskId)) throw new Error("Invalid task identifier");
     return this.withTaskLock(taskId, () => this.createCore(taskId, sourceRoot));
   }
 
@@ -669,6 +848,34 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     sourceRoot: string,
   ): Promise<WorkspaceHandle> {
     const name = this.containerName(taskId);
+    // OWNERSHIP GATE BEFORE ANY DESTRUCTIVE CALL: a container may already
+    // exist under the normal name (a previous attempt by this or another
+    // instance). The label is verified (the name alone is not proof of
+    // which task the container was created for), and a container owned by
+    // ANOTHER live instance must never be rm'd here — removing it would
+    // destroy that instance's live workspace. A quarantined-name container
+    // (any owner) is not gated: it is unusable by definition.
+    const existing = await this.inspectContainer(name);
+    if (existing.exists) {
+      // A container labeled for a DIFFERENT task is never replaced
+      // (the name alone is not proof of which task it was created for).
+      // An unlabeled (legacy) container may be replaced: it belongs to
+      // no live task.
+      if (existing.taskLabel !== NO_LABEL && existing.taskLabel !== taskId) {
+        throw new Error(WORKSPACE_UNAVAILABLE);
+      }
+      // A RUNNING container owned by another live instance is that
+      // instance's live workspace — never removed. A STOPPED foreign
+      // container (e.g. the quarantine stop-fallback state) has no
+      // possible live user — no operation can run in a stopped
+      // container — so replacing it is safe.
+      if (
+        this.classifyContainer(existing.instanceLabel) === "foreign" &&
+        existing.running
+      ) {
+        throw new Error(WORKSPACE_OWNED);
+      }
+    }
     // Note: a previous quarantine is NOT cleared here. Setup (start,
     // source staging, reaper installation, git baseline) must complete
     // first — if it fails and the container cannot be removed, the
@@ -735,23 +942,36 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       "valmont.managed=true",
       "--label",
       `valmont.task=${taskId}`,
+      // The instance-ownership stamp (see the cross-instance ownership
+      // section of the class documentation): set at creation, immutable
+      // after, and read by every instance — including this one after a
+      // restart — when resolving who owns the container.
+      "--label",
+      `valmont.instance=${this.instanceId}`,
       "--restart",
       "no",
       "--stop-timeout",
       "5",
       this.image,
     ];
-    const created = await this.docker(
-      createArgs,
-      60_000,
-      this.outputLimitBytes,
-    );
-    if (created.code !== 0) {
-      throw new Error(
-        `Could not create sandbox container: ${created.stderr.trim() || created.code}`,
-      );
-    }
     try {
+      // `docker create` is INSIDE the setup coverage: a CLI-level failure
+      // or timeout here is an UNCERTAIN side effect — the daemon may have
+      // accepted the container, which then exists half-initialized under
+      // the normal name. The catch below covers exactly that: remove the
+      // container if it can be removed, QUARANTINE it if it cannot, so a
+      // leaked half-initialized container is never openable — by this
+      // instance or any other.
+      const created = await this.docker(
+        createArgs,
+        60_000,
+        this.outputLimitBytes,
+      );
+      if (created.code !== 0) {
+        throw new Error(
+          `Could not create sandbox container: ${created.stderr.trim() || created.code}`,
+        );
+      }
       const started = await this.docker(
         ["start", name],
         30_000,
@@ -766,67 +986,93 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       await this.installValidationReaper(taskId, name);
       await this.gitBaseline(taskId, name);
     } catch (error) {
-      // Setup failed. If the container cannot be removed it is
-      // half-initialized and must NOT be reusable (a later open() would
-      // hand out a workspace missing the reaper/baseline/git setup) —
-      // quarantine it (in-memory flag + durable container label + one
-      // more best-effort removal). If the removal succeeds there is
-      // nothing left to quarantine. The original setup error wins.
-      const removed = await this.cleanup(taskId).then(
-        () => true,
-        () => false,
-      );
-      if (!removed) {
+      // Setup failed — including the `docker create` call itself, whose
+      // failure/timeout is an UNCERTAIN side effect (the daemon may hold
+      // a half-initialized container under the normal name). If the
+      // container cannot be removed it must NOT be reusable (a later
+      // open() would hand out a workspace missing the reaper/baseline/
+      // git setup — or, on a create failure, one that never got any
+      // setup at all) — quarantine it (in-memory flag + durable rename +
+      // stop fallback, so no instance can open it). If the removal
+      // succeeds there is nothing left to quarantine. The original setup
+      // error wins.
+      await this.cleanupAll(taskId).catch(() => undefined);
+      const surviving = await this.inspectContainer(name);
+      if (surviving.exists) {
         await this.quarantineTask(taskId);
       }
       throw error;
     }
     // Setup completed fully: a previous quarantine (which trusted
     // nothing about the OLD container) no longer applies — the new
-    // container has no label and the flag is cleared only now.
+    // container is freshly stamped — and the flag is cleared only now.
+    // Claim the task with a fresh lease (the liveness signal peer
+    // instances' reapers consult before touching it).
     this.quarantinedTasks.delete(taskId);
+    await this.writeLease(taskId, name);
     return { id: taskId, root: "/workspace" };
   }
 
   async open(taskId: string): Promise<WorkspaceHandle> {
-    if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
+    if (!isValidTaskId(taskId)) throw new Error("Invalid task identifier");
     return this.withTaskLock(taskId, () => this.openCore(taskId));
   }
 
   private async openCore(taskId: string): Promise<WorkspaceHandle> {
     this.assertNotQuarantined(taskId);
-    const inspected = await this.docker(
-      ["inspect", "--format", "{{.State.Running}}", this.containerName(taskId)],
-      15_000,
-      20_000,
-    );
-    if (inspected.code !== 0) {
-      // No container under the task name. Before reporting "unavailable",
-      // probe the durable quarantine marker: a surviving unremovable
-      // container was RENAMED to <name>-quarantined (see
-      // quarantineTask) — that state is in the daemon, so this instance
-      // sees it even after a restart, and even when it is a SECOND
-      // instance with no in-memory state.
-      const quarantined = await this.docker(
-        [
-          "inspect",
-          "--format",
-          "{{.State.Running}}",
-          this.quarantinedContainerName(taskId),
-        ],
-        15_000,
-        20_000,
-      );
-      if (quarantined.code === 0) {
-        this.quarantinedTasks.add(taskId);
-        throw new Error(QUARANTINE_ERROR);
+    const name = this.containerName(taskId);
+    const inspected = await this.inspectContainer(name);
+    if (inspected.exists) {
+      // LABEL VERIFICATION before anything else: a container under this
+      // task's name must have been created FOR this task. The name alone
+      // is not proof — a rename that failed with "name already in use"
+      // can leave a foreign container under a name this instance expects
+      // to be its own, and (without the reserved-suffix check) a
+      // quarantined container of another task could sit at exactly this
+      // name. Handing out either of those would be a cross-task leak.
+      // An UNLABELED container (taskLabel = "<no value>") is the legacy
+      // case (created before this mechanism): it is provably not any
+      // live instance's current task, so it is adopted (see below). A
+      // container labeled for a DIFFERENT task is never handed out.
+      if (inspected.taskLabel !== NO_LABEL && inspected.taskLabel !== taskId) {
+        throw new Error(WORKSPACE_UNAVAILABLE);
       }
-      throw new Error(WORKSPACE_UNAVAILABLE);
+      // OWNERSHIP: a container stamped with ANOTHER instance is that
+      // instance's live workspace (its lease may be stale if it is idle
+      // — operating on it anyway would let our reaper SIGKILL its
+      // processes and race its operations). Only the owning instance
+      // operates on its own containers; an unlabeled container has no
+      // live label-owner (every live instance stamps the label at
+      // creation) and is adopted — the adoption is claimed via the
+      // lease, since the label itself cannot be changed.
+      if (this.classifyContainer(inspected.instanceLabel) === "foreign") {
+        throw new Error(WORKSPACE_OWNED);
+      }
+      if (this.classifyContainer(inspected.instanceLabel) === "unlabeled") {
+        await this.writeLease(taskId, name);
+      }
+      if (!inspected.running) {
+        // A stopped container (e.g. left stopped by a quarantine's
+        // rename-failure stop fallback) is unusable — open() reports the
+        // plain lifecycle error; destroy() can still remove it.
+        throw new Error(WORKSPACE_UNAVAILABLE);
+      }
+      return { id: taskId, root: "/workspace" };
     }
-    if (inspected.stdout.trim() !== "true") {
-      throw new Error(WORKSPACE_UNAVAILABLE);
+    // No container under the task name. Before reporting "unavailable",
+    // probe the durable quarantine marker: a surviving unremovable
+    // container was RENAMED to <name>-quarantined (see
+    // quarantineTask) — that state is in the daemon, so this instance
+    // sees it even after a restart, and even when it is a SECOND
+    // instance with no in-memory state.
+    const quarantined = await this.inspectContainer(
+      this.quarantinedContainerName(taskId),
+    );
+    if (quarantined.exists) {
+      this.quarantinedTasks.add(taskId);
+      throw new Error(QUARANTINE_ERROR);
     }
-    return { id: taskId, root: "/workspace" };
+    throw new Error(WORKSPACE_UNAVAILABLE);
   }
 
   async readFile(
@@ -1257,13 +1503,26 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       // The rename failed for a reason other than "the original name is
       // already gone" (which is the success case: the container was
       // already renamed by a prior quarantine, or nothing remains). The
-      // in-memory flag still blocks THIS instance, but the container is
-      // still under its task name and a fresh instance could open it.
-      // There is no other durable daemon-side marker available (labels
-      // are immutable after creation, so a rename is the only one), so
-      // this is logged-loudly-by-absence: the TTL reaper on this
-      // instance remains the backstop. The flag is never cleared, so at
-      // least this instance keeps rejecting.
+      // container KEEPS its normal name, so the in-memory flag alone
+      // would FAIL OPEN across instances: a restarted or second provider
+      // would see a RUNNING container under the task name and open it.
+      // Fail closed with a second supported, DURABLE operation: stop
+      // the container. A stopped container reports Running=false, so
+      // EVERY instance's open() rejects it (openCore requires
+      // Running=true — no process-local state is trusted), while
+      // destroy() and the reaper can still `rm -f` it whenever the
+      // daemon cooperates.
+      const stopped = await this.docker(
+        ["stop", this.containerName(taskId)],
+        30_000,
+        20_000,
+      );
+      if (stopped.code !== 0 && !/no such container/i.test(stopped.stderr)) {
+        // BOTH the rename and the stop failed: the daemon is broken
+        // enough that no durable marker can be written. The in-memory
+        // flag (set above, never cleared) blocks this instance, and the
+        // TTL reaper remains the backstop for the container.
+      }
     }
   }
 
@@ -1282,12 +1541,38 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * (renamed) container is actually destroyed here, not orphaned.
    */
   async destroy(taskId: string): Promise<void> {
-    if (!TASK_ID.test(taskId)) throw new Error("Invalid task identifier");
+    if (!isValidTaskId(taskId)) throw new Error("Invalid task identifier");
     return this.withTaskLock(taskId, async () => {
+      // The same ownership gate as open/create, applied BEFORE any rm:
+      // a normal-name container whose task label differs, or that is
+      // stamped with another instance, must never be removed by this
+      // instance (it is another instance's live workspace). A
+      // quarantined-name container is not gated: it is unusable by
+      // definition, and destroy() is the explicit operation that clears
+      // a quarantine.
+      const existing = await this.inspectContainer(this.containerName(taskId));
+      if (existing.exists) {
+        // Same rules as create(): a container labeled for a different
+        // task is never removed; a STOPPED foreign container (the
+        // quarantine stop-fallback state, left behind by an instance
+        // whose flag this process does not hold) has no possible live
+        // user, so removing it is how that state gets cleaned up.
+        if (existing.taskLabel !== NO_LABEL && existing.taskLabel !== taskId) {
+          throw new Error(WORKSPACE_UNAVAILABLE);
+        }
+        if (
+          this.classifyContainer(existing.instanceLabel) === "foreign" &&
+          existing.running
+        ) {
+          throw new Error(WORKSPACE_OWNED);
+        }
+      }
       await this.cleanupAll(taskId);
       // The removal was checked (cleanupAll throws on a failed rm): the
-      // task's container is gone, so its quarantine is over too.
+      // task's container is gone, so its quarantine is over too, and its
+      // lease no longer claims liveness for anything.
       this.quarantinedTasks.delete(taskId);
+      await this.deleteLease(taskId);
     });
   }
 
@@ -1322,7 +1607,16 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     fn: (myTail: Promise<void>) => Promise<T>,
     recordActivity: boolean = true,
   ): Promise<T> {
-    if (recordActivity) this.taskActivity.set(taskId, Date.now());
+    if (recordActivity) {
+      this.taskActivity.set(taskId, Date.now());
+      // The lease is the cross-instance liveness claim: refresh it while
+      // the operation is QUEUED (a queued operation already proves the
+      // task is in use, for peer instances' reapers as for our own) and
+      // again when it COMPLETES (see below). Fire-and-forget: an
+      // operation's outcome must never depend on lease I/O (writeLease
+      // catches all errors).
+      void this.writeLease(taskId, this.containerName(taskId));
+    }
     const previous = this.taskLocks.get(taskId) ?? Promise.resolve();
     let release: () => void = () => undefined;
     const current = previous
@@ -1346,6 +1640,25 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
           if (this.taskLocks.get(taskId) === current) {
             this.taskLocks.delete(taskId);
           }
+          if (recordActivity && this.taskActivity.has(taskId)) {
+            // Refresh activity at COMPLETION as well as at enqueue: the
+            // task was in use until the operation FINISHED, and a long
+            // operation can outlive its own enqueue timestamp. The TTL
+            // reaper waits behind this operation for the per-task lock,
+            // so without the completion refresh its in-lock check would
+            // still see the stale enqueue timestamp and remove the
+            // container the moment the operation completes. The guard
+            // means "refresh an EXISTING record, never create one": if
+            // the record was dropped while this operation was in flight
+            // (the documented rm-race outcome: the container is gone and
+            // this operation failed with the lifecycle error), the
+            // completion must not resurrect the bookkeeping. (The
+            // reaper's own removal passes recordActivity=false and
+            // refreshes nothing — it must not make the task it is
+            // removing look active.)
+            this.taskActivity.set(taskId, Date.now());
+            void this.writeLease(taskId, this.containerName(taskId));
+          }
         }
       });
   }
@@ -1360,6 +1673,145 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    */
   private quarantinedContainerName(taskId: string): string {
     return `${this.containerName(taskId)}${QUARANTINED_SUFFIX}`;
+  }
+
+  /**
+   * Inspect a container by name in ONE call, reading its Running state and
+   * the two ownership labels (task + instance). The NAME alone is never
+   * trusted for ownership: a rename that failed with "name already in use"
+   * can leave a foreign container under a name this instance expects to be
+   * its own, so the labels are authoritative. A missing label renders as
+   * `<no value>` (NO_LABEL); a missing container is exists=false.
+   */
+  private async inspectContainer(name: string): Promise<{
+    exists: boolean;
+    running: boolean;
+    taskLabel: string;
+    instanceLabel: string;
+  }> {
+    const result = await this.docker(
+      [
+        "inspect",
+        "--format",
+        '{{.State.Running}}|{{index .Config.Labels "valmont.task"}}|{{index .Config.Labels "valmont.instance"}}',
+        name,
+      ],
+      15_000,
+      this.outputLimitBytes,
+    );
+    if (result.code !== 0) {
+      return {
+        exists: false,
+        running: false,
+        taskLabel: "",
+        instanceLabel: "",
+      };
+    }
+    const [running, taskLabel, instanceLabel] = result.stdout.trim().split("|");
+    return {
+      exists: true,
+      running: running === "true",
+      taskLabel: taskLabel ?? "",
+      instanceLabel: instanceLabel ?? "",
+    };
+  }
+
+  /**
+   * Classify a container's `valmont.instance` label relative to THIS
+   * instance: "mine" (the label is this instanceId), "unlabeled" (no label
+   * — the creator predates the mechanism or is gone; no live instance can
+   * own it), or "foreign" (another live-or-dead instance created it).
+   */
+  private classifyContainer(
+    instanceLabel: string,
+  ): "mine" | "unlabeled" | "foreign" {
+    if (instanceLabel === "" || instanceLabel === NO_LABEL) return "unlabeled";
+    if (instanceLabel === this.instanceId) return "mine";
+    return "foreign";
+  }
+
+  private leasePath(taskId: string): string {
+    return path.join(this.leaseDir!, `${taskId}.lease`);
+  }
+
+  /**
+   * Read this task's lease. "absent" = no file (or no leaseDir);
+   * "corrupt" = a file that is not valid lease JSON (a torn write —
+   * treated as "cannot prove death", the strict side); "valid" = a parsed
+   * lease. A corrupt lease is NEVER treated as "owner dead".
+   */
+  private async readLease(
+    taskId: string,
+  ): Promise<
+    | { kind: "absent" }
+    | { kind: "corrupt" }
+    | { kind: "valid"; instanceId: string; updatedAt: number }
+  > {
+    if (!this.leaseDir) return { kind: "absent" };
+    let raw: string;
+    try {
+      raw = await readFile(this.leasePath(taskId), "utf8");
+    } catch {
+      return { kind: "absent" };
+    }
+    try {
+      const parsed = JSON.parse(raw) as {
+        instanceId?: unknown;
+        updatedAt?: unknown;
+      };
+      if (
+        typeof parsed.instanceId !== "string" ||
+        typeof parsed.updatedAt !== "number"
+      ) {
+        return { kind: "corrupt" };
+      }
+      return {
+        kind: "valid",
+        instanceId: parsed.instanceId,
+        updatedAt: parsed.updatedAt,
+      };
+    } catch {
+      return { kind: "corrupt" };
+    }
+  }
+
+  /**
+   * Best-effort lease write (a liveness claim for this task, held by THIS
+   * instance). Never throws: a failed write must not fail the operation —
+   * it only degrades liveness detection (at worst another instance takes
+   * over a task whose owner stopped refreshing). Written to a temp file
+   * then renamed so a crashed writer leaves either the previous lease or
+   * the new one, never a torn file (a torn file reads as "corrupt" =
+   * strict, never "dead").
+   */
+  private async writeLease(
+    taskId: string,
+    containerName: string,
+  ): Promise<void> {
+    if (!this.leaseDir) return;
+    const payload = JSON.stringify({
+      instanceId: this.instanceId,
+      updatedAt: Date.now(),
+      containerName,
+    });
+    try {
+      await mkdir(this.leaseDir, { recursive: true });
+      const tmp = `${this.leaseDir}/${taskId}.lease.tmp`;
+      await writeFile(tmp, payload, "utf8");
+      await rename(tmp, this.leasePath(taskId));
+    } catch {
+      // best-effort
+    }
+  }
+
+  /** Best-effort lease deletion (the task is gone or quarantined). */
+  private async deleteLease(taskId: string): Promise<void> {
+    if (!this.leaseDir) return;
+    try {
+      await rm(this.leasePath(taskId), { force: true });
+    } catch {
+      // best-effort
+    }
   }
 
   /**
@@ -1877,6 +2329,13 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     if (this.reaperRunning) return;
     this.reaperRunning = true;
     try {
+      // Four columns: the container ID (the rm target), the task label,
+      // the INSTANCE label (ownership, see the class documentation), and
+      // the name (carries the quarantine marker). The instance column is
+      // what lets this instance SKIP containers a live foreign instance
+      // owns — reaping them here would remove a task another instance is
+      // using. (A missing label renders as "<no value>" — Go template
+      // behavior the fake daemon mirrors.)
       const listed = await this.docker(
         [
           "ps",
@@ -1884,7 +2343,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
           "--filter",
           "label=valmont.managed=true",
           "--format",
-          '{{.ID}}\t{{.Label "valmont.task"}}',
+          '{{.ID}}\t{{.Label "valmont.task"}}\t{{.Label "valmont.instance"}}\t{{.Names}}',
         ],
         30_000,
         this.psListLimitBytes,
@@ -1903,16 +2362,21 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         return;
       }
       for (const line of listed.stdout.split(/\r?\n/).filter(Boolean)) {
-        const [id, task] = line.split("\t");
+        const [id, task, instance, nameRaw] = line.split("\t");
         if (!id || !task) continue;
-        if (!TASK_ID.test(task)) {
+        // `docker ps` renders `.Names` with a leading "/". The 2-column
+        // listing shape (id \t task) — what tests inject — carries no
+        // instance or name column; its id IS the name.
+        const name = (nameRaw ?? id).trim().replace(/^\//, "");
+        if (!isValidTaskId(task)) {
           // A managed container whose label is not a valid task identifier
-          // has no queue to go through; remove it directly. The result is
-          // checked: a failed removal must not be treated as done — it
-          // simply leaves the container for the next interval (there is
-          // no queue or activity record for an invalid label to update).
-          // Either way the loop must NOT fall through to the task-queue
-          // logic below, which assumes a valid task label.
+          // (including the reserved quarantine suffix, which no valid task
+          // may hold) has no queue to go through; remove it directly. The
+          // result is checked: a failed removal must not be treated as
+          // done — it simply leaves the container for the next interval
+          // (there is no queue or activity record for an invalid label to
+          // update). Either way the loop must NOT fall through to the
+          // task-queue logic below, which assumes a valid task label.
           const removed = await this.docker(["rm", "-f", id], 30_000, 20_000);
           if (
             removed.code !== 0 &&
@@ -1922,6 +2386,51 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
             // interval.
           }
           continue;
+        }
+        // OWNERSHIP ROUTING (see the cross-instance ownership section of
+        // the class documentation). "mine": this instance's activity
+        // record drives the TTL decision (the current behavior).
+        // "age": the container is not this instance's — it is a
+        // quarantined container (unusable by definition: no live user, no
+        // activity of any instance could make it useful) or its owner is
+        // provably gone (stale/absent lease, or unlabeled with no live
+        // claim) — the only available abandonment signal is the
+        // container's age. "skip": a LIVE foreign instance owns it (fresh
+        // lease) — removing it would destroy another instance's live
+        // workspace; the owner's own reaper handles it. A CORRUPT lease
+        // fails closed to "skip" (the owner may still be alive).
+        let routing: "mine" | "age" | "skip";
+        if (name.endsWith(QUARANTINED_SUFFIX)) {
+          routing = "age";
+        } else if (instance === undefined) {
+          routing = "mine";
+        } else if (this.classifyContainer(instance) === "mine") {
+          routing = "mine";
+        } else {
+          const lease = await this.readLease(task);
+          const leaseFresh =
+            lease.kind === "valid" &&
+            Date.now() - lease.updatedAt <= this.leaseTtlMs;
+          if (leaseFresh && lease.instanceId === this.instanceId) {
+            // My takeover claim on an unlabeled container: I operate on
+            // it, so my activity record drives the decision.
+            routing = "mine";
+          } else if (lease.kind === "corrupt" || leaseFresh) {
+            routing = "skip";
+          } else {
+            routing = "age";
+          }
+        }
+        if (routing === "skip") {
+          // Leave it to the owning instance's reaper (never touch its
+          // lease file either).
+          continue;
+        }
+        if (routing === "mine") {
+          // Keep my liveness claim fresh so peer reapers skip this task
+          // for as long as I am alive — including while the task is idle
+          // (the refresh happens here, not only on operations).
+          void this.writeLease(task, name);
         }
         const inspected = await this.docker(
           ["inspect", "--format", "{{.Created}}", id],
@@ -1938,17 +2447,36 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         // Abandoned = no provider operation for longer than the TTL. When
         // no activity is recorded (e.g. the provider process restarted),
         // fall back to the container's age — the only signal available.
-        const reference = lastActivity ?? created;
+        // For a taken-over (non-mine) container there is NO shared
+        // activity across instances, so the age alone is the signal.
+        const reference =
+          routing === "mine" ? (lastActivity ?? created) : created;
         if (Date.now() - reference <= this.ttlMs) continue;
         // Removal goes through the per-task queue and re-checks activity
         // inside it, so it can never run while an operation is in flight
         // (and never sees its own removal as task activity).
+        const quarantinedRow = name.endsWith(QUARANTINED_SUFFIX);
         await this.withTaskLock(
           task,
           async (myTail) => {
             const fresh = this.taskActivity.get(task);
             if (fresh !== undefined && Date.now() - fresh <= this.ttlMs) {
               return;
+            }
+            if (routing === "age" && !quarantinedRow) {
+              // Re-check liveness immediately before the destructive
+              // call: between the ps-time routing and now, the presumed-
+              // dead owner may have come back (a live owner writes a
+              // fresh lease on every operation). A quarantined row is
+              // exempt: the container is unusable by definition, so
+              // removing it only ever cleans up a remnant — even if the
+              // owner is alive, it gets the same result its own
+              // destroy() would.
+              const leaseNow = await this.readLease(task);
+              const freshNow =
+                leaseNow.kind === "valid" &&
+                Date.now() - leaseNow.updatedAt <= this.leaseTtlMs;
+              if (leaseNow.kind === "corrupt" || freshNow) return;
             }
             const still = await this.docker(
               ["inspect", "--format", "{{.State.Running}}", id],
@@ -1969,6 +2497,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
               // record (and its fresh activity) is dropped.
               if (/no such object/i.test(still.stderr)) {
                 this.taskActivity.delete(task);
+                await this.deleteLease(task);
               }
               return;
             }
@@ -1996,8 +2525,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
               // unavailable" (the container it wanted does not exist),
               // which is the documented outcome for work that races a
               // successful removal; the task can be re-created with
-              // create().
+              // create(). The lease goes with it (mine, or the dead
+              // owner's stale one) — never a fresh foreign lease: those
+              // rows are "skip"ped at routing and never reach the rm.
               this.taskActivity.delete(task);
+              await this.deleteLease(task);
             }
             // A FAILED removal must NOT drop the activity record: the
             // container is still here, an operation may have enqueued
