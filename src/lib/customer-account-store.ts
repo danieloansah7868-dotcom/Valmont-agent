@@ -10,6 +10,7 @@ import {
 import { getSqliteChatStore } from "@/lib/chat-store";
 import {
   createCustomerToken,
+  DUMMY_CUSTOMER_PASSWORD_HASH,
   hashCustomerPassword,
   hashCustomerToken,
   normalizeCustomerEmail,
@@ -384,9 +385,9 @@ export class SqliteCustomerAccountStore implements CustomerAccountStore {
       .prepare("SELECT * FROM customer_accounts WHERE email = ?")
       .get(normalizeCustomerEmail(email)) as unknown as
       (SqliteAccountRow & { password_hash: string }) | undefined;
-    if (!row || !(await verifyCustomerPassword(password, row.password_hash))) {
-      return null;
-    }
+    const passwordHash = row?.password_hash ?? DUMMY_CUSTOMER_PASSWORD_HASH;
+    const valid = await verifyCustomerPassword(password, passwordHash);
+    if (!row || !valid) return null;
     return sqliteAccount(row);
   }
 }
@@ -599,9 +600,9 @@ export class PostgresCustomerAccountStore implements CustomerAccountStore {
       .from(customerAccounts)
       .where(eq(customerAccounts.email, normalizeCustomerEmail(email)))
       .limit(1);
-    if (!row || !(await verifyCustomerPassword(password, row.passwordHash))) {
-      return null;
-    }
+    const passwordHash = row?.passwordHash ?? DUMMY_CUSTOMER_PASSWORD_HASH;
+    const valid = await verifyCustomerPassword(password, passwordHash);
+    if (!row || !valid) return null;
     return pgAccount(row);
   }
 }

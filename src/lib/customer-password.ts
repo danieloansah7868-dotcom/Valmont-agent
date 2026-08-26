@@ -12,6 +12,14 @@ const BLOCK_SIZE = 8;
 const PARALLELIZATION = 1;
 const MAX_MEMORY = 64 * 1024 * 1024;
 
+/**
+ * A valid, fixed-cost hash used for login attempts against unknown emails.
+ * Running the same scrypt work on both paths avoids a remote timing oracle;
+ * this value is never associated with a real account.
+ */
+export const DUMMY_CUSTOMER_PASSWORD_HASH =
+  "scrypt$N=32768,r=8,p=1$dmFsbW9udC1kdW1teS1zYWx0LTE2$ieBH5rbJOt3P2-W5S0NDHYRNnFknDyRYk7DDr5ZitlY";
+
 function deriveKey(
   password: string,
   salt: Buffer,

@@ -122,6 +122,17 @@ export function analyticsRangeStart(
 }
 
 /**
+ * Returns the exclusive UTC timestamp after the current Accra calendar day.
+ * Accra is UTC, so this can be used directly by the database query without
+ * changing the meaning of a date selected in the analytics UI.
+ */
+export function analyticsRangeEndExclusive(now = new Date()): string | null {
+  const today = accraDateKey(now);
+  if (!today) return null;
+  return `${addCalendarDays(today, 1)}T00:00:00.000Z`;
+}
+
+/**
  * Applies the owner-selected website and date filters before summarising.
  * Ownership is enforced by OrdersStore; this function only narrows the data it
  * receives and is deliberately pure.

@@ -5,6 +5,8 @@ import { getOrdersStore } from "@/lib/studio/orders";
 import {
   ACCRA_TIME_ZONE,
   ANALYTICS_DATE_RANGES,
+  analyticsRangeEndExclusive,
+  analyticsRangeStart,
   filterAnalyticsOrders,
   isAnalyticsDateRange,
   summariseOrders,
@@ -30,6 +32,9 @@ export default async function StudioAnalyticsPage({
     ? requestedRange
     : "all";
   const ownerId = canonicalUserId(user);
+  const now = new Date();
+  const rangeStart = analyticsRangeStart(dateRange, now);
+  const rangeEndExclusive = analyticsRangeEndExclusive(now);
   const drafts = await getStudioDraftStore().list(user);
   const websites = drafts
     .map((draft) => ({ id: draft.id, name: draft.brief.businessName }))
@@ -42,11 +47,14 @@ export default async function StudioAnalyticsPage({
     limit: ORDER_LIMIT,
     filter: "all",
     draftId: selectedWebsite?.id,
+    createdAfter: rangeStart ? `${rangeStart}T00:00:00.000Z` : undefined,
+    createdBefore: rangeStart ? (rangeEndExclusive ?? undefined) : undefined,
   });
   const analytics = summariseOrders(
     filterAnalyticsOrders(orders, {
       draftId: selectedWebsite?.id,
       dateRange,
+      now,
     }),
   );
 
@@ -136,7 +144,7 @@ export default async function StudioAnalyticsPage({
         {dateRange !== "all"
           ? ` · ${ANALYTICS_DATE_RANGES.find((range) => range.id === dateRange)?.label}`
           : " · all time"}
-        {` · based on up to ${ORDER_LIMIT.toLocaleString("en-GH")} recent orders`}
+        {` · based on up to ${ORDER_LIMIT.toLocaleString("en-GH")} orders in this view`}
       </p>
 
       <section

@@ -209,7 +209,7 @@ export default async function StudioPage({
                         Shop orders
                       </Link>
                       <Link
-                        href={`/studio/analytics?website=${website.id}`}
+                        href={`/studio/analytics?website=${encodeURIComponent(website.id)}`}
                         className="text-xs font-medium text-navy underline"
                         data-testid="website-analytics-link"
                       >

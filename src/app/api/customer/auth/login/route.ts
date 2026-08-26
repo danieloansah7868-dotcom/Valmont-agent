@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { assertCsrf } from "@/lib/security";
 import {
@@ -26,31 +26,22 @@ class InvalidCustomerCredentialsError extends Error {
   }
 }
 
-class UnverifiedCustomerEmailError extends Error {
-  readonly status = 403;
-
-  constructor() {
-    super("Please verify your email address before signing in.");
-    this.name = "UnverifiedCustomerEmailError";
-  }
-}
-
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "customer-login", 10);
     const body = (await readBoundedJson(
       request as unknown as Request,
       BODY_LIMIT_BYTES,
     )) as unknown;
     const parsed = loginSchema.parse(body);
+    const email = normalizeCustomerEmail(parsed.email);
+    assertCustomerRateLimit(request, "customer-login", email, 10);
     const store = getCustomerAccountStore();
-    const account = await store.verifyPassword(
-      normalizeCustomerEmail(parsed.email),
-      parsed.password,
-    );
-    if (!account) throw new InvalidCustomerCredentialsError();
-    if (!account.emailVerifiedAt) throw new UnverifiedCustomerEmailError();
+    const account = await store.verifyPassword(email, parsed.password);
+    if (!account || !account.emailVerifiedAt) {
+      // Keep both unknown and unverified accounts on the same response path.
+      throw new InvalidCustomerCredentialsError();
+    }
 
     const session = await store.createSession(account.id);
     const response = NextResponse.json({

@@ -1,13 +1,17 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
 import {
   CUSTOMER_VERIFICATION_TTL_MS,
   getCustomerAccountStore,
 } from "@/lib/customer-account-store";
 import { normalizeCustomerEmail } from "@/lib/customer-password";
-import { customerEmailHtml, sendCustomerEmail } from "@/lib/customer-email";
+import {
+  assertCustomerEmailDeliveryReady,
+  customerEmailHtml,
+  sendCustomerEmail,
+} from "@/lib/customer-email";
 import { assertCsrf } from "@/lib/security";
 
 const resendSchema = z.object({
@@ -17,14 +21,16 @@ const resendSchema = z.object({
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "customer-resend-verification", 5);
     const body = (await readBoundedJson(
       request as unknown as Request,
       16_000,
     )) as unknown;
-    const { email } = resendSchema.parse(body);
+    const { email: submittedEmail } = resendSchema.parse(body);
+    const email = normalizeCustomerEmail(submittedEmail);
+    assertCustomerRateLimit(request, "customer-resend-verification", email, 5);
+    assertCustomerEmailDeliveryReady();
     const store = getCustomerAccountStore();
-    const account = await store.getByEmail(normalizeCustomerEmail(email));
+    const account = await store.getByEmail(email);
     let verificationLink: string | undefined;
 
     if (account && !account.emailVerifiedAt) {

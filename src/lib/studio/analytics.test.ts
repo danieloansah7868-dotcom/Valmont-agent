@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { OrderRecord, OrderStatus } from "./orders";
 import {
   accraDateKey,
+  analyticsRangeEndExclusive,
   analyticsRangeStart,
   filterAnalyticsOrders,
   summariseOrders,
@@ -48,6 +49,12 @@ describe("analytics date helpers", () => {
     expect(
       analyticsRangeStart("7d", new Date("2026-08-25T12:00:00.000Z")),
     ).toBe("2026-08-19");
+  });
+
+  it("ends a range after the current Accra calendar day", () => {
+    expect(
+      analyticsRangeEndExclusive(new Date("2026-08-25T12:00:00.000Z")),
+    ).toBe("2026-08-26T00:00:00.000Z");
   });
 
   it("returns no lower bound for all-time analytics", () => {

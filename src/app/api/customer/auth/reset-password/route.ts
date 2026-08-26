@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { assertCsrf } from "@/lib/security";
 import { getCustomerAccountStore } from "@/lib/customer-account-store";
@@ -23,12 +23,17 @@ class InvalidPasswordResetError extends Error {
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "customer-reset-password", 5);
     const body = (await readBoundedJson(
       request as unknown as Request,
       BODY_LIMIT_BYTES,
     )) as unknown;
     const parsed = resetSchema.parse(body);
+    assertCustomerRateLimit(
+      request,
+      "customer-reset-password",
+      parsed.token,
+      5,
+    );
     const store = getCustomerAccountStore();
     const consumed = await store.consumeToken(parsed.token, "reset_password");
     if (!consumed) throw new InvalidPasswordResetError();

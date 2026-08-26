@@ -1,12 +1,20 @@
+import { createHash } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 import { NotConnectedError } from "@/lib/auth";
 import { checkRateLimit } from "@/lib/security";
 
+/**
+ * Returns a request bucket key only when the deployment explicitly trusts its
+ * reverse proxy. Browsers can forge X-Forwarded-For and X-Real-IP when the
+ * application is reached directly, so the safe default is one shared
+ * untrusted-client bucket rather than an attacker-controlled identity.
+ */
 export function clientKey(request: NextRequest): string {
+  if (process.env.TRUST_PROXY !== "true") return "untrusted-client";
   return (
     request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-    request.headers.get("x-real-ip") ??
-    "local"
+    request.headers.get("x-real-ip")?.trim() ??
+    "trusted-proxy-unknown-client"
   );
 }
 
@@ -16,6 +24,35 @@ export function assertApiRateLimit(
   limit = 30,
 ): void {
   if (!checkRateLimit(`${operation}:${clientKey(request)}`, limit)) {
+    throw new RateLimitError();
+  }
+}
+
+/**
+ * Customer authentication needs a stable identity bucket as well as a
+ * network bucket. The identifier is hashed before entering the in-process map
+ * so email addresses, tokens, and account ids are not retained there in plain
+ * text. The network bucket is deliberately wider to avoid penalising a shared
+ * connection while the identity bucket prevents header rotation from
+ * bypassing password/credential limits.
+ */
+export function assertCustomerRateLimit(
+  request: NextRequest,
+  operation: string,
+  identifier: string,
+  limit = 10,
+): void {
+  const identifierKey = createHash("sha256")
+    .update(identifier.trim().toLowerCase())
+    .digest("hex");
+  if (!checkRateLimit(`${operation}:identifier:${identifierKey}`, limit)) {
+    throw new RateLimitError();
+  }
+
+  const networkLimit = Math.max(limit * 5, 30);
+  if (
+    !checkRateLimit(`${operation}:network:${clientKey(request)}`, networkLimit)
+  ) {
     throw new RateLimitError();
   }
 }

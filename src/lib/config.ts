@@ -28,6 +28,12 @@ export function databaseConfigured(env: RuntimeEnv = process.env): boolean {
   return Boolean(env.DATABASE_URL);
 }
 
+export function customerEmailConfigured(
+  env: RuntimeEnv = process.env,
+): boolean {
+  return Boolean(env.RESEND_API_KEY && env.NOTIFY_EMAIL_FROM);
+}
+
 export interface RuntimeReadiness {
   github: boolean;
   model: boolean;
@@ -54,5 +60,16 @@ export function missingLiveRequirements(
   if (!env.GITHUB_CLIENT_ID) missing.push("GITHUB_CLIENT_ID");
   if (!env.GITHUB_CLIENT_SECRET) missing.push("GITHUB_CLIENT_SECRET");
   if (!env.MODEL_API_KEY) missing.push("MODEL_API_KEY");
+  return missing;
+}
+
+/** Customer-account email is required for the production account flows. */
+export function missingCustomerEmailRequirements(
+  env: RuntimeEnv = process.env,
+): string[] {
+  if (env.NODE_ENV !== "production") return [];
+  const missing: string[] = [];
+  if (!env.RESEND_API_KEY) missing.push("RESEND_API_KEY");
+  if (!env.NOTIFY_EMAIL_FROM) missing.push("NOTIFY_EMAIL_FROM");
   return missing;
 }

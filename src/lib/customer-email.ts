@@ -7,6 +7,28 @@ export class CustomerEmailDeliveryError extends Error {
   }
 }
 
+export class CustomerEmailConfigurationError extends Error {
+  readonly status = 503;
+
+  constructor() {
+    super("Customer email delivery is not configured for this deployment.");
+    this.name = "CustomerEmailConfigurationError";
+  }
+}
+
+export function customerEmailDeliveryConfigured(): boolean {
+  return Boolean(process.env.RESEND_API_KEY && process.env.NOTIFY_EMAIL_FROM);
+}
+
+export function assertCustomerEmailDeliveryReady(): void {
+  if (
+    process.env.NODE_ENV === "production" &&
+    !customerEmailDeliveryConfigured()
+  ) {
+    throw new CustomerEmailConfigurationError();
+  }
+}
+
 interface CustomerEmailInput {
   to: string;
   name: string;
@@ -43,20 +65,25 @@ export async function sendCustomerEmail(
   const apiKey = process.env.RESEND_API_KEY;
   const from = process.env.NOTIFY_EMAIL_FROM;
   if (apiKey && from) {
-    const response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from,
-        to: [input.to],
-        subject: input.subject,
-        text: input.text,
-        html: input.html,
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from,
+          to: [input.to],
+          subject: input.subject,
+          text: input.text,
+          html: input.html,
+        }),
+      });
+    } catch {
+      throw new CustomerEmailDeliveryError();
+    }
     if (!response.ok) {
       throw new CustomerEmailDeliveryError();
     }
@@ -65,7 +92,7 @@ export async function sendCustomerEmail(
 
   // Never return authentication links in production. A production deployment
   // must configure a provider before these flows can be customer-facing.
-  if (process.env.NODE_ENV === "production") return { delivered: false };
+  assertCustomerEmailDeliveryReady();
 
   // Keep a useful local path without logging or persisting the raw token.
   return {

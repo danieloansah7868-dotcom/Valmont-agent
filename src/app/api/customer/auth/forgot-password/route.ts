@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { assertCsrf } from "@/lib/security";
 import {
@@ -8,7 +8,11 @@ import {
   getCustomerAccountStore,
 } from "@/lib/customer-account-store";
 import { normalizeCustomerEmail } from "@/lib/customer-password";
-import { customerEmailHtml, sendCustomerEmail } from "@/lib/customer-email";
+import {
+  assertCustomerEmailDeliveryReady,
+  customerEmailHtml,
+  sendCustomerEmail,
+} from "@/lib/customer-email";
 
 const BODY_LIMIT_BYTES = 16_000;
 const forgotSchema = z.object({
@@ -18,16 +22,16 @@ const forgotSchema = z.object({
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "customer-forgot-password", 5);
     const body = (await readBoundedJson(
       request as unknown as Request,
       BODY_LIMIT_BYTES,
     )) as unknown;
     const parsed = forgotSchema.parse(body);
+    const email = normalizeCustomerEmail(parsed.email);
+    assertCustomerRateLimit(request, "customer-forgot-password", email, 5);
+    assertCustomerEmailDeliveryReady();
     const store = getCustomerAccountStore();
-    const account = await store.getByEmail(
-      normalizeCustomerEmail(parsed.email),
-    );
+    const account = await store.getByEmail(email);
 
     // Keep the response identical whether the address exists. The local link
     // is intentionally the only development exception and is never returned

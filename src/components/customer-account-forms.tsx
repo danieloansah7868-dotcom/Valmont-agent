@@ -27,8 +27,8 @@ function FormMessage({ error, success }: { error?: string; success?: string }) {
           ? "bg-fail-soft text-fail-strong"
           : "bg-pass-soft text-pass-strong"
       }`}
-      role="status"
-      aria-live="polite"
+      role={error ? "alert" : "status"}
+      aria-live={error ? "assertive" : "polite"}
     >
       {error || success}
     </p>
@@ -277,7 +277,7 @@ export function RegisterForm({
         <p className="mt-1 text-xs text-slate">Use at least 10 characters.</p>
       </div>
       {claimAccessCode ? (
-        <p className="rounded-lg bg-success-soft px-3 py-2 text-sm text-success-strong">
+        <p className="rounded-lg bg-pass-soft px-3 py-2 text-sm text-pass-strong">
           Your completed order will be linked to this account after you finish
           registration.
         </p>

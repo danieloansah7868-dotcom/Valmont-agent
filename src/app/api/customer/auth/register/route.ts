@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { assertCsrf } from "@/lib/security";
 import {
@@ -8,7 +8,11 @@ import {
   getCustomerAccountStore,
 } from "@/lib/customer-account-store";
 import { normalizeCustomerEmail } from "@/lib/customer-password";
-import { customerEmailHtml, sendCustomerEmail } from "@/lib/customer-email";
+import {
+  assertCustomerEmailDeliveryReady,
+  customerEmailHtml,
+  sendCustomerEmail,
+} from "@/lib/customer-email";
 import { getOrdersStore } from "@/lib/studio/orders";
 
 const BODY_LIMIT_BYTES = 16_000;
@@ -32,18 +36,19 @@ class InvalidOrderClaimError extends Error {
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "customer-register", 5);
     const body = (await readBoundedJson(
       request as unknown as Request,
       BODY_LIMIT_BYTES,
     )) as unknown;
     const parsed = registerSchema.parse(body);
     const email = normalizeCustomerEmail(parsed.email);
+    assertCustomerRateLimit(request, "customer-register", email, 5);
+    assertCustomerEmailDeliveryReady();
     const claimAccessCode = parsed.claimAccessCode || undefined;
     const orders = getOrdersStore();
 
     // Validate the claim before creating the account. An order can be claimed
-    // only once, and when checkout captured an email it must match exactly.
+    // only once, and checkout must have captured an email that matches exactly.
     if (claimAccessCode) {
       const order = await orders.getByAccessCode(claimAccessCode);
       if (!order)
@@ -53,10 +58,12 @@ export async function POST(request: NextRequest) {
           "That order has already been linked to an account.",
         );
       }
-      if (
-        order.customerEmail &&
-        normalizeCustomerEmail(order.customerEmail) !== email
-      ) {
+      if (!order.customerEmail) {
+        throw new InvalidOrderClaimError(
+          "This guest order has no email address to verify, so it cannot be linked to an account.",
+        );
+      }
+      if (normalizeCustomerEmail(order.customerEmail) !== email) {
         throw new InvalidOrderClaimError(
           "Use the email address entered at checkout to link this order.",
         );
@@ -106,9 +113,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       {
         ok: true,
-        message: delivery.delivered
-          ? "Your account is ready. Check your email to verify the address before signing in."
-          : "Your account is ready. Check your email to verify the address before signing in.",
+        message:
+          "Your account is ready. Check your email to verify the address before signing in.",
         ...(delivery.developmentLink
           ? { verificationLink: delivery.developmentLink }
           : {}),

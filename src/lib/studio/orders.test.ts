@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import { SqliteOrdersStore, type NewOrderInput } from "./orders";
 
@@ -41,6 +41,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   setSqliteChatStoreForTests(null);
   for (const dir of dirs.splice(0))
     rmSync(dir, { recursive: true, force: true });
@@ -123,6 +124,21 @@ describe("SqliteOrdersStore", () => {
     expect(ownerTwoBusiness.map((order) => order.accessCode)).toEqual([
       "owner-2-a",
     ]);
+  });
+
+  it("applies created-at bounds in the database query before returning orders", async () => {
+    vi.setSystemTime(new Date("2026-08-01T12:00:00.000Z"));
+    await store.create(newOrder({ accessCode: "old-order" }));
+    vi.setSystemTime(new Date("2026-08-26T12:00:00.000Z"));
+    await store.create(newOrder({ accessCode: "recent-order" }));
+
+    const recent = await store.listForOwner("owner-1", {
+      limit: 50,
+      createdAfter: "2026-08-26T00:00:00.000Z",
+      createdBefore: "2026-08-27T00:00:00.000Z",
+    });
+    expect(recent.map((order) => order.accessCode)).toEqual(["recent-order"]);
+    vi.useRealTimers();
   });
 
   it("finds an order by its id for the confirmation page", async () => {

@@ -133,21 +133,32 @@ export default async function OrderConfirmedPage({
       {!order.customerAccountId ? (
         <div className="mt-6 rounded-lg border border-brandblue-200 bg-brandblue-50 p-4">
           <p className="text-sm font-semibold text-navy">
-            Want this order in your account?
+            {order.customerEmail
+              ? "Want this order in your account?"
+              : "Guest order account linking unavailable"}
           </p>
-          <p className="mt-1 text-sm leading-6 text-slate">
-            Customer accounts are optional. Link this order now to track it
-            alongside future purchases.
-          </p>
-          {customerSession ? (
-            <ClaimOrderButton accessCode={order.accessCode} />
+          {order.customerEmail ? (
+            <>
+              <p className="mt-1 text-sm leading-6 text-slate">
+                Customer accounts are optional. Link this order now to track it
+                alongside future purchases.
+              </p>
+              {customerSession ? (
+                <ClaimOrderButton accessCode={order.accessCode} />
+              ) : (
+                <Link
+                  href={`/account/register?claim=${encodeURIComponent(order.accessCode)}`}
+                  className="btn-primary mt-3 inline-flex"
+                >
+                  Create an account and link order
+                </Link>
+              )}
+            </>
           ) : (
-            <Link
-              href={`/account/register?claim=${encodeURIComponent(order.accessCode)}`}
-              className="btn-primary mt-3 inline-flex"
-            >
-              Create an account and link order
-            </Link>
+            <p className="mt-1 text-sm leading-6 text-slate">
+              This order was checked out without an email address, so it cannot
+              be linked securely to a customer account.
+            </p>
           )}
         </div>
       ) : null}

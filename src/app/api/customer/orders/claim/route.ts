@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { assertApiRateLimit, safeApiError } from "@/lib/api";
+import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { requireCustomerSession } from "@/lib/customer-auth";
 import { normalizeCustomerEmail } from "@/lib/customer-password";
@@ -23,8 +23,13 @@ class InvalidOrderClaimError extends Error {
 export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
-    assertApiRateLimit(request, "customer-order-claim", 10);
     const session = await requireCustomerSession();
+    assertCustomerRateLimit(
+      request,
+      "customer-order-claim",
+      session.account.id,
+      10,
+    );
     const body = (await readBoundedJson(
       request as unknown as Request,
       8_000,
@@ -33,10 +38,14 @@ export async function POST(request: NextRequest) {
     const orders = getOrdersStore();
     const order = await orders.getByAccessCode(accessCode);
     if (!order) throw new InvalidOrderClaimError("That order link is invalid.");
+    if (!order.customerEmail) {
+      throw new InvalidOrderClaimError(
+        "This guest order has no email address to verify, so it cannot be linked to an account.",
+      );
+    }
     if (
-      order.customerEmail &&
       normalizeCustomerEmail(order.customerEmail) !==
-        normalizeCustomerEmail(session.account.email)
+      normalizeCustomerEmail(session.account.email)
     ) {
       throw new InvalidOrderClaimError(
         "This order was checked out with a different email address.",

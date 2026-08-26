@@ -16,8 +16,10 @@ verification resend, password reset, secure hashed sessions, customer-only
 order history, and post-checkout order linking. SQLite is provisioned locally
 from the shared Studio store; PostgreSQL uses migration `0008` plus `0009`.
 Email delivery stays behind `src/lib/customer-email.ts`: configure the existing
-`RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` values for delivery, or use the clearly
-marked one-time development links when no provider is configured locally.
+`RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` values for delivery. In local
+development, the absence of a provider exposes clearly marked one-time links;
+in production, registration, verification resend, and password-reset requests
+fail clearly with HTTP 503 until a sender is configured.
 
 Before production, configure a real email sender, run the PostgreSQL migrations
 manually, and replace the in-process limiter with a distributed rate-limit

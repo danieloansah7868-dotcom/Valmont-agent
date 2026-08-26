@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lt, or } from "drizzle-orm";
 import { getDatabase } from "@/db";
 import { studioOrders } from "@/db/schema";
 import { getSqliteChatStore } from "@/lib/chat-store";
@@ -97,6 +97,10 @@ export interface ListOrdersOptions {
   filter?: OrderFilterId;
   /** Optional owner-scoped business (draft) filter. */
   draftId?: string;
+  /** Inclusive lower bound for created_at, as an ISO timestamp. */
+  createdAfter?: string;
+  /** Exclusive upper bound for created_at, as an ISO timestamp. */
+  createdBefore?: string;
 }
 
 const toMinor = (amount: number): number => Math.round(amount * 100);
@@ -195,18 +199,28 @@ interface NormalizedListOrdersOptions {
   limit: number;
   filter: OrderFilterId;
   draftId?: string;
+  createdAfter?: string;
+  createdBefore?: string;
 }
 
 function normalizeListOptions(
   options?: number | ListOrdersOptions,
 ): NormalizedListOrdersOptions {
   if (typeof options === "number") {
-    return { limit: options, filter: "all", draftId: undefined };
+    return {
+      limit: options,
+      filter: "all",
+      draftId: undefined,
+      createdAfter: undefined,
+      createdBefore: undefined,
+    };
   }
   return {
     limit: options?.limit ?? 10,
     filter: options?.filter ?? "all",
     draftId: options?.draftId,
+    createdAfter: options?.createdAfter,
+    createdBefore: options?.createdBefore,
   };
 }
 
@@ -415,18 +429,27 @@ export class SqliteOrdersStore implements OrdersStore {
     ownerId: string,
     options?: number | ListOrdersOptions,
   ): Promise<OrderRecord[]> {
-    const { limit, filter, draftId } = normalizeListOptions(options);
-    const rows = draftId
-      ? (this.db
-          .prepare(
-            "SELECT * FROM studio_orders WHERE owner_id = ? AND draft_id = ? ORDER BY created_at DESC LIMIT ?",
-          )
-          .all(ownerId, draftId, Math.max(limit, 200)) as unknown as OrderRow[])
-      : (this.db
-          .prepare(
-            "SELECT * FROM studio_orders WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?",
-          )
-          .all(ownerId, Math.max(limit, 200)) as unknown as OrderRow[]);
+    const { limit, filter, draftId, createdAfter, createdBefore } =
+      normalizeListOptions(options);
+    const conditions = ["owner_id = ?"];
+    const parameters: Array<string | number> = [ownerId];
+    if (draftId) {
+      conditions.push("draft_id = ?");
+      parameters.push(draftId);
+    }
+    if (createdAfter) {
+      conditions.push("created_at >= ?");
+      parameters.push(createdAfter);
+    }
+    if (createdBefore) {
+      conditions.push("created_at < ?");
+      parameters.push(createdBefore);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM studio_orders WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(...parameters, Math.max(limit, 200)) as unknown as OrderRow[];
     const mapped = rows.map(rowToOrder);
     const filtered =
       filter === "all"
@@ -655,9 +678,16 @@ export class PostgresOrdersStore implements OrdersStore {
     ownerId: string,
     options?: number | ListOrdersOptions,
   ): Promise<OrderRecord[]> {
-    const { limit, filter, draftId } = normalizeListOptions(options);
+    const { limit, filter, draftId, createdAfter, createdBefore } =
+      normalizeListOptions(options);
     const conditions = [eq(studioOrders.ownerId, ownerId)];
     if (draftId) conditions.push(eq(studioOrders.draftId, draftId));
+    if (createdAfter) {
+      conditions.push(gte(studioOrders.createdAt, new Date(createdAfter)));
+    }
+    if (createdBefore) {
+      conditions.push(lt(studioOrders.createdAt, new Date(createdBefore)));
+    }
     const rows = await getDatabase()
       .select()
       .from(studioOrders)
