@@ -26,6 +26,15 @@ manually, and replace the in-process limiter with a distributed rate-limit
 store. Live payments, deployment, and paid services remain intentionally
 inactive.
 
+## Customer order tracking and status notifications — implemented on this branch
+
+Authenticated customers can open `/account/orders/[id]` to see an owner-scoped
+order timeline, item details, and the current delivery status. Merchant status
+changes and payment webhook transitions send a best-effort transactional email
+to the checkout address when the production Resend configuration is present;
+orders without an email remain valid guest orders but cannot receive email
+updates.
+
 ---
 
 ## 1. Fix the formatting on `main`

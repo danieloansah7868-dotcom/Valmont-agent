@@ -170,6 +170,10 @@ export interface OrdersStore {
    */
   getById(id: string): Promise<OrderRecord | null>;
   getForOwner(ownerId: string, id: string): Promise<OrderRecord | null>;
+  getForCustomer(
+    customerAccountId: string,
+    id: string,
+  ): Promise<OrderRecord | null>;
   listForOwner(
     ownerId: string,
     options?: number | ListOrdersOptions,
@@ -425,6 +429,18 @@ export class SqliteOrdersStore implements OrdersStore {
     return row ? rowToOrder(row) : null;
   }
 
+  async getForCustomer(
+    customerAccountId: string,
+    id: string,
+  ): Promise<OrderRecord | null> {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM studio_orders WHERE id = ? AND customer_account_id = ?",
+      )
+      .get(id, customerAccountId) as unknown as OrderRow | undefined;
+    return row ? rowToOrder(row) : null;
+  }
+
   async listForOwner(
     ownerId: string,
     options?: number | ListOrdersOptions,
@@ -670,6 +686,23 @@ export class PostgresOrdersStore implements OrdersStore {
       .select()
       .from(studioOrders)
       .where(and(eq(studioOrders.id, id), eq(studioOrders.ownerId, ownerId)))
+      .limit(1);
+    return row ? pgRowToOrder(row) : null;
+  }
+
+  async getForCustomer(
+    customerAccountId: string,
+    id: string,
+  ): Promise<OrderRecord | null> {
+    const [row] = await getDatabase()
+      .select()
+      .from(studioOrders)
+      .where(
+        and(
+          eq(studioOrders.id, id),
+          eq(studioOrders.customerAccountId, customerAccountId),
+        ),
+      )
       .limit(1);
     return row ? pgRowToOrder(row) : null;
   }

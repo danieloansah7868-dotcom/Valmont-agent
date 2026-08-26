@@ -160,6 +160,9 @@ export async function POST(
           normalizeCustomerEmail(customerSession.account.email))
         ? customerSession.account.id
         : undefined;
+    const orderCustomerEmail = customerAccountId
+      ? customerSession?.account.email
+      : payload.customerEmail || undefined;
 
     const order = await getOrdersStore().create({
       ownerId: draft.ownerId,
@@ -173,7 +176,7 @@ export async function POST(
       lines,
       customerName: payload.customerName,
       customerPhone: payload.customerPhone,
-      customerEmail: payload.customerEmail || undefined,
+      customerEmail: orderCustomerEmail,
       customerAddress: payload.customerAddress || undefined,
       customerAccountId,
       paymentMethod: payload.paymentMethod,
@@ -212,7 +215,7 @@ export async function POST(
       reference: order.id,
       description: `${draft.brief.businessName} order`,
       customerName: payload.customerName,
-      customerEmail: payload.customerEmail || undefined,
+      customerEmail: orderCustomerEmail,
       customerPhone: payload.customerPhone,
       callbackUrl: `${origin}/api/payments/webhook?access_code=${code}`,
     });

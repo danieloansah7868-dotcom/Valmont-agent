@@ -163,6 +163,16 @@ export default async function OrderConfirmedPage({
         </div>
       ) : null}
 
+      {order.customerAccountId &&
+      customerSession?.account.id === order.customerAccountId ? (
+        <Link
+          href={`/account/orders/${encodeURIComponent(order.id)}`}
+          className="btn-secondary mt-6 inline-flex"
+        >
+          Track this order in your account
+        </Link>
+      ) : null}
+
       <p className="mt-6 text-xs text-slate-500">
         Contact the business directly if you have any questions about this
         order.

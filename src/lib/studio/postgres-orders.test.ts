@@ -167,6 +167,10 @@ describe.runIf(connectionString)("PostgreSQL order ownership", () => {
       ),
     ).toEqual(["pg-owner-a"]);
     expect(
+      await store.getForCustomer(accountAId, ownerAOrder.id),
+    ).not.toBeNull();
+    expect(await store.getForCustomer(accountBId, ownerAOrder.id)).toBeNull();
+    expect(
       await store.claimForCustomer(accountBId, ownerAOrder.accessCode),
     ).toBe(null);
     expect(await store.listForCustomer(accountBId)).toEqual([]);

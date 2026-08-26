@@ -2,6 +2,7 @@ import Link from "next/link";
 import { CustomerLogoutButton } from "@/components/customer-account-forms";
 import { getCustomerSession } from "@/lib/customer-auth";
 import { getOrdersStore, type OrderRecord } from "@/lib/studio/orders";
+import { STATUS_BADGE_CLASS, STATUS_LABELS } from "@/lib/studio/order-status";
 import { formatMoney } from "@/lib/studio/valmont-pay";
 import { redirect } from "next/navigation";
 
@@ -11,19 +12,6 @@ const dateFormatter = new Intl.DateTimeFormat("en-GH", {
   dateStyle: "medium",
   timeZone: "Africa/Accra",
 });
-
-const statusLabels: Record<string, string> = {
-  pending: "Awaiting payment",
-  cod_pending: "Cash on delivery",
-  paid: "Paid",
-  preparing: "Being prepared",
-  out_for_delivery: "Out for delivery",
-  delivered: "Delivered",
-  fulfilled: "Complete",
-  payment_failed: "Payment failed",
-  cancelled: "Cancelled",
-  refunded: "Refunded",
-};
 
 function OrderCard({ order }: { order: OrderRecord }) {
   return (
@@ -37,8 +25,12 @@ function OrderCard({ order }: { order: OrderRecord }) {
             {dateFormatter.format(new Date(order.createdAt))}
           </p>
         </div>
-        <span className="rounded-full bg-brandblue-50 px-2.5 py-1 text-xs font-semibold text-brandblue ring-1 ring-inset ring-brandblue-100">
-          {statusLabels[order.status] || order.status}
+        <span
+          className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+            STATUS_BADGE_CLASS[order.status] ?? "bg-slate-200 text-slate-700"
+          }`}
+        >
+          {STATUS_LABELS[order.status]}
         </span>
       </div>
       <div className="mt-4 flex flex-wrap items-end justify-between gap-3">
@@ -60,10 +52,10 @@ function OrderCard({ order }: { order: OrderRecord }) {
             {formatMoney(order.total, order.currency)}
           </p>
           <Link
-            href={`/orders/${order.id}/confirmed`}
+            href={`/account/orders/${encodeURIComponent(order.id)}`}
             className="text-sm font-semibold text-copper-700 hover:underline"
           >
-            View order
+            Track order
           </Link>
         </div>
       </div>

@@ -159,6 +159,18 @@ describe("SqliteOrdersStore", () => {
     expect(
       (await store.listForCustomer("account-one")).map((o) => o.accessCode),
     ).toEqual(["customer-one"]);
+    expect(
+      await store.getForCustomer(
+        "account-one",
+        (await store.getByAccessCode("customer-one"))!.id,
+      ),
+    ).not.toBeNull();
+    expect(
+      await store.getForCustomer(
+        "account-two",
+        (await store.getByAccessCode("customer-one"))!.id,
+      ),
+    ).toBeNull();
     expect(await store.listForCustomer("account-two")).toEqual([]);
   });
 
