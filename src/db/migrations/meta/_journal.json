@@ -57,6 +57,20 @@
       "when": 1787573273009,
       "tag": "0007_studio_domains",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1787737842730,
+      "tag": "0008_flimsy_ironclad",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1787738197336,
+      "tag": "0009_uneven_orphan",
+      "breakpoints": true
     }
   ]
 }

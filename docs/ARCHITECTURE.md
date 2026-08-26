@@ -95,6 +95,8 @@ The local adapter is development-only. Production uses a separate container/exte
 Drizzle/PostgreSQL entities:
 
 - users, accounts, sessions
+- optional customer accounts, hashed customer sessions, and one-time email tokens
+- customer-owned Studio order links
 - repository connections
 - coding tasks and task events
 - approvals
@@ -103,6 +105,8 @@ Drizzle/PostgreSQL entities:
 - pull request records
 
 `PostgresTaskStore` is selected automatically when `DATABASE_URL` is configured and enforces session ownership in every task query. It hydrates normalized event, approval, tool, and pull-request records. Raw repository content and assembled model prompts are not stored in these tables. Account token ciphertext is explicitly server-only. The task JSON fallback uses `.data/task-store.json`, atomic rename writes, and a process-local serialization queue; it starts empty and is never seeded with fixtures.
+
+`CustomerAccountStore` uses the same automatic SQLite/PostgreSQL selection as Studio orders. Customer email addresses are normalized, passwords are stored as parameterized scrypt hashes, session/token values are stored only as SHA-256 hashes, and customer order queries always filter by the authenticated customer account id.
 
 `SqliteChatStore` persists user-owned session metadata, redacted message history, FTS retrieval rows, summaries, memories, and memory preferences in ignored local SQLite storage. `CHAT_STORE_PATH` is retained solely as the backwards-compatible legacy JSON input (default `.data/chat-store.json`). `CHAT_SQLITE_PATH` optionally selects the SQLite destination; when omitted, the destination is a distinct sibling `.sqlite` path next to the configured legacy source (for example `chat-store.json` becomes `chat-store.sqlite`). Startup validates that source and destination are distinct before opening SQLite, copies the source to an adjacent `.pre-sqlite-backup`, migrates rows and the completion marker in one immediate transaction, and rechecks the marker under the transaction lock to make restarts idempotent. The legacy JSON is never opened as SQLite or overwritten. Every get/list/delete operation includes the authenticated GitHub user ID. Repository context is deliberately absent from persisted messages; it is retrieved again after authorization checks for each repository-aware turn. This local-first store is intended for the trusted self-hosted runtime. A multi-instance production deployment must replace it with a transactional, encrypted, user-scoped store and retention/deletion controls.
 

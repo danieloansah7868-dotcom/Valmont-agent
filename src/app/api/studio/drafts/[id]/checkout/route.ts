@@ -4,6 +4,8 @@ import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { assertSameOrigin } from "@/lib/security";
 import { readBoundedJson } from "@/lib/bounded-json";
+import { getCustomerSession } from "@/lib/customer-auth";
+import { normalizeCustomerEmail } from "@/lib/customer-password";
 import { internalGetDraftForCheckout } from "@/lib/studio/draft-public";
 import { getOrdersStore, type OrderLine } from "@/lib/studio/orders";
 import {
@@ -46,10 +48,12 @@ function accessCode(): string {
 }
 
 /**
- * Public checkout. No session: a shopper is never signed in. Security rests on
- * (1) the draft id being an unguessable UUID, (2) a same-origin check, (3) the
- * server re-pricing the basket against the stored catalogue, and (4) an
- * unguessable per-order access code guarding the payment page and webhook.
+ * Public checkout remains guest-accessible. A verified customer session is
+ * attached automatically when the checkout email is blank or matches the
+ * account; a mismatched email stays a guest order. Security rests on (1) the
+ * draft id being an unguessable UUID, (2) a same-origin check, (3) the server
+ * re-pricing the basket against the stored catalogue, and (4) an unguessable
+ * per-order access code guarding the payment page and webhook.
  */
 export async function POST(
   request: NextRequest,
@@ -146,6 +150,16 @@ export async function POST(
 
     const code = accessCode();
     const isCod = payload.paymentMethod === "cod";
+    // Customer accounts are optional; an account-store outage must never take
+    // guest checkout down with it.
+    const customerSession = await getCustomerSession().catch(() => null);
+    const customerAccountId =
+      customerSession &&
+      (!payload.customerEmail ||
+        normalizeCustomerEmail(payload.customerEmail) ===
+          normalizeCustomerEmail(customerSession.account.email))
+        ? customerSession.account.id
+        : undefined;
 
     const order = await getOrdersStore().create({
       ownerId: draft.ownerId,
@@ -161,6 +175,7 @@ export async function POST(
       customerPhone: payload.customerPhone,
       customerEmail: payload.customerEmail || undefined,
       customerAddress: payload.customerAddress || undefined,
+      customerAccountId,
       paymentMethod: payload.paymentMethod,
       merchantNote: payload.note || undefined,
     });

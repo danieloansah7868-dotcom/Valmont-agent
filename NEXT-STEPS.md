@@ -8,6 +8,24 @@ independent review).
 
 ---
 
+## Website Studio Customer Accounts v1 — implemented on this branch
+
+Customer accounts are optional and do not change guest checkout. The public
+account flow now supports registration, sign-in/sign-out, email verification,
+verification resend, password reset, secure hashed sessions, customer-only
+order history, and post-checkout order linking. SQLite is provisioned locally
+from the shared Studio store; PostgreSQL uses migration `0008` plus `0009`.
+Email delivery stays behind `src/lib/customer-email.ts`: configure the existing
+`RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` values for delivery, or use the clearly
+marked one-time development links when no provider is configured locally.
+
+Before production, configure a real email sender, run the PostgreSQL migrations
+manually, and replace the in-process limiter with a distributed rate-limit
+store. Live payments, deployment, and paid services remain intentionally
+inactive.
+
+---
+
 ## 1. Fix the formatting on `main`
 
 **Status: resolved.** The final-corrections branch fixed the formatting on

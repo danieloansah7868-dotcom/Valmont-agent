@@ -308,6 +308,70 @@ export const studioImportFences = pgTable("studio_import_fences", {
 });
 
 /**
+ * Optional customer accounts for public storefront shoppers. These are separate
+ * from GitHub/Studio owners: a customer can order as a guest, then create an
+ * account to claim the order and see future order history.
+ */
+export const customerAccounts = pgTable(
+  "customer_accounts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    email: text("email").notNull(),
+    name: text("name").notNull(),
+    passwordHash: text("password_hash").notNull(),
+    emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [uniqueIndex("customer_accounts_email_unique").on(table.email)],
+);
+
+export const customerSessions = pgTable(
+  "customer_sessions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => customerAccounts.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull().unique(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [index("customer_sessions_account_idx").on(table.accountId)],
+);
+
+export const customerTokens = pgTable(
+  "customer_tokens",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => customerAccounts.id, { onDelete: "cascade" }),
+    purpose: text("purpose").notNull(),
+    tokenHash: text("token_hash").notNull().unique(),
+    /** Server-only context, used to defer a checkout claim until verification. */
+    context: text("context"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("customer_tokens_account_purpose_idx").on(
+      table.accountId,
+      table.purpose,
+    ),
+  ],
+);
+
+/**
  * Phase 3 orders. A customer basket that has been checked out. Rows are created
  * by the public checkout endpoint and advanced by the payments webhook. The
  * `access_code` is an unguessable secret that both the hosted payment page and
@@ -334,6 +398,10 @@ export const studioOrders = pgTable(
     customerPhone: text("customer_phone").notNull(),
     customerEmail: text("customer_email"),
     customerAddress: text("customer_address"),
+    customerAccountId: uuid("customer_account_id").references(
+      () => customerAccounts.id,
+      { onDelete: "set null" },
+    ),
     paymentMethod: text("payment_method").notNull(),
     paymentRef: text("payment_ref"),
     paidAt: timestamp("paid_at", { withTimezone: true }),
@@ -354,6 +422,7 @@ export const studioOrders = pgTable(
   (table) => [
     index("studio_orders_owner_created_idx").on(table.ownerId, table.createdAt),
     index("studio_orders_draft_idx").on(table.draftId),
+    index("studio_orders_customer_account_idx").on(table.customerAccountId),
     uniqueIndex("studio_orders_access_code_idx").on(table.accessCode),
   ],
 );

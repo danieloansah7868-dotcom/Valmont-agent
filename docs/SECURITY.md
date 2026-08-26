@@ -10,6 +10,7 @@ This document describes the MVP's boundaries and the additional controls require
 - workspace files and command output
 - approval records and audit history
 - user/session identity
+- optional customer account credentials, sessions, and order history
 - locally persisted Chat with Valmont conversation history
 
 Valmont must not read or transmit `.env` files, credentials, private keys, payment data, or customer-record exports. Raw source and retrieved repository context are not stored in the application database or chat store. Reopenable chat messages are intentionally persisted after redaction in the ignored local chat store — a SQLite database (`chat-store.sqlite`), with the older JSON file retained only for one-way migration — and must be treated as sensitive user data.
@@ -17,12 +18,13 @@ Valmont must not read or transmit `.env` files, credentials, private keys, payme
 ## Trust boundaries
 
 1. **Browser ↔ Next.js:** browser input is untrusted. Mutations require same origin, a double-submit CSRF token, Zod validation, and rate checks.
-2. **Next.js ↔ GitHub/model:** credentials are server-only. OAuth session payloads are AES-256-GCM encrypted and placed in short-lived HttpOnly cookies. Production should store token ciphertext in PostgreSQL/KMS-backed storage and keep only an opaque hashed session ID in the cookie.
-3. **Repository creation ↔ GitHub:** creation is an explicit authenticated form mutation, not a model capability. The server fixes the GitHub host, endpoint, authenticated owner, and README initialization; the user controls only validated metadata and private/public visibility.
-4. **Repository ↔ retrieval/model:** repository content is adversarial, including prompt injection. Path exclusion, content bounds, lexical selection, redaction, structured output, tool validation, and capability gates apply independently of model instructions. Chat marks repository excerpts as untrusted and exposes no write tools.
-5. **Chat ↔ coding workflow:** a chat has no workspace or GitHub mutation capability. Its only handoff is an editable task-form draft; task creation and both approval gates remain separate server-side operations.
-6. **Agent ↔ workspace:** generated paths and commands are adversarial. Only explicit provider methods are exposed. There is no arbitrary shell tool.
-7. **Workspace ↔ host/network:** the included local adapter is not a secure isolation boundary. Production must replace it.
+2. **Customer account ↔ Next.js:** customer passwords are scrypt-hashed, session cookies are opaque HttpOnly/SameSite values, and the database stores only session/token hashes. Verification and reset tokens are one-time and expire; guest-order linking is deferred until the email is verified.
+3. **Next.js ↔ GitHub/model:** credentials are server-only. OAuth session payloads are AES-256-GCM encrypted and placed in short-lived HttpOnly cookies. Production should store token ciphertext in PostgreSQL/KMS-backed storage and keep only an opaque hashed session ID in the cookie.
+4. **Repository creation ↔ GitHub:** creation is an explicit authenticated form mutation, not a model capability. The server fixes the GitHub host, endpoint, authenticated owner, and README initialization; the user controls only validated metadata and private/public visibility.
+5. **Repository ↔ retrieval/model:** repository content is adversarial, including prompt injection. Path exclusion, content bounds, lexical selection, redaction, structured output, tool validation, and capability gates apply independently of model instructions. Chat marks repository excerpts as untrusted and exposes no write tools.
+6. **Chat ↔ coding workflow:** a chat has no workspace or GitHub mutation capability. Its only handoff is an editable task-form draft; task creation and both approval gates remain separate server-side operations.
+7. **Agent ↔ workspace:** generated paths and commands are adversarial. Only explicit provider methods are exposed. There is no arbitrary shell tool.
+8. **Workspace ↔ host/network:** the included local adapter is not a secure isolation boundary. Production must replace it.
 
 ## Threats and MVP controls
 
@@ -30,6 +32,8 @@ Valmont must not read or transmit `.env` files, credentials, private keys, payme
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Credential leakage to browser/model/log | server-only env variables; sensitive path exclusion; redaction; no raw repository context in persistence; local chat-history access controls            |
 | OAuth CSRF/session tampering            | random OAuth state; AES-GCM authenticated encryption; HttpOnly, SameSite, Secure-in-production cookies; expiry                                          |
+| Customer credential/session compromise  | scrypt password hashing; opaque random session cookies; SHA-256 token/session storage; expiry, sign-out revocation, and reset revocation                |
+| Customer order takeover                 | customer id filter on history; checkout email match; one-time access-code claim; claim deferred until the account email is verified                     |
 | Cross-site mutation                     | same-origin check; double-submit CSRF token; JSON APIs                                                                                                  |
 | Unauthorized repository creation        | authenticated session; fixed GitHub endpoint/owner; Zod validation; creation-specific rate limit; no model tool or deletion/settings method             |
 | Accidental public repository            | private client/server default; explicit private/public selection; visibility echoed after creation                                                      |

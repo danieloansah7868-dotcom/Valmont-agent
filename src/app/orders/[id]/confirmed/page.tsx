@@ -1,4 +1,6 @@
 import Link from "next/link";
+import { ClaimOrderButton } from "@/components/customer-account-forms";
+import { getCustomerSession } from "@/lib/customer-auth";
 import { getSessionUser } from "@/lib/auth";
 import { orderConfirmationDestination } from "@/lib/studio/order-confirmation";
 import { getOrdersStore } from "@/lib/studio/orders";
@@ -32,6 +34,7 @@ export default async function OrderConfirmedPage({
   }
 
   const viewer = await getSessionUser();
+  const customerSession = await getCustomerSession();
   const destination = orderConfirmationDestination(order, viewer);
   const paid = order.status === "paid";
   const cod = order.status === "cod_pending";
@@ -126,6 +129,28 @@ export default async function OrderConfirmedPage({
           ordering again.
         </p>
       )}
+
+      {!order.customerAccountId ? (
+        <div className="mt-6 rounded-lg border border-brandblue-200 bg-brandblue-50 p-4">
+          <p className="text-sm font-semibold text-navy">
+            Want this order in your account?
+          </p>
+          <p className="mt-1 text-sm leading-6 text-slate">
+            Customer accounts are optional. Link this order now to track it
+            alongside future purchases.
+          </p>
+          {customerSession ? (
+            <ClaimOrderButton accessCode={order.accessCode} />
+          ) : (
+            <Link
+              href={`/account/register?claim=${encodeURIComponent(order.accessCode)}`}
+              className="btn-primary mt-3 inline-flex"
+            >
+              Create an account and link order
+            </Link>
+          )}
+        </div>
+      ) : null}
 
       <p className="mt-6 text-xs text-slate-500">
         Contact the business directly if you have any questions about this

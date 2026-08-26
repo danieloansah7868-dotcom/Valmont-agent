@@ -131,6 +131,21 @@ describe("SqliteOrdersStore", () => {
     expect(byId?.accessCode).toBe("code-abc");
   });
 
+  it("claims an order once and isolates customer history", async () => {
+    await store.create(newOrder({ accessCode: "customer-one" }));
+    await store.create(newOrder({ accessCode: "customer-two" }));
+
+    const claimed = await store.claimForCustomer("account-one", "customer-one");
+    expect(claimed?.customerAccountId).toBe("account-one");
+    expect(
+      await store.claimForCustomer("account-two", "customer-one"),
+    ).toBeNull();
+    expect(
+      (await store.listForCustomer("account-one")).map((o) => o.accessCode),
+    ).toEqual(["customer-one"]);
+    expect(await store.listForCustomer("account-two")).toEqual([]);
+  });
+
   it("walks a paid order through preparing, out for delivery and delivered", async () => {
     const created = await store.create(newOrder());
     await store.markPaid("code-abc", "ref-1");
