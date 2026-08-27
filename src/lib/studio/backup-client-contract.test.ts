@@ -39,6 +39,10 @@ const SUCCESS_FIELDS = [
   "skippedMemories",
   "studioDrafts",
   "remappedDraftIds",
+  "customerAccounts",
+  "skippedCustomerAccounts",
+  "customerSessions",
+  "customerTokens",
   "atomicity",
   "notice",
 ] as const;

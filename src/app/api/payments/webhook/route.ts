@@ -3,6 +3,7 @@ import { z } from "zod";
 import { safeApiError } from "@/lib/api";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { verifyWebhookSignature } from "@/lib/studio/valmont-pay";
+import { notifyCustomerOrderStatus } from "@/lib/customer-order-notifications";
 
 const WEBHOOK_BODY_LIMIT_BYTES = 50_000;
 
@@ -68,6 +69,13 @@ export async function POST(request: NextRequest) {
     const order = succeeded
       ? await store.markPaid(accessCode, parsed.reference)
       : await store.markFailed(accessCode);
+
+    if (order && existing.status !== order.status) {
+      await notifyCustomerOrderStatus({
+        order,
+        origin: request.nextUrl.origin,
+      }).catch(() => "failed");
+    }
 
     return NextResponse.json({ ok: true, status: order?.status });
   } catch (e) {

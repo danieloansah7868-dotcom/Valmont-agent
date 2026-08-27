@@ -848,3 +848,250 @@ describe.runIf(connectionString)("PostgreSQL coordinated backup import", () => {
     await emptyStudio(ownerIdB);
   });
 });
+
+// Customer accounts live in GLOBAL tables (customer_accounts,
+// customer_sessions, customer_tokens) shared across every tenant in a
+// PostgreSQL deployment. The export must therefore be scoped to customers
+// linked to the exporting owner's orders, mirroring the SQLite test in
+// backup.test.ts. These are the PostgreSQL counterparts of that test.
+describe.runIf(connectionString)(
+  "PostgreSQL customer backup is owner-scoped and restores safely",
+  () => {
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    let buildBackup: any;
+    let importBackup: any;
+    let parseBackup: any;
+    let ensureStudioUser: any;
+    let canonicalUserId: any;
+    let getDatabase: any;
+    let closeDatabase: any;
+    let customerAccountStore: any;
+    let ordersStore: any;
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    const customerPassword = "a sufficiently long password";
+
+    beforeAll(async () => {
+      process.env.DATABASE_URL = connectionString;
+      const backup = await import("./backup");
+      const identity = await import("@/lib/user-identity");
+      const db = await import("@/db");
+      const customers = await import("@/lib/customer-account-store");
+      const orders = await import("./orders");
+
+      buildBackup = backup.buildBackup;
+      importBackup = backup.importBackup;
+      parseBackup = backup.parseBackup;
+      ensureStudioUser = identity.ensureStudioUser;
+      canonicalUserId = identity.canonicalUserId;
+      getDatabase = db.getDatabase;
+      closeDatabase = db.closeDatabase;
+      customerAccountStore = customers.getCustomerAccountStore();
+      ordersStore = orders.getOrdersStore();
+      await ensureStudioUser(owner);
+    });
+
+    async function emptyCustomerTables() {
+      const { studioOrders, customerAccounts } = await import("@/db/schema");
+      // Orders first: studio_orders.customer_account_id is a foreign key,
+      // and customer_sessions/customer_tokens cascade from customer_accounts.
+      await getDatabase().delete(studioOrders);
+      await getDatabase().delete(customerAccounts);
+    }
+
+    /**
+     * Places one order for the test owner and attaches a customer account to
+     * it, the way checkout-attach or guest claim does. The order's draft is
+     * created through the real studio draft store.
+     */
+    async function seedCustomer(label: string): Promise<{
+      account: { id: string; email: string };
+      token: string;
+    }> {
+      const { PostgresStudioDraftStore } = await import("./draft-store");
+      const { createDefaultBrief } = await import("./site-brief/defaults");
+      const draft = await new PostgresStudioDraftStore().create(
+        owner,
+        createDefaultBrief({
+          businessName: `${label} Shop`,
+          phone: "+233201234567",
+          adminEmail: `${label}@adom.example`,
+        }),
+      );
+      const account = await customerAccountStore.createAccount({
+        email: `${label}-shopper@example.com`,
+        name: `${label} Shopper`,
+        password: customerPassword,
+      });
+      await customerAccountStore.verifyEmail(account.id);
+      const session = await customerAccountStore.createSession(account.id);
+      await customerAccountStore.createToken(
+        account.id,
+        "verify_email",
+        60_000,
+        `${label}-code`,
+      );
+      await ordersStore.create({
+        ownerId: canonicalUserId(owner),
+        draftId: draft.id,
+        accessCode: `${label}-access-code`,
+        status: "paid",
+        currency: "GHS",
+        subtotal: 100,
+        deliveryFee: 0,
+        total: 100,
+        lines: [{ itemId: "i1", name: "Jollof Rice", price: 100, quantity: 1 }],
+        customerName: `${label} Shopper`,
+        customerPhone: "+233240000000",
+        customerEmail: `${label}-shopper@example.com`,
+        customerAccountId: account.id,
+        paymentMethod: "cod",
+      });
+      return { account, token: session.token };
+    }
+
+    it("never exports another tenant's customer — accounts linked only to a different owner's orders, or to no orders at all, stay out", async () => {
+      await emptyCustomerTables();
+      // Owner A: a customer who ordered on A's shop -> belongs in A's backup.
+      await seedCustomer("ownera");
+
+      // A second tenant B sharing the global customer table, with B's own
+      // customer who ordered only on B's shop -> must NOT enter A's backup.
+      const otherUser = {
+        id: "pgb-9002",
+        login: "kofi",
+        name: "Kofi Other",
+      } as const;
+      const otherOwnerId = await ensureStudioUser(otherUser);
+      const { PostgresStudioDraftStore } = await import("./draft-store");
+      const { createDefaultBrief } = await import("./site-brief/defaults");
+      const otherDraft = await new PostgresStudioDraftStore().create(
+        otherUser,
+        createDefaultBrief({
+          businessName: "Other Owner Shop",
+          phone: "+233209999999",
+          adminEmail: "other@adom.example",
+        }),
+      );
+      const foreignAccount = await customerAccountStore.createAccount({
+        email: "foreign-shopper@example.com",
+        name: "Foreign Tenant",
+        password: customerPassword,
+      });
+      await ordersStore.create({
+        ownerId: otherOwnerId,
+        draftId: otherDraft.id,
+        accessCode: "foreign-access-code",
+        status: "paid",
+        currency: "GHS",
+        subtotal: 50,
+        deliveryFee: 0,
+        total: 50,
+        lines: [{ itemId: "i9", name: "Waakye", price: 50, quantity: 1 }],
+        customerName: "Foreign Tenant",
+        customerPhone: "+23320999888",
+        customerEmail: "foreign-shopper@example.com",
+        customerAccountId: foreignAccount.id,
+        paymentMethod: "cod",
+      });
+
+      // An account with no order on any shop is excluded too.
+      await customerAccountStore.createAccount({
+        email: "never-ordered@example.com",
+        name: "Never Ordered",
+        password: customerPassword,
+      });
+
+      const backup = JSON.parse(JSON.stringify(await buildBackup(owner)));
+      const emails = backup.customers.accounts.map(
+        (customer: { email: string }) => customer.email,
+      );
+      expect(emails).toEqual(["ownera-shopper@example.com"]);
+      expect(JSON.stringify(backup)).not.toContain(
+        "foreign-shopper@example.com",
+      );
+      expect(JSON.stringify(backup)).not.toContain("never-ordered@example.com");
+    });
+
+    it("restores accounts, sessions and tokens so the customer can still sign in with the same password", async () => {
+      await emptyCustomerTables();
+      await seedCustomer("restore");
+      const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
+      expect(file.customers.accounts).toHaveLength(1);
+      expect(file.customers.sessions).toHaveLength(1);
+      expect(file.customers.tokens).toHaveLength(1);
+
+      await emptyCustomerTables();
+
+      const summary = await importBackup(owner, parseBackup(file));
+      expect(summary.customerAccounts).toBe(1);
+      expect(summary.skippedCustomerAccounts).toBe(0);
+      expect(summary.customerSessions).toBe(1);
+      expect(summary.customerTokens).toBe(1);
+
+      const restored = await customerAccountStore.getByEmail(
+        "restore-shopper@example.com",
+      );
+      expect(restored?.emailVerifiedAt).toBeDefined();
+      // The scrypt envelope travelled as-is, so the same password still works.
+      expect(
+        await customerAccountStore.verifyPassword(
+          "restore-shopper@example.com",
+          customerPassword,
+        ),
+      ).toMatchObject({ email: "restore-shopper@example.com" });
+      expect(
+        await customerAccountStore.verifyPassword(
+          "restore-shopper@example.com",
+          "wrong password entirely",
+        ),
+      ).toBeNull();
+    });
+
+    it("never exports a readable password or session token — hashes only", async () => {
+      await emptyCustomerTables();
+      const { token } = await seedCustomer("hashonly");
+      const { hashCustomerToken } = await import("@/lib/customer-password");
+      const raw = JSON.stringify(await buildBackup(owner));
+
+      expect(raw).not.toContain(customerPassword);
+      expect(raw).not.toContain(token);
+      expect(raw).toContain("scrypt$N=32768");
+      expect(raw).toContain(hashCustomerToken(token));
+    });
+
+    it("re-importing an older backup never overwrites the current password or account", async () => {
+      await emptyCustomerTables();
+      const { account } = await seedCustomer("overwrite");
+      const older = JSON.parse(JSON.stringify(await buildBackup(owner)));
+
+      await customerAccountStore.updatePassword(
+        account.id,
+        "the newer replacement password",
+      );
+
+      const summary = await importBackup(owner, parseBackup(older));
+      expect(summary.customerAccounts).toBe(0);
+      expect(summary.skippedCustomerAccounts).toBe(1);
+
+      expect(
+        await customerAccountStore.verifyPassword(
+          "overwrite-shopper@example.com",
+          "the newer replacement password",
+        ),
+      ).toMatchObject({ email: "overwrite-shopper@example.com" });
+      expect(
+        await customerAccountStore.verifyPassword(
+          "overwrite-shopper@example.com",
+          customerPassword,
+        ),
+      ).toBeNull();
+    });
+
+    afterAll(async () => {
+      await emptyCustomerTables();
+      await closeDatabase();
+      delete process.env.DATABASE_URL;
+    });
+  },
+);

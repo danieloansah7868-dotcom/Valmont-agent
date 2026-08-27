@@ -8,6 +8,42 @@ independent review).
 
 ---
 
+## Website Studio Customer Accounts v1 — implemented on this branch
+
+Customer accounts are optional and do not change guest checkout. The public
+account flow now supports registration, sign-in/sign-out, email verification,
+verification resend, password reset, secure hashed sessions, customer-only
+order history, and post-checkout order linking. The feature is an explicit
+owner opt-in per website: Step 5 of the website wizard has a "Customer
+accounts" switch (`features.customerAccounts`, default off), and websites
+without it show no Account link, attach no session at checkout, refuse order
+claims, and expose nothing through `/account`. Customer accounts, sessions and
+tokens are included in Studio backup v2 (hashes only — never plaintext
+passwords, tokens, or payment credentials), and restoring never overwrites an
+account that already exists. SQLite is provisioned locally
+from the shared Studio store; PostgreSQL uses migration `0008` plus `0009`.
+Email delivery stays behind `src/lib/customer-email.ts`: configure the existing
+`RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` values for delivery. In local
+development, the absence of a provider exposes clearly marked one-time links;
+in production, registration, verification resend, and password-reset requests
+fail clearly with HTTP 503 until a sender is configured.
+
+Before production, configure a real email sender, run the PostgreSQL migrations
+manually, and replace the in-process limiter with a distributed rate-limit
+store. Live payments, deployment, and paid services remain intentionally
+inactive.
+
+## Customer order tracking and status notifications — implemented on this branch
+
+Authenticated customers can open `/account/orders/[id]` to see an owner-scoped
+order timeline, item details, and the current delivery status. Merchant status
+changes and payment webhook transitions send a best-effort transactional email
+to the checkout address when the production Resend configuration is present;
+orders without an email remain valid guest orders but cannot receive email
+updates.
+
+---
+
 ## 1. Fix the formatting on `main`
 
 **Status: resolved.** The final-corrections branch fixed the formatting on

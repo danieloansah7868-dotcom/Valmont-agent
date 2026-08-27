@@ -183,6 +183,7 @@ export function createDefaultBrief(
       notifications: {},
       staged: { enabled: false, stages: [] },
     },
+    features: { customerAccounts: false },
     plannedPaymentMethods: [],
     country: GHANA_DEFAULTS.country,
     currency: GHANA_DEFAULTS.currency,

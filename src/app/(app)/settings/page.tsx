@@ -5,6 +5,7 @@ import {
   Database,
   Github,
   KeyRound,
+  Mail,
   LockKeyhole,
   Radio,
   Server,
@@ -12,7 +13,11 @@ import {
 } from "lucide-react";
 import { PageHeading } from "@/components/states";
 import { githubConfigured, requireSessionUser } from "@/lib/auth";
-import { missingLiveRequirements } from "@/lib/config";
+import {
+  customerEmailConfigured,
+  missingCustomerEmailRequirements,
+  missingLiveRequirements,
+} from "@/lib/config";
 import { tryCreateModelProvider } from "@/lib/models";
 
 export const dynamic = "force-dynamic";
@@ -23,7 +28,11 @@ export default async function SettingsPage() {
   const modelReady = Boolean(model);
   const githubReady = githubConfigured();
   const databaseReady = Boolean(process.env.DATABASE_URL);
-  const missing = missingLiveRequirements();
+  const customerEmailReady = customerEmailConfigured();
+  const missing = [
+    ...missingLiveRequirements(),
+    ...missingCustomerEmailRequirements(),
+  ];
   const liveReady = missing.length === 0;
 
   return (
@@ -133,6 +142,21 @@ export default async function SettingsPage() {
                 : "Not configured. Tasks persist to a local ignored data file instead."
             }
             ready={databaseReady}
+          />
+          <Integration
+            icon={Mail}
+            title="Customer account email"
+            description={
+              customerEmailReady
+                ? "Resend is configured for verification and password-reset messages."
+                : process.env.NODE_ENV === "production"
+                  ? "Required in production. Set RESEND_API_KEY and NOTIFY_EMAIL_FROM before customer account email flows can work."
+                  : "Not configured. Local development uses clearly marked one-time links."
+            }
+            ready={customerEmailReady}
+            warning={
+              !customerEmailReady && process.env.NODE_ENV !== "production"
+            }
           />
           <Integration
             icon={Server}

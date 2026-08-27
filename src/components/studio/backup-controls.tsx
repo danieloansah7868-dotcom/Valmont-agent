@@ -17,6 +17,10 @@ interface ImportSummary {
   skippedMemories: number;
   studioDrafts: number;
   remappedDraftIds: number;
+  customerAccounts: number;
+  skippedCustomerAccounts: number;
+  customerSessions: number;
+  customerTokens: number;
   atomicity: "single-transaction" | "coordinated";
   notice?: string;
 }
@@ -151,10 +155,31 @@ export function BackupControls() {
                   status.summary.remappedDraftIds === 1 ? "" : "s"
                 } added as a separate copy)`
               : ""}
+            {status.summary.customerAccounts > 0 ||
+            status.summary.customerSessions > 0 ||
+            status.summary.customerTokens > 0
+              ? `, plus ${status.summary.customerAccounts} customer account${
+                  status.summary.customerAccounts === 1 ? "" : "s"
+                }`
+              : ""}
             .
           </span>
         )}
       </p>
+
+      {/* Accounts already on this machine are deliberately left untouched —
+          a restore never overwrites a customer's current password. */}
+      {status.kind === "done" && status.summary.skippedCustomerAccounts > 0 && (
+        <p
+          role="status"
+          data-testid="import-skipped-customers"
+          className="text-sm text-amber-800"
+        >
+          {status.summary.skippedCustomerAccounts} customer account
+          {status.summary.skippedCustomerAccounts === 1 ? "" : "s"} already
+          existed here and were left unchanged.
+        </p>
+      )}
 
       {/* Skipped memories are reported next to the success, not hidden by it.
           The counts above are what was written; this is what was not. */}

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  customerAccountsEnabled,
   customerFacingPaymentMethods,
   isHttpsSafeUrl,
   PAYMENT_METHODS,
@@ -88,15 +89,25 @@ export function Storefront({
             ) : null}
           </div>
         </div>
-        {shopOpen && pricedItems.length > 0 ? (
-          <a
-            href="#menu"
-            className="shrink-0 rounded-lg px-3 py-2 text-sm font-bold"
-            style={{ background: accent, color: primary }}
-          >
-            {cta}
-          </a>
-        ) : null}
+        <div className="flex shrink-0 items-center gap-2">
+          {variant === "public" && customerAccountsEnabled(brief) ? (
+            <a
+              href="/account"
+              className="rounded-lg px-3 py-2 text-sm font-semibold text-white/90 hover:bg-white/10"
+            >
+              Account
+            </a>
+          ) : null}
+          {shopOpen && pricedItems.length > 0 ? (
+            <a
+              href="#menu"
+              className="rounded-lg px-3 py-2 text-sm font-bold"
+              style={{ background: accent, color: primary }}
+            >
+              {cta}
+            </a>
+          ) : null}
+        </div>
       </header>
 
       <section className="px-4 py-8 sm:px-6 sm:py-12">

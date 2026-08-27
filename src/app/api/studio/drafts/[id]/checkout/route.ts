@@ -4,6 +4,8 @@ import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { assertSameOrigin } from "@/lib/security";
 import { readBoundedJson } from "@/lib/bounded-json";
+import { getCustomerSession } from "@/lib/customer-auth";
+import { normalizeCustomerEmail } from "@/lib/customer-password";
 import { internalGetDraftForCheckout } from "@/lib/studio/draft-public";
 import { getOrdersStore, type OrderLine } from "@/lib/studio/orders";
 import {
@@ -11,7 +13,10 @@ import {
   createPaymentLink,
   type PricedLine,
 } from "@/lib/studio/valmont-pay";
-import { isPaymentMethodId } from "@/lib/studio/site-brief/schema";
+import {
+  customerAccountsEnabled,
+  isPaymentMethodId,
+} from "@/lib/studio/site-brief/schema";
 import { notifyMerchantNewOrder } from "@/lib/studio/notifications";
 
 const CHECKOUT_BODY_LIMIT_BYTES = 100_000;
@@ -46,10 +51,13 @@ function accessCode(): string {
 }
 
 /**
- * Public checkout. No session: a shopper is never signed in. Security rests on
- * (1) the draft id being an unguessable UUID, (2) a same-origin check, (3) the
- * server re-pricing the basket against the stored catalogue, and (4) an
- * unguessable per-order access code guarding the payment page and webhook.
+ * Public checkout remains guest-accessible. On websites whose owner enabled
+ * customer accounts, a verified customer session is attached automatically
+ * when the checkout email is blank or matches the account; a mismatched email
+ * stays a guest order. Websites without the feature never attach a session. Security rests on (1) the
+ * draft id being an unguessable UUID, (2) a same-origin check, (3) the server
+ * re-pricing the basket against the stored catalogue, and (4) an unguessable
+ * per-order access code guarding the payment page and webhook.
  */
 export async function POST(
   request: NextRequest,
@@ -146,6 +154,23 @@ export async function POST(
 
     const code = accessCode();
     const isCod = payload.paymentMethod === "cod";
+    // Customer accounts are an owner opt-in per website; when the website has
+    // not enabled them, checkout stays purely guest and never reads a session.
+    // An account-store outage must never take guest checkout down with it.
+    const accountsEnabled = customerAccountsEnabled(draft.brief);
+    const customerSession = accountsEnabled
+      ? await getCustomerSession().catch(() => null)
+      : null;
+    const customerAccountId =
+      customerSession &&
+      (!payload.customerEmail ||
+        normalizeCustomerEmail(payload.customerEmail) ===
+          normalizeCustomerEmail(customerSession.account.email))
+        ? customerSession.account.id
+        : undefined;
+    const orderCustomerEmail = customerAccountId
+      ? customerSession?.account.email
+      : payload.customerEmail || undefined;
 
     const order = await getOrdersStore().create({
       ownerId: draft.ownerId,
@@ -159,8 +184,9 @@ export async function POST(
       lines,
       customerName: payload.customerName,
       customerPhone: payload.customerPhone,
-      customerEmail: payload.customerEmail || undefined,
+      customerEmail: orderCustomerEmail,
       customerAddress: payload.customerAddress || undefined,
+      customerAccountId,
       paymentMethod: payload.paymentMethod,
       merchantNote: payload.note || undefined,
     });
@@ -197,7 +223,7 @@ export async function POST(
       reference: order.id,
       description: `${draft.brief.businessName} order`,
       customerName: payload.customerName,
-      customerEmail: payload.customerEmail || undefined,
+      customerEmail: orderCustomerEmail,
       customerPhone: payload.customerPhone,
       callbackUrl: `${origin}/api/payments/webhook?access_code=${code}`,
     });

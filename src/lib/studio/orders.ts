@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { and, desc, eq, gte, inArray, lt } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lt, or } from "drizzle-orm";
 import { getDatabase } from "@/db";
 import { studioOrders } from "@/db/schema";
 import { getSqliteChatStore } from "@/lib/chat-store";
@@ -56,6 +56,8 @@ export interface OrderRecord {
   customerPhone: string;
   customerEmail?: string;
   customerAddress?: string;
+  /** Set after an optional customer account claims the order. */
+  customerAccountId?: string;
   paymentMethod: string;
   paymentRef?: string;
   paidAt?: string;
@@ -85,6 +87,7 @@ export interface NewOrderInput {
   customerPhone: string;
   customerEmail?: string;
   customerAddress?: string;
+  customerAccountId?: string;
   paymentMethod: string;
   merchantNote?: string;
 }
@@ -167,10 +170,23 @@ export interface OrdersStore {
    */
   getById(id: string): Promise<OrderRecord | null>;
   getForOwner(ownerId: string, id: string): Promise<OrderRecord | null>;
+  getForCustomer(
+    customerAccountId: string,
+    id: string,
+  ): Promise<OrderRecord | null>;
   listForOwner(
     ownerId: string,
     options?: number | ListOrdersOptions,
   ): Promise<OrderRecord[]>;
+  listForCustomer(
+    customerAccountId: string,
+    limit?: number,
+  ): Promise<OrderRecord[]>;
+  /** Claims only an unclaimed order, or returns the already-linked order. */
+  claimForCustomer(
+    customerAccountId: string,
+    accessCode: string,
+  ): Promise<OrderRecord | null>;
   markPaid(
     accessCode: string,
     paymentRef?: string,
@@ -231,6 +247,7 @@ interface OrderRow {
   customer_phone: string;
   customer_email: string | null;
   customer_address: string | null;
+  customer_account_id: string | null;
   payment_method: string;
   payment_ref: string | null;
   paid_at: string | null;
@@ -261,6 +278,7 @@ function rowToOrder(row: OrderRow): OrderRecord {
     customerPhone: row.customer_phone,
     customerEmail: row.customer_email ?? undefined,
     customerAddress: row.customer_address ?? undefined,
+    customerAccountId: row.customer_account_id ?? undefined,
     paymentMethod: row.payment_method,
     paymentRef: row.payment_ref ?? undefined,
     paidAt: row.paid_at ?? undefined,
@@ -307,6 +325,7 @@ export function ensureOrdersSchema(db: DatabaseSync): void {
       customer_phone TEXT NOT NULL,
       customer_email TEXT,
       customer_address TEXT,
+      customer_account_id TEXT,
       payment_method TEXT NOT NULL,
       payment_ref TEXT,
       paid_at TEXT,
@@ -335,6 +354,10 @@ export function ensureOrdersSchema(db: DatabaseSync): void {
   ensureColumn(db, "out_for_delivery_at", "TEXT", existing);
   ensureColumn(db, "refunded_at", "TEXT", existing);
   ensureColumn(db, "status_history_json", "TEXT", existing);
+  ensureColumn(db, "customer_account_id", "TEXT", existing);
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS studio_orders_customer_account ON studio_orders(customer_account_id)",
+  );
 }
 
 export class SqliteOrdersStore implements OrdersStore {
@@ -354,8 +377,9 @@ export class SqliteOrdersStore implements OrdersStore {
           id, owner_id, draft_id, access_code, status, currency,
           subtotal, delivery_fee, total, lines_json,
           customer_name, customer_phone, customer_email, customer_address,
-          payment_method, merchant_note, created_at, updated_at, status_history_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          customer_account_id, payment_method, merchant_note, created_at, updated_at,
+          status_history_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -372,6 +396,7 @@ export class SqliteOrdersStore implements OrdersStore {
         input.customerPhone,
         input.customerEmail ?? null,
         input.customerAddress ?? null,
+        input.customerAccountId ?? null,
         input.paymentMethod,
         input.merchantNote ?? null,
         now,
@@ -401,6 +426,18 @@ export class SqliteOrdersStore implements OrdersStore {
     const row = this.db
       .prepare("SELECT * FROM studio_orders WHERE id = ? AND owner_id = ?")
       .get(id, ownerId) as unknown as OrderRow | undefined;
+    return row ? rowToOrder(row) : null;
+  }
+
+  async getForCustomer(
+    customerAccountId: string,
+    id: string,
+  ): Promise<OrderRecord | null> {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM studio_orders WHERE id = ? AND customer_account_id = ?",
+      )
+      .get(id, customerAccountId) as unknown as OrderRow | undefined;
     return row ? rowToOrder(row) : null;
   }
 
@@ -435,6 +472,44 @@ export class SqliteOrdersStore implements OrdersStore {
         ? mapped
         : mapped.filter((order) => matchesFilter(order.status, filter));
     return filtered.slice(0, limit);
+  }
+
+  async listForCustomer(
+    customerAccountId: string,
+    limit = 50,
+  ): Promise<OrderRecord[]> {
+    const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 100);
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM studio_orders WHERE customer_account_id = ? ORDER BY created_at DESC LIMIT ?",
+      )
+      .all(customerAccountId, boundedLimit) as unknown as OrderRow[];
+    return rows.map(rowToOrder);
+  }
+
+  async claimForCustomer(
+    customerAccountId: string,
+    accessCode: string,
+  ): Promise<OrderRecord | null> {
+    const existing = await this.getByAccessCode(accessCode);
+    if (!existing) return null;
+    if (
+      existing.customerAccountId &&
+      existing.customerAccountId !== customerAccountId
+    ) {
+      return null;
+    }
+    if (!existing.customerAccountId) {
+      this.db
+        .prepare(
+          `UPDATE studio_orders
+              SET customer_account_id = ?, updated_at = ?
+            WHERE access_code = ? AND customer_account_id IS NULL`,
+        )
+        .run(customerAccountId, new Date().toISOString(), accessCode);
+    }
+    const claimed = await this.getByAccessCode(accessCode);
+    return claimed?.customerAccountId === customerAccountId ? claimed : null;
   }
 
   async markPaid(
@@ -544,6 +619,7 @@ function pgRowToOrder(row: typeof studioOrders.$inferSelect): OrderRecord {
     customerPhone: row.customerPhone,
     customerEmail: row.customerEmail ?? undefined,
     customerAddress: row.customerAddress ?? undefined,
+    customerAccountId: row.customerAccountId ?? undefined,
     paymentMethod: row.paymentMethod,
     paymentRef: row.paymentRef ?? undefined,
     paidAt: row.paidAt?.toISOString(),
@@ -578,6 +654,7 @@ export class PostgresOrdersStore implements OrdersStore {
         customerPhone: input.customerPhone,
         customerEmail: input.customerEmail ?? null,
         customerAddress: input.customerAddress ?? null,
+        customerAccountId: input.customerAccountId ?? null,
         paymentMethod: input.paymentMethod,
         merchantNote: input.merchantNote ?? null,
         statusHistory: appendHistory([], input.status, now.toISOString()),
@@ -613,6 +690,23 @@ export class PostgresOrdersStore implements OrdersStore {
     return row ? pgRowToOrder(row) : null;
   }
 
+  async getForCustomer(
+    customerAccountId: string,
+    id: string,
+  ): Promise<OrderRecord | null> {
+    const [row] = await getDatabase()
+      .select()
+      .from(studioOrders)
+      .where(
+        and(
+          eq(studioOrders.id, id),
+          eq(studioOrders.customerAccountId, customerAccountId),
+        ),
+      )
+      .limit(1);
+    return row ? pgRowToOrder(row) : null;
+  }
+
   async listForOwner(
     ownerId: string,
     options?: number | ListOrdersOptions,
@@ -639,6 +733,40 @@ export class PostgresOrdersStore implements OrdersStore {
         ? mapped
         : mapped.filter((order) => matchesFilter(order.status, filter));
     return filtered.slice(0, limit);
+  }
+
+  async listForCustomer(
+    customerAccountId: string,
+    limit = 50,
+  ): Promise<OrderRecord[]> {
+    const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 100);
+    const rows = await getDatabase()
+      .select()
+      .from(studioOrders)
+      .where(eq(studioOrders.customerAccountId, customerAccountId))
+      .orderBy(desc(studioOrders.createdAt))
+      .limit(boundedLimit);
+    return rows.map(pgRowToOrder);
+  }
+
+  async claimForCustomer(
+    customerAccountId: string,
+    accessCode: string,
+  ): Promise<OrderRecord | null> {
+    await getDatabase()
+      .update(studioOrders)
+      .set({ customerAccountId })
+      .where(
+        and(
+          eq(studioOrders.accessCode, accessCode),
+          or(
+            isNull(studioOrders.customerAccountId),
+            eq(studioOrders.customerAccountId, customerAccountId),
+          ),
+        ),
+      );
+    const claimed = await this.getByAccessCode(accessCode);
+    return claimed?.customerAccountId === customerAccountId ? claimed : null;
   }
 
   async markPaid(

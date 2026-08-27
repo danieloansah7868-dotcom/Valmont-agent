@@ -532,6 +532,20 @@ const baseSiteBriefV1 = z.object({
   items: z.array(catalogItemSchema).max(200).default([]),
   /** Phase 3 payments and delivery configuration. */
   payments: paymentsConfigSchema,
+  /**
+   * Optional per-website features. Every feature defaults to OFF so an owner
+   * who never asked for it sees zero trace of it on their public website.
+   */
+  features: z
+    .object({
+      /**
+       * Lets shoppers create an optional account and track their orders.
+       * When off, the storefront shows no account link, checkout never
+       * attaches a customer account, and orders cannot be claimed.
+       */
+      customerAccounts: z.boolean().default(false),
+    })
+    .default({ customerAccounts: false }),
   country: z.string().max(60).default("Ghana"),
   currency: z.string().max(10).default("GHS"),
   timezone: z.string().max(40).default("Africa/Accra"),
@@ -574,6 +588,17 @@ export const siteBriefSchemaV1 = baseSiteBriefV1.superRefine((brief, ctx) => {
 });
 
 export type SiteBriefV1 = z.infer<typeof baseSiteBriefV1>;
+
+/**
+ * Whether a website has opted in to optional customer accounts. Drafts created
+ * before this flag existed have no `features` block and are treated as off,
+ * so existing websites never gain the feature silently.
+ */
+export function customerAccountsEnabled(
+  brief: Partial<SiteBriefV1> | null | undefined,
+): boolean {
+  return brief?.features?.customerAccounts === true;
+}
 
 export interface StudioDraft {
   id: string;

@@ -17,6 +17,9 @@ import {
 import { ImportInProgressError } from "./import-coordinator";
 import { SqliteStudioDraftStore } from "./draft-store";
 import { createDefaultBrief } from "./site-brief/defaults";
+import { SqliteCustomerAccountStore } from "@/lib/customer-account-store";
+import { hashCustomerToken } from "@/lib/customer-password";
+import { SqliteOrdersStore, type NewOrderInput } from "./orders";
 
 const userA: SessionUser = { id: "9001", login: "ama", name: "Ama" };
 const userB: SessionUser = { id: "9002", login: "kofi", name: "Kofi" };
@@ -349,6 +352,152 @@ describe("import round trip", () => {
     expect(summary.studioDrafts).toBe(0);
     expect(await drafts.list(userA)).toHaveLength(0);
     expect(await chatStore.list(userA.id)).toHaveLength(1);
+  });
+});
+
+describe("customer accounts survive export and restore", () => {
+  const CUSTOMER_PASSWORD = "a sufficiently long password";
+
+  /**
+   * The customer backup is scoped to accounts linked to the exporting
+   * owner's ORDERS (an account a shopper never used on this owner's
+   * shops is another tenant's data and never enters the file). The
+   * seeding helper therefore places one order for userA and attaches
+   * the customer account to it, the way checkout/claim would.
+   */
+  async function seedCustomer(): Promise<{
+    account: { id: string; email: string; name: string };
+    session: { token: string };
+  }> {
+    const store = new SqliteCustomerAccountStore();
+    const account = await store.createAccount({
+      email: "shopper@example.com",
+      name: "Ama Shopper",
+      password: CUSTOMER_PASSWORD,
+    });
+    await store.verifyEmail(account.id);
+    const session = await store.createSession(account.id);
+    await store.createToken(account.id, "verify_email", 60_000, "order-code-1");
+
+    const orders = new SqliteOrdersStore();
+    await orders.create({
+      ownerId: canonicalUserId(userA),
+      draftId: "draft-for-customer",
+      accessCode: "order-code-1",
+      status: "paid",
+      currency: "GHS",
+      subtotal: 100,
+      deliveryFee: 0,
+      total: 100,
+      lines: [
+        {
+          itemId: "i1",
+          name: "Jollof Rice",
+          price: 100,
+          quantity: 1,
+        },
+      ],
+      customerName: "Ama Shopper",
+      customerPhone: "+233240000000",
+      customerEmail: "shopper@example.com",
+      customerAccountId: account.id,
+      paymentMethod: "cod",
+    } satisfies NewOrderInput);
+    return { account, session };
+  }
+
+  it("never exports a customer who never ordered on this owner's shops", async () => {
+    // A customer of ANOTHER tenant (no order row links them to userA).
+    const store = new SqliteCustomerAccountStore();
+    await store.createAccount({
+      email: "other-tenant-shopper@example.com",
+      name: "Other Tenant",
+      password: CUSTOMER_PASSWORD,
+    });
+    await seedUserA();
+    const backup = await buildBackup(userA);
+    expect(backup.customers?.accounts).toEqual([]);
+    expect(JSON.stringify(backup)).not.toContain(
+      "other-tenant-shopper@example.com",
+    );
+  });
+
+  it("restores accounts, sessions and tokens into an empty database — the customer can still sign in with the same password", async () => {
+    await seedCustomer();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    expect(backup.customers.accounts).toHaveLength(1);
+    expect(backup.customers.sessions).toHaveLength(1);
+    expect(backup.customers.tokens).toHaveLength(1);
+
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+
+    expect(summary.customerAccounts).toBe(1);
+    expect(summary.skippedCustomerAccounts).toBe(0);
+    expect(summary.customerSessions).toBe(1);
+    expect(summary.customerTokens).toBe(1);
+
+    const store = new SqliteCustomerAccountStore();
+    const restored = await store.getByEmail("shopper@example.com");
+    expect(restored?.emailVerifiedAt).toBeDefined();
+    // The scrypt hash travelled as-is, so the same password still verifies.
+    expect(
+      await store.verifyPassword("shopper@example.com", CUSTOMER_PASSWORD),
+    ).toMatchObject({ email: "shopper@example.com" });
+  });
+
+  it("never exports a readable password or session token — hashes only", async () => {
+    const { session } = await seedCustomer();
+    const raw = JSON.stringify(await buildBackup(userA));
+
+    expect(raw).not.toContain(CUSTOMER_PASSWORD);
+    expect(raw).not.toContain(session.token);
+    expect(raw).toContain("scrypt$N=32768");
+    expect(raw).toContain(hashCustomerToken(session.token));
+  });
+
+  it("restoring an older backup never overwrites the current password or account", async () => {
+    const { account } = await seedCustomer();
+    const older = JSON.parse(JSON.stringify(await buildBackup(userA)));
+
+    const live = new SqliteCustomerAccountStore();
+    await live.updatePassword(account.id, "the newer replacement password");
+
+    const summary = await importBackup(userA, parseBackup(older));
+    expect(summary.customerAccounts).toBe(0);
+    expect(summary.skippedCustomerAccounts).toBe(1);
+
+    expect(
+      await live.verifyPassword(
+        "shopper@example.com",
+        "the newer replacement password",
+      ),
+    ).toMatchObject({ email: "shopper@example.com" });
+    expect(
+      await live.verifyPassword("shopper@example.com", CUSTOMER_PASSWORD),
+    ).toBeNull();
+  });
+
+  it("refuses a file where a password hash is not an scrypt envelope", async () => {
+    await seedCustomer();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    backup.customers.accounts[0].passwordHash = "not-a-hash-at-all";
+
+    expect(() => parseBackup(backup)).toThrow(BackupValidationError);
+  });
+
+  it("a v2 file written before customer accounts existed still imports cleanly", async () => {
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    delete backup.customers;
+
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+
+    expect(summary.studioDrafts).toBe(1);
+    expect(summary.customerAccounts).toBe(0);
+    expect(summary.customerSessions).toBe(0);
+    expect(summary.customerTokens).toBe(0);
   });
 });
 
