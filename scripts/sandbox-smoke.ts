@@ -95,6 +95,15 @@ const hostId = (role: string) => {
   hostInstanceIds.add(instanceId);
   return instanceId;
 };
+/**
+ * A run-scoped task id. The provider derives the container NAME from
+ * the task id (`valmont-sandbox-<taskId>`, workspace-docker.ts), and
+ * create() treats a stopped same-NAME container as replaceable — so a
+ * fixed task id could collide with (or destroy) an unrelated
+ * container. Scoping the id scopes the name; it stays within the
+ * provider's TASK_ID pattern (^[a-zA-Z0-9_-]{3,80}$).
+ */
+const task = (name: string) => `${name}-${RUN_ID}`;
 
 const log = (...args: unknown[]) => console.log(...args);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -472,7 +481,7 @@ async function main(): Promise<void> {
     // ------------------------------------------------------- scenarios
     await step("end-to-end lifecycle on the host daemon", async () => {
       const provider = mkHost({ instanceId: hostId("a") });
-      const ws = await provider.create("taske2e", srcBase);
+      const ws = await provider.create(task("taske2e"), srcBase);
       await provider.writeFile(ws, "notes.txt", "hello from the smoke test\n");
       const note = await provider.readFile(ws, "notes.txt");
       check(
@@ -493,9 +502,9 @@ async function main(): Promise<void> {
         result.output.includes("smoke-ok"),
         "the validation output contains the task's own output",
       );
-      await provider.destroy("taske2e");
+      await provider.destroy(task("taske2e"));
       check(
-        (await containerIds("taske2e")).length === 0,
+        (await containerIds(task("taske2e"))).length === 0,
         "destroy removed the container",
       );
     });
@@ -505,34 +514,34 @@ async function main(): Promise<void> {
       async () => {
         const a = mkHost({ instanceId: hostId("a") });
         const b = mkHost({ instanceId: hostId("b") });
-        await a.create("taskown", srcBase);
+        await a.create(task("taskown"), srcBase);
         await expectReject(
-          () => b.open("taskown"),
+          () => b.open(task("taskown")),
           /owned by another/,
           "peer open",
         );
         await expectReject(
-          () => b.create("taskown", srcBase),
+          () => b.create(task("taskown"), srcBase),
           /owned by another/,
           "peer create",
         );
         await expectReject(
-          () => b.destroy("taskown"),
+          () => b.destroy(task("taskown")),
           /owned by another/,
           "peer destroy",
         );
         check(
-          (await containerIds("taskown")).length === 1,
+          (await containerIds(task("taskown"))).length === 1,
           "the container survived every peer attempt",
         );
-        await a.destroy("taskown");
+        await a.destroy(task("taskown"));
       },
     );
 
     await step(
       "atomic adoption of an unlabeled legacy container (one winner)",
       async () => {
-        const container = "valmont-sandbox-taskadopt";
+        const container = `valmont-sandbox-${task("taskadopt")}`;
         await docker([
           "create",
           "--name",
@@ -540,7 +549,7 @@ async function main(): Promise<void> {
           "--label",
           "valmont.managed=true",
           "--label",
-          "valmont.task=taskadopt",
+          `valmont.task=${task("taskadopt")}`,
           // Marks this container as created by THIS smoke run, so the
           // teardown can remove it precisely if the scenario dies.
           "--label",
@@ -554,8 +563,8 @@ async function main(): Promise<void> {
           fenceOwnerWaitMs: 30_000,
         });
         const races = await Promise.allSettled([
-          a.open("taskadopt"),
-          b.open("taskadopt"),
+          a.open(task("taskadopt")),
+          b.open(task("taskadopt")),
         ]);
         const winners = races.filter((r) => r.status === "fulfilled");
         const losers = races.filter((r) => r.status === "rejected");
@@ -575,9 +584,9 @@ async function main(): Promise<void> {
         }
         const winnerIndex = races.findIndex((r) => r.status === "fulfilled");
         const winner = winnerIndex === 0 ? a : b;
-        await winner.destroy("taskadopt");
+        await winner.destroy(task("taskadopt"));
         check(
-          (await containerIds("taskadopt")).length === 0,
+          (await containerIds(task("taskadopt"))).length === 0,
           "the winner's destroy removed the adopted container",
         );
       },
@@ -592,22 +601,22 @@ async function main(): Promise<void> {
           reapIntervalMs: 3_600_000,
         });
         const peer = mkHost({ instanceId: hostId("b2") });
-        await owner.create("taskreap", srcBase);
+        await owner.create(task("taskreap"), srcBase);
         // A peer instance sweeps while the owner's lease is fresh: skip.
         await internals(peer).reapExpired();
         check(
-          (await containerIds("taskreap")).length === 1,
+          (await containerIds(task("taskreap"))).length === 1,
           "a fresh foreign lease was respected (no reap)",
         );
         // Abandoned: no activity for longer than the owner's TTL.
         await sleep(4_600);
         await internals(owner).reapExpired();
         check(
-          (await containerIds("taskreap")).length === 0,
+          (await containerIds(task("taskreap"))).length === 0,
           "the abandoned task was reaped",
         );
         check(
-          !existsSync(leaseFileOf("taskreap")),
+          !existsSync(leaseFileOf(task("taskreap"))),
           "the reaped task's lease was retired",
         );
       },
@@ -617,42 +626,48 @@ async function main(): Promise<void> {
       "durable quarantine marker blocks a fresh instance until destroy",
       async () => {
         const a = mkHost({ instanceId: hostId("a") });
-        await a.create("taskq", srcBase);
+        await a.create(task("taskq"), srcBase);
         // A marker written by "any instance" (the durable stop-fallback
         // state): simulate it by writing the same payload the provider
         // writes into the shared lease directory.
         writeFileSync(
-          markerFileOf("taskq"),
+          markerFileOf(task("taskq")),
           JSON.stringify({
-            taskId: "taskq",
+            taskId: task("taskq"),
             instanceId: "some-other-instance",
             quarantinedAt: Date.now(),
           }),
         );
         const fresh = mkHost({ instanceId: hostId("c") });
         await expectReject(
-          () => fresh.open("taskq"),
+          () => fresh.open(task("taskq")),
           /quarantined/,
           "fresh instance open",
         );
         await expectReject(
           () =>
-            fresh.readFile({ id: "taskq", root: "/workspace" }, "package.json"),
+            fresh.readFile(
+              { id: task("taskq"), root: "/workspace" },
+              "package.json",
+            ),
           /quarantined/,
           "fresh instance handle op",
         );
         check(
-          (await containerIds("taskq")).length === 1,
+          (await containerIds(task("taskq"))).length === 1,
           "the quarantined container is untouched",
         );
-        await a.destroy("taskq");
-        check(!existsSync(markerFileOf("taskq")), "destroy cleared the marker");
+        await a.destroy(task("taskq"));
         check(
-          (await containerIds("taskq")).length === 0,
+          !existsSync(markerFileOf(task("taskq"))),
+          "destroy cleared the marker",
+        );
+        check(
+          (await containerIds(task("taskq"))).length === 0,
           "destroy removed the container",
         );
         await expectReject(
-          () => fresh.open("taskq"),
+          () => fresh.open(task("taskq")),
           /unavailable/,
           "open after destroy",
         );
@@ -679,27 +694,27 @@ async function main(): Promise<void> {
           instanceId: hostId("b3"),
           fenceOwnerWaitMs: 1_500,
         });
-        const ws = await a.create("taskrenew", srcSlow);
+        const ws = await a.create(task("taskrenew"), srcSlow);
         const validation = a.runValidation(ws, "npm test");
         // If a step below throws first, the pending validation must not
         // surface as an unhandled rejection; awaiting it below still
         // reports its real outcome.
         validation.catch(() => undefined);
         await waitFor(
-          () => tokenFileOf("taskrenew") !== null,
+          () => tokenFileOf(task("taskrenew")) !== null,
           "the validation op to take the fence",
         );
-        const token = tokenFileOf("taskrenew")!;
+        const token = tokenFileOf(task("taskrenew"))!;
         const mtimeBefore = lstatSync(token).mtimeMs;
         // While the long validation holds the fence, a peer operation on
         // the SAME task must fail closed (never run unfenced).
         await expectReject(
-          () => b.create("taskrenew", srcSlow),
+          () => b.create(task("taskrenew"), srcSlow),
           /peer holds the task fence/,
           "peer create during the in-flight validation",
         );
         check(
-          (await containerIds("taskrenew")).length === 1,
+          (await containerIds(task("taskrenew"))).length === 1,
           "the in-flight task's container is untouched",
         );
         // The heartbeat must renew the token while the op runs. The poll
@@ -711,7 +726,7 @@ async function main(): Promise<void> {
         let renewed = false;
         await waitFor(
           () => {
-            const current = tokenFileOf("taskrenew");
+            const current = tokenFileOf(task("taskrenew"));
             if (current === null) {
               if (renewed) return true;
               throw new Error(
@@ -732,16 +747,16 @@ async function main(): Promise<void> {
           result.status === "passed" && result.output.includes("slow-ok"),
           `the long validation passed (${result.status}: ${result.output.slice(0, 200)})`,
         );
-        await a.destroy("taskrenew");
+        await a.destroy(task("taskrenew"));
       },
     );
 
     await step(
       "MULTI-HOST: a peer host's fence fails this host's op closed",
       async () => {
-        const peerHold = peerRun(["hold", "taskxh", "9000"]);
+        const peerHold = peerRun(["hold", task("taskxh"), "9000"]);
         await waitFor(
-          () => tokenFileOf("taskxh") !== null,
+          () => tokenFileOf(task("taskxh")) !== null,
           "the peer host to take the fence through the shared volume",
         );
         const host = mkHost({
@@ -749,12 +764,12 @@ async function main(): Promise<void> {
           fenceOwnerWaitMs: 1_500,
         });
         await expectReject(
-          () => host.create("taskxh", srcBase),
+          () => host.create(task("taskxh"), srcBase),
           /peer holds the task fence/,
           "cross-host create while the peer holds the fence",
         );
         check(
-          (await containerIds("taskxh")).length === 0,
+          (await containerIds(task("taskxh"))).length === 0,
           "no container was created for the failed cross-host op",
         );
         const peerOut = await peerHold;
@@ -764,8 +779,8 @@ async function main(): Promise<void> {
           `the peer held and released cleanly (${peerOut.stdout.trim()})`,
         );
         // Once the peer released, this host proceeds.
-        await host.create("taskxh", srcBase);
-        await host.destroy("taskxh");
+        await host.create(task("taskxh"), srcBase);
+        await host.destroy(task("taskxh"));
       },
     );
 
@@ -773,9 +788,12 @@ async function main(): Promise<void> {
       "MULTI-HOST: this host's fence fails the peer's op closed",
       async () => {
         const host = mkHost({ instanceId: hostId("y") });
-        const fence = await internals(host).acquireTaskFence("taskyh", "owner");
+        const fence = await internals(host).acquireTaskFence(
+          task("taskyh"),
+          "owner",
+        );
         check(fence?.active === true, "this host acquired the fence");
-        const peerOut = await peerRun(["attempt", "taskyh"]);
+        const peerOut = await peerRun(["attempt", task("taskyh")]);
         check(
           peerOut.stdout.includes("EXPECTED_CONTENTION"),
           `the peer failed closed with the contention error (${peerOut.stdout.trim()})`,
@@ -789,12 +807,12 @@ async function main(): Promise<void> {
       async () => {
         // The peer "crashes" in effect: its token goes stale on the
         // shared volume while it still believes it holds the fence.
-        const peerHold = peerRun(["hold", "taskzh", "20000"]);
+        const peerHold = peerRun(["hold", task("taskzh"), "20000"]);
         await waitFor(
-          () => tokenFileOf("taskzh") !== null,
+          () => tokenFileOf(task("taskzh")) !== null,
           "the peer host to take the fence",
         );
-        const token = tokenFileOf("taskzh")!;
+        const token = tokenFileOf(task("taskzh"))!;
         const stale = new Date(Date.now() - 60_000);
         await utimes(token, stale, stale);
         // This host must break the stale lock (capture-verify-restore on
@@ -803,12 +821,12 @@ async function main(): Promise<void> {
           instanceId: hostId("z"),
           fenceOwnerWaitMs: 8_000,
         });
-        await host.create("taskzh", srcBase);
+        await host.create(task("taskzh"), srcBase);
         check(
-          (await containerIds("taskzh")).length === 1,
+          (await containerIds(task("taskzh"))).length === 1,
           "this host created its container after the takeover",
         );
-        await host.destroy("taskzh");
+        await host.destroy(task("taskzh"));
         const peerOut = await peerHold;
         check(
           peerOut.stdout.includes("RELEASED"),
@@ -820,21 +838,21 @@ async function main(): Promise<void> {
     await step(
       "MULTI-HOST: full lifecycle on the peer's own daemon",
       async () => {
-        const peerOut = await peerRun(["lifecycle", "taskph", "/src"]);
+        const peerOut = await peerRun(["lifecycle", task("taskph"), "/src"]);
         check(
           peerOut.stdout.includes("LIFECYCLE_OK"),
           `the peer completed create/validate/destroy on its own daemon (${peerOut.stdout.trim()})`,
         );
         check(
-          (await containerIds("taskph")).length === 0,
+          (await containerIds(task("taskph"))).length === 0,
           "the peer's container never existed on the host daemon",
         );
         check(
-          (await containerIdsOnDind("taskph")).length === 0,
+          (await containerIdsOnDind(task("taskph"))).length === 0,
           "the peer cleaned up its own daemon",
         );
         check(
-          !existsSync(leaseFileOf("taskph")),
+          !existsSync(leaseFileOf(task("taskph"))),
           "the peer's destroy retired the SHARED lease file",
         );
       },
