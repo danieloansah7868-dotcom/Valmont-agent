@@ -131,6 +131,24 @@ describe("GitHub API adapter", () => {
     ).rejects.toThrow(/valmont/);
   });
 
+  it("returns the files it has when the Git tree is truncated", async () => {
+    const fetcher = vi.fn(async () =>
+      json({
+        truncated: true,
+        tree: [
+          { path: "README.md", type: "blob", size: 120 },
+          { path: "ads/src/app/page.tsx", type: "blob", size: 800 },
+          { path: ".env", type: "blob", size: 40 },
+        ],
+      }),
+    );
+    const provider = new GitHubApiProvider({ accessToken: "token", fetcher });
+    await expect(provider.listFiles("acme", "app", "main")).resolves.toEqual([
+      "README.md",
+      "ads/src/app/page.tsx",
+    ]);
+  });
+
   it("blocks sensitive file reads before making a request", async () => {
     const fetcher = vi.fn(async (input: FetchInput, init?: FetchInit) => {
       void input;

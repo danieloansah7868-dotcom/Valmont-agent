@@ -28,13 +28,16 @@ export function LogoMark({
 export function Logo({
   inverse = false,
   href = "/dashboard",
+  onClick,
 }: {
   inverse?: boolean;
   href?: string;
+  onClick?: () => void;
 }) {
   return (
     <Link
       href={href}
+      onClick={onClick}
       className="inline-flex items-center gap-2.5 rounded-md"
       aria-label="Valmont Agent home"
     >
