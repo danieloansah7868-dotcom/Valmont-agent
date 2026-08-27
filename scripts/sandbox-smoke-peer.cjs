@@ -37,10 +37,13 @@ const { DockerWorkspaceProvider } = require("./provider.cjs");
 
 /**
  * The lease volume is bind-mounted at /leases in the smoke topology;
- * the env override exists so the fencing mechanics can also be
- * exercised outside the container (two plain processes, one directory).
+ * the env overrides exist so the fencing mechanics can also be
+ * exercised outside the container (two plain processes, one directory)
+ * and so the runner can scope every resource to its own run.
  */
 const LEASE_DIR = process.env.SMOKE_PEER_LEASE_DIR || "/leases";
+const IMAGE = process.env.SMOKE_PEER_IMAGE || "valmont-sandbox:smoke";
+const INSTANCE_ID = process.env.SMOKE_PEER_INSTANCE_ID || "peer-host-b";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -49,9 +52,9 @@ const internals = (provider) => provider;
 
 async function hold(taskId, ms) {
   const provider = new DockerWorkspaceProvider({
-    image: "valmont-sandbox:smoke",
+    image: IMAGE,
     leaseDir: LEASE_DIR,
-    instanceId: "peer-host-b",
+    instanceId: INSTANCE_ID,
   });
   const fence = await internals(provider).acquireTaskFence(taskId, "owner");
   if (!fence || !fence.active) {
@@ -68,9 +71,9 @@ async function hold(taskId, ms) {
 
 async function attempt(taskId) {
   const provider = new DockerWorkspaceProvider({
-    image: "valmont-sandbox:smoke",
+    image: IMAGE,
     leaseDir: LEASE_DIR,
-    instanceId: "peer-host-b",
+    instanceId: INSTANCE_ID,
     // Short owner wait: the assertion is that the op FAILS CLOSED while a
     // peer verifiably holds the fence — not that it waits forever.
     fenceOwnerWaitMs: 2_000,
@@ -94,9 +97,9 @@ async function attempt(taskId) {
 
 async function lifecycle(taskId, sourceRoot) {
   const provider = new DockerWorkspaceProvider({
-    image: "valmont-sandbox:smoke",
+    image: IMAGE,
     leaseDir: LEASE_DIR,
-    instanceId: "peer-host-b",
+    instanceId: INSTANCE_ID,
   });
   const ws = await provider.create(taskId, sourceRoot);
   console.log(`CREATED:${ws.id}`);

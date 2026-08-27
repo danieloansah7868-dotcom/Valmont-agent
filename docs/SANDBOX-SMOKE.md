@@ -75,9 +75,34 @@ npm ci                 # once; esbuild ships with the dev dependencies
 npm run smoke:sandbox
 ```
 
-CI runs it on every push and pull request (the `sandbox-smoke` job in
-`.github/workflows/ci.yml`). The script is self-contained: it builds the
-sandbox and peer images, starts the throwaway dind daemon, runs the
-scenarios, tears everything down (images are kept for fast re-runs), and
-on failure dumps `docker ps -a` on both daemons, the dind logs, and the
-retained scratch directory path.
+The script is self-contained: it builds the sandbox and peer images,
+starts the throwaway dind daemon, runs the scenarios, tears everything
+down, and on failure dumps `docker ps -a` on both daemons, the dind
+logs, and the retained scratch directory path.
+
+### Isolation and cleanup
+
+Every Docker resource a run creates is suffixed with a unique run id —
+the image tags, the network, the dind container, the peer container
+names, and the provider instanceIds (which become `valmont.instance`
+labels on the containers the provider creates). The teardown removes
+**only** resources carrying this run's identity: it never matches on
+`valmont.managed=true` alone, so it cannot delete an unrelated Valmont
+or developer container, and it cannot collide with (or clean up) a
+concurrent or previously aborted smoke run. The dind daemon is reached
+on an ephemeral host port allocated by the daemon itself
+(`-p 127.0.0.1::2375`), so nothing on the machine needs to be free for
+the smoke to run. The per-run image tags are removed in the teardown;
+re-runs are still fast because the Docker layer cache, not the tag,
+does the caching.
+
+### CI status
+
+The intended wiring is a `sandbox-smoke` job in
+`.github/workflows/ci.yml` (checkout + Node 22 + `npm ci` +
+`npm run smoke:sandbox`, 25-minute timeout). The automation token that
+pushes this branch is not permitted to modify workflow files, so the
+exact job YAML is attached to the pull request as a comment for a
+maintainer to apply. **Until that job is present in the default
+workflow and green, the real-Docker evidence above is provisional:
+run `npm run smoke:sandbox` manually on any Docker-capable machine.**

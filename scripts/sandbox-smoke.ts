@@ -15,10 +15,12 @@
  *      concurrent adopter wins), the TTL reaper (age removal + fresh
  *      lease respected), and durable quarantine markers that block a
  *      fresh instance.
- *   3. Fence renewal observable on a real clock: a validation whose
- *      command outlives fenceLockTtlMs/3 keeps its token fresh (mtime
- *      advances) while a peer's operation on the same task fails closed
- *      with the contention error.
+ *   3. Fence renewal observable on a real clock — deterministically: a
+ *      validation whose command sleeps 10 s past one heartbeat interval
+ *      (60 s command vs 50 s heartbeat at a 150 s TTL, inside the 70 s
+ *      exec budget the constructor bound allows) keeps its token fresh
+ *      (the token's mtime provably advances) while a peer's operation
+ *      on the same task fails closed with the contention error.
  *   4. The MULTI-HOST topology: a second host (a docker:dind daemon,
  *      reached over TCP by a peer container running the same bundled
  *      provider) shares ONLY the lease volume with this host. Cross-host
@@ -30,6 +32,12 @@
  * What this still does NOT prove (documented in docs/SANDBOX-SMOKE.md):
  * genuinely concurrent multi-writer volume semantics of a specific NFS
  * offering, daemon-failure injection, and host-level kill races.
+ *
+ * Every Docker resource the run creates is suffixed with a unique run id
+ * (image tags, network, the dind container, peer container names, the
+ * provider instanceIds that become container labels), and the teardown
+ * removes ONLY those — never anything that merely looks similar. The
+ * dind daemon is reached on an ephemeral, daemon-allocated host port.
  *
  * Usage (requires a working `docker` and ~2 GB free for the images):
  *   npm run smoke:sandbox
@@ -47,6 +55,7 @@ import {
 } from "node:fs";
 import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { createRequire } from "node:module";
 import {
@@ -54,12 +63,38 @@ import {
   type DockerWorkspaceOptions,
 } from "@/lib/workspace-docker";
 
-const SANDBOX_IMAGE = "valmont-sandbox:smoke";
-const PEER_IMAGE = "valmont-smoke-peer:smoke";
-const DIND_NAME = "valmont-smoke-dind";
-const DIND_NETWORK = "valmont-smoke-net";
-const DIND_HOST = "tcp://127.0.0.1:23750";
-const PEER_DOCKER_HOST = "tcp://valmont-smoke-dind:2375";
+/**
+ * Every Docker resource this run creates — image tags, the network,
+ * the dind container, peer container names, the provider instanceIds
+ * (which become `valmont.instance` labels) — is suffixed with a unique
+ * run id, and the teardown removes ONLY those. A smoke run can never
+ * collide with, or delete, resources it does not own (including a
+ * concurrent or aborted smoke run, or a developer's real Valmont
+ * containers, whatever labels they carry).
+ */
+const RUN_ID = randomUUID().replace(/-/g, "").slice(0, 10);
+const SANDBOX_IMAGE = `valmont-sandbox:smoke-${RUN_ID}`;
+const PEER_IMAGE = `valmont-smoke-peer:smoke-${RUN_ID}`;
+const DIND_NETWORK = `valmont-smoke-net-${RUN_ID}`;
+const DIND_NAME = `valmont-smoke-dind-${RUN_ID}`;
+/** Extra label put on containers the harness itself creates by hand. */
+const SMOKE_RUN_LABEL = `valmont.smoke-run=${RUN_ID}`;
+/** The second host's provider instanceId (labels its dind containers). */
+const PEER_INSTANCE_ID = `smoke-peer-${RUN_ID}`;
+/** Run-scoped host provider instanceIds, registered by mkHost(). */
+const hostInstanceIds = new Set<string>();
+/** Names of peer containers started so far (removed in teardown). */
+const peerContainerNames: string[] = [];
+/** Set once the dind daemon container is running. */
+let dindContainerId: string | null = null;
+/** tcp://... endpoint of the dind daemon, once discovered. */
+let dindHost = "";
+/** A host provider instanceId scoped to this run. */
+const hostId = (role: string) => {
+  const instanceId = `smoke-${role}-${RUN_ID}`;
+  hostInstanceIds.add(instanceId);
+  return instanceId;
+};
 
 const log = (...args: unknown[]) => console.log(...args);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -95,8 +130,12 @@ const run = (
 
 const docker = (args: readonly string[], timeoutMs?: number) =>
   run("docker", args, timeoutMs);
-const dockerOnDind = (args: readonly string[], timeoutMs?: number) =>
-  run("docker", ["-H", DIND_HOST, ...args], timeoutMs);
+const dockerOnDind = (args: readonly string[], timeoutMs?: number) => {
+  if (!dindHost) {
+    throw new Error("the dind daemon has not been started in this run");
+  }
+  return run("docker", ["-H", dindHost, ...args], timeoutMs);
+};
 
 const waitFor = async (
   predicate: () => boolean | Promise<boolean>,
@@ -191,7 +230,9 @@ async function main(): Promise<void> {
       `a working Docker daemon is required for the sandbox smoke test (${cause})`,
     );
   }
-  log(`docker daemon ${dockerVersion}; esbuild ${path.dirname(esbuildEntry)}`);
+  log(
+    `docker daemon ${dockerVersion}; esbuild ${path.dirname(esbuildEntry)}; run id ${RUN_ID}`,
+  );
 
   const work = mkdtempSync(path.join(tmpdir(), "valmont-sandbox-smoke-"));
   const leaseDir = path.join(work, "leases");
@@ -216,7 +257,7 @@ async function main(): Promise<void> {
   await makeSource(srcBase, "node test.js");
   await makeSource(
     srcSlow,
-    "node -e \"setTimeout(() => console.log('slow-ok'), 9000)\"",
+    "node -e \"setTimeout(() => console.log('slow-ok'), 60000)\"",
   );
 
   const lockDirOf = (taskId: string) =>
@@ -251,12 +292,16 @@ async function main(): Promise<void> {
     return stdout.split("\n").filter(Boolean);
   };
 
-  const mkHost = (extra: Partial<DockerWorkspaceOptions> = {}) =>
-    new DockerWorkspaceProvider({
+  const mkHost = (extra: Partial<DockerWorkspaceOptions> = {}) => {
+    if (extra.instanceId) {
+      hostInstanceIds.add(extra.instanceId);
+    }
+    return new DockerWorkspaceProvider({
       image: SANDBOX_IMAGE,
       leaseDir,
       ...extra,
     });
+  };
 
   /**
    * Run the SECOND-HOST peer (same bundled provider code) against the
@@ -266,9 +311,16 @@ async function main(): Promise<void> {
   const peerRun = (args: readonly string[]) => {
     const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
     const gid = typeof process.getgid === "function" ? process.getgid() : 1000;
+    // Run-scoped name so a crashed run's peer container can be removed
+    // precisely in the teardown (docker run --rm does not kill the
+    // container when the client dies).
+    const name = `valmont-smoke-peer-${RUN_ID}-${peerContainerNames.length + 1}`;
+    peerContainerNames.push(name);
     return docker([
       "run",
       "--rm",
+      "--name",
+      name,
       "--network",
       DIND_NETWORK,
       "-u",
@@ -278,14 +330,18 @@ async function main(): Promise<void> {
       "-v",
       `${srcBase}:/src:ro`,
       "-e",
-      `DOCKER_HOST=${PEER_DOCKER_HOST}`,
+      `DOCKER_HOST=tcp://${DIND_NAME}:2375`,
+      "-e",
+      `SMOKE_PEER_IMAGE=${SANDBOX_IMAGE}`,
+      "-e",
+      `SMOKE_PEER_INSTANCE_ID=${PEER_INSTANCE_ID}`,
       PEER_IMAGE,
       ...args,
     ]);
   };
 
   const diagnostics = async () => {
-    log("\n--- diagnostics ---");
+    log(`\n--- diagnostics (run id ${RUN_ID}) ---`);
     try {
       const ps = await docker([
         "ps",
@@ -293,7 +349,7 @@ async function main(): Promise<void> {
         "--filter",
         "label=valmont.managed=true",
       ]);
-      log("host docker ps -a (managed):\n" + ps.stdout);
+      log("host docker ps -a (all managed; read-only):\n" + ps.stdout);
     } catch {
       /* best effort */
     }
@@ -355,20 +411,35 @@ async function main(): Promise<void> {
       "start the second host's Docker daemon (docker:dind)",
       async () => {
         await docker(["network", "create", DIND_NETWORK]);
-        await docker([
-          "run",
-          "-d",
-          "--privileged",
-          "--name",
-          DIND_NAME,
-          "--network",
-          DIND_NETWORK,
-          "-p",
-          "127.0.0.1:23750:2375",
-          "-e",
-          "DOCKER_TLS_CERTDIR=",
-          "docker:27-dind",
-        ]);
+        // An EMPTY host port ("-p 127.0.0.1::2375") makes the daemon
+        // pick a free ephemeral port itself: no fixed port to collide
+        // with anything else running on this machine.
+        dindContainerId = (
+          await docker([
+            "run",
+            "-d",
+            "--privileged",
+            "--name",
+            DIND_NAME,
+            "--network",
+            DIND_NETWORK,
+            "-p",
+            "127.0.0.1::2375",
+            "-e",
+            "DOCKER_TLS_CERTDIR=",
+            "docker:27-dind",
+          ])
+        ).stdout.trim();
+        const port = (await docker(["port", DIND_NAME, "2375"])).stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .find((line) => line.startsWith("127.0.0.1:"));
+        if (!port) {
+          throw new Error("could not discover the dind daemon's mapped port");
+        }
+        dindHost = `tcp://${port}`;
+        log(`dind endpoint ${dindHost} (container ${DIND_NAME})`);
         await waitFor(
           async () => {
             try {
@@ -400,7 +471,7 @@ async function main(): Promise<void> {
 
     // ------------------------------------------------------- scenarios
     await step("end-to-end lifecycle on the host daemon", async () => {
-      const provider = mkHost({ instanceId: "smoke-host-a" });
+      const provider = mkHost({ instanceId: hostId("a") });
       const ws = await provider.create("taske2e", srcBase);
       await provider.writeFile(ws, "notes.txt", "hello from the smoke test\n");
       const note = await provider.readFile(ws, "notes.txt");
@@ -432,8 +503,8 @@ async function main(): Promise<void> {
     await step(
       "ownership matrix: a peer instance never touches a live task",
       async () => {
-        const a = mkHost({ instanceId: "smoke-host-a" });
-        const b = mkHost({ instanceId: "smoke-host-b" });
+        const a = mkHost({ instanceId: hostId("a") });
+        const b = mkHost({ instanceId: hostId("b") });
         await a.create("taskown", srcBase);
         await expectReject(
           () => b.open("taskown"),
@@ -470,12 +541,16 @@ async function main(): Promise<void> {
           "valmont.managed=true",
           "--label",
           "valmont.task=taskadopt",
+          // Marks this container as created by THIS smoke run, so the
+          // teardown can remove it precisely if the scenario dies.
+          "--label",
+          SMOKE_RUN_LABEL,
           SANDBOX_IMAGE,
         ]);
         await docker(["start", container]);
-        const a = mkHost({ instanceId: "smoke-host-a" });
+        const a = mkHost({ instanceId: hostId("a") });
         const b = mkHost({
-          instanceId: "smoke-host-b",
+          instanceId: hostId("b"),
           fenceOwnerWaitMs: 30_000,
         });
         const races = await Promise.allSettled([
@@ -512,11 +587,11 @@ async function main(): Promise<void> {
       "TTL reaper: fresh foreign lease respected, abandoned task removed",
       async () => {
         const owner = mkHost({
-          instanceId: "smoke-host-r",
+          instanceId: hostId("r"),
           ttlMs: 4_000,
           reapIntervalMs: 3_600_000,
         });
-        const peer = mkHost({ instanceId: "smoke-host-b2" });
+        const peer = mkHost({ instanceId: hostId("b2") });
         await owner.create("taskreap", srcBase);
         // A peer instance sweeps while the owner's lease is fresh: skip.
         await internals(peer).reapExpired();
@@ -541,7 +616,7 @@ async function main(): Promise<void> {
     await step(
       "durable quarantine marker blocks a fresh instance until destroy",
       async () => {
-        const a = mkHost({ instanceId: "smoke-host-a" });
+        const a = mkHost({ instanceId: hostId("a") });
         await a.create("taskq", srcBase);
         // A marker written by "any instance" (the durable stop-fallback
         // state): simulate it by writing the same payload the provider
@@ -554,7 +629,7 @@ async function main(): Promise<void> {
             quarantinedAt: Date.now(),
           }),
         );
-        const fresh = mkHost({ instanceId: "smoke-host-c" });
+        const fresh = mkHost({ instanceId: hostId("c") });
         await expectReject(
           () => fresh.open("taskq"),
           /quarantined/,
@@ -587,16 +662,21 @@ async function main(): Promise<void> {
     await step(
       "fence renewal is observable on a real clock; a peer fails closed mid-op",
       async () => {
-        // TTL 30 s => the heartbeat renews the token every 10 s; the
-        // validation command sleeps 9 s so the whole fenced operation
-        // outlives one heartbeat interval.
+        // The timing is chosen so the renewal is DETERMINISTIC, not
+        // incidental: with fenceLockTtlMs = 150 s the provider's renewal
+        // heartbeat interval is max(25 ms, TTL/3) = 50 s, and the
+        // validation command sleeps 60 s — comfortably (10 s) past one
+        // heartbeat — while the 70 s exec budget (the constructor bound
+        // is floor(150 s/2) - 2 s = 73 s) still contains it with ~9 s
+        // to spare. The fence is therefore provably alive only because
+        // the heartbeat renewed it, never because the op finished first.
         const a = mkHost({
-          instanceId: "smoke-host-a2",
-          fenceLockTtlMs: 30_000,
-          timeoutMs: 13_000,
+          instanceId: hostId("a2"),
+          fenceLockTtlMs: 150_000,
+          timeoutMs: 70_000,
         });
         const b = mkHost({
-          instanceId: "smoke-host-b3",
+          instanceId: hostId("b3"),
           fenceOwnerWaitMs: 1_500,
         });
         const ws = await a.create("taskrenew", srcSlow);
@@ -622,12 +702,31 @@ async function main(): Promise<void> {
           (await containerIds("taskrenew")).length === 1,
           "the in-flight task's container is untouched",
         );
-        // The heartbeat must have renewed the token while the op ran.
+        // The heartbeat must renew the token while the op runs. The poll
+        // distinguishes the two outcomes instead of crashing: an mtime
+        // advance means "renewed" (pass); the token disappearing first
+        // means the operation already released the fence without any
+        // renewal having landed — a deterministic failure of THIS
+        // scenario's premise, reported as such.
+        let renewed = false;
         await waitFor(
-          () => lstatSync(token).mtimeMs > mtimeBefore + 5_000,
+          () => {
+            const current = tokenFileOf("taskrenew");
+            if (current === null) {
+              if (renewed) return true;
+              throw new Error(
+                "the validation released the fence before any heartbeat " +
+                  "renewal was observed (the command did not outlive the " +
+                  "heartbeat interval; the renewal was never proven)",
+              );
+            }
+            renewed = lstatSync(current).mtimeMs > mtimeBefore + 5_000;
+            return renewed;
+          },
           "a fence renewal to land on the token",
-          25_000,
+          75_000,
         );
+        check(renewed, "the token's mtime advanced (a real renewal landed)");
         const result = await validation;
         check(
           result.status === "passed" && result.output.includes("slow-ok"),
@@ -646,7 +745,7 @@ async function main(): Promise<void> {
           "the peer host to take the fence through the shared volume",
         );
         const host = mkHost({
-          instanceId: "smoke-host-x",
+          instanceId: hostId("x"),
           fenceOwnerWaitMs: 1_500,
         });
         await expectReject(
@@ -673,7 +772,7 @@ async function main(): Promise<void> {
     await step(
       "MULTI-HOST: this host's fence fails the peer's op closed",
       async () => {
-        const host = mkHost({ instanceId: "smoke-host-y" });
+        const host = mkHost({ instanceId: hostId("y") });
         const fence = await internals(host).acquireTaskFence("taskyh", "owner");
         check(fence?.active === true, "this host acquired the fence");
         const peerOut = await peerRun(["attempt", "taskyh"]);
@@ -701,7 +800,7 @@ async function main(): Promise<void> {
         // This host must break the stale lock (capture-verify-restore on
         // the shared volume) and complete its operation.
         const host = mkHost({
-          instanceId: "smoke-host-z",
+          instanceId: hostId("z"),
           fenceOwnerWaitMs: 8_000,
         });
         await host.create("taskzh", srcBase);
@@ -750,22 +849,51 @@ async function main(): Promise<void> {
     await diagnostics();
     throw error;
   } finally {
-    // Best-effort teardown of the daemons/network/containers; the images
-    // (valmont-sandbox:smoke, valmont-smoke-peer:smoke) are left in place
-    // for faster re-runs.
-    const ids = await docker([
-      "ps",
-      "-aq",
-      "--filter",
-      "label=valmont.managed=true",
-    ])
-      .then((r) => r.stdout.split("\n").filter(Boolean))
-      .catch(() => [] as string[]);
-    for (const id of ids) {
-      await docker(["rm", "-f", id]).catch(() => undefined);
+    // Teardown removes ONLY resources this run created, by construction:
+    //
+    // - provider-created containers are matched by the run-scoped
+    //   `valmont.instance` labels of the instances mkHost() minted (the
+    //   provider puts its instanceId on every container it creates), so
+    //   unrelated Valmont containers — whatever their labels — are never
+    //   touched;
+    // - containers the harness itself created by hand carry the
+    //   run-scoped `valmont.smoke-run` label;
+    // - peer containers, the dind container, the network and the image
+    //   tags all embed the unique RUN_ID.
+    //
+    // Every step is best-effort: a resource that never came into
+    // existence (or already went away) makes the call fail, which is
+    // swallowed.
+    const rmByIds = async (args: readonly string[]) => {
+      const ids = await docker(args)
+        .then((r) => r.stdout.split("\n").filter(Boolean))
+        .catch(() => [] as string[]);
+      for (const id of ids) {
+        await docker(["rm", "-f", id]).catch(() => undefined);
+      }
+    };
+    for (const instanceId of hostInstanceIds) {
+      await rmByIds([
+        "ps",
+        "-aq",
+        "--filter",
+        `label=valmont.instance=${instanceId}`,
+      ]);
     }
-    await docker(["rm", "-f", DIND_NAME]).catch(() => undefined);
+    await rmByIds(["ps", "-aq", "--filter", `label=${SMOKE_RUN_LABEL}`]);
+    for (const name of peerContainerNames) {
+      await docker(["rm", "-f", name]).catch(() => undefined);
+    }
+    // Removing the dind container also destroys everything that ever
+    // existed inside its daemon (the peer's containers and images).
+    if (dindContainerId) {
+      await docker(["rm", "-f", dindContainerId]).catch(() => undefined);
+    } else {
+      await docker(["rm", "-f", DIND_NAME]).catch(() => undefined);
+    }
     await docker(["network", "rm", DIND_NETWORK]).catch(() => undefined);
+    await docker(["rmi", "-f", SANDBOX_IMAGE]).catch(() => undefined);
+    await docker(["rmi", "-f", PEER_IMAGE]).catch(() => undefined);
   }
 }
 
