@@ -290,7 +290,7 @@ export async function buildBackup(
   if (process.env.DATABASE_URL) {
     const chat = await getSqliteChatStore().exportUser(user.id);
     const drafts = await new PostgresStudioDraftStore().list(user);
-    const customers = await exportCustomersPostgres();
+    const customers = await exportCustomersPostgres(canonicalUserId(user));
     return assembleBackup(chat, drafts, customers);
   }
 
@@ -344,7 +344,7 @@ export async function buildBackup(
         return parsed;
       })(),
     }));
-    customers = exportCustomersSnapshot(store.connection);
+    customers = exportCustomersSnapshot(store.connection, ownerId);
   });
   return assembleBackup(chat!, drafts, customers);
 }
@@ -412,22 +412,53 @@ interface SqliteCustomerTokenRow {
 }
 
 /**
- * Reads the customer tables from the open SQLite connection. Runs inside the
- * caller's read transaction so the export is one consistent snapshot. The
- * schema itself is ensured by the caller BEFORE the read transaction starts —
- * DDL inside a read transaction would try to upgrade it to a write and die
- * with "database is locked" against any concurrent writer.
+ * Reads the customer tables from the open SQLite connection, SCOPED to the
+ * customers tied to the exporting owner's orders. Runs inside the caller's
+ * read transaction so the export is one consistent snapshot. The schema
+ * itself is ensured by the caller BEFORE the read transaction starts — DDL
+ * inside a read transaction would try to upgrade it to a write and die with
+ * "database is locked" against any concurrent writer.
+ *
+ * Customer accounts are a global, per-website-opt-in table (a shopper can
+ * place orders on more than one business), so a Studio backup must never
+ * serialize accounts that never interacted with THIS owner's shops: a
+ * backup is per owner and an unscoped dump would copy every other tenant's
+ * customers (names, emails, scrypt password envelopes) into this file.
  */
-function exportCustomersSnapshot(db: DatabaseSync): CustomerSection {
-  const accounts = db
-    .prepare("SELECT * FROM customer_accounts ORDER BY created_at")
-    .all() as unknown as SqliteCustomerAccountRow[];
-  const sessions = db
-    .prepare("SELECT * FROM customer_sessions ORDER BY created_at")
-    .all() as unknown as SqliteCustomerSessionRow[];
-  const tokens = db
-    .prepare("SELECT * FROM customer_tokens ORDER BY created_at")
-    .all() as unknown as SqliteCustomerTokenRow[];
+function exportCustomersSnapshot(
+  db: DatabaseSync,
+  ownerId: string,
+): CustomerSection {
+  const linked = sqliteScopedCustomerIds(db, ownerId);
+  const accounts =
+    linked.size === 0
+      ? []
+      : (db
+          .prepare(
+            `SELECT * FROM customer_accounts
+               WHERE id IN (${placeholders(linked.size)}) ORDER BY created_at`,
+          )
+          .all(...linked) as unknown as SqliteCustomerAccountRow[]);
+  const sessions =
+    linked.size === 0
+      ? []
+      : (db
+          .prepare(
+            `SELECT * FROM customer_sessions
+               WHERE account_id IN (${placeholders(linked.size)})
+               ORDER BY created_at`,
+          )
+          .all(...linked) as unknown as SqliteCustomerSessionRow[]);
+  const tokens =
+    linked.size === 0
+      ? []
+      : (db
+          .prepare(
+            `SELECT * FROM customer_tokens
+               WHERE account_id IN (${placeholders(linked.size)})
+               ORDER BY created_at`,
+          )
+          .all(...linked) as unknown as SqliteCustomerTokenRow[]);
   return {
     version: 1,
     accounts: accounts.map((row) => ({
@@ -459,17 +490,92 @@ function exportCustomersSnapshot(db: DatabaseSync): CustomerSection {
   };
 }
 
-/** PostgreSQL counterpart of {@link exportCustomersSnapshot}. */
-async function exportCustomersPostgres(): Promise<CustomerSection> {
+/** Builds a `?,?,?` placeholder list of the requested size (bounded by callers). */
+function placeholders(count: number): string {
+  return Array.from({ length: Math.min(count, 1_000_000) }, () => "?").join(
+    ",",
+  );
+}
+
+/**
+ * The customer accounts that belong in THIS owner's backup: every account
+ * attached to one of the owner's orders (checkout-session attach or a guest
+ * claim). Accounts with no order on any of the owner's shops are other
+ * tenants' customers and are excluded.
+ */
+function sqliteScopedCustomerIds(
+  db: DatabaseSync,
+  ownerId: string,
+): Set<string> {
+  // The orders schema is ensured lazily by the orders store; an export
+  // running before any order ever existed may not have it yet. Treat a
+  // missing orders table the same as "no orders": there is nothing to
+  // scope to, so no customer rows are exported.
+  try {
+    const rows = db
+      .prepare(
+        `SELECT DISTINCT customer_account_id AS id FROM studio_orders
+           WHERE owner_id = ? AND customer_account_id IS NOT NULL`,
+      )
+      .all(ownerId) as unknown as Array<{ id: string }>;
+    return new Set(rows.map((row) => row.id));
+  } catch (error) {
+    if (error instanceof Error && /no such table/i.test(error.message)) {
+      return new Set();
+    }
+    throw error;
+  }
+}
+
+/**
+ * PostgreSQL counterpart of {@link exportCustomersSnapshot}, SCOPED to the
+ * customers tied to the exporting owner's orders. The customer tables are
+ * global (one set per multi-tenant deployment), so without this scope every
+ * Studio owner's backup would contain every other tenant's customers — their
+ * names, emails and scrypt password envelopes.
+ */
+async function exportCustomersPostgres(
+  ownerId: string,
+): Promise<CustomerSection> {
+  const { and, eq, inArray, isNotNull } = await import("drizzle-orm");
   const { getDatabase } = await import("@/db");
-  const { customerAccounts, customerSessions, customerTokens } =
+  const { customerAccounts, customerSessions, customerTokens, studioOrders } =
     await import("@/db/schema");
   const db = getDatabase();
-  const [accounts, sessions, tokens] = await Promise.all([
-    db.select().from(customerAccounts),
-    db.select().from(customerSessions),
-    db.select().from(customerTokens),
-  ]);
+  // Accounts attached to one of THIS owner's orders (session attach or
+  // guest claim). An account that never ordered on the owner's shops is
+  // another tenant's customer and never enters the backup file.
+  const linkedRows = await db
+    .selectDistinct({ id: studioOrders.customerAccountId })
+    .from(studioOrders)
+    .where(
+      and(
+        eq(studioOrders.ownerId, ownerId),
+        isNotNull(studioOrders.customerAccountId),
+      ),
+    );
+  const linkedIds = [
+    ...new Set(
+      linkedRows.map((row) => row.id).filter((id): id is string => Boolean(id)),
+    ),
+  ];
+  const [accounts, sessions, tokens] =
+    linkedIds.length === 0
+      ? [[], [], []]
+      : await Promise.all([
+          db
+            .select()
+            .from(customerAccounts)
+            .where(inArray(customerAccounts.id, linkedIds)),
+          db
+            .select()
+            .from(customerSessions)
+            .where(inArray(customerSessions.accountId, linkedIds)),
+          db
+            .select()
+            .from(customerTokens)
+            .where(inArray(customerTokens.accountId, linkedIds)),
+        ]);
   return {
     version: 1,
     accounts: accounts.map((row) => ({

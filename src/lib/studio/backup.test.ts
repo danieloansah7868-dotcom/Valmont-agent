@@ -19,6 +19,7 @@ import { SqliteStudioDraftStore } from "./draft-store";
 import { createDefaultBrief } from "./site-brief/defaults";
 import { SqliteCustomerAccountStore } from "@/lib/customer-account-store";
 import { hashCustomerToken } from "@/lib/customer-password";
+import { SqliteOrdersStore, type NewOrderInput } from "./orders";
 
 const userA: SessionUser = { id: "9001", login: "ama", name: "Ama" };
 const userB: SessionUser = { id: "9002", login: "kofi", name: "Kofi" };
@@ -357,7 +358,17 @@ describe("import round trip", () => {
 describe("customer accounts survive export and restore", () => {
   const CUSTOMER_PASSWORD = "a sufficiently long password";
 
-  async function seedCustomer() {
+  /**
+   * The customer backup is scoped to accounts linked to the exporting
+   * owner's ORDERS (an account a shopper never used on this owner's
+   * shops is another tenant's data and never enters the file). The
+   * seeding helper therefore places one order for userA and attaches
+   * the customer account to it, the way checkout/claim would.
+   */
+  async function seedCustomer(): Promise<{
+    account: { id: string; email: string; name: string };
+    session: { token: string };
+  }> {
     const store = new SqliteCustomerAccountStore();
     const account = await store.createAccount({
       email: "shopper@example.com",
@@ -367,8 +378,49 @@ describe("customer accounts survive export and restore", () => {
     await store.verifyEmail(account.id);
     const session = await store.createSession(account.id);
     await store.createToken(account.id, "verify_email", 60_000, "order-code-1");
+
+    const orders = new SqliteOrdersStore();
+    await orders.create({
+      ownerId: canonicalUserId(userA),
+      draftId: "draft-for-customer",
+      accessCode: "order-code-1",
+      status: "paid",
+      currency: "GHS",
+      subtotal: 100,
+      deliveryFee: 0,
+      total: 100,
+      lines: [
+        {
+          itemId: "i1",
+          name: "Jollof Rice",
+          price: 100,
+          quantity: 1,
+        },
+      ],
+      customerName: "Ama Shopper",
+      customerPhone: "+233240000000",
+      customerEmail: "shopper@example.com",
+      customerAccountId: account.id,
+      paymentMethod: "cod",
+    } satisfies NewOrderInput);
     return { account, session };
   }
+
+  it("never exports a customer who never ordered on this owner's shops", async () => {
+    // A customer of ANOTHER tenant (no order row links them to userA).
+    const store = new SqliteCustomerAccountStore();
+    await store.createAccount({
+      email: "other-tenant-shopper@example.com",
+      name: "Other Tenant",
+      password: CUSTOMER_PASSWORD,
+    });
+    await seedUserA();
+    const backup = await buildBackup(userA);
+    expect(backup.customers?.accounts).toEqual([]);
+    expect(JSON.stringify(backup)).not.toContain(
+      "other-tenant-shopper@example.com",
+    );
+  });
 
   it("restores accounts, sessions and tokens into an empty database — the customer can still sign in with the same password", async () => {
     await seedCustomer();
