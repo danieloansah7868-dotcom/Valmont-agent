@@ -2757,7 +2757,7 @@ describe("DockerWorkspaceProvider", () => {
       instanceId: "instance-a",
       leaseDir,
       leaseTtlMs: 600_000,
-      fenceLockTtlMs: 300,
+      fenceLockTtlMs: 600,
       fenceOwnerWaitMs: 8_000,
       fenceReapWaitMs: 1_200,
       timeoutMs: 100,
@@ -2766,7 +2766,7 @@ describe("DockerWorkspaceProvider", () => {
       instanceId: "instance-b",
       leaseDir,
       leaseTtlMs: 600_000,
-      fenceLockTtlMs: 300,
+      fenceLockTtlMs: 600,
       fenceOwnerWaitMs: 8_000,
       fenceReapWaitMs: 1_200,
       timeoutMs: 100,
@@ -3042,7 +3042,7 @@ describe("DockerWorkspaceProvider", () => {
     leaseDirs.push(leaseDir);
     const provider = makeProvider(state, {
       leaseDir,
-      fenceLockTtlMs: 250,
+      fenceLockTtlMs: 600,
       fenceReapWaitMs: 200,
       fenceOwnerWaitMs: 2_000,
       timeoutMs: 100,
@@ -3118,6 +3118,210 @@ describe("DockerWorkspaceProvider", () => {
       provider.deleteFile({ id: "bad id", root: "/workspace" }, "a.txt"),
     ).rejects.toThrow("Invalid task identifier");
     expect(state.calls.filter((c) => c.command === "docker")).toHaveLength(0);
+  });
+
+  it("an adopted (unlabeled) container with a STALE same-instance claim is routed 'mine' and re-heartbeated — never age-reaped on a live adopter", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    // No leases at all -> the adoption claims one. ttlMs is large: the
+    // point of the test is the LEASE-driven routing of a live adopter,
+    // not TTL abandonment (a live adopter's provider also refreshes its
+    // activity on every operation; here the provider goes idle right
+    // after the adoption, as it would between long-idle validations).
+    const provider = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      leaseTtlMs: 300,
+      ttlMs: 3_600_000,
+    });
+    // A RUNNING unlabeled container (legacy), seeded the way a real
+    // daemon holds one.
+    seedContainer(state, "valmont-sandbox-taskLegacy", {
+      "valmont.task": "taskLegacy",
+    });
+    // adopt it
+    const ws = await provider.open("taskLegacy");
+    expect(ws.id).toBe("taskLegacy");
+    // Let the claim go STALE (the adopter is still alive; the sweeps
+    // that would have refreshed it were simply missed).
+    await sleep(450);
+    // Reap: pre-fix, the stale claim flipped routing to "age" and the
+    // OLD_CREATED container was removed; post-fix the claim NAMES this
+    // instance so it routes "mine", the in-fence heartbeat refreshes
+    // it, and the container survives despite its old age.
+    await internals(provider).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskLegacy")).toBe(true);
+    // The heartbeat refreshed the claim (it reads back fresh and ours).
+    const lease = JSON.parse(
+      readFileSync(path.join(leaseDir, "taskLegacy.lease"), "utf8"),
+    );
+    expect(lease.instanceId).toBe("instance-a");
+    expect(Date.now() - lease.updatedAt).toBeLessThan(2_000);
+    // A second sweep keeps it alive (the heartbeat is per-sweep).
+    await internals(provider).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskLegacy")).toBe(true);
+  });
+
+  it("a peer reaper skips a FRESH foreign adoption claim and age-reaps a STALE one (the documented unlabeled-adoption liveness rule)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const b = makeProvider(state, {
+      instanceId: "instance-b",
+      leaseDir,
+      leaseTtlMs: 300,
+    });
+    seedContainer(state, "valmont-sandbox-taskX", {
+      "valmont.task": "taskX",
+    });
+    // FRESH foreign claim: B skips it (despite the container's old age).
+    writeFileSync(
+      path.join(leaseDir, "taskX.lease"),
+      JSON.stringify({
+        instanceId: "instance-a",
+        updatedAt: Date.now(),
+        containerName: "valmont-sandbox-taskX",
+        taskId: "taskX",
+        generation: "gen-A",
+      }),
+    );
+    await internals(b).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskX")).toBe(true);
+    // A's claim stays untouched.
+    const lease = JSON.parse(
+      readFileSync(path.join(leaseDir, "taskX.lease"), "utf8"),
+    );
+    expect(lease.instanceId).toBe("instance-a");
+    // The claim goes stale: B age-reaps the orphaned adoption.
+    await sleep(400);
+    await internals(b).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskX")).toBe(false);
+  });
+
+  it("handle ops on an unlabeled container FAIL CLOSED when the durable adoption claim is absent (never mint a claim implicitly)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, { leaseDir });
+    seedContainer(state, "valmont-sandbox-taskClaim", {
+      "valmont.task": "taskClaim",
+    });
+    // A FORGED handle (never issued by open): no lease exists. The
+    // gate must fail closed rather than let the op proceed.
+    const handle = { id: "taskClaim", root: "/workspace" };
+    await expect(provider.readFile(handle, "a.txt")).rejects.toThrow(
+      /could not be determined/,
+    );
+    await expect(provider.writeFile(handle, "a.txt", "x")).rejects.toThrow(
+      /could not be determined/,
+    );
+    await expect(provider.runValidation(handle, "npm test")).rejects.toThrow(
+      /could not be determined/,
+    );
+    // ...whereas open() ADOPTS and then file ops succeed (the claim is
+    // established only by open/create).
+    const ws = await provider.open("taskClaim");
+    // There is no a.txt in the seeded container; the gate must now
+    // PASS (failing later at cat, not at the ownership gate).
+    await expect(provider.readFile(ws, "a.txt")).rejects.toThrow(
+      /Could not read workspace file/,
+    );
+  });
+
+  it("an invalid instanceId (empty, whitespace, or label-breaking) is rejected at construction", () => {
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", instanceId: "   " }),
+    ).toThrow(/instanceId must be a non-empty/);
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", instanceId: "a|b" }),
+    ).toThrow(/instanceId must be a non-empty/);
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", instanceId: "a b" }),
+    ).toThrow(/instanceId must be a non-empty/);
+    // A clean id is accepted.
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", instanceId: "inst-1" }),
+    ).not.toThrow();
+  });
+
+  it("re-adoption after the original adopter is gone mints a fresh generation (never reuses a foreign generation)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    // B has the SAME stable identity as a restarted instance A? No:
+    // distinct id. The stale claim names A; B adopts and must stamp its
+    // own generation.
+    const b = makeProvider(state, {
+      instanceId: "instance-b",
+      leaseDir,
+      leaseTtlMs: 300,
+    });
+    seedContainer(state, "valmont-sandbox-taskGen", {
+      "valmont.task": "taskGen",
+    });
+    writeFileSync(
+      path.join(leaseDir, "taskGen.lease"),
+      JSON.stringify({
+        instanceId: "instance-a",
+        updatedAt: Date.now() - 60_000,
+        containerName: "valmont-sandbox-taskGen",
+        taskId: "taskGen",
+        generation: "gen-FROM-A",
+      }),
+    );
+    await b.open("taskGen");
+    const lease = JSON.parse(
+      readFileSync(path.join(leaseDir, "taskGen.lease"), "utf8"),
+    );
+    expect(lease.instanceId).toBe("instance-b");
+    expect(lease.generation).not.toBe("gen-FROM-A");
+    expect(lease.generation).toBeTruthy();
+
+    // Same-identity RESTART resumes with the SAME generation.
+    const restarted = makeProvider(state, {
+      instanceId: "instance-b",
+      leaseDir,
+      leaseTtlMs: 300,
+    });
+    await restarted.open("taskGen");
+    const lease2 = JSON.parse(
+      readFileSync(path.join(leaseDir, "taskGen.lease"), "utf8"),
+    ) as { instanceId: string; generation: string };
+    expect(lease2.instanceId).toBe("instance-b");
+    expect(lease2.generation).toBe(lease.generation);
+  });
+
+  it("fromEnv wires the cross-instance coordination settings (lease dir, instance id, TTLs)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "valmont-env-leases-"));
+    leaseDirs.push(dir);
+    const p = DockerWorkspaceProvider.fromEnv({
+      VALMONT_SANDBOX_IMAGE: "test:latest",
+      VALMONT_SANDBOX_LEASE_DIR: dir,
+      VALMONT_SANDBOX_INSTANCE_ID: "stable-inst-42",
+      VALMONT_SANDBOX_LEASE_TTL_MS: "123000",
+      VALMONT_SANDBOX_FENCE_TTL_MS: "456000",
+    } as unknown as NodeJS.ProcessEnv);
+    const intern = internals(p) as unknown as {
+      leaseDir: string;
+      instanceId: string;
+      leaseTtlMs: number;
+      fenceLockTtlMs: number;
+    };
+    expect(intern.leaseDir).toBe(dir);
+    expect(intern.instanceId).toBe("stable-inst-42");
+    expect(intern.leaseTtlMs).toBe(123000);
+    expect(intern.fenceLockTtlMs).toBe(456000);
+    // Defaults stay correct when the vars are absent.
+    const d = DockerWorkspaceProvider.fromEnv({
+      VALMONT_SANDBOX_IMAGE: "x",
+    } as unknown as NodeJS.ProcessEnv);
+    const di = internals(d) as unknown as {
+      leaseDir: string;
+      instanceId: string;
+    };
+    expect(di.leaseDir).toContain("valmont-sandbox-leases");
+    expect(di.instanceId.length).toBeGreaterThan(8);
   });
 });
 

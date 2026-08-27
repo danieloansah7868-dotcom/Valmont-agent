@@ -136,9 +136,13 @@ import {
  *   overrides): without them the default config would either let one
  *   instance's reaper remove a task another live instance is using, or
  *   orphan every container after a restart — both are worse than a few
- *   hundred bytes of lease files. Lease file I/O is best-effort: a
- *   failed write never fails an operation (degraded liveness
- *   detection), and a corrupt/torn lease file is treated as "cannot
+ *   hundred bytes of lease files. Lease I/O fails CLOSED under a
+ *   functioning fence: a claim/adoption whose write cannot be read
+ *   back fails the owning operation (an unprovable live claim must
+ *   never meet another instance's reaper), while a DEGRADED fence
+ *   (the coordination directory itself is unusable for the whole
+ *   fleet) proceeds best-effort because no reaper can fence either.
+ *   A corrupt/torn or unreadable lease is always treated as "cannot
  *   prove death" (strict — the task is left alone), never as "dead";
  * - the quarantine marker name space is disjoint from the task name space:
  *   task identifiers ending in `-quarantined` are REJECTED at every public
@@ -286,8 +290,12 @@ export interface DockerWorkspaceOptions {
    * ALWAYS enabled (see the constructor: without them the default
    * config is either cross-instance unsafe or leaks containers across
    * restarts). Point several provider processes on one host at a shared
-   * directory (the default already is, on a single host). Lease file
-   * I/O is best-effort and never fails an operation.
+   * directory (the default already is, on a single host). Providers on
+   * SEPARATE hosts must mount a SHARED, POSIX-consistent volume here:
+   * the mkdir/rename/utimes fencing lives in this directory and only
+   * coordinates across hosts that see the same files. Lease writes fail
+   * CLOSED under a functioning fence; a degraded coordination directory
+   * fails open for owners only (and shuts the reaper down).
    */
   leaseDir?: string;
   /**
@@ -853,7 +861,17 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     this.psListLimitBytes = options.psListLimitBytes ?? 4_194_304;
     this.allowedCommands = options.allowedCommands ?? DEFAULT_ALLOWED_COMMANDS;
     this.spawnImpl = options.spawnOverride ?? nodeSpawn;
+    // The instance identity becomes part of a container LABEL, whose
+    // values are parsed by `inspectContainer` as a single pipe-delimited
+    // line. An empty/whitespace id would read back as NO_LABEL (every
+    // container would look unlabeled); a `|`/newline would break the
+    // parse. Both are rejected at construction.
     this.instanceId = options.instanceId ?? randomUUID();
+    if (this.instanceId.trim() === "" || /[\s|]/.test(this.instanceId)) {
+      throw new Error(
+        `The sandbox instanceId must be a non-empty, whitespace-free label: ${JSON.stringify(this.instanceId)}`,
+      );
+    }
     // Lease files are ALWAYS enabled: without cross-instance liveness
     // information the default config would either let one instance's
     // reaper remove a task another live instance is using (foreign
@@ -868,22 +886,47 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     this.fenceReapWaitMs = options.fenceReapWaitMs ?? 15_000;
     this.fenceOwnerWaitMs =
       options.fenceOwnerWaitMs ?? this.fenceLockTtlMs + 30_000;
-    // An owner operation may run no longer than the fence TTL: the
-    // renewal heartbeat (at TTL/3) keeps a live holder fresh, but a
-    // process frozen longer than the TTL would have its lock
-    // stale-broken and a peer would take over — the bounded operation
-    // must have ended well before that, so the docker timeout is capped
-    // at half the TTL. A misconfiguration (e.g. a 30-minute command
-    // timeout with a 10-minute fence) is rejected at construction.
-    const maxOperationMs = Math.floor(this.fenceLockTtlMs / 2);
+    // All timing knobs are positive and internally consistent: a non-
+    // positive value would silently disable a guard (e.g. reaper timer
+    // with reapIntervalMs=0 aside, the fence waits must be > 0 or the
+    // acquire loops return immediately), and an operation that can run
+    // LONGER than the fence TTL cannot exist safely — the renewal
+    // heartbeat (at TTL/3, floor 200 ms) keeps a live holder fresh, but
+    // a process frozen longer than the TTL would have its lock
+    // stale-broken and a peer would take over while this operation is
+    // still touching the container. The owner wait must reach at least
+    // the TTL so one stale lock can be broken within it. The hard floor
+    // on the fence TTL (500 ms) keeps the heartbeat's 200 ms renewal
+    // cadence meaningful for the fast-TTL tests.
+    const positiveNumber = (value: number, name: string): void => {
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(
+          `The sandbox ${name} must be a positive number: ${value}`,
+        );
+      }
+    };
+    positiveNumber(this.timeoutMs, "timeoutMs");
+    positiveNumber(this.leaseTtlMs, "leaseTtlMs");
+    positiveNumber(this.fenceLockTtlMs, "fenceLockTtlMs");
+    positiveNumber(this.fenceReapWaitMs, "fenceReapWaitMs");
+    positiveNumber(this.fenceOwnerWaitMs, "fenceOwnerWaitMs");
+    if (this.fenceLockTtlMs < 500) {
+      throw new Error(
+        `fenceLockTtlMs must be at least 500 ms (heartbeat cadence floor): ${this.fenceLockTtlMs}`,
+      );
+    }
     if (this.timeoutMs >= this.fenceLockTtlMs) {
       throw new Error(
         `timeoutMs (${this.timeoutMs}) must be below the fence TTL ` +
           `(fenceLockTtlMs=${this.fenceLockTtlMs}): an operation cannot ` +
-          `outlive the fence that serializes it; configure timeoutMs at ` +
-          `most ${maxOperationMs}.`,
+          `outlive the fence that serializes it.`,
       );
     }
+    // Note on the owner/reaper waits: they default to TTL+30 s (long
+    // enough to break one stale lock) and are validated as positive
+    // above, but deliberately not cross-checked against the TTL: fast
+    // TTL configurations (tests; an operator choosing a tight lease
+    // volume) legitimately shorten the wait too.
     const reapIntervalMs = options.reapIntervalMs ?? 600_000;
     if (reapIntervalMs > 0 && this.ttlMs > 0) {
       this.reaperTimer = setInterval(() => {
@@ -929,6 +972,33 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       ),
       ttlMs: positive(env.VALMONT_SANDBOX_TTL_MS, 3_600_000),
       reapIntervalMs: positive(env.VALMONT_SANDBOX_REAP_INTERVAL_MS, 600_000),
+      // Cross-instance coordination. In a single-process deployment the
+      // defaults (a per-host tmpdir lease dir, a random per-process
+      // identity) are correct; a deployment with several provider
+      // processes sharing one Docker daemon — in particular processes
+      // on DIFFERENT hosts — must point VALMONT_SANDBOX_LEASE_DIR at a
+      // shared POSIX-consistent volume (the mkdir/rename/utimes fence
+      // lives there) and, for processes expected to resume their own
+      // tasks across restarts, give each logical provider a stable
+      // VALMONT_SANDBOX_INSTANCE_ID (distinct per concurrently-live
+      // provider).
+      ...(env.VALMONT_SANDBOX_LEASE_DIR?.trim()
+        ? { leaseDir: env.VALMONT_SANDBOX_LEASE_DIR.trim() }
+        : {}),
+      ...(env.VALMONT_SANDBOX_INSTANCE_ID?.trim()
+        ? { instanceId: env.VALMONT_SANDBOX_INSTANCE_ID.trim() }
+        : {}),
+      ...(env.VALMONT_SANDBOX_LEASE_TTL_MS
+        ? { leaseTtlMs: positive(env.VALMONT_SANDBOX_LEASE_TTL_MS, 600_000) }
+        : {}),
+      ...(env.VALMONT_SANDBOX_FENCE_TTL_MS
+        ? {
+            fenceLockTtlMs: positive(
+              env.VALMONT_SANDBOX_FENCE_TTL_MS,
+              1_200_000,
+            ),
+          }
+        : {}),
     });
   }
 
@@ -1237,10 +1307,18 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
             // closed the same way, never claim over uncertainty.
             throw new Error(WORKSPACE_UNDETERMINED);
           }
-          // Claim with THIS instance's lease generation (persisted in
-          // the lease so a same-identity restart keeps one generation).
+          // Claim with THIS instance's lease generation. The existing
+          // generation is reused ONLY when it is already claimed by
+          // THIS instance (a same-identity restart resuming the same
+          // container: the teardown that wrote it is the same logical
+          // provider, so its generation token stays valid for the
+          // delete guard). A stale FOREIGN claim is a different logical
+          // owner — its generation belongs to that provider's
+          // generation, so this adoption mints a fresh token.
           const adoptionGeneration =
-            existing.kind === "valid" && existing.generation
+            existing.kind === "valid" &&
+            existing.instanceId === this.instanceId &&
+            existing.generation
               ? existing.generation
               : randomUUID();
           const claimed = await this.writeLease(
@@ -1965,6 +2043,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     taskId: string,
     fence: HeldFence,
   ): Promise<void> {
+    // The fence is held by the caller (withOwnerTaskOperation) and is
+    // what makes every read below atomic across instances; it is not
+    // touched by the gate itself.
+    void fence;
     // A handle is just an id: validate it the same way create/open/
     // destroy do, so a forged or stale handle (including the reserved
     // quarantine suffix, which must never reach a container name) is
@@ -1996,23 +2078,50 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     // adopted it and wrote THIS instance's lease claim (the adoption is
     // atomic under the fence). Re-verify that claim: a peer instance
     // must not hand one of its own handles to an unlabeled container
-    // another instance adopted, and a handle whose adopter lost
-    // refresh (lease gone stale/corrupt) must not keep operating
-    // cross-instance.
+    // another instance adopted, and a handle whose durable claim is
+    // missing/unreadable/corrupt must not keep operating cross-
+    // instance — between this operation and the next a peer could
+    // adopt the claim-less container, after which writes/execs here
+    // would race the peer. open() is the operation that establishes a
+    // missing claim; the file/exec entry points never do.
     if (this.classifyContainer(inspected.instanceLabel) === "unlabeled") {
-      const lease = await this.readLease(taskId, this.containerName(taskId));
-      if (
-        lease.kind === "valid" &&
-        lease.instanceId !== this.instanceId &&
-        Date.now() - lease.updatedAt <= this.leaseTtlMs
-      ) {
-        throw new Error(WORKSPACE_OWNED);
-      }
-      if (lease.kind === "unreadable" || lease.kind === "corrupt") {
-        throw new Error(WORKSPACE_UNDETERMINED);
-      }
+      await this.assertUnlabeledClaim(taskId);
     }
-    void fence;
+  }
+
+  /**
+   * Gate for the durable adoption claim behind every handle operation on
+   * an UNLABELED (legacy) container. A fresh foreign claim means the
+   * container is owned by a live peer; a missing/unreadable/corrupt
+   * claim is uncertainty about who may adopt it next — both fail closed
+   * (owned / undetermined respectively). Only a claim naming THIS
+   * instance passes. Called inside the held fence by
+   * gateHandleOperation.
+   */
+  private async assertUnlabeledClaim(taskId: string): Promise<void> {
+    const lease = await this.readLease(taskId, this.containerName(taskId));
+    if (lease.kind === "unreadable" || lease.kind === "corrupt") {
+      throw new Error(WORKSPACE_UNDETERMINED);
+    }
+    if (lease.kind === "absent") {
+      // No durable claim on a running unlabeled container: never was
+      // adopted, or the claim was lost externally. A file op must not
+      // mint a claim implicitly; open()/create() do that.
+      throw new Error(WORKSPACE_UNDETERMINED);
+    }
+    if (lease.instanceId !== this.instanceId) {
+      // Foreign claim: it blocks when FRESH; a stale foreign claim
+      // means the peer adopter is gone, in which case the claim is not
+      // a peer owner of THIS operation either — but THIS instance is
+      // not the adopter either, so an operation with our handle on an
+      // unlabeled container whose claim went stale must go through
+      // open() again (it re-adopts and refreshes) rather than proceed.
+      throw new Error(
+        Date.now() - lease.updatedAt <= this.leaseTtlMs
+          ? WORKSPACE_OWNED
+          : WORKSPACE_UNDETERMINED,
+      );
+    }
   }
 
   /**
@@ -2648,7 +2757,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         // the fence (a stale-break took it), the token file is gone and
         // this loop stops touching the directory. It renews at a third
         // of the TTL, comfortably inside the double-read stale check.
-        const renewalMs = Math.max(1_000, Math.floor(this.fenceLockTtlMs / 3));
+        const renewalMs = Math.max(200, Math.floor(this.fenceLockTtlMs / 3));
         const heartbeat: NodeJS.Timeout = setInterval(() => {
           void this.renewFence(lockDir, tokenFile, heartbeat);
         }, renewalMs);
@@ -3641,9 +3750,21 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
             const leaseFresh =
               lease.kind === "valid" &&
               Date.now() - lease.updatedAt <= this.leaseTtlMs;
-            if (leaseFresh && lease.instanceId === this.instanceId) {
-              // My takeover claim on an unlabeled container: I operate on
-              // it, so my activity record drives the decision.
+            if (
+              lease.kind === "valid" &&
+              lease.instanceId === this.instanceId
+            ) {
+              // An unlabeled container CLAIMED BY THIS INSTANCE (via an
+              // open() adoption) is mine regardless of lease freshness:
+              // ownership of a claim is the identity it names, not its
+              // age. Routing by freshness here would flip an idle-but-
+              // adopted task to "age" the moment a couple of reaper
+              // sweeps are missed near the lease TTL, after which the
+              // in-fence heartbeat below would never run again — the
+              // container could then be age-reaped while THIS instance
+              // is still its only live adopter. Routing "mine" keeps the
+              // in-fence heartbeat refreshing the claim (freshness of a
+              // PEER claim still decides skip vs. age below).
               routing = "mine";
             } else if (
               lease.kind === "corrupt" ||
@@ -3652,6 +3773,12 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
             ) {
               routing = "skip";
             } else {
+              // Stale/absent foreign claim on an unlabeled container:
+              // the adopter's sweeps have not refreshed the claim for a
+              // full lease TTL, so it is orphaned by the only liveness
+              // signal an unlabeled container can have — age route it
+              // (same rule as a labeled foreign container whose label-
+              // owner's lease is stale).
               routing = "age";
             }
           }
