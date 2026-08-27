@@ -4,7 +4,10 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { chatTitleFromMessage, generateChatReply } from "@/lib/chat";
 import { getChatStore } from "@/lib/chat-store";
-import { retrieveGitHubContext } from "@/lib/github-retrieval";
+import {
+  retrieveChatRepositoryContext,
+  retrievePinnedRepositoryFiles,
+} from "@/lib/github-retrieval";
 import { createModelProvider } from "@/lib/models";
 import { assertCsrf } from "@/lib/security";
 
@@ -28,37 +31,48 @@ export async function POST(
 
     let repositoryContext;
     if (session.repository) {
-      const github = await getGitHubProvider();
-      const repositories = await github.listRepositories();
-      const authorized = repositories.find(
-        (repository) => repository.id === session.repository?.id,
-      );
-      if (
-        !authorized ||
-        authorized.owner !== session.repository.owner ||
-        authorized.name !== session.repository.name
-      ) {
-        throw new Error("The chat repository is no longer authorized");
+      try {
+        const github = await getGitHubProvider();
+        try {
+          const snapshot = await Promise.race([
+            retrieveChatRepositoryContext(
+              github,
+              session.repository.owner,
+              session.repository.name,
+              session.repository.baseBranch,
+              input.content,
+            ),
+            new Promise<never>((_, reject) => {
+              setTimeout(
+                () => reject(new Error("Repository context timed out")),
+                15_000,
+              );
+            }),
+          ]);
+          repositoryContext = {
+            repository: session.repository,
+            files: snapshot.files,
+            paths: snapshot.paths,
+          };
+        } catch {
+          const files = await retrievePinnedRepositoryFiles(
+            github,
+            session.repository.owner,
+            session.repository.name,
+            session.repository.baseBranch,
+          );
+          repositoryContext = {
+            repository: session.repository,
+            files,
+            paths: files.map((file) => file.path),
+          };
+        }
+      } catch {
+        repositoryContext = {
+          repository: session.repository,
+          files: [],
+        };
       }
-      const branches = await github.listBranches(
-        authorized.owner,
-        authorized.name,
-      );
-      if (!branches.includes(session.repository.baseBranch)) {
-        throw new Error("The chat branch is no longer available");
-      }
-      const retrieved = await retrieveGitHubContext(
-        github,
-        authorized.owner,
-        authorized.name,
-        session.repository.baseBranch,
-        input.content,
-        8,
-      );
-      repositoryContext = {
-        repository: session.repository,
-        files: retrieved.files,
-      };
     }
 
     const memoryStore = store as typeof store & {

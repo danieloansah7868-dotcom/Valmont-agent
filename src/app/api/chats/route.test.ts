@@ -11,7 +11,8 @@ const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   getGitHubProvider: vi.fn(),
   list: vi.fn(),
-  retrieveGitHubContext: vi.fn(),
+  retrieveChatRepositoryContext: vi.fn(),
+  retrievePinnedRepositoryFiles: vi.fn(),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -37,9 +38,15 @@ vi.mock("@/lib/models", () => ({
   createModelProvider: mocks.createModelProvider,
 }));
 
-vi.mock("@/lib/github-retrieval", () => ({
-  retrieveGitHubContext: mocks.retrieveGitHubContext,
-}));
+vi.mock("@/lib/github-retrieval", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/github-retrieval")>();
+  return {
+    ...actual,
+    retrieveChatRepositoryContext: mocks.retrieveChatRepositoryContext,
+    retrievePinnedRepositoryFiles: mocks.retrievePinnedRepositoryFiles,
+  };
+});
 
 const csrf = "1234567890abcdef";
 
@@ -178,7 +185,7 @@ describe("chat APIs", () => {
     );
   });
 
-  it("rechecks repository authorization before retrieving read-only context", async () => {
+  it("retrieves read-only context without listing every repo first", async () => {
     const session = emptySession({
       repository: {
         id: "42",
@@ -189,17 +196,13 @@ describe("chat APIs", () => {
       },
     });
     const github = {
-      listRepositories: vi
-        .fn()
-        .mockResolvedValue([
-          { id: "42", owner: "acme", name: "app", fullName: "acme/app" },
-        ]),
-      listBranches: vi.fn().mockResolvedValue(["main"]),
+      listRepositories: vi.fn(),
+      listBranches: vi.fn(),
     };
     mocks.get.mockResolvedValue(session);
     mocks.getGitHubProvider.mockResolvedValue(github);
-    mocks.retrieveGitHubContext.mockResolvedValue({
-      totalFiles: 1,
+    mocks.retrieveChatRepositoryContext.mockResolvedValue({
+      paths: ["README.md", "ads/src/app/page.tsx"],
       files: [{ path: "README.md", content: "Project docs", score: 10 }],
     });
     mocks.createModelProvider.mockReturnValue({
@@ -228,14 +231,120 @@ describe("chat APIs", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(github.listBranches).toHaveBeenCalledWith("acme", "app");
-    expect(mocks.retrieveGitHubContext).toHaveBeenCalledWith(
+    expect(github.listRepositories).not.toHaveBeenCalled();
+    expect(github.listBranches).not.toHaveBeenCalled();
+    expect(mocks.retrieveChatRepositoryContext).toHaveBeenCalledWith(
       github,
       "acme",
       "app",
       "main",
       "What does this project do?",
-      8,
     );
+  });
+
+  it("falls back to pinned briefings when the full tree times out", async () => {
+    const session = emptySession({
+      repository: {
+        id: "42",
+        owner: "acme",
+        name: "Valmont-data",
+        fullName: "acme/Valmont-data",
+        baseBranch: "main",
+      },
+    });
+    const github = { listRepositories: vi.fn(), listBranches: vi.fn() };
+    mocks.get.mockResolvedValue(session);
+    mocks.getGitHubProvider.mockResolvedValue(github);
+    mocks.retrieveChatRepositoryContext.mockRejectedValue(
+      new Error("Repository context timed out"),
+    );
+    mocks.retrievePinnedRepositoryFiles.mockResolvedValue([
+      {
+        path: "ads/CONTEXT-FOR-AGENT.md",
+        content: "Classifieds only.",
+        score: 60,
+      },
+    ]);
+    const chat = vi.fn().mockResolvedValue({
+      content: "Valmont Ads is classifieds, not an ad network.",
+      model: "gemini-test",
+      provider: "openai-compatible",
+      finishReason: "stop",
+      toolCalls: [],
+      usage: { inputTokens: 10, outputTokens: 8, totalTokens: 18 },
+    });
+    mocks.createModelProvider.mockReturnValue({ chat });
+    mocks.appendMessages.mockImplementation(
+      async (_id, _userId, messages, titleIfNew) => ({
+        ...session,
+        title: titleIfNew ?? session.title,
+        messages,
+      }),
+    );
+
+    const response = await sendMessage(
+      mutationRequest("http://localhost/api/chats/chat-1/messages", {
+        content: "What is Valmont Ads?",
+      }),
+      { params: Promise.resolve({ id: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.retrievePinnedRepositoryFiles).toHaveBeenCalledWith(
+      github,
+      "acme",
+      "Valmont-data",
+      "main",
+    );
+    expect(chat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            role: "system",
+            content: expect.stringContaining("Classifieds only."),
+          }),
+        ]),
+      }),
+    );
+  });
+
+  it("still replies when repository retrieval fails", async () => {
+    const session = emptySession({
+      repository: {
+        id: "42",
+        owner: "acme",
+        name: "app",
+        fullName: "acme/app",
+        baseBranch: "main",
+      },
+    });
+    mocks.get.mockResolvedValue(session);
+    mocks.getGitHubProvider.mockRejectedValue(new Error("GitHub timed out"));
+    const chat = vi.fn().mockResolvedValue({
+      content: "I can still help without the file tree.",
+      model: "gemini-test",
+      provider: "openai-compatible",
+      finishReason: "stop",
+      toolCalls: [],
+      usage: { inputTokens: 8, outputTokens: 6, totalTokens: 14 },
+    });
+    mocks.createModelProvider.mockReturnValue({ chat });
+    mocks.appendMessages.mockImplementation(
+      async (_id, _userId, messages, titleIfNew) => ({
+        ...session,
+        title: titleIfNew ?? session.title,
+        messages,
+      }),
+    );
+
+    const response = await sendMessage(
+      mutationRequest("http://localhost/api/chats/chat-1/messages", {
+        content: "What is still missing?",
+      }),
+      { params: Promise.resolve({ id: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(chat).toHaveBeenCalledOnce();
   });
 });

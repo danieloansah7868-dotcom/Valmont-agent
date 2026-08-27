@@ -58,6 +58,79 @@ describe("Chat with Valmont", () => {
     expect(messages.at(-1)?.content).not.toContain("ghp_AAAAA");
   });
 
+  it("puts agent briefing files first so the model cannot invent the product", () => {
+    const messages = buildChatCompletionMessages({
+      session: session(),
+      userContent: "What is Valmont Ads?",
+      repositoryContext: {
+        repository: {
+          id: "42",
+          owner: "acme",
+          name: "Valmont-data",
+          fullName: "acme/Valmont-data",
+          baseBranch: "arena/ads",
+        },
+        paths: [
+          "ads/CONTEXT-FOR-AGENT.md",
+          "ads/src/app/page.tsx",
+          "ads/README.md",
+        ],
+        files: [
+          {
+            path: "ads/src/app/page.tsx",
+            content: "export default function Home() { return null }",
+            score: 10,
+          },
+          {
+            path: "ads/CONTEXT-FOR-AGENT.md",
+            content:
+              "A classifieds marketplace for Ghana. Kofi sells a fridge. Not an ad network.",
+            score: 60,
+          },
+        ],
+      },
+    });
+    const note = messages.find((message) =>
+      message.content.includes("<repository_context>"),
+    );
+    expect(note?.content).toContain("product definition");
+    expect(note?.content).toContain("classifieds marketplace");
+    expect(note?.content.indexOf("CONTEXT-FOR-AGENT")).toBeLessThan(
+      note?.content.indexOf("ads/src/app/page.tsx") ?? Number.POSITIVE_INFINITY,
+    );
+    expect(messages[0]?.content).toContain("Fetch first");
+    expect(messages[0]?.content).toContain("Already-built stays built");
+  });
+
+  it("refuses to invent a product when the repo is attached but empty", () => {
+    const messages = buildChatCompletionMessages({
+      session: session({
+        repository: {
+          id: "42",
+          owner: "acme",
+          name: "ads",
+          fullName: "acme/ads",
+          baseBranch: "main",
+        },
+      }),
+      userContent: "What is missing?",
+      repositoryContext: {
+        repository: {
+          id: "42",
+          owner: "acme",
+          name: "ads",
+          fullName: "acme/ads",
+          baseBranch: "main",
+        },
+        files: [],
+      },
+    });
+    const note = messages.find((message) =>
+      message.content.includes("could not read the tree"),
+    );
+    expect(note?.content).toContain("Do not invent the product");
+  });
+
   it("bounds model history to the most recent 24 messages", () => {
     const history = Array.from({ length: 30 }, (_, index) => ({
       id: `message-${index}`,
@@ -93,6 +166,7 @@ describe("Chat with Valmont", () => {
     });
 
     expect(chat).toHaveBeenCalledOnce();
+    expect(chat.mock.calls[0]?.[0]).toMatchObject({ maxTokens: 4_096 });
     expect(result.assistantMessage).toMatchObject({
       role: "assistant",
       model: "gemini-test",
@@ -103,6 +177,9 @@ describe("Chat with Valmont", () => {
       "assistant-secret-value",
     );
     expect(result.userMessage).toMatchObject({ role: "user" });
+    expect(
+      Date.parse(result.assistantMessage.createdAt),
+    ).toBeGreaterThanOrEqual(Date.parse(result.userMessage.createdAt));
   });
 
   it("creates an editable, bounded task handoff without changing the chat", () => {
@@ -140,6 +217,48 @@ describe("Chat with Valmont", () => {
     expect(original.messages).toHaveLength(2);
     expect(chatTitleFromMessage("  Discuss   command menus  ")).toBe(
       "Discuss command menus",
+    );
+  });
+
+  it("retries without repository context when the first reply is empty", async () => {
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({
+        content: "   ",
+        model: "gemini-test",
+        provider: "openai-compatible",
+        finishReason: "stop",
+        toolCalls: [],
+        usage: { inputTokens: 80, outputTokens: 0, totalTokens: 80 },
+      })
+      .mockResolvedValueOnce({
+        content: "The ads app lives under ads/.",
+        model: "gemini-test",
+        provider: "openai-compatible",
+        finishReason: "stop",
+        toolCalls: [],
+        usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
+      });
+
+    const result = await generateChatReply({
+      model: { chat } as unknown as ModelProvider,
+      session: session(),
+      userContent: "How is this repo organized?",
+      repositoryContext: {
+        repository: {
+          id: "42",
+          owner: "acme",
+          name: "ads",
+          fullName: "acme/ads",
+          baseBranch: "main",
+        },
+        files: [{ path: "README.md", content: "# Ads", score: 10 }],
+      },
+    });
+
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(result.assistantMessage.content).toBe(
+      "The ads app lives under ads/.",
     );
   });
 });

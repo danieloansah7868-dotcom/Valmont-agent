@@ -15,7 +15,8 @@ export default function NotFound() {
           This page could not be found
         </h1>
         <p className="mt-2 text-sm leading-6 text-slate">
-          The task may have been removed, or the link is no longer valid.
+          That address is not a page in this workspace. The chat or task may
+          have been removed, or the link is no longer valid.
         </p>
         <div className="mt-6 flex flex-col justify-center gap-3 sm:flex-row">
           <Link href="/dashboard" className="btn-primary">

@@ -17,11 +17,26 @@ interface ProviderConfig {
   fetcher?: typeof fetch;
 }
 
+/** Gemini and some OpenAI-compatible hosts return parts instead of a string. */
+export function extractMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => extractMessageText(part)).join("");
+  }
+  if (content && typeof content === "object") {
+    const record = content as Record<string, unknown>;
+    if (typeof record.text === "string") return record.text;
+    if (typeof record.content === "string") return record.content;
+  }
+  return "";
+}
+
 interface OpenAIResponse {
   model?: string;
   choices?: Array<{
+    text?: string | null;
     message?: {
-      content?: string | null;
+      content?: unknown;
       tool_calls?: Array<{
         id: string;
         function: { name: string; arguments: string };
@@ -236,7 +251,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
       })),
       temperature: request.temperature ?? 0.2,
-      max_tokens: request.maxTokens ?? 2_000,
+      max_tokens: request.maxTokens ?? 4_096,
       stream,
       ...(stream ? { stream_options: { include_usage: true } } : {}),
       ...(request.tools?.length
@@ -305,7 +320,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
       }),
     );
     return {
-      content: choice?.message?.content ?? "",
+      content: extractMessageText(
+        choice?.message?.content ?? choice?.text ?? "",
+      ),
       toolCalls: calls,
       usage: this.usage(data.usage),
       model: data.model ?? this.model,
