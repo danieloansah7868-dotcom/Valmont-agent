@@ -13,9 +13,17 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
-import { mkdir, rm, mkdtemp, writeFile as fsWriteFile } from "node:fs/promises";
+import {
+  mkdir,
+  rm,
+  mkdtemp,
+  rename as fsRename,
+  utimes as fsUtimes,
+  writeFile as fsWriteFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, afterAll, describe, expect, it } from "vitest";
@@ -24,6 +32,7 @@ import {
   VALIDATION_REAPER_SCRIPT,
   type DockerSpawn,
   type DockerWorkspaceOptions,
+  type FenceFsSeam,
 } from "@/lib/workspace-docker";
 
 const OLD_CREATED = "2020-01-01T00:00:00.000Z";
@@ -100,6 +109,43 @@ interface FakeState {
     cmd: string[],
     user: string,
   ) => ExecResult | undefined;
+  /**
+   * Immutable container IDs (real Docker semantics: every create mints a
+   * unique 64-hex id; the id is stable for the container's whole life,
+   * never re-used by a replacement, and accepted by every subcommand in
+   * place of a name). `idOf`/`nameOfId` are maintained by create/rename/
+   * rm/seed.
+   */
+  idOf: Map<string, string>;
+  nameOfId: Map<string, string>;
+  /** Monotonic sequence for minted fake container ids. */
+  idSeq: number;
+  /**
+   * Artificial latency (ms) for non-exec docker subcommands, keyed by the
+   * subcommand ("stop", "inspect", "rm", "rename", "create", ...): the
+   * child's streams end after the delay. Tests use it to hold a docker
+   * operation in flight across a fence-loss or takeover window.
+   */
+  dockerDelays: Map<string, number>;
+  /**
+   * LATE CREATE VISIBILITY: a `docker create` request that reports an
+   * error (a CLI-level timeout/transport failure) WITHOUT the container
+   * being visible yet — the daemon is still processing the request and
+   * may register the half-initialized container LATER. The labels and
+   * the deferred registration are captured at create time; the test
+   * calls `flushLateCreate` to make the container appear at the exact
+   * moment the scenario demands (e.g. after the provider's cleanup
+   * probes concluded "missing").
+   */
+  lateCreates: Map<
+    string,
+    { labels: Record<string, string>; pending: boolean }
+  >;
+  /**
+   * Replacement-acquisition hook: fired when a `docker create` under a
+   * RESERVED name would conflict... (not needed — rename/create already
+   * model conflicts).
+   */
 }
 
 function makeState(): FakeState {
@@ -123,6 +169,11 @@ function makeState(): FakeState {
     cpFailures: 0,
     inspectErrors: new Map(),
     spawnFail: new Map(),
+    idOf: new Map(),
+    nameOfId: new Map(),
+    idSeq: 0,
+    dockerDelays: new Map(),
+    lateCreates: new Map(),
   };
   // Baseline: the two mounts exist with exactly the create-time flags'
   // result, and /workspace is a directory. Unregistered paths are missing.
@@ -222,6 +273,70 @@ function makeErrorChild(message: string): ChildProcess {
   return child as unknown as ChildProcess;
 }
 
+/**
+ * Resolve a docker CLI reference (a container NAME or its immutable ID)
+ * to the tracked container name, mirroring the real daemon's lookup.
+ * Injected 2-column ps lines use the name where the id column belongs,
+ * so name lookup is the fallback.
+ */
+function resolveRef(state: FakeState, ref: string): string | undefined {
+  const byId = state.nameOfId.get(ref);
+  if (byId !== undefined) return byId;
+  return state.containers.has(ref) ? ref : undefined;
+}
+
+/** Mint a fresh unique immutable container id. */
+function newContainerId(state: FakeState): string {
+  state.idSeq += 1;
+  return `fakeid-${state.idSeq}`;
+}
+
+/**
+ * Register a container the way the daemon does, with a unique immutable
+ * id, creation time, and creation-time labels (immutable afterwards).
+ */
+function registerContainer(
+  state: FakeState,
+  name: string,
+  labels: Record<string, string>,
+): string {
+  const id = newContainerId(state);
+  state.containers.add(name);
+  state.createdAt.set(name, OLD_CREATED);
+  state.labels.set(name, labels);
+  state.idOf.set(name, id);
+  state.nameOfId.set(id, name);
+  return id;
+}
+
+/** Drop a container's registration (rm), including its id mappings. */
+function unregisterContainer(state: FakeState, name: string): void {
+  const id = state.idOf.get(name);
+  if (id !== undefined) {
+    state.nameOfId.delete(id);
+  }
+  state.idOf.delete(name);
+  state.containers.delete(name);
+  state.createdAt.delete(name);
+  state.labels.delete(name);
+  state.stopped.delete(name);
+}
+
+/**
+ * Flush a LATE create: the daemon finally registers the half-initialized
+ * container whose create request failed/timed out earlier. Returns
+ * whether a pending create was flushed.
+ */
+function flushLateCreate(state: FakeState, name: string): boolean {
+  const pending = state.lateCreates.get(name);
+  if (!pending || !pending.pending) return false;
+  pending.pending = false;
+  if (!state.containers.has(name)) {
+    registerContainer(state, name, pending.labels);
+  }
+  return true;
+}
+
 function makeSpawn(state: FakeState): DockerSpawn {
   return (command, args, options) => {
     state.calls.push({ command, args, stdinPath: options.stdinPath });
@@ -231,6 +346,7 @@ function makeSpawn(state: FakeState): DockerSpawn {
     let delay: number | undefined;
     if (command === "docker") {
       const sub = args[0];
+      delay = state.dockerDelays.get(sub);
       if (sub === "create") {
         const name = args[args.indexOf("--name") + 1];
         // Labels are SET AT CREATION (real Docker: immutable after) and
@@ -249,43 +365,58 @@ function makeSpawn(state: FakeState): DockerSpawn {
         // registered (the daemon holds it, half-initialized) but the
         // call reports an error — the uncertain side effect the
         // provider must treat as a possible leak.
-        state.containers.add(name);
-        state.createdAt.set(name, OLD_CREATED);
-        state.labels.set(name, labelMap);
         const forcedCreate = state.createErrors.get(name);
+        const lateCreate = state.lateCreates.get(name);
         if (forcedCreate !== undefined) {
+          registerContainer(state, name, labelMap);
           code = 1;
           stderr = forcedCreate;
+        } else if (lateCreate !== undefined) {
+          // The REQUEST reports a timeout/transport error and the
+          // container is NOT visible yet: registration is deferred
+          // until the test flushes it (the daemon "finishes" the
+          // create later).
+          lateCreate.labels = labelMap;
+          lateCreate.pending = true;
+          code = 1;
+          stderr = "Error: create request timed out\n";
         } else {
-          stdout = "fakecontainerid\n";
+          const id = registerContainer(state, name, labelMap);
+          stdout = `${id}\n`;
         }
       } else if (sub === "start") {
-        const name = args[1];
-        if (!state.containers.has(name)) {
+        const ref = args[1];
+        const name = resolveRef(state, ref);
+        if (name === undefined) {
           code = 1;
-          stderr = `Error: No such container: ${name}\n`;
+          stderr = `Error: No such container: ${ref}\n`;
         } else {
           state.stopped.delete(name);
-          stdout = `${name}\n`;
+          stdout = `${ref}\n`;
         }
       } else if (sub === "rm") {
-        const name = args[args.length - 1];
+        const ref = args[args.length - 1];
+        const name = resolveRef(state, ref);
         // Synchronous hook, fired BEFORE the state change: tests use it to
-        // enqueue an operation while the removal is in flight.
-        state.onRm?.(name);
-        const forced = state.rmErrors.get(name);
-        if (forced !== undefined) {
+        // enqueue an operation while the removal is in flight. The hook
+        // sees the resolved NAME (hooks are written against names).
+        if (name !== undefined) state.onRm?.(name);
+        const forced =
+          name !== undefined ? state.rmErrors.get(name) : undefined;
+        if (name === undefined) {
+          // The reference matches nothing: a by-ID rm of an already-gone
+          // container reports the reference it was given.
+          code = 1;
+          stderr = `Error: No such container: ${ref}\n`;
+        } else if (forced !== undefined) {
           code = 1;
           stderr = forced;
         } else if (state.containers.has(name)) {
-          state.containers.delete(name);
-          state.createdAt.delete(name);
-          state.labels.delete(name);
-          state.stopped.delete(name);
-          stdout = `${name}\n`;
+          unregisterContainer(state, name);
+          stdout = `${ref}\n`;
         } else {
           code = 1;
-          stderr = `Error: No such container: ${name}\n`;
+          stderr = `Error: No such container: ${ref}\n`;
         }
       } else if (sub === "rename") {
         // `docker rename <old> <new>`: a metadata operation that works
@@ -295,50 +426,59 @@ function makeSpawn(state: FakeState): DockerSpawn {
         // the new name; a failure other than "no such container" leaves
         // the original name in place (the provider's stop fallback
         // then makes the quarantine fail closed).
-        const [oldName, newName] = args.slice(1);
-        const forcedRename = state.renameErrors.get(oldName);
-        if (forcedRename !== undefined) {
+        const [oldRef, newName] = args.slice(1);
+        const oldName = resolveRef(state, oldRef);
+        const forcedRename =
+          oldName !== undefined ? state.renameErrors.get(oldName) : undefined;
+        if (oldName === undefined) {
+          code = 1;
+          stderr = `Error: No such container: ${oldRef}\n`;
+        } else if (forcedRename !== undefined) {
           code = 1;
           stderr = forcedRename;
-        } else if (!state.containers.has(oldName)) {
-          code = 1;
-          stderr = `Error: No such container: ${oldName}\n`;
         } else if (state.containers.has(newName)) {
           code = 1;
           stderr = `Error: renaming container: ${newName} already in use\n`;
         } else {
-          state.containers.delete(oldName);
-          state.containers.add(newName);
           const created = state.createdAt.get(oldName);
+          const carriedLabels = state.labels.get(oldName);
+          const id = state.idOf.get(oldName);
+          unregisterContainer(state, oldName);
+          state.containers.add(newName);
           if (created !== undefined) {
-            state.createdAt.delete(oldName);
             state.createdAt.set(newName, created);
           }
-          const carriedLabels = state.labels.get(oldName);
           if (carriedLabels !== undefined) {
-            state.labels.delete(oldName);
             state.labels.set(newName, carriedLabels);
+          }
+          // The immutable ID travels with the renamed container.
+          if (id !== undefined) {
+            state.idOf.set(newName, id);
+            state.nameOfId.set(id, newName);
           }
         }
       } else if (sub === "stop") {
-        // `docker stop <name>`: a real, supported operation; a stopped
+        // `docker stop <ref>`: a real, supported operation; a stopped
         // container reports Running=false (the provider's fail-closed
         // quarantine fallback) and still accepts `rm -f`.
-        const name = args[1];
-        const forcedStop = state.stopErrors.get(name);
-        if (forcedStop !== undefined) {
+        const ref = args[1];
+        const name = resolveRef(state, ref);
+        const forcedStop =
+          name !== undefined ? state.stopErrors.get(name) : undefined;
+        if (name === undefined) {
+          code = 1;
+          stderr = `Error: No such container: ${ref}\n`;
+        } else if (forcedStop !== undefined) {
           code = 1;
           stderr = forcedStop;
-        } else if (!state.containers.has(name)) {
-          code = 1;
-          stderr = `Error: No such container: ${name}\n`;
         } else {
           state.stopped.add(name);
-          stdout = `${name}\n`;
+          stdout = `${ref}\n`;
         }
       } else if (sub === "inspect") {
         const format = args[args.indexOf("--format") + 1];
-        const name = args[args.length - 1];
+        const ref = args[args.length - 1];
+        const name = resolveRef(state, ref) ?? ref;
         state.onInspect?.(name, format);
         if (format === "{{.State.Running}}") {
           const forced = state.inspectErrors.get(name);
@@ -358,11 +498,13 @@ function makeSpawn(state: FakeState): DockerSpawn {
           }
         } else if (
           format ===
-          '{{.State.Running}}|{{index .Config.Labels "valmont.task"}}|{{index .Config.Labels "valmont.instance"}}'
+          '{{.Id}}|{{.State.Running}}|{{index .Config.Labels "valmont.task"}}|{{index .Config.Labels "valmont.instance"}}'
         ) {
-          // The combined open/create/destroy probe. Missing labels
+          // The combined open/create/destroy/gate probe. Missing labels
           // render as "<no value>" (Go template behavior, mirrored
-          // exactly — the provider treats that as "no label").
+          // exactly — the provider treats that as "no label"). The ID
+          // column is the container's immutable identity, which the
+          // provider binds its rm/rename/stop/exec references to.
           const forced = state.inspectErrors.get(name);
           if (forced !== undefined) {
             code = 1;
@@ -373,9 +515,9 @@ function makeSpawn(state: FakeState): DockerSpawn {
           } else {
             const labels = state.labels.get(name) ?? {};
             const running = state.stopped.has(name) ? "false" : "true";
-            stdout = `${running}|${labels["valmont.task"] ?? "<no value>"}|${
-              labels["valmont.instance"] ?? "<no value>"
-            }\n`;
+            stdout = `${state.idOf.get(name) ?? name}|${running}|${
+              labels["valmont.task"] ?? "<no value>"
+            }|${labels["valmont.instance"] ?? "<no value>"}\n`;
           }
         } else if (format === "{{.Created}}") {
           const created = state.createdAt.get(name);
@@ -390,24 +532,27 @@ function makeSpawn(state: FakeState): DockerSpawn {
         // state (id, task label, instance label, name with the leading
         // "/" that `docker ps` renders) — so a container that was
         // created, renamed, or stopped shows up exactly as the real
-        // daemon would list it. Injected lines override (tests that
-        // pin a specific listing).
+        // daemon would list it, with the container's immutable ID in
+        // the first column. Injected lines override (tests that pin a
+        // specific listing; a 2-column injected line's "id" is the
+        // name, which resolveRef falls back to).
         const lines =
           state.psLines.length > 0
             ? state.psLines
             : [...state.containers].map((n) => {
                 const labels = state.labels.get(n) ?? {};
-                return `${n}\t${labels["valmont.task"] ?? "<no value>"}\t${
-                  labels["valmont.instance"] ?? "<no value>"
-                }\t/${n}`;
+                return `${state.idOf.get(n) ?? n}\t${
+                  labels["valmont.task"] ?? "<no value>"
+                }\t${labels["valmont.instance"] ?? "<no value>"}\t/${n}`;
               });
         stdout = lines.length === 0 ? "" : `${lines.join("\n")}\n`;
       } else if (sub === "cp") {
         const dest = args[2];
-        const name = dest.split(":")[0];
-        if (!state.containers.has(name)) {
+        const ref = dest.split(":")[0];
+        const name = resolveRef(state, ref);
+        if (name === undefined) {
           code = 1;
-          stderr = `Error: No such container: ${name}\n`;
+          stderr = `Error: No such container: ${ref}\n`;
         } else if (state.cpFailures > 0) {
           state.cpFailures -= 1;
           code = 1;
@@ -416,17 +561,20 @@ function makeSpawn(state: FakeState): DockerSpawn {
           state.cpDestinations.push(dest);
         }
       } else if (sub === "exec") {
-        const name = args.find((a) => a.startsWith("valmont-sandbox-"));
-        if (!name || !state.containers.has(name)) {
+        // The exec reference follows "--workdir /workspace": it is the
+        // immutable container ID for every gated/setup exec.
+        const ref = args[args.indexOf("--workdir") + 2];
+        const name = resolveRef(state, ref);
+        if (name === undefined) {
           code = 1;
-          stderr = `Error: No such container: ${name ?? "unknown"}\n`;
+          stderr = `Error: No such container: ${ref}\n`;
         } else if (state.stopped.has(name)) {
           // Real Docker refuses exec into a stopped container: no
           // operation can race a quarantined (stopped) container.
           code = 1;
           stderr = `Error: container ${name} is not running\n`;
         } else {
-          const cmd = args.slice(args.indexOf(name) + 1);
+          const cmd = args.slice(args.indexOf(ref) + 1);
           const user = args[args.indexOf("--user") + 1];
           const failedSpawn = state.spawnFail.get(cmd[0]);
           if (failedSpawn !== undefined) {
@@ -503,10 +651,11 @@ function seedContainer(
   state: FakeState,
   name: string,
   labels: Record<string, string> = {},
-): void {
-  state.containers.add(name);
-  state.createdAt.set(name, OLD_CREATED);
-  state.labels.set(name, { ...labels });
+): string {
+  // Re-seeding an existing name keeps its identity (the daemon never
+  // re-uses an id while the container lives).
+  if (state.containers.has(name)) return state.idOf.get(name) ?? name;
+  return registerContainer(state, name, { ...labels });
 }
 
 const sourceDirs: string[] = [];
@@ -543,6 +692,71 @@ interface Internals {
 
 const internals = (p: DockerWorkspaceProvider) => p as unknown as Internals;
 
+/**
+ * A held fence as the race tests need to see it: the public active/
+ * release shape plus the token path and the sticky loss flag.
+ */
+interface FenceHandle extends HeldFenceLike {
+  lost?: boolean;
+  tokenFile?: string;
+}
+
+/** All entries in a fence lock directory (normally exactly one token). */
+const lockEntries = (lockDir: string): string[] =>
+  existsSync(lockDir) ? readdirSync(lockDir) : [];
+
+/** The single token file inside a lock directory, when there is exactly one. */
+const tokenPathOf = (lockDir: string): string | null => {
+  const entries = lockEntries(lockDir);
+  return entries.length === 1 ? path.join(lockDir, entries[0]!) : null;
+};
+
+/**
+ * Simulate a COMPLETED stale-break of a holder's fence: the token is
+ * removed, the lock directory is reclaimed, and a replacement holder's
+ * token is installed. Everything after this point must fail closed for
+ * the old holder and never touch the replacement's state.
+ */
+const breakFenceAndReplace = (lockDir: string): string => {
+  const token = tokenPathOf(lockDir);
+  if (token) rmSync(token, { force: true });
+  rmSync(lockDir, { recursive: true, force: true });
+  mkdirSync(lockDir, { recursive: true });
+  const replacement = path.join(lockDir, "replacement-token");
+  writeFileSync(replacement, "peer\n");
+  return replacement;
+};
+
+/** Poll until predicate() holds (bounded) — used to catch mid-flight states. */
+const waitFor = async (
+  predicate: () => boolean,
+  timeoutMs = 3_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("waitFor timed out");
+    await sleep(25);
+  }
+};
+
+/** An fs error carrying a specific errno code (for the FenceFsSeam overrides). */
+const errnoFailure = (code: string): NodeJS.ErrnoException =>
+  Object.assign(new Error(`injected ${code} failure`), {
+    code,
+  }) as NodeJS.ErrnoException;
+
+/**
+ * Build an fsOverride whose mkdir rejects with the given errno for every
+ * path under the coordination `.locks` namespace (the fence itself), while
+ * every other operation hits the real filesystem.
+ */
+const failingLocksMkdir = (code: string): Partial<FenceFsSeam> => ({
+  mkdir: (p, options) =>
+    p.includes(`${path.sep}.locks`)
+      ? Promise.reject(errnoFailure(code))
+      : mkdir(p, options),
+});
+
 /** lstat mtime ms (a cheap change-detection token for lease files). */
 const lstatSyncSafe = (file: string): number => lstatSync(file).mtimeMs;
 
@@ -565,8 +779,10 @@ const execUser = (c: { args: readonly string[] }) =>
   c.args[c.args.indexOf("--user") + 1];
 
 const execCmd = (c: { args: readonly string[] }): string[] => {
-  const idx = c.args.findIndex((a) => a.startsWith("valmont-sandbox-"));
-  return c.args.slice(idx + 1);
+  // The exec reference (container id or name) follows "--workdir
+  // /workspace"; the command argv starts right after the reference.
+  const idx = c.args.indexOf("--workdir");
+  return c.args.slice(idx + 3);
 };
 
 const rootExecs = (state: FakeState) =>
@@ -604,7 +820,11 @@ describe("DockerWorkspaceProvider", () => {
     );
   });
 
-  it("rejects an operation timeout at or above the fence TTL (an op cannot outlive the fence that serializes it)", () => {
+  it("rejects operation timeouts that break the documented fence bound (half the TTL, host overhead and fixed Docker timeouts included)", () => {
+    // The DOCUMENTED bound is now enforced: a fenced Docker command may
+    // run at most floor(TTL/2) - host overhead, and the FIXED Docker
+    // operation timeouts (15-60 s) count against that budget too, so a
+    // small fence TTL is rejected outright.
     expect(
       () =>
         new DockerWorkspaceProvider({
@@ -612,7 +832,7 @@ describe("DockerWorkspaceProvider", () => {
           fenceLockTtlMs: 10_000,
           timeoutMs: 10_000,
         }),
-    ).toThrow(/must be below the fence TTL/);
+    ).toThrow(/fenced operation bound|too small/);
     expect(
       () =>
         new DockerWorkspaceProvider({
@@ -620,16 +840,58 @@ describe("DockerWorkspaceProvider", () => {
           fenceLockTtlMs: 10_000,
           timeoutMs: 30_000,
         }),
-    ).toThrow(/must be below the fence TTL/);
-    // A comfortably bounded timeout is accepted.
+    ).toThrow(/fenced operation bound|too small/);
+    // A long fixed-timeout operation (the default 180 s command timeout)
+    // against a small fence TTL is rejected as well.
     expect(
       () =>
         new DockerWorkspaceProvider({
           image: "x",
           fenceLockTtlMs: 10_000,
-          timeoutMs: 4_000,
+        }),
+    ).toThrow(/fenced operation bound|too small/);
+    // TTLs too small for ANY fenced command budget (the fixed 15-60 s
+    // Docker operation timeouts could not fit in half the TTL).
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", fenceLockTtlMs: 300 }),
+    ).toThrow(/too small/);
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", fenceLockTtlMs: 5_000 }),
+    ).toThrow(/too small/);
+    // A comfortably bounded timeout inside a valid TTL is accepted:
+    // budget = floor(10s/2) - 2s = 3s.
+    expect(
+      () =>
+        new DockerWorkspaceProvider({
+          image: "x",
+          fenceLockTtlMs: 10_000,
+          timeoutMs: 2_000,
         }),
     ).not.toThrow();
+    // Non-finite/non-positive timing values are rejected.
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", timeoutMs: Number.NaN }),
+    ).toThrow(/positive finite/);
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", timeoutMs: 0 }),
+    ).toThrow(/positive finite/);
+    expect(
+      () =>
+        new DockerWorkspaceProvider({
+          image: "x",
+          leaseTtlMs: Number.POSITIVE_INFINITY,
+        }),
+    ).toThrow(/positive finite/);
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", ttlMs: -1 }),
+    ).toThrow(/positive finite/);
+    expect(
+      () =>
+        new DockerWorkspaceProvider({
+          image: "x",
+          fenceLockTtlMs: Number.NaN,
+        }),
+    ).toThrow(/positive finite/);
   });
 
   it("fromEnv never produces a root identity", () => {
@@ -737,8 +999,9 @@ describe("DockerWorkspaceProvider", () => {
     const cpCall = state.calls.find(
       (c) => c.command === "docker" && c.args[0] === "cp",
     )!;
+    // The cp destination is bound to the IMMUTABLE container ID.
     expect(cpCall.args[2]).toBe(
-      "valmont-sandbox-task1:/reap/validation-reap.mjs",
+      `${state.idOf.get("valmont-sandbox-task1")}:/reap/validation-reap.mjs`,
     );
     const root = rootExecs(state);
     expect(root).toHaveLength(2);
@@ -1255,11 +1518,12 @@ describe("DockerWorkspaceProvider", () => {
       if (
         !fired &&
         name === "valmont-sandbox-task1" &&
-        format === "{{.State.Running}}"
+        format ===
+          '{{.Id}}|{{.State.Running}}|{{index .Config.Labels "valmont.task"}}|{{index .Config.Labels "valmont.instance"}}'
       ) {
         fired = true;
-        // Enqueue while the in-lock existence check is in flight: fresh
-        // activity must abort the removal.
+        // Enqueue while the in-fence identity re-check is in flight:
+        // fresh activity must abort the removal.
         openPromise = provider.open("task1");
       }
     };
@@ -1640,11 +1904,13 @@ describe("DockerWorkspaceProvider", () => {
     // be forced.
     state.cpFailures = 1;
     const ORIGINAL = "valmont-sandbox-task1";
-    let originalRmCount = 0;
+    // Force the rm failure only while the (half-initialized) container
+    // actually EXISTS: the pre-cleanup inspect sees no container before
+    // the create and skips the rm entirely (rm is bound to a re-inspected
+    // container id), so the catch-path removal is the one that must fail.
     state.onRm = (name) => {
       if (name !== ORIGINAL) return;
-      originalRmCount += 1;
-      if (originalRmCount >= 2) {
+      if (state.containers.has(name)) {
         state.rmErrors.set(
           name,
           "Error: removing container: device or resource busy\n",
@@ -1825,7 +2091,13 @@ describe("DockerWorkspaceProvider", () => {
     const stopCall = state.calls.find(
       (c) => c.command === "docker" && c.args[0] === "stop",
     );
-    expect(stopCall?.args).toEqual(["stop", "valmont-sandbox-task1"]);
+    // The stop is bound to the IMMUTABLE container id (never the
+    // reusable name), so it can only ever hit the container the
+    // quarantine sequence inspected.
+    expect(stopCall?.args).toEqual([
+      "stop",
+      state.idOf.get("valmont-sandbox-task1")!,
+    ]);
     // A fresh instance (no in-memory flag) gets no handle: the
     // container is owned by the other instance and is not running —
     // fail closed.
@@ -2145,20 +2417,22 @@ describe("DockerWorkspaceProvider", () => {
     // whenever it did not clearly show an existing container, which
     // an UNKNOWN result masqueraded as. The new catch quarantines
     // unconditionally.
-    let combined = 0;
     state.onInspect = (_name, format) => {
-      if (format.startsWith("{{.State.Running}}|")) {
-        combined += 1;
-        if (combined >= 2) {
-          state.inspectErrors.set(
-            "valmont-sandbox-task1",
-            "Error: response from daemon: request timed out\n",
-          );
-          state.inspectErrors.set(
-            "valmont-sandbox-task1-quarantined",
-            "Error: response from daemon: request timed out\n",
-          );
-        }
+      // Arm the forced UNKNOWN only once the half-initialized container
+      // exists (the pre-cleanup inspect precedes the create and must
+      // still answer "missing" so the sequence reaches the failing cp).
+      if (
+        format.startsWith("{{.Id}}|") &&
+        state.containers.has("valmont-sandbox-task1")
+      ) {
+        state.inspectErrors.set(
+          "valmont-sandbox-task1",
+          "Error: response from daemon: request timed out\n",
+        );
+        state.inspectErrors.set(
+          "valmont-sandbox-task1-quarantined",
+          "Error: response from daemon: request timed out\n",
+        );
       }
     };
     await expect(provider.create("task1", src)).rejects.toThrow(
@@ -2188,7 +2462,7 @@ describe("DockerWorkspaceProvider", () => {
       instanceId: "instance-a",
       leaseDir,
       leaseTtlMs: 600_000,
-      fenceLockTtlMs: 5_000,
+      fenceLockTtlMs: 8_000,
       fenceReapWaitMs: 2_000,
       fenceOwnerWaitMs: 8_000,
       timeoutMs: 2_000,
@@ -2197,7 +2471,7 @@ describe("DockerWorkspaceProvider", () => {
       instanceId: "instance-b",
       leaseDir,
       leaseTtlMs: 600_000,
-      fenceLockTtlMs: 5_000,
+      fenceLockTtlMs: 8_000,
       fenceReapWaitMs: 2_000,
       fenceOwnerWaitMs: 8_000,
       timeoutMs: 2_000,
@@ -2585,37 +2859,48 @@ describe("DockerWorkspaceProvider", () => {
     }
   });
 
-  it("a lease write failure degrades safely (owner proceeds; the reaper never removes)", async () => {
+  it("an unwritable lease directory fails the owner op CLOSED (no docker call; the reaper removes nothing)", async () => {
     const state = makeState();
-    // A lease directory that is created but then made unwritable: the
-    // owner's heartbeat/claim cannot land; an operation still proceeds
-    // (best-effort liveness), but the reaper can no longer acquire its
-    // fence and therefore fails closed — no removal.
     const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
     leaseDirs.push(leaseDir);
     const src = await makeSource({ "a.txt": "x" });
-    // Create itself also writes a lease post-setup; point the provider
-    // at a read-only lease directory BEFORE construction.
+    // The lease directory is unwritable (0o500): the token fence cannot
+    // be created at all, so cross-instance mutual exclusion is NOT
+    // established. The old "degraded coordination, proceed" behavior
+    // would run create() unfenced — exactly the two-holders hazard two
+    // provider instances must never hit. The operation must fail
+    // closed instead (unknown coordination failure, not unavailable:
+    // THIS process cannot know whether peers can still fence).
     chmodForce(path.join(leaseDir), 0o500);
+    let provider: DockerWorkspaceProvider | undefined;
     try {
-      const p2 = makeProvider(state, {
+      provider = makeProvider(state, {
         leaseDir,
-        fenceReapWaitMs: 100,
+        fenceOwnerWaitMs: 250,
+        fenceReapWaitMs: 250,
       });
-      // Owner operations still function (liveness writes are best
-      // effort).
-      const handle = await p2.create("taskW", src);
-      expect(handle.id).toBe("taskW");
-      // Old by age...
+      await expect(provider.create("taskW", src)).rejects.toThrow(
+        /could not be determined/,
+      );
+      // Fail-closed BEFORE any docker call: nothing was created.
+      expect(state.calls.filter((c) => c.command === "docker")).toHaveLength(0);
+      // The reaper cannot fence either: an abandoned old container is
+      // left for the operator/next interval, never removed.
       state.containers.add("valmont-sandbox-old1");
       state.createdAt.set("valmont-sandbox-old1", OLD_CREATED);
       state.psLines = ["valmont-sandbox-old1\told1"];
-      await internals(p2).reapExpired();
-      // The reaper cannot fence: no destructive rm must occur.
+      await internals(provider).reapExpired();
       expect(state.containers.has("valmont-sandbox-old1")).toBe(true);
+      expect(
+        state.calls.filter((c) => c.command === "docker" && c.args[0] === "rm"),
+      ).toHaveLength(0);
     } finally {
       chmodForce(leaseDir, 0o700);
     }
+    // Once the directory is writable again the provider recovers: the
+    // failure above was fail-closed coordination, not a dead provider.
+    const handle = await provider!.create("taskW", src);
+    expect(handle.id).toBe("taskW");
   });
 
   it("a successful destroy() leaves no lease, no activity, no marker", async () => {
@@ -2751,61 +3036,127 @@ describe("DockerWorkspaceProvider", () => {
     const state = makeState();
     const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
     leaseDirs.push(leaseDir);
-    // fenceLockTtlMs shorter than the long operation; a holder that
-    // did not renew would look stale mid-operation.
-    const a = makeProvider(state, {
-      instanceId: "instance-a",
-      leaseDir,
-      leaseTtlMs: 600_000,
-      fenceLockTtlMs: 600,
-      fenceOwnerWaitMs: 8_000,
-      fenceReapWaitMs: 1_200,
-      timeoutMs: 100,
-    });
-    const b = makeProvider(state, {
-      instanceId: "instance-b",
-      leaseDir,
-      leaseTtlMs: 600_000,
-      fenceLockTtlMs: 600,
-      fenceOwnerWaitMs: 8_000,
-      fenceReapWaitMs: 1_200,
-      timeoutMs: 100,
-    });
-    const src = await makeSource({ "a.txt": "x" });
+    // TTL 8 s => the renewal heartbeat fires every ~2.67 s. The read
+    // below takes ~10 s (six delayed `stat` execs + a delayed `cat`),
+    // i.e. LONGER than the fence TTL: a holder that did not renew
+    // would be stale-broken mid-operation. timeoutMs stays inside the
+    // documented bound (half the TTL minus host overhead = 2 s) so
+    // every fenced command fits the fence it runs under.
+    const mk = (instanceId: string) =>
+      makeProvider(state, {
+        instanceId,
+        leaseDir,
+        leaseTtlMs: 600_000,
+        fenceLockTtlMs: 8_000,
+        fenceOwnerWaitMs: 500,
+        fenceReapWaitMs: 500,
+        timeoutMs: 2_000,
+      });
+    const a = mk("instance-a");
+    const b = mk("instance-b");
+    const src = await makeSource({ "a/b/c/d/e/f.txt": "x" });
     const ws = await a.create("taskRenew", src);
-    state.statResults.set("/workspace/a.txt", {
+    // Age the container so a lease-based reap decision would be "old".
+    state.createdAt.set("valmont-sandbox-taskRenew", OLD_CREATED);
+    // Deep read: /workspace + a + b + c + d + e + f.txt => six `stat`
+    // execs (1.5 s each) plus the `cat` (1 s) ~= 10 s under one fence.
+    const deep = "/workspace/a/b/c/d/e/f.txt";
+    for (const dir of [
+      "/workspace",
+      "/workspace/a",
+      "/workspace/a/b",
+      "/workspace/a/b/c",
+      "/workspace/a/b/c/d",
+      "/workspace/a/b/c/d/e",
+    ]) {
+      state.statResults.set(dir, {
+        code: 0,
+        stdout: "directory\n",
+        stderr: "",
+      });
+    }
+    state.statResults.set(deep, {
       code: 0,
       stdout: "regular file\n",
       stderr: "",
     });
-    state.fileContents.set("/workspace/a.txt", {
-      code: 0,
-      stdout: "x\n",
-      stderr: "",
-    });
-    // A read that lasts ~3 lock TTLs — A's fence must renew.
+    state.fileContents.set(deep, { code: 0, stdout: "x\n", stderr: "" });
+    state.execDelays.set("stat", 1_500);
     state.execDelays.set("cat", 1_000);
+    // Rewind the lease to STALE the moment the read is under way (at
+    // its first stat): lease freshness can then never explain why B
+    // cannot remove the container mid-op — only the RENEWED FENCE can.
+    let rewound = false;
+    state.onExec = (_n, cmd) => {
+      if (cmd[0] === "stat" && !rewound) {
+        rewound = true;
+        writeFileSync(
+          path.join(leaseDir, "taskRenew.lease"),
+          JSON.stringify({
+            instanceId: "instance-a",
+            updatedAt: Date.now() - 30 * 60_000,
+            containerName: "valmont-sandbox-taskRenew",
+            taskId: "taskRenew",
+            generation: "rewound-generation",
+          }),
+        );
+      }
+      return undefined;
+    };
     state.psLines = [
       "valmont-sandbox-taskRenew\ttaskRenew\tinstance-a\t/valmont-sandbox-taskRenew",
     ];
-    // Rewind the lease to stale so B routes "age" (would remove if it
-    // ever got the fence) — the renewal, not the lease, protects it.
-    writeFileSync(
-      path.join(leaseDir, "taskRenew.lease"),
-      JSON.stringify({
-        instanceId: "instance-a",
-        updatedAt: Date.now() - 30 * 60_000,
-        containerName: "valmont-sandbox-taskRenew",
-        taskId: "taskRenew",
-      }),
+    const lockDir = path.join(leaseDir, ".locks", "taskRenew.lock");
+    const read = a.readFile(ws, "a/b/c/d/e/f.txt");
+    // Wait until the fence is held, then past the first heartbeat, and
+    // sample the token's mtime EARLY (directly observable renewal).
+    await waitFor(() => tokenPathOf(lockDir) !== null);
+    await sleep(3_300);
+    const token = tokenPathOf(lockDir)!;
+    const earlyMtime = lstatSync(token).mtimeMs;
+    // Renewed within the last heartbeat interval — not the stale
+    // acquire-time mtime a non-renewing holder would still carry.
+    expect(Date.now() - earlyMtime).toBeLessThan(2_700);
+    // B's reaper routes the (now stale) lease by AGE — it would remove
+    // the container if it ever got the fence. It must be declined.
+    await internals(b).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskRenew")).toBe(true);
+    // A direct owner-role takeover attempt by B fails the same way.
+    const takeover = await internals(b).acquireTaskFence("taskRenew", "owner");
+    expect(takeover?.active).toBe(false);
+    // Wait until the final `cat` exec has been issued (the op is about
+    // to complete) and sample the token's mtime LATE — while the fence
+    // is still held, BEFORE the release removes the token.
+    await waitFor(
+      () =>
+        state.calls.some(
+          (c) =>
+            c.command === "docker" &&
+            c.args[0] === "exec" &&
+            c.args.includes("cat"),
+        ),
+      10_000,
     );
-    const read = a.readFile(ws, "a.txt");
-    await sleep(150); // let the read acquire the fence
-    await internals(b).reapExpired(); // must NOT remove: fence held + renewed
+    const lateMtime = lstatSync(token).mtimeMs;
     const contents = await read;
     expect(contents).toBe("x\n");
+    expect(rewound).toBe(true);
+    expect(lateMtime).toBeGreaterThan(earlyMtime + 2_000);
+    expect(Date.now() - lateMtime).toBeLessThan(4_000);
     expect(state.containers.has("valmont-sandbox-taskRenew")).toBe(true);
-  });
+    // The lease stayed STALE for the whole operation (only the renewed
+    // fence protected the container — the renewal is what this test
+    // isolates; a lease-freshness explanation is excluded by design).
+    const leaseNow = JSON.parse(
+      readFileSync(path.join(leaseDir, "taskRenew.lease"), "utf8"),
+    );
+    expect(Date.now() - leaseNow.updatedAt).toBeGreaterThan(25 * 60_000);
+    // After A released, B CAN acquire the fence: the rejections above
+    // were genuine live-holder contention, not a broken provider.
+    const later = await internals(b).acquireTaskFence("taskRenew", "owner");
+    expect(later?.active).toBe(true);
+    await later!.release();
+  }, 30_000);
 
   it("an owner operation FAILS CLOSED (undetermined) when a peer holds the fence past the owner wait — it never runs with an inactive contended fence", async () => {
     const state = makeState();
@@ -2815,7 +3166,7 @@ describe("DockerWorkspaceProvider", () => {
       instanceId: "instance-a",
       leaseDir,
       leaseTtlMs: 600_000,
-      fenceLockTtlMs: 5_000,
+      fenceLockTtlMs: 8_000,
       fenceOwnerWaitMs: 400,
       fenceReapWaitMs: 400,
       timeoutMs: 2_000,
@@ -2824,7 +3175,7 @@ describe("DockerWorkspaceProvider", () => {
       instanceId: "instance-b",
       leaseDir,
       leaseTtlMs: 600_000,
-      fenceLockTtlMs: 5_000,
+      fenceLockTtlMs: 8_000,
       fenceOwnerWaitMs: 400,
       fenceReapWaitMs: 400,
       timeoutMs: 2_000,
@@ -2979,14 +3330,24 @@ describe("DockerWorkspaceProvider", () => {
     const state = makeState();
     const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
     leaseDirs.push(leaseDir);
+    // The FENCE keeps working (`.locks` is fine); only the durable
+    // MARKER channel fails: every write of a `.quarantined` marker file
+    // dies with EIO. That isolates the quarantine catch's own ladder:
+    // in-memory flag first, then each durable channel in turn.
     const provider = makeProvider(state, {
       leaseDir,
       fenceOwnerWaitMs: 500,
       fenceReapWaitMs: 300,
+      fsOverride: {
+        writeFile: (p, data, options) =>
+          p.includes(".quarantined")
+            ? Promise.reject(errnoFailure("EIO"))
+            : fsWriteFile(p, data, options),
+      },
     });
     const src = await makeSource({ "a.txt": "x" });
     const ws = await provider.create("taskQ", src);
-    // Every daemon marker fails ambiguously...
+    // Every daemon marker channel fails ambiguously...
     state.spawnFail.set("node", "spawn docker ENOENT");
     state.rmErrors.set(
       "valmont-sandbox-taskQ",
@@ -3000,31 +3361,25 @@ describe("DockerWorkspaceProvider", () => {
       "valmont-sandbox-taskQ",
       "Error: response from daemon: request timed out\n",
     );
-    // ...and the lease VOLUME is unreachable for the duration of the
-    // op (0o000): the fence cannot be acquired (degraded — owner ops
-    // proceed best-effort since no reaper can fence either), the host
-    // marker write fails, and every lease read is unreadable. The
-    // validation exec itself fails at spawn (spawnFail above). The
-    // quarantine catch must still: set the in-memory flag FIRST (no I/O
-    // required), attempt every durable channel — marker write EACCES,
-    // rename failure, stop timeout/ambiguous, container confirmed still
-    // running — and report UNDETERMINED to the caller.
-    chmodForce(path.join(leaseDir), 0o000);
-    try {
-      await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
-        /could not be determined|quarantined|validation/i,
-      );
-    } finally {
-      chmodForce(path.join(leaseDir), 0o700);
-    }
+    // ...and the validation exec itself fails at spawn. The quarantine
+    // catch must still: set the in-memory flag FIRST (no I/O required),
+    // attempt every durable channel — marker write EIO, rm failure,
+    // rename failure, stop timeout/ambiguous, container confirmed
+    // still running — and report UNDETERMINED to the caller (it can
+    // never claim "durable" without a durably-written marker).
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      /could not be determined|quarantined|validation/i,
+    );
     // The in-memory flag still protects THIS process regardless of the
     // durable failure.
     expect(internals(provider).quarantinedTasks.has("taskQ")).toBe(true);
     await expect(provider.open("taskQ")).rejects.toThrow(/quarantined/);
+    // No durable marker could be written (the EIO channel failed).
+    expect(existsSync(path.join(leaseDir, "taskQ.quarantined"))).toBe(false);
     // The container was never removed/renamed/stopped (all channels
-    // failed) and no durable marker could be written; the only remaining
-    // protection after a process restart is operator/TTL backstop.
+    // failed) and survives for the operator/TTL backstop.
     expect(state.containers.has("valmont-sandbox-taskQ")).toBe(true);
+    expect(state.stopped.has("valmont-sandbox-taskQ")).toBe(false);
     // Once the daemon cooperates again, explicit destroy clears the
     // container (the flag is removed by a successful teardown) and the
     // task is recoverable.
@@ -3042,21 +3397,21 @@ describe("DockerWorkspaceProvider", () => {
     leaseDirs.push(leaseDir);
     const provider = makeProvider(state, {
       leaseDir,
-      fenceLockTtlMs: 600,
-      fenceReapWaitMs: 200,
+      fenceLockTtlMs: 6_000,
+      fenceReapWaitMs: 2_000,
       fenceOwnerWaitMs: 2_000,
-      timeoutMs: 100,
+      timeoutMs: 1_000,
     });
-    state.containers.add("valmont-sandbox-taskEmpty");
-    state.createdAt.set("valmont-sandbox-taskEmpty", OLD_CREATED);
-    state.labels.set("valmont-sandbox-taskEmpty", {
+    seedContainer(state, "valmont-sandbox-taskEmpty", {
       "valmont.task": "taskEmpty",
     });
     // A lock directory with NO token (an acquire interrupted after
-    // mkdir but before its token write), aged past the TTL.
+    // mkdir but before its token write), aged past the TTL. The
+    // twice-read staleness check (dir mtime, gap 120 ms) must see it
+    // stale and the non-recursive rmdir recovers it.
     const lockDir = path.join(leaseDir, ".locks", "taskEmpty.lock");
     mkdirSync(lockDir, { recursive: true });
-    await sleep(450); // mtime older than the 250ms fence TTL
+    await sleep(6_300); // mtime older than the 6 s fence TTL
     state.psLines = [
       "valmont-sandbox-taskEmpty\ttaskEmpty\t<no value>\t/valmont-sandbox-taskEmpty",
     ];
@@ -3064,7 +3419,7 @@ describe("DockerWorkspaceProvider", () => {
     // The stale EMPTY lock was broken (rmdir of an empty dir) and the
     // sweep proceeded to remove the abandoned container.
     expect(state.containers.has("valmont-sandbox-taskEmpty")).toBe(false);
-  });
+  }, 20_000);
 
   it("lease generation: a teardown never unlinks a lease whose generation differs from the container it removed", async () => {
     const state = makeState();
@@ -3120,47 +3475,58 @@ describe("DockerWorkspaceProvider", () => {
     expect(state.calls.filter((c) => c.command === "docker")).toHaveLength(0);
   });
 
-  it("an adopted (unlabeled) container with a STALE same-instance claim is routed 'mine' and re-heartbeated — never age-reaped on a live adopter", async () => {
-    const state = makeState();
-    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
-    leaseDirs.push(leaseDir);
-    // No leases at all -> the adoption claims one. ttlMs is large: the
-    // point of the test is the LEASE-driven routing of a live adopter,
-    // not TTL abandonment (a live adopter's provider also refreshes its
-    // activity on every operation; here the provider goes idle right
-    // after the adoption, as it would between long-idle validations).
-    const provider = makeProvider(state, {
-      instanceId: "instance-a",
-      leaseDir,
-      leaseTtlMs: 300,
-      ttlMs: 3_600_000,
-    });
-    // A RUNNING unlabeled container (legacy), seeded the way a real
-    // daemon holds one.
-    seedContainer(state, "valmont-sandbox-taskLegacy", {
-      "valmont.task": "taskLegacy",
-    });
-    // adopt it
-    const ws = await provider.open("taskLegacy");
-    expect(ws.id).toBe("taskLegacy");
-    // Let the claim go STALE (the adopter is still alive; the sweeps
-    // that would have refreshed it were simply missed).
-    await sleep(450);
-    // Reap: pre-fix, the stale claim flipped routing to "age" and the
-    // OLD_CREATED container was removed; post-fix the claim NAMES this
-    // instance so it routes "mine", the in-fence heartbeat refreshes
-    // it, and the container survives despite its old age.
-    await internals(provider).reapExpired();
-    expect(state.containers.has("valmont-sandbox-taskLegacy")).toBe(true);
-    // The heartbeat refreshed the claim (it reads back fresh and ours).
-    const lease = JSON.parse(
-      readFileSync(path.join(leaseDir, "taskLegacy.lease"), "utf8"),
-    );
-    expect(lease.instanceId).toBe("instance-a");
-    expect(Date.now() - lease.updatedAt).toBeLessThan(2_000);
-    // A second sweep keeps it alive (the heartbeat is per-sweep).
-    await internals(provider).reapExpired();
-    expect(state.containers.has("valmont-sandbox-taskLegacy")).toBe(true);
+  // -------------------------------------------------------------------------
+  // Cross-instance coordination config & unlabeled-adoption liveness rules
+  // (carried over from the merged PR #32 baseline; adapted where the
+  // fail-closed rewrite strengthened the behavior).
+  // -------------------------------------------------------------------------
+
+  it("an invalid instanceId (empty, whitespace, or label-breaking) is rejected at construction", () => {
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", instanceId: "   " }),
+    ).toThrow(/instanceId must be a non-empty/);
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", instanceId: "a|b" }),
+    ).toThrow(/instanceId must be a non-empty/);
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", instanceId: "a b" }),
+    ).toThrow(/instanceId must be a non-empty/);
+    // A clean id is accepted.
+    expect(
+      () => new DockerWorkspaceProvider({ image: "x", instanceId: "inst-1" }),
+    ).not.toThrow();
+  });
+
+  it("fromEnv wires the cross-instance coordination settings (lease dir, instance id, TTLs)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "valmont-env-leases-"));
+    leaseDirs.push(dir);
+    const p = DockerWorkspaceProvider.fromEnv({
+      VALMONT_SANDBOX_IMAGE: "test:latest",
+      VALMONT_SANDBOX_LEASE_DIR: dir,
+      VALMONT_SANDBOX_INSTANCE_ID: "stable-inst-42",
+      VALMONT_SANDBOX_LEASE_TTL_MS: "123000",
+      VALMONT_SANDBOX_FENCE_TTL_MS: "456000",
+    } as unknown as NodeJS.ProcessEnv);
+    const intern = internals(p) as unknown as {
+      leaseDir: string;
+      instanceId: string;
+      leaseTtlMs: number;
+      fenceLockTtlMs: number;
+    };
+    expect(intern.leaseDir).toBe(dir);
+    expect(intern.instanceId).toBe("stable-inst-42");
+    expect(intern.leaseTtlMs).toBe(123000);
+    expect(intern.fenceLockTtlMs).toBe(456000);
+    // Defaults stay correct when the vars are absent.
+    const d = DockerWorkspaceProvider.fromEnv({
+      VALMONT_SANDBOX_IMAGE: "x",
+    } as unknown as NodeJS.ProcessEnv);
+    const di = internals(d) as unknown as {
+      leaseDir: string;
+      instanceId: string;
+    };
+    expect(di.leaseDir).toContain("valmont-sandbox-leases");
+    expect(di.instanceId.length).toBeGreaterThan(8);
   });
 
   it("a peer reaper skips a FRESH foreign adoption claim and age-reaps a STALE one (the documented unlabeled-adoption liveness rule)", async () => {
@@ -3197,7 +3563,51 @@ describe("DockerWorkspaceProvider", () => {
     await sleep(400);
     await internals(b).reapExpired();
     expect(state.containers.has("valmont-sandbox-taskX")).toBe(false);
-  });
+  }, 10_000);
+
+  it("an adopted (unlabeled) container with a STALE same-instance claim is routed 'mine' and re-heartbeated — never age-reaped on a live adopter", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    // No leases at all -> the adoption claims one. ttlMs is large: the
+    // point of the test is the LEASE-driven routing of a live adopter,
+    // not TTL abandonment (a live adopter's provider also refreshes its
+    // activity on every operation; here the provider goes idle right
+    // after the adoption, as it would between long-idle validations).
+    const provider = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      leaseTtlMs: 300,
+      ttlMs: 3_600_000,
+    });
+    // A RUNNING unlabeled container (legacy), seeded the way a real
+    // daemon holds one.
+    seedContainer(state, "valmont-sandbox-taskLegacy", {
+      "valmont.task": "taskLegacy",
+    });
+    // adopt it
+    const ws = await provider.open("taskLegacy");
+    expect(ws.id).toBe("taskLegacy");
+    // Let the claim go STALE (the adopter is still alive; the sweeps
+    // that would have refreshed it were simply missed).
+    await sleep(450);
+    // Reap: a stale claim that NAMES THIS INSTANCE must route "mine"
+    // (the adopter's own activity record drives the decision), so the
+    // in-fence heartbeat refreshes the claim and the container
+    // survives despite its old age — never age-reaped on a live
+    // adopter.
+    await internals(provider).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskLegacy")).toBe(true);
+    // The heartbeat refreshed the claim (it reads back fresh and ours).
+    const lease = JSON.parse(
+      readFileSync(path.join(leaseDir, "taskLegacy.lease"), "utf8"),
+    );
+    expect(lease.instanceId).toBe("instance-a");
+    expect(Date.now() - lease.updatedAt).toBeLessThan(2_000);
+    // A second sweep keeps it alive (the heartbeat is per-sweep).
+    await internals(provider).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskLegacy")).toBe(true);
+  }, 10_000);
 
   it("handle ops on an unlabeled container FAIL CLOSED when the durable adoption claim is absent (never mint a claim implicitly)", async () => {
     const state = makeState();
@@ -3229,29 +3639,12 @@ describe("DockerWorkspaceProvider", () => {
     );
   });
 
-  it("an invalid instanceId (empty, whitespace, or label-breaking) is rejected at construction", () => {
-    expect(
-      () => new DockerWorkspaceProvider({ image: "x", instanceId: "   " }),
-    ).toThrow(/instanceId must be a non-empty/);
-    expect(
-      () => new DockerWorkspaceProvider({ image: "x", instanceId: "a|b" }),
-    ).toThrow(/instanceId must be a non-empty/);
-    expect(
-      () => new DockerWorkspaceProvider({ image: "x", instanceId: "a b" }),
-    ).toThrow(/instanceId must be a non-empty/);
-    // A clean id is accepted.
-    expect(
-      () => new DockerWorkspaceProvider({ image: "x", instanceId: "inst-1" }),
-    ).not.toThrow();
-  });
-
   it("re-adoption after the original adopter is gone mints a fresh generation (never reuses a foreign generation)", async () => {
     const state = makeState();
     const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
     leaseDirs.push(leaseDir);
-    // B has the SAME stable identity as a restarted instance A? No:
-    // distinct id. The stale claim names A; B adopts and must stamp its
-    // own generation.
+    // A distinct id from the dead adopter: the stale claim names
+    // instance-a; B adopts and must stamp its OWN generation.
     const b = makeProvider(state, {
       instanceId: "instance-b",
       leaseDir,
@@ -3292,37 +3685,839 @@ describe("DockerWorkspaceProvider", () => {
     expect(lease2.generation).toBe(lease.generation);
   });
 
-  it("fromEnv wires the cross-instance coordination settings (lease dir, instance id, TTLs)", () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "valmont-env-leases-"));
-    leaseDirs.push(dir);
-    const p = DockerWorkspaceProvider.fromEnv({
-      VALMONT_SANDBOX_IMAGE: "test:latest",
-      VALMONT_SANDBOX_LEASE_DIR: dir,
-      VALMONT_SANDBOX_INSTANCE_ID: "stable-inst-42",
-      VALMONT_SANDBOX_LEASE_TTL_MS: "123000",
-      VALMONT_SANDBOX_FENCE_TTL_MS: "456000",
-    } as unknown as NodeJS.ProcessEnv);
-    const intern = internals(p) as unknown as {
-      leaseDir: string;
-      instanceId: string;
-      leaseTtlMs: number;
-      fenceLockTtlMs: number;
+  // ---------------------------------------------------------------------------
+  // Token-fence race windows (review items 1, 2, 5, 6, 7, 8, 9): every test
+  // below drives the provider THROUGH the race (delayed fs ops, mid-flight
+  // token deletion, replacement holders) rather than around it.
+  // ---------------------------------------------------------------------------
+
+  it("losing the fence token mid-operation aborts the op before its next docker call — and the release never touches the replacement holder", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const a = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      leaseTtlMs: 600_000,
+      fenceLockTtlMs: 8_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 2_000,
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await a.create("taskAbort", src);
+    state.statResults.set("/workspace", {
+      code: 0,
+      stdout: "directory\n",
+      stderr: "",
+    });
+    state.statResults.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "regular file\n",
+      stderr: "",
+    });
+    state.fileContents.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "x\n",
+      stderr: "",
+    });
+    state.execDelays.set("stat", 900);
+    const lockDir = path.join(leaseDir, ".locks", "taskAbort.lock");
+    let statStarted = false;
+    state.onExec = (_n, cmd) => {
+      if (cmd[0] === "stat" && cmd[cmd.length - 1] === "/workspace/a.txt") {
+        statStarted = true;
+      }
+      return undefined;
     };
-    expect(intern.leaseDir).toBe(dir);
-    expect(intern.instanceId).toBe("stable-inst-42");
-    expect(intern.leaseTtlMs).toBe(123000);
-    expect(intern.fenceLockTtlMs).toBe(456000);
-    // Defaults stay correct when the vars are absent.
-    const d = DockerWorkspaceProvider.fromEnv({
-      VALMONT_SANDBOX_IMAGE: "x",
-    } as unknown as NodeJS.ProcessEnv);
-    const di = internals(d) as unknown as {
-      leaseDir: string;
-      instanceId: string;
-    };
-    expect(di.leaseDir).toContain("valmont-sandbox-leases");
-    expect(di.instanceId.length).toBeGreaterThan(8);
+    const read = a.readFile(ws, "a.txt");
+    // The (delayed) verification stat is in flight. While it runs, a
+    // stale-breaker completes a break of A's fence and a replacement
+    // holder installs its own token.
+    await waitFor(() => statStarted);
+    const callsAtLoss = state.calls.length;
+    expect(tokenPathOf(lockDir)).not.toBeNull();
+    const replacement = breakFenceAndReplace(lockDir);
+    // The operation must fail CLOSED: the `cat` that would have
+    // followed the stat never runs (zero docker calls after the loss).
+    await expect(read).rejects.toThrow(/could not be determined/);
+    expect(state.calls.length).toBe(callsAtLoss);
+    // The abort left the container alone.
+    expect(state.containers.has("valmont-sandbox-taskAbort")).toBe(true);
+    // The failed operation's own release (finally block) could not
+    // touch the replacement holder's token or lock directory.
+    expect(existsSync(replacement)).toBe(true);
+    expect(existsSync(lockDir)).toBe(true);
+    // Every later owner op on this provider also fails closed while
+    // the replacement holds the fence (no touch, no takeover).
+    await expect(a.readFile(ws, "a.txt")).rejects.toThrow(
+      /could not be determined/,
+    );
+    expect(existsSync(replacement)).toBe(true);
+  }, 15_000);
+
+  it("a renewal DELAYED past a completed break fails with ENOENT: the fence is lost and the operation fails closed", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    // The heartbeat's utimes is slowed (event-loop pause / slow fs):
+    // while it is in flight a breaker deletes the token. The renewal
+    // must then fail (ENOENT on the removed path) and mark the fence
+    // lost — never silently "succeed" against a replacement's state.
+    const renewalStarts: number[] = [];
+    const a = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      leaseTtlMs: 600_000,
+      fenceLockTtlMs: 6_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 1_000,
+      fsOverride: {
+        utimes: async (p, atime, mtime) => {
+          renewalStarts.push(Date.now());
+          await sleep(700);
+          await fsUtimes(p, atime, mtime);
+        },
+      },
+    });
+    const src = await makeSource({ "a/b.txt": "x" });
+    const ws = await a.create("taskDU", src);
+    const deep = "/workspace/a/b.txt";
+    for (const dir of ["/workspace", "/workspace/a"]) {
+      state.statResults.set(dir, {
+        code: 0,
+        stdout: "directory\n",
+        stderr: "",
+      });
+    }
+    state.statResults.set(deep, {
+      code: 0,
+      stdout: "regular file\n",
+      stderr: "",
+    });
+    state.fileContents.set(deep, { code: 0, stdout: "x\n", stderr: "" });
+    state.execDelays.set("stat", 900);
+    state.execDelays.set("cat", 900);
+    const lockDir = path.join(leaseDir, ".locks", "taskDU.lock");
+    const read = a.readFile(ws, "a/b.txt");
+    // Wait until the first heartbeat renewal is IN FLIGHT (it started
+    // but has not landed yet), then complete a break under it.
+    await waitFor(() => renewalStarts.length > 0);
+    const token = tokenPathOf(lockDir)!;
+    rmSync(token, { force: true });
+    rmSync(lockDir, { recursive: true, force: true });
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, "replacement-token"), "peer\n");
+    // The delayed renewal lands on the deleted path => ENOENT => the
+    // fence is marked lost => the pending `cat` aborts the operation.
+    await expect(read).rejects.toThrow(/could not be determined/);
+    // The cat exec never ran (only the two stats did).
+    expect(
+      state.calls.filter(
+        (c) =>
+          c.command === "docker" &&
+          c.args[0] === "exec" &&
+          c.args.includes("cat"),
+      ),
+    ).toHaveLength(0);
+    expect(state.containers.has("valmont-sandbox-taskDU")).toBe(true);
+    expect(existsSync(path.join(lockDir, "replacement-token"))).toBe(true);
+  }, 15_000);
+
+  it("a stale-break CANNOT capture a token renewed before the capture: it restores the token and declines", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const a = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      fenceLockTtlMs: 6_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 1_000,
+    });
+    // B's breaker sees a token whose mtime is stale at the cheap
+    // pre-check, but the holder renews BETWEEN that check and the
+    // capture rename (the rename is delayed here; the renewal lands on
+    // the token first). The capture-verify step must observe the FRESH
+    // mtime, restore the token, and decline the break.
+    const b = makeProvider(state, {
+      instanceId: "instance-b",
+      leaseDir,
+      fenceLockTtlMs: 6_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 1_000,
+      fsOverride: {
+        rename: async (oldPath, newPath) => {
+          if (newPath.includes(".deadtoken.")) {
+            // The live holder renews while the breaker holds the
+            // pre-capture window; the captured file carries the fresh
+            // mtime once the rename lands.
+            const now = new Date();
+            await fsUtimes(oldPath, now, now);
+          }
+          return fsRename(oldPath, newPath);
+        },
+      },
+    });
+    const fenceA = (await internals(a).acquireTaskFence(
+      "taskVR",
+      "owner",
+    )) as FenceHandle | null;
+    expect(fenceA?.active).toBe(true);
+    const lockDir = path.join(leaseDir, ".locks", "taskVR.lock");
+    const token = tokenPathOf(lockDir)!;
+    // Make the token look stale to the pre-check...
+    const old = new Date(Date.now() - 60_000);
+    await fsUtimes(token, old, old);
+    // ...then have B try to break it.
+    const attempt = await internals(b).acquireTaskFence("taskVR", "owner");
+    expect(attempt?.active).toBe(false);
+    // A's token was RESTORED (not captured, not deleted) and the fence
+    // is still usable: the next renewal succeeds and stays fresh.
+    expect(existsSync(token)).toBe(true);
+    expect(Date.now() - lstatSync(token).mtimeMs).toBeLessThan(5_000);
+    await (
+      internals(a) as unknown as {
+        renewFence(f: unknown): Promise<void>;
+      }
+    ).renewFence(fenceA);
+    expect(fenceA?.lost).toBeFalsy();
+    expect(Date.now() - lstatSync(token).mtimeMs).toBeLessThan(2_000);
+    // No graveyard leftovers from the aborted capture.
+    expect(
+      readdirSync(path.join(leaseDir, ".locks")).filter((e) =>
+        e.includes(".deadtoken."),
+      ),
+    ).toHaveLength(0);
+    await fenceA!.release();
+    expect(existsSync(lockDir)).toBe(false);
+  }, 15_000);
+
+  it("a broken stale holder loses its fence: its own release leaves the replacement holder's lock untouched", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const a = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      fenceLockTtlMs: 6_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 1_000,
+    });
+    const b = makeProvider(state, {
+      instanceId: "instance-b",
+      leaseDir,
+      fenceLockTtlMs: 6_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 1_000,
+    });
+    const fenceA = (await internals(a).acquireTaskFence(
+      "taskSB",
+      "owner",
+    )) as FenceHandle | null;
+    expect(fenceA?.active).toBe(true);
+    const lockDir = path.join(leaseDir, ".locks", "taskSB.lock");
+    // A's token is genuinely stale (the holder died): B breaks it and
+    // takes over with its OWN token.
+    const token = tokenPathOf(lockDir)!;
+    const old = new Date(Date.now() - 60_000);
+    await fsUtimes(token, old, old);
+    const attempt = await internals(b).acquireTaskFence("taskSB", "owner");
+    expect(attempt?.active).toBe(true);
+    // A's next renewal fails on its removed token path: the fence is
+    // lost (sticky) for the rest of A's operation.
+    expect(existsSync(fenceA?.tokenFile ?? token)).toBe(false);
+    await (
+      internals(a) as unknown as {
+        renewFence(f: unknown): Promise<void>;
+      }
+    ).renewFence(fenceA);
+    expect(fenceA?.lost).toBe(true);
+    // A's release (e.g. the finally of an operation that already
+    // failed) removes NOTHING of B's: the replacement token and the
+    // lock directory survive it.
+    await fenceA!.release();
+    const bToken = tokenPathOf(lockDir)!;
+    expect(existsSync(bToken)).toBe(true);
+    expect(existsSync(lockDir)).toBe(true);
+    // B still holds a fully working fence and releases cleanly.
+    const now = new Date();
+    await fsUtimes(bToken, now, now);
+    await attempt!.release();
+    expect(existsSync(lockDir)).toBe(false);
+  }, 15_000);
+
+  it("coordination-directory failures (EIO/ENOENT/ESTALE/EACCES) fail the owner op CLOSED with zero docker calls", async () => {
+    // These are LOCAL/transient failures: this instance cannot know
+    // whether peers can still fence, so proceeding would risk two
+    // holders. None of them may be read as "degraded, proceed".
+    for (const code of ["EIO", "ENOENT", "ESTALE", "EACCES"]) {
+      const state = makeState();
+      const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+      leaseDirs.push(leaseDir);
+      const src = await makeSource({ "a.txt": "x" });
+      const provider = makeProvider(state, {
+        leaseDir,
+        fenceOwnerWaitMs: 250,
+        fenceReapWaitMs: 250,
+        fsOverride: failingLocksMkdir(code),
+      });
+      await expect(
+        provider.create("taskDeg", src),
+        `code ${code} must fail closed`,
+      ).rejects.toThrow(/could not be determined/);
+      expect(
+        state.calls.filter((c) => c.command === "docker"),
+        `code ${code} must not run docker`,
+      ).toHaveLength(0);
+    }
+  }, 15_000);
+
+  it("with the fence unusable, two instances NEVER concurrently adopt the same unlabeled container", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    seedContainer(state, "valmont-sandbox-taskNA", {
+      "valmont.task": "taskNA",
+    });
+    const mk = (instanceId: string) =>
+      makeProvider(state, {
+        instanceId,
+        leaseDir,
+        leaseTtlMs: 600_000,
+        fenceOwnerWaitMs: 200,
+        fenceReapWaitMs: 200,
+        fsOverride: failingLocksMkdir("EIO"),
+      });
+    const a = mk("instance-a");
+    const b = mk("instance-b");
+    // Both instances race to adopt the legacy (unlabeled) container.
+    const [ra, rb] = await Promise.allSettled([
+      a.open("taskNA"),
+      b.open("taskNA"),
+    ]);
+    expect(ra.status).toBe("rejected");
+    expect(rb.status).toBe("rejected");
+    expect(String((ra as PromiseRejectedResult).reason)).toMatch(
+      /could not be determined/,
+    );
+    expect(String((rb as PromiseRejectedResult).reason)).toMatch(
+      /could not be determined/,
+    );
+    // Neither attempt wrote a lease claim, neither ran ANY docker
+    // command, and the container is exactly as it was.
+    expect(existsSync(path.join(leaseDir, "taskNA.lease"))).toBe(false);
+    expect(state.calls.filter((c) => c.command === "docker")).toHaveLength(0);
+    expect(state.containers.has("valmont-sandbox-taskNA")).toBe(true);
+  }, 15_000);
+
+  it("a stale own lease on a REPLACEMENT container is never refreshed: the rejected op cannot poison the new owner", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const a = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      leaseTtlMs: 600_000,
+    });
+    const b = makeProvider(state, {
+      instanceId: "instance-b",
+      leaseDir,
+      leaseTtlMs: 600_000,
+    });
+    // B's REPLACEMENT container under the task name (A's original was
+    // destroyed and B re-created): the immutable instance label names
+    // B — but A's OLD lease for the destroyed original is still on
+    // disk, stale.
+    seedContainer(state, "valmont-sandbox-taskPO", {
+      "valmont.task": "taskPO",
+      "valmont.instance": "instance-b",
+    });
+    const leasePath = path.join(leaseDir, "taskPO.lease");
+    const staleLease = JSON.stringify({
+      instanceId: "instance-a",
+      updatedAt: Date.now() - 30 * 60_000,
+      containerName: "valmont-sandbox-taskPO",
+      taskId: "taskPO",
+      generation: "old-generation",
+    });
+    writeFileSync(leasePath, staleLease);
+    const mtimeBefore = lstatSyncSafe(leasePath);
+    await sleep(20);
+    // A's open and handle op both reject (the container is foreign)...
+    await expect(a.open("taskPO")).rejects.toThrow(/owned by another/);
+    await expect(
+      a.readFile({ id: "taskPO", root: "/workspace" }, "a.txt"),
+    ).rejects.toThrow(/owned by another|could not be determined/);
+    // ...CRITICALLY without refreshing the stale lease: the old
+    // pre-gate heartbeat would have re-stamped it fresh, blocking B's
+    // create/destroy with a bogus "owned by another" claim.
+    expect(readFileSync(leasePath, "utf8")).toBe(staleLease);
+    expect(lstatSyncSafe(leasePath)).toBe(mtimeBefore);
+    // B — the replacement's real owner — is unaffected: its open
+    // succeeds and re-mints the claim for B.
+    const handle = await b.open("taskPO");
+    expect(handle.id).toBe("taskPO");
+    const lease = JSON.parse(readFileSync(leasePath, "utf8"));
+    expect(lease.instanceId).toBe("instance-b");
+    expect(lease.generation).not.toBe("old-generation");
   });
+
+  it("losing the lease file mid-operation does not disturb the fenced op; the next op re-establishes the claim", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, {
+      instanceId: "instance-ll",
+      leaseDir,
+      leaseTtlMs: 600_000,
+      fenceLockTtlMs: 8_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 2_000,
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("taskLL", src);
+    state.statResults.set("/workspace", {
+      code: 0,
+      stdout: "directory\n",
+      stderr: "",
+    });
+    state.statResults.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "regular file\n",
+      stderr: "",
+    });
+    state.fileContents.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "x\n",
+      stderr: "",
+    });
+    state.execDelays.set("stat", 800);
+    const leasePath = path.join(leaseDir, "taskLL.lease");
+    let statStarted = false;
+    state.onExec = (_n, cmd) => {
+      if (cmd[0] === "stat" && cmd[cmd.length - 1] === "/workspace/a.txt") {
+        statStarted = true;
+      }
+      return undefined;
+    };
+    const read = provider.readFile(ws, "a.txt");
+    await waitFor(() => statStarted);
+    // The claim file vanishes mid-op (operator cleanup / disk fault):
+    // the fence still proves exclusivity for the in-flight operation,
+    // which completes normally.
+    rmSync(leasePath, { force: true });
+    expect(await read).toBe("x\n");
+    expect(state.containers.has("valmont-sandbox-taskLL")).toBe(true);
+    // The NEXT operation re-establishes the claim under the fence
+    // (labeled-mine + absent => fresh generation), so peer reapers
+    // still see a live owner rather than an adoptable orphan.
+    expect(await provider.readFile(ws, "a.txt")).toBe("x\n");
+    const lease = JSON.parse(readFileSync(leasePath, "utf8"));
+    expect(lease.instanceId).toBe("instance-ll");
+    expect(typeof lease.generation).toBe("string");
+    expect(lease.generation.length).toBeGreaterThan(0);
+  }, 15_000);
+
+  it("a reaper that loses its fence token mid-sweep NEVER issues the rm (the replacement holder's lock is untouched)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, {
+      leaseDir,
+      ttlMs: 400,
+      fenceReapWaitMs: 2_000,
+    });
+    seedContainer(state, "valmont-sandbox-taskTL", {
+      "valmont.task": "taskTL",
+      "valmont.instance": "instance-b",
+    });
+    // A stale foreign lease => the reaper routes the row by AGE (it
+    // would remove the container if it got the fence).
+    writeFileSync(
+      path.join(leaseDir, "taskTL.lease"),
+      JSON.stringify({
+        instanceId: "instance-b",
+        updatedAt: Date.now() - 30 * 60_000,
+        containerName: "valmont-sandbox-taskTL",
+        taskId: "taskTL",
+      }),
+    );
+    const lockDir = path.join(leaseDir, ".locks", "taskTL.lock");
+    // The reaper is INSIDE its fence (the in-fence identity re-check
+    // inspect) when a stale-breaker completes a break and a
+    // replacement holder takes over the lock directory.
+    let broke = false;
+    state.onInspect = (name, format) => {
+      if (
+        !broke &&
+        name === "valmont-sandbox-taskTL" &&
+        format.startsWith("{{.Id}}|")
+      ) {
+        broke = true;
+        breakFenceAndReplace(lockDir);
+      }
+    };
+    state.psLines = [
+      "valmont-sandbox-taskTL\ttaskTL\tinstance-b\t/valmont-sandbox-taskTL",
+    ];
+    // The sweep must fail closed (undetermined) instead of issuing the
+    // rm it can no longer prove it is entitled to.
+    await expect(internals(provider).reapExpired()).rejects.toThrow(
+      /could not be determined/,
+    );
+    expect(broke).toBe(true);
+    expect(
+      state.calls.filter((c) => c.command === "docker" && c.args[0] === "rm"),
+    ).toHaveLength(0);
+    expect(state.containers.has("valmont-sandbox-taskTL")).toBe(true);
+    // The replacement holder's token survived the failed sweep's
+    // cleanup/release path.
+    expect(existsSync(path.join(lockDir, "replacement-token"))).toBe(true);
+  }, 15_000);
+
+  it("a replacement created between the ps row and the in-fence re-check is skipped; its fresh lease is restored, never unlinked", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, {
+      leaseDir,
+      ttlMs: 400,
+      fenceReapWaitMs: 2_000,
+    });
+    seedContainer(state, "valmont-sandbox-taskRP", {
+      "valmont.task": "taskRP",
+      "valmont.instance": "instance-a",
+    });
+    const oldId = state.idOf.get("valmont-sandbox-taskRP")!;
+    // Stale lease => the reaper routes by age.
+    writeFileSync(
+      path.join(leaseDir, "taskRP.lease"),
+      JSON.stringify({
+        instanceId: "instance-a",
+        updatedAt: Date.now() - 30 * 60_000,
+        containerName: "valmont-sandbox-taskRP",
+        taskId: "taskRP",
+      }),
+    );
+    const leasePath = path.join(leaseDir, "taskRP.lease");
+    // Between the ps listing and the reaper's in-fence re-check, the
+    // old container dies and a REPLACEMENT (a different immutable id,
+    // owned by instance-a) takes the name with a FRESH lease.
+    let swapped = false;
+    state.onInspect = (name, format) => {
+      if (
+        !swapped &&
+        format.startsWith("{{.Id}}|") &&
+        (name === oldId || name === "valmont-sandbox-taskRP")
+      ) {
+        swapped = true;
+        unregisterContainer(state, "valmont-sandbox-taskRP");
+        registerContainer(state, "valmont-sandbox-taskRP", {
+          "valmont.task": "taskRP",
+          "valmont.instance": "instance-a",
+        });
+        state.createdAt.set("valmont-sandbox-taskRP", new Date().toISOString());
+        writeFileSync(
+          leasePath,
+          JSON.stringify({
+            instanceId: "instance-a",
+            updatedAt: Date.now(),
+            containerName: "valmont-sandbox-taskRP",
+            taskId: "taskRP",
+            generation: "replacement-generation",
+          }),
+        );
+      }
+    };
+    state.psLines = [`${oldId}\ttaskRP\tinstance-a\t/valmont-sandbox-taskRP`];
+    await internals(provider).reapExpired();
+    expect(swapped).toBe(true);
+    // The rm targeted the row's immutable ID; by re-check time that id
+    // resolves to nothing, so NO rm was ever issued...
+    expect(
+      state.calls.filter((c) => c.command === "docker" && c.args[0] === "rm"),
+    ).toHaveLength(0);
+    // ...the replacement container is intact...
+    expect(state.containers.has("valmont-sandbox-taskRP")).toBe(true);
+    expect(state.idOf.get("valmont-sandbox-taskRP")).not.toBe(oldId);
+    // ...and its fresh lease SURVIVED the sweep's generation-aware
+    // deletion: still the replacement owner's claim (never unlinked,
+    // never left absent — capture-verify-restore refused it).
+    const afterLease = JSON.parse(readFileSync(leasePath, "utf8"));
+    expect(afterLease.instanceId).toBe("instance-a");
+    expect(afterLease.generation).toBe("replacement-generation");
+    expect(Date.now() - afterLease.updatedAt).toBeLessThan(60_000);
+  }, 15_000);
+
+  it("a restarted provider with the SAME stable instance id honors its predecessor's fresh lease (removes only once it is stale)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const first = makeProvider(state, {
+      instanceId: "stable-id",
+      leaseDir,
+      leaseTtlMs: 600_000,
+      ttlMs: 400,
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    await first.create("taskST", src);
+    // The first "process" is gone; its container is old by age, but its
+    // lease claim is FRESH (a recent idle heartbeat). A restarted
+    // process with the same stable identity must NOT remove it.
+    state.createdAt.set("valmont-sandbox-taskST", OLD_CREATED);
+    const leasePath = path.join(leaseDir, "taskST.lease");
+    const restarted = makeProvider(state, {
+      instanceId: "stable-id",
+      leaseDir,
+      leaseTtlMs: 600_000,
+      ttlMs: 400,
+      fenceReapWaitMs: 2_000,
+    });
+    state.psLines = [
+      "valmont-sandbox-taskST\ttaskST\tstable-id\t/valmont-sandbox-taskST",
+    ];
+    await internals(restarted).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskST")).toBe(true);
+    // Control: once the lease is truly stale, the same sweep removes
+    // the container — proving the skip above was lease-driven, not a
+    // disabled reaper.
+    writeFileSync(
+      leasePath,
+      JSON.stringify({
+        instanceId: "stable-id",
+        updatedAt: Date.now() - 30 * 60_000,
+        containerName: "valmont-sandbox-taskST",
+        taskId: "taskST",
+        generation: "g1",
+      }),
+    );
+    await internals(restarted).reapExpired();
+    expect(state.containers.has("valmont-sandbox-taskST")).toBe(false);
+  }, 15_000);
+
+  it("deleteLease restores a lease a replacement owner swapped in between the teardown's read and the capture", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    await provider.create("taskGR", src);
+    const leasePath = path.join(leaseDir, "taskGR.lease");
+    const original = JSON.parse(readFileSync(leasePath, "utf8"));
+    // A replacement owner's writeLease (tmp + rename) completes in the
+    // window between this teardown's lease READ (generation g1) and its
+    // capture rename: the capture grabs the REPLACEMENT's file, the
+    // verification fails, and the captured file is RESTORED — the
+    // lease is never unlinked.
+    const replacementLease = JSON.stringify({
+      instanceId: "instance-b",
+      updatedAt: Date.now(),
+      containerName: "valmont-sandbox-taskGR",
+      taskId: "taskGR",
+      generation: "g2",
+    });
+    const rigged = makeProvider(state, {
+      instanceId: "instance-a",
+      leaseDir,
+      fsOverride: {
+        rename: async (oldPath, newPath) => {
+          if (oldPath === leasePath) {
+            // The concurrent replacement write lands first...
+            const tmp = `${leasePath}.peer.${Date.now()}.tmp`;
+            await fsWriteFile(tmp, replacementLease);
+            await fsRename(tmp, leasePath);
+          }
+          return fsRename(oldPath, newPath);
+        },
+      },
+    });
+    const intern = rigged as unknown as {
+      deleteLease(
+        taskId: string,
+        expectedContainerName?: string,
+        fence?: unknown,
+        expectedGeneration?: string,
+      ): Promise<string>;
+    };
+    const outcome = await intern.deleteLease(
+      "taskGR",
+      "valmont-sandbox-taskGR",
+      undefined,
+      original.generation,
+    );
+    // The lease on disk is the REPLACEMENT's claim, byte-for-byte...
+    expect(readFileSync(leasePath, "utf8")).toBe(replacementLease);
+    // ...and the outcome reports a valid lease left in place (never
+    // "deleted", never a silent success).
+    expect(outcome).toBe("valid-left");
+  });
+
+  it("a destroy that loses its fence mid-teardown reports undetermined, keeps the lease, and a retry completes", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, {
+      leaseDir,
+      fenceLockTtlMs: 8_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 2_000,
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    await provider.create("taskFD", src);
+    const leasePath = path.join(leaseDir, "taskFD.lease");
+    const leaseBefore = readFileSync(leasePath, "utf8");
+    const lockDir = path.join(leaseDir, ".locks", "taskFD.lock");
+    // The rm is slow; while it is in flight a stale-breaker completes a
+    // break and a replacement holder takes the lock.
+    state.dockerDelays.set("rm", 800);
+    let broke = false;
+    state.onRm = (name) => {
+      if (name === "valmont-sandbox-taskFD" && !broke) {
+        broke = true;
+        breakFenceAndReplace(lockDir);
+      }
+    };
+    await expect(provider.destroy("taskFD")).rejects.toThrow(
+      /could not be determined/,
+    );
+    // The rm itself was issued under a fence that was live at issue
+    // time, so the container is gone — but the teardown REFUSED to
+    // retire state it could no longer prove it owned: the lease
+    // survives untouched for the replacement/retry to resolve...
+    expect(broke).toBe(true);
+    expect(state.containers.has("valmont-sandbox-taskFD")).toBe(false);
+    expect(readFileSync(leasePath, "utf8")).toBe(leaseBefore);
+    // ...and the replacement holder's token was not swept by the
+    // failed teardown's release.
+    expect(existsSync(path.join(lockDir, "replacement-token"))).toBe(true);
+    // The replacement holder finishes and releases; a retry completes
+    // the teardown cleanly.
+    state.dockerDelays.clear();
+    state.onRm = undefined;
+    rmSync(lockDir, { recursive: true, force: true });
+    await provider.destroy("taskFD");
+    expect(existsSync(leasePath)).toBe(false);
+  }, 15_000);
+
+  it("quarantine stops at fence loss: no rename, no stop, and the undetermined outcome is surfaced", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, {
+      leaseDir,
+      fenceLockTtlMs: 8_000,
+      fenceOwnerWaitMs: 400,
+      fenceReapWaitMs: 400,
+      timeoutMs: 2_000,
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    const ws = await provider.create("taskQF", src);
+    const lockDir = path.join(leaseDir, ".locks", "taskQF.lock");
+    // The validation cleanup fails (a survivor escapes the reaper) and
+    // the quarantine's own rm fails while the container survives —
+    // and MID-SEQUENCE the fence is broken away with a replacement
+    // holder taking over. The sequence must STOP: no rename by name,
+    // no stop, no marker/lease retirement.
+    state.onExec = (_n, cmd) =>
+      cmd[0] === "node"
+        ? {
+            code: 1,
+            stdout: "",
+            stderr: "validation-reap: survivor pid 42 (state R)\n",
+          }
+        : undefined;
+    state.rmErrors.set(
+      "valmont-sandbox-taskQF",
+      "Error: removing container: device or resource busy\n",
+    );
+    state.dockerDelays.set("rm", 600);
+    let broke = false;
+    state.onRm = (name) => {
+      if (name === "valmont-sandbox-taskQF" && !broke) {
+        broke = true;
+        breakFenceAndReplace(lockDir);
+      }
+    };
+    await expect(provider.runValidation(ws, "npm test")).rejects.toThrow(
+      /could not be determined|quarantined|validation/i,
+    );
+    // The in-memory flag was set FIRST (no I/O needed)...
+    expect(internals(provider).quarantinedTasks.has("taskQF")).toBe(true);
+    // ...the durable marker was written BEFORE the loss and is kept...
+    expect(existsSync(path.join(leaseDir, "taskQF.quarantined"))).toBe(true);
+    // ...and NO rename or stop was ever issued (the sequence stopped
+    // at the fence gate instead of touching a container a replacement
+    // may hold).
+    expect(
+      state.calls.filter(
+        (c) =>
+          c.command === "docker" &&
+          (c.args[0] === "rename" || c.args[0] === "stop"),
+      ),
+    ).toHaveLength(0);
+    expect(state.containers.has("valmont-sandbox-taskQF")).toBe(true);
+    expect(state.stopped.has("valmont-sandbox-taskQF")).toBe(false);
+    // The replacement holder finishes; an explicit destroy recovers
+    // the task (container, marker, and flag all cleared).
+    state.onExec = undefined;
+    state.rmErrors.delete("valmont-sandbox-taskQF");
+    state.dockerDelays.clear();
+    state.onRm = undefined;
+    rmSync(lockDir, { recursive: true, force: true });
+    await provider.destroy("taskQF");
+    expect(state.containers.has("valmont-sandbox-taskQF")).toBe(false);
+    expect(existsSync(path.join(leaseDir, "taskQF.quarantined"))).toBe(false);
+    expect(internals(provider).quarantinedTasks.has("taskQF")).toBe(false);
+  }, 15_000);
+
+  it("a LATE-registered create keeps the tombstone: the surfaced container is unopenable until an explicit destroy clears it", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, { leaseDir });
+    const src = await makeSource({ "a.txt": "x" });
+    // The create request times out client-side; the daemon is still
+    // processing it and the container is NOT yet visible.
+    state.lateCreates.set("valmont-sandbox-taskLC", {
+      labels: {},
+      pending: false,
+    });
+    await expect(provider.create("taskLC", src)).rejects.toThrow(/create/);
+    // The cleanup probes correctly saw nothing under either name — but
+    // the create outcome was UNCERTAIN, so the durable tombstone is
+    // RETAINED (never retired on a "missing" probe alone).
+    expect(existsSync(path.join(leaseDir, "taskLC.quarantined"))).toBe(true);
+    expect(internals(provider).quarantinedTasks.has("taskLC")).toBe(true);
+    // The daemon finishes the create LATE: the container appears AFTER
+    // the cleanup probes concluded "missing"...
+    expect(flushLateCreate(state, "valmont-sandbox-taskLC")).toBe(true);
+    expect(state.containers.has("valmont-sandbox-taskLC")).toBe(true);
+    // ...and it is NOT openable: this instance and a fresh one both
+    // hit the durable tombstone.
+    await expect(provider.open("taskLC")).rejects.toThrow(/quarantined/);
+    const fresh = makeProvider(state, { leaseDir });
+    await expect(fresh.open("taskLC")).rejects.toThrow(/quarantined/);
+    // An explicit destroy removes the late-created container (bound to
+    // its immutable id), the marker, and the bookkeeping.
+    await provider.destroy("taskLC");
+    expect(state.containers.has("valmont-sandbox-taskLC")).toBe(false);
+    expect(existsSync(path.join(leaseDir, "taskLC.quarantined"))).toBe(false);
+    // ...and the task is usable again.
+    state.lateCreates.delete("valmont-sandbox-taskLC");
+    const ws = await provider.create("taskLC", src);
+    expect(ws.id).toBe("taskLC");
+  }, 15_000);
 });
 
 describe("validation reaper script (run directly against a synthetic /proc)", () => {
