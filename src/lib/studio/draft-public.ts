@@ -2,17 +2,22 @@ import { eq } from "drizzle-orm";
 import { getDatabase } from "@/db";
 import { studioDrafts } from "@/db/schema";
 import { getStudioSqliteDb, normalizeBrief } from "./draft-store";
-import type { SiteBriefV1, StudioDraft } from "./site-brief/schema";
+import {
+  customerAccountsEnabled,
+  type SiteBriefV1,
+  type StudioDraft,
+} from "./site-brief/schema";
 
 /**
  * A brief safe to send to an anonymous shopper. Secrets — the Valmont Pay API
  * key above all — are stripped, and the brief is normalized so a pre-Phase-3
  * draft still exposes an `items`/`payments` shape.
  *
- * Checkout is public (a customer is never signed in), so these readers are
- * deliberately owner-agnostic. Security rests on the draft id being an
- * unguessable UUID and on the server re-pricing every basket against this
- * catalogue, never trusting a client-sent price.
+ * Checkout is public and remains available to guests. A signed-in customer may
+ * be attached by the checkout endpoint after its session is verified, but these
+ * readers remain deliberately owner-agnostic. Security rests on the draft id
+ * being an unguessable UUID and on the server re-pricing every basket against
+ * this catalogue, never trusting a client-sent price.
  */
 export type PublicBrief = SiteBriefV1;
 
@@ -119,4 +124,27 @@ export async function internalGetDraftForCheckout(
     ownerId: row.owner_id,
     brief: normalizeBrief(JSON.parse(row.brief_json) as SiteBriefV1),
   };
+}
+
+/**
+ * Keeps only orders that belong to websites whose owner has enabled customer
+ * accounts. Customer order history must not reveal orders on websites that
+ * never opted in, even if an account id somehow became attached. Drafts are
+ * looked up once per website.
+ */
+export async function ordersWithCustomerAccountsEnabled<
+  T extends { draftId: string },
+>(orders: readonly T[]): Promise<T[]> {
+  const cache = new Map<string, boolean>();
+  const kept: T[] = [];
+  for (const order of orders) {
+    let enabled = cache.get(order.draftId);
+    if (enabled === undefined) {
+      const draft = await publicGetDraft(order.draftId).catch(() => null);
+      enabled = draft ? customerAccountsEnabled(draft.brief) : false;
+      cache.set(order.draftId, enabled);
+    }
+    if (enabled) kept.push(order);
+  }
+  return kept;
 }

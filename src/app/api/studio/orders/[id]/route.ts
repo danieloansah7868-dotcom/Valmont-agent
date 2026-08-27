@@ -7,6 +7,7 @@ import { canonicalUserId } from "@/lib/user-identity";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { ALL_ORDER_STATUSES } from "@/lib/studio/order-status";
 import { readBoundedJson } from "@/lib/bounded-json";
+import { notifyCustomerOrderStatus } from "@/lib/customer-order-notifications";
 
 export async function GET(
   _: NextRequest,
@@ -42,9 +43,25 @@ export async function PATCH(
     const { status } = z
       .object({ status: z.enum(ALL_ORDER_STATUSES) })
       .parse(body);
-    const updated = await getOrdersStore().updateStatus(ownerId, id, status);
+    const orders = getOrdersStore();
+    const existing = await orders.getForOwner(ownerId, id);
+    if (!existing) {
+      return NextResponse.json({ error: "Order not found" }, { status: 404 });
+    }
+    const updated = await orders.updateStatus(ownerId, id, status);
     if (!updated) {
       return NextResponse.json({ error: "Order not found" }, { status: 404 });
+    }
+
+    // Updating the status is the source of truth; a customer email is a
+    // best-effort side effect and must never turn a successful merchant update
+    // into an error. The pre-check also keeps a repeated same-status PATCH from
+    // sending a duplicate notification.
+    if (existing.status !== status) {
+      await notifyCustomerOrderStatus({
+        order: updated,
+        origin: request.nextUrl.origin,
+      }).catch(() => "failed");
     }
     return NextResponse.json(updated);
   } catch (error) {

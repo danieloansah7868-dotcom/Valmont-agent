@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  customerEmailConfigured,
   databaseConfigured,
   githubCredentialsConfigured,
+  missingCustomerEmailRequirements,
   missingLiveRequirements,
   modelCredentialsConfigured,
   runtimeReadiness,
@@ -18,6 +20,16 @@ describe("runtime configuration", () => {
       database: false,
       liveReady: false,
     });
+  });
+
+  it("requires both customer email provider variables", () => {
+    expect(customerEmailConfigured({})).toBe(false);
+    expect(
+      customerEmailConfigured({
+        RESEND_API_KEY: "resend-key",
+        NOTIFY_EMAIL_FROM: "Valmont <noreply@example.com>",
+      }),
+    ).toBe(true);
   });
 
   it("requires the full GitHub OAuth triple before GitHub counts as configured", () => {
@@ -67,6 +79,27 @@ describe("runtime configuration", () => {
         GITHUB_CLIENT_SECRET: "secret",
         MODEL_API_KEY: "key",
       }),
+    ).toEqual([]);
+  });
+
+  it("reports missing customer email delivery configuration in production", () => {
+    const env = {
+      NODE_ENV: "production",
+      SESSION_SECRET: "a".repeat(32),
+      GITHUB_CLIENT_ID: "id",
+      GITHUB_CLIENT_SECRET: "secret",
+      MODEL_API_KEY: "key",
+    };
+    expect(missingLiveRequirements(env)).toEqual([]);
+    expect(missingCustomerEmailRequirements(env)).toEqual([
+      "RESEND_API_KEY",
+      "NOTIFY_EMAIL_FROM",
+    ]);
+  });
+
+  it("does not require customer email delivery for local development", () => {
+    expect(
+      missingCustomerEmailRequirements({ NODE_ENV: "development" }),
     ).toEqual([]);
   });
 

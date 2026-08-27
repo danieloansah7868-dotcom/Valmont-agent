@@ -964,6 +964,36 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 </p>
               </fieldset>
 
+              <fieldset className="grid gap-2 rounded-lg border border-line p-3">
+                <legend className="text-sm font-semibold">
+                  Customer accounts (optional)
+                </legend>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={brief.features.customerAccounts}
+                    onChange={(event) =>
+                      update({
+                        features: {
+                          ...brief.features,
+                          customerAccounts: event.target.checked,
+                        },
+                      })
+                    }
+                    data-testid="customer-accounts-enabled"
+                  />
+                  <span className="text-sm">
+                    Let customers create an account to track their orders
+                  </span>
+                </label>
+                <p className="text-xs text-slate-600">
+                  Customers can always order as guests. When this is on, your
+                  public website shows an Account link and customers can sign in
+                  to see their orders. Turn it off at any time — your orders
+                  stay safe in Website Studio.
+                </p>
+              </fieldset>
+
               {brief.payments.enabled && (
                 <>
                   <fieldset className="grid gap-2 rounded-lg border border-line p-3">

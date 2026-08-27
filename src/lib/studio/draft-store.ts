@@ -502,6 +502,14 @@ export function normalizeBrief(brief: SiteBriefV1): SiteBriefV1 {
     };
   }
 
+  // Drafts saved before the features block existed get every optional feature
+  // in its default off state, so older websites never gain anything silently.
+  if (!next.features) {
+    next.features = { customerAccounts: false };
+  } else if (typeof next.features.customerAccounts !== "boolean") {
+    next.features = { ...next.features, customerAccounts: false };
+  }
+
   return next;
 }
 

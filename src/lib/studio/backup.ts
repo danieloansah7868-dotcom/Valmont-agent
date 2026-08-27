@@ -37,6 +37,7 @@ import {
   PostgresStudioDraftStore,
   STUDIO_SCHEMA_VERSION,
 } from "./draft-store";
+import { ensureCustomerAccountSchema } from "@/lib/customer-account-store";
 
 export const BACKUP_VERSION = 2 as const;
 export const CHAT_SECTION_VERSION = 1 as const;
@@ -142,12 +143,74 @@ export const studioSectionSchema = z.object({
   drafts: z.array(studioDraftSchema).max(5_000),
 });
 
+/**
+ * An scrypt password envelope — the ONLY form a customer password may ever
+ * take in a backup. Plaintext never leaves the database; the hash travels
+ * as-is so a restored account still accepts its owner's password. Anything
+ * that does not carry the scrypt parameter block is refused before a single
+ * write happens.
+ */
+const customerPasswordHash = z
+  .string()
+  .regex(
+    /^scrypt\$N=\d+,r=\d+,p=\d+\$[A-Za-z0-9_-]{16,}\$[A-Za-z0-9_-]{32,}$/,
+    "must be a scrypt password hash",
+  );
+
+/** Session and one-time token secrets are exported only as SHA-256 digests. */
+const customerTokenDigest = z
+  .string()
+  .regex(/^[0-9a-f]{64}$/, "must be a SHA-256 digest");
+
+const customerAccountBackupSchema = z.object({
+  id: draftId,
+  email: z.string().email().max(254),
+  name: z.string().min(1).max(80),
+  passwordHash: customerPasswordHash,
+  emailVerifiedAt: isoTimestamp.optional(),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+
+const customerSessionBackupSchema = z.object({
+  id: draftId,
+  accountId: draftId,
+  tokenHash: customerTokenDigest,
+  expiresAt: isoTimestamp,
+  createdAt: isoTimestamp,
+});
+
+const customerTokenBackupSchema = z.object({
+  id: draftId,
+  accountId: draftId,
+  purpose: z.enum(["verify_email", "reset_password"]),
+  tokenHash: customerTokenDigest,
+  context: z.string().max(200).optional(),
+  expiresAt: isoTimestamp,
+  usedAt: isoTimestamp.optional(),
+  createdAt: isoTimestamp,
+});
+
+/**
+ * Optional backup section: customer accounts, sessions and one-time tokens.
+ * Present so the accounts a shop's customers created survive export and
+ * restore. Absent in backups made before the feature existed; payment
+ * credentials and environment secrets are never part of any section.
+ */
+export const customerSectionSchema = z.object({
+  version: z.literal(1),
+  accounts: z.array(customerAccountBackupSchema).max(100_000),
+  sessions: z.array(customerSessionBackupSchema).max(500_000),
+  tokens: z.array(customerTokenBackupSchema).max(500_000),
+});
+
 /** A complete backup: chat, memories and website drafts together. */
 export const backupV2Schema = z.object({
   backupVersion: z.literal(2),
   exportedAt: isoTimestamp,
   chat: chatSectionSchema,
   studio: studioSectionSchema,
+  customers: customerSectionSchema.optional(),
 });
 
 /** The older chat-only file produced by /api/memories/export. */
@@ -155,10 +218,13 @@ export const backupV1Schema = chatSectionSchema;
 
 export type BackupV2 = z.infer<typeof backupV2Schema>;
 export type StudioSection = z.infer<typeof studioSectionSchema>;
+export type CustomerSection = z.infer<typeof customerSectionSchema>;
 
 export interface NormalizedBackup {
   chat: z.infer<typeof chatSectionSchema>;
   studio: StudioSection;
+  /** Present only in backups written after customer accounts existed. */
+  customers?: CustomerSection;
   sourceVersion: 1 | 2;
 }
 
@@ -180,6 +246,7 @@ export function parseBackup(input: unknown): NormalizedBackup {
     return {
       chat: parsed.data.chat,
       studio: parsed.data.studio,
+      customers: parsed.data.customers,
       sourceVersion: 2,
     };
   }
@@ -223,7 +290,8 @@ export async function buildBackup(
   if (process.env.DATABASE_URL) {
     const chat = await getSqliteChatStore().exportUser(user.id);
     const drafts = await new PostgresStudioDraftStore().list(user);
-    return assembleBackup(chat, drafts);
+    const customers = await exportCustomersPostgres();
+    return assembleBackup(chat, drafts, customers);
   }
 
   // Chat and drafts are read back to back from the one shared connection
@@ -233,6 +301,9 @@ export async function buildBackup(
   // entirely "before" or entirely "after", never a mixture of the two.
   const store = getStudioSqliteStore();
   const ownerId = canonicalUserId(user);
+  // Create the customer tables before opening the read transaction: DDL inside
+  // a read snapshot would force a write upgrade and fail under concurrency.
+  ensureCustomerAccountSchema(store.connection);
   let chat: {
     version: number;
     sessions: ChatSession[];
@@ -240,6 +311,9 @@ export async function buildBackup(
     memoryEnabled: boolean;
   };
   let drafts: StudioDraft[] = [];
+  // Customer accounts share the same snapshot so a shopper signing up
+  // mid-export cannot split the file between two points in time.
+  let customers: CustomerSection | undefined;
   store.runInReadTransaction(() => {
     chat = store.exportUserSync(user.id);
     // Test hook: proves the export cannot combine records from different
@@ -270,8 +344,9 @@ export async function buildBackup(
         return parsed;
       })(),
     }));
+    customers = exportCustomersSnapshot(store.connection);
   });
-  return assembleBackup(chat!, drafts);
+  return assembleBackup(chat!, drafts, customers);
 }
 
 function assembleBackup(
@@ -282,6 +357,7 @@ function assembleBackup(
     memoryEnabled: boolean;
   },
   drafts: StudioDraft[],
+  customers?: CustomerSection,
 ): BackupV2 {
   return {
     backupVersion: BACKUP_VERSION,
@@ -297,6 +373,131 @@ function assembleBackup(
       schemaVersion: 1,
       drafts,
     },
+    customers: customers ?? {
+      version: 1,
+      accounts: [],
+      sessions: [],
+      tokens: [],
+    },
+  };
+}
+
+interface SqliteCustomerAccountRow {
+  id: string;
+  email: string;
+  name: string;
+  password_hash: string;
+  email_verified_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface SqliteCustomerSessionRow {
+  id: string;
+  account_id: string;
+  token_hash: string;
+  expires_at: string;
+  created_at: string;
+}
+
+interface SqliteCustomerTokenRow {
+  id: string;
+  account_id: string;
+  purpose: string;
+  token_hash: string;
+  context: string | null;
+  expires_at: string;
+  used_at: string | null;
+  created_at: string;
+}
+
+/**
+ * Reads the customer tables from the open SQLite connection. Runs inside the
+ * caller's read transaction so the export is one consistent snapshot. The
+ * schema itself is ensured by the caller BEFORE the read transaction starts —
+ * DDL inside a read transaction would try to upgrade it to a write and die
+ * with "database is locked" against any concurrent writer.
+ */
+function exportCustomersSnapshot(db: DatabaseSync): CustomerSection {
+  const accounts = db
+    .prepare("SELECT * FROM customer_accounts ORDER BY created_at")
+    .all() as unknown as SqliteCustomerAccountRow[];
+  const sessions = db
+    .prepare("SELECT * FROM customer_sessions ORDER BY created_at")
+    .all() as unknown as SqliteCustomerSessionRow[];
+  const tokens = db
+    .prepare("SELECT * FROM customer_tokens ORDER BY created_at")
+    .all() as unknown as SqliteCustomerTokenRow[];
+  return {
+    version: 1,
+    accounts: accounts.map((row) => ({
+      id: row.id,
+      email: row.email,
+      name: row.name,
+      passwordHash: row.password_hash,
+      emailVerifiedAt: row.email_verified_at ?? undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+    sessions: sessions.map((row) => ({
+      id: row.id,
+      accountId: row.account_id,
+      tokenHash: row.token_hash,
+      expiresAt: row.expires_at,
+      createdAt: row.created_at,
+    })),
+    tokens: tokens.map((row) => ({
+      id: row.id,
+      accountId: row.account_id,
+      purpose: row.purpose as "verify_email" | "reset_password",
+      tokenHash: row.token_hash,
+      context: row.context ?? undefined,
+      expiresAt: row.expires_at,
+      usedAt: row.used_at ?? undefined,
+      createdAt: row.created_at,
+    })),
+  };
+}
+
+/** PostgreSQL counterpart of {@link exportCustomersSnapshot}. */
+async function exportCustomersPostgres(): Promise<CustomerSection> {
+  const { getDatabase } = await import("@/db");
+  const { customerAccounts, customerSessions, customerTokens } =
+    await import("@/db/schema");
+  const db = getDatabase();
+  const [accounts, sessions, tokens] = await Promise.all([
+    db.select().from(customerAccounts),
+    db.select().from(customerSessions),
+    db.select().from(customerTokens),
+  ]);
+  return {
+    version: 1,
+    accounts: accounts.map((row) => ({
+      id: row.id,
+      email: row.email,
+      name: row.name,
+      passwordHash: row.passwordHash,
+      emailVerifiedAt: row.emailVerifiedAt?.toISOString(),
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    })),
+    sessions: sessions.map((row) => ({
+      id: row.id,
+      accountId: row.accountId,
+      tokenHash: row.tokenHash,
+      expiresAt: row.expiresAt.toISOString(),
+      createdAt: row.createdAt.toISOString(),
+    })),
+    tokens: tokens.map((row) => ({
+      id: row.id,
+      accountId: row.accountId,
+      purpose: row.purpose as "verify_email" | "reset_password",
+      tokenHash: row.tokenHash,
+      context: row.context ?? undefined,
+      expiresAt: row.expiresAt.toISOString(),
+      usedAt: row.usedAt?.toISOString(),
+      createdAt: row.createdAt.toISOString(),
+    })),
   };
 }
 
@@ -315,6 +516,16 @@ export interface ImportSummary {
   studioDrafts: number;
   /** Drafts whose id already existed and were given a fresh id. */
   remappedDraftIds: number;
+  /**
+   * Customer accounts actually inserted. An account already present — by id
+   * or by email — is left untouched and counted in `skippedCustomerAccounts`,
+   * so a restore never overwrites a customer's current password hash.
+   */
+  customerAccounts: number;
+  skippedCustomerAccounts: number;
+  /** Customer sessions and one-time tokens actually inserted. */
+  customerSessions: number;
+  customerTokens: number;
   /**
    * How the import was made atomic across stores.
    *
@@ -435,6 +646,10 @@ export async function importBackup(
     skippedMemories: 0,
     studioDrafts: 0,
     remappedDraftIds: 0,
+    customerAccounts: 0,
+    skippedCustomerAccounts: 0,
+    customerSessions: 0,
+    customerTokens: 0,
     atomicity: process.env.DATABASE_URL ? "coordinated" : "single-transaction",
   };
 
@@ -481,6 +696,9 @@ async function importIntoSqlite(
       summary.memories = counts.memories;
       summary.skippedMemories = counts.skippedMemories;
       importStudioDrafts(db, ownerId, backup.studio, summary);
+      if (backup.customers) {
+        importCustomersSqlite(db, backup.customers, summary);
+      }
       // Test hook: proves a failure after inserts rolls the whole import back.
       options.failAfterInsertForTests?.();
     });
@@ -529,6 +747,85 @@ export function importStudioDrafts(
   }
 }
 
+/**
+ * Restores customer accounts, sessions and one-time tokens. INSERT OR IGNORE
+ * means a row that already exists — same account id OR same email address —
+ * is never overwritten, so restoring an older backup cannot roll a customer's
+ * current password back and importing a foreign file cannot take over an
+ * existing local account. Sessions and tokens are restored only for accounts
+ * that are present after this pass, so no orphan rows can be created.
+ */
+export function importCustomersSqlite(
+  db: DatabaseSync,
+  customers: CustomerSection,
+  summary: ImportSummary,
+): void {
+  ensureCustomerAccountSchema(db);
+  const insertAccount = db.prepare(
+    `INSERT OR IGNORE INTO customer_accounts(
+       id, email, name, password_hash, email_verified_at, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const account of customers.accounts) {
+    const result = insertAccount.run(
+      account.id,
+      account.email.trim().toLowerCase(),
+      account.name,
+      account.passwordHash,
+      account.emailVerifiedAt ?? null,
+      account.createdAt,
+      account.updatedAt,
+    );
+    if (Number(result.changes) > 0) summary.customerAccounts += 1;
+    else summary.skippedCustomerAccounts += 1;
+  }
+
+  const usable = new Set(
+    (
+      db.prepare("SELECT id FROM customer_accounts").all() as unknown as Array<{
+        id: string;
+      }>
+    ).map((row) => row.id),
+  );
+
+  const insertSession = db.prepare(
+    `INSERT OR IGNORE INTO customer_sessions(
+       id, account_id, token_hash, expires_at, created_at
+     ) VALUES (?, ?, ?, ?, ?)`,
+  );
+  for (const session of customers.sessions) {
+    if (!usable.has(session.accountId)) continue;
+    const result = insertSession.run(
+      session.id,
+      session.accountId,
+      session.tokenHash,
+      session.expiresAt,
+      session.createdAt,
+    );
+    if (Number(result.changes) > 0) summary.customerSessions += 1;
+  }
+
+  const insertToken = db.prepare(
+    `INSERT OR IGNORE INTO customer_tokens(
+       id, account_id, purpose, token_hash, context, expires_at, used_at, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const token of customers.tokens) {
+    if (!usable.has(token.accountId)) continue;
+    const result = insertToken.run(
+      token.id,
+      token.accountId,
+      token.purpose,
+      token.tokenHash,
+      token.context ?? null,
+      token.expiresAt,
+      token.usedAt ?? null,
+      token.createdAt,
+    );
+    if (Number(result.changes) > 0) summary.customerTokens += 1;
+  }
+}
+
 async function importIntoPostgres(
   user: SessionUser,
   backup: NormalizedBackup,
@@ -536,7 +833,8 @@ async function importIntoPostgres(
   options: ImportOptions,
 ): Promise<void> {
   const { getDatabase } = await import("@/db");
-  const { studioDrafts } = await import("@/db/schema");
+  const { customerAccounts, customerSessions, customerTokens, studioDrafts } =
+    await import("@/db/schema");
   const { ensureStudioUser } = await import("@/lib/user-identity");
   const { eq } = await import("drizzle-orm");
 
@@ -669,6 +967,92 @@ async function importIntoPostgres(
           brief: incoming.brief,
         });
         insertedDrafts += 1;
+      }
+
+      // Customer accounts ride in the same PostgreSQL transaction so a failed
+      // or fenced import cannot leave half-restored customer data behind. The
+      // onConflictDoNothing + pre-filter combination mirrors the SQLite path:
+      // an existing account (by id or unique email) is never overwritten.
+      if (backup.customers) {
+        const existingRows = await tx
+          .select({ id: customerAccounts.id, email: customerAccounts.email })
+          .from(customerAccounts);
+        const usableAccountIds = new Set(existingRows.map((row) => row.id));
+        const existingEmails = new Set(
+          existingRows.map((row) => row.email.toLowerCase()),
+        );
+        const freshAccounts = backup.customers.accounts.filter((account) => {
+          const email = account.email.trim().toLowerCase();
+          return (
+            !usableAccountIds.has(account.id) && !existingEmails.has(email)
+          );
+        });
+        summary.skippedCustomerAccounts =
+          backup.customers.accounts.length - freshAccounts.length;
+        if (freshAccounts.length > 0) {
+          const insertedAccounts = await tx
+            .insert(customerAccounts)
+            .values(
+              freshAccounts.map((account) => ({
+                id: account.id,
+                email: account.email.trim().toLowerCase(),
+                name: account.name,
+                passwordHash: account.passwordHash,
+                emailVerifiedAt: account.emailVerifiedAt
+                  ? new Date(account.emailVerifiedAt)
+                  : null,
+                createdAt: new Date(account.createdAt),
+                updatedAt: new Date(account.updatedAt),
+              })),
+            )
+            .onConflictDoNothing()
+            .returning({ id: customerAccounts.id });
+          summary.customerAccounts = insertedAccounts.length;
+          for (const row of insertedAccounts) usableAccountIds.add(row.id);
+        }
+
+        const freshSessions = backup.customers.sessions.filter((session) =>
+          usableAccountIds.has(session.accountId),
+        );
+        if (freshSessions.length > 0) {
+          const insertedSessions = await tx
+            .insert(customerSessions)
+            .values(
+              freshSessions.map((session) => ({
+                id: session.id,
+                accountId: session.accountId,
+                tokenHash: session.tokenHash,
+                expiresAt: new Date(session.expiresAt),
+                createdAt: new Date(session.createdAt),
+              })),
+            )
+            .onConflictDoNothing()
+            .returning({ id: customerSessions.id });
+          summary.customerSessions = insertedSessions.length;
+        }
+
+        const freshTokens = backup.customers.tokens.filter((token) =>
+          usableAccountIds.has(token.accountId),
+        );
+        if (freshTokens.length > 0) {
+          const insertedTokens = await tx
+            .insert(customerTokens)
+            .values(
+              freshTokens.map((token) => ({
+                id: token.id,
+                accountId: token.accountId,
+                purpose: token.purpose,
+                tokenHash: token.tokenHash,
+                context: token.context ?? null,
+                expiresAt: new Date(token.expiresAt),
+                usedAt: token.usedAt ? new Date(token.usedAt) : null,
+                createdAt: new Date(token.createdAt),
+              })),
+            )
+            .onConflictDoNothing()
+            .returning({ id: customerTokens.id });
+          summary.customerTokens = insertedTokens.length;
+        }
       }
       // A throw here rolls the PostgreSQL transaction back; the coordinator
       // still restores the already-committed chat half.

@@ -1,7 +1,11 @@
 import Link from "next/link";
+import { ClaimOrderButton } from "@/components/customer-account-forms";
+import { getCustomerSession } from "@/lib/customer-auth";
 import { getSessionUser } from "@/lib/auth";
 import { orderConfirmationDestination } from "@/lib/studio/order-confirmation";
+import { publicGetDraft } from "@/lib/studio/draft-public";
 import { getOrdersStore } from "@/lib/studio/orders";
+import { customerAccountsEnabled } from "@/lib/studio/site-brief/schema";
 import { formatMoney, STATUS_LABELS } from "@/lib/studio/valmont-pay";
 
 export const dynamic = "force-dynamic";
@@ -32,6 +36,13 @@ export default async function OrderConfirmedPage({
   }
 
   const viewer = await getSessionUser();
+  // Account prompts appear only on websites where the owner enabled customer
+  // accounts; other orders keep a pure guest confirmation page.
+  const draft = await publicGetDraft(order.draftId).catch(() => null);
+  const accountsEnabled = draft ? customerAccountsEnabled(draft.brief) : false;
+  const customerSession = accountsEnabled
+    ? await getCustomerSession().catch(() => null)
+    : null;
   const destination = orderConfirmationDestination(order, viewer);
   const paid = order.status === "paid";
   const cod = order.status === "cod_pending";
@@ -126,6 +137,50 @@ export default async function OrderConfirmedPage({
           ordering again.
         </p>
       )}
+
+      {accountsEnabled && !order.customerAccountId ? (
+        <div className="mt-6 rounded-lg border border-brandblue-200 bg-brandblue-50 p-4">
+          <p className="text-sm font-semibold text-navy">
+            {order.customerEmail
+              ? "Want this order in your account?"
+              : "Guest order account linking unavailable"}
+          </p>
+          {order.customerEmail ? (
+            <>
+              <p className="mt-1 text-sm leading-6 text-slate">
+                Customer accounts are optional. Link this order now to track it
+                alongside future purchases.
+              </p>
+              {customerSession ? (
+                <ClaimOrderButton accessCode={order.accessCode} />
+              ) : (
+                <Link
+                  href={`/account/register?claim=${encodeURIComponent(order.accessCode)}`}
+                  className="btn-primary mt-3 inline-flex"
+                >
+                  Create an account and link order
+                </Link>
+              )}
+            </>
+          ) : (
+            <p className="mt-1 text-sm leading-6 text-slate">
+              This order was checked out without an email address, so it cannot
+              be linked securely to a customer account.
+            </p>
+          )}
+        </div>
+      ) : null}
+
+      {accountsEnabled &&
+      order.customerAccountId &&
+      customerSession?.account.id === order.customerAccountId ? (
+        <Link
+          href={`/account/orders/${encodeURIComponent(order.id)}`}
+          className="btn-secondary mt-6 inline-flex"
+        >
+          Track this order in your account
+        </Link>
+      ) : null}
 
       <p className="mt-6 text-xs text-slate-500">
         Contact the business directly if you have any questions about this
