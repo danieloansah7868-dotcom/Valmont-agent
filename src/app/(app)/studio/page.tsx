@@ -200,13 +200,22 @@ export default async function StudioPage({
                   </Link>
                   <ShareLinkButton draftId={website.id} compact />
                   {website.hasShop && (
-                    <Link
-                      href={SHOP_ORDERS_PATH}
-                      className="text-xs font-medium text-navy underline"
-                      data-testid="shop-orders-link"
-                    >
-                      Shop orders
-                    </Link>
+                    <>
+                      <Link
+                        href={SHOP_ORDERS_PATH}
+                        className="text-xs font-medium text-navy underline"
+                        data-testid="shop-orders-link"
+                      >
+                        Shop orders
+                      </Link>
+                      <Link
+                        href={`/studio/analytics?website=${encodeURIComponent(website.id)}`}
+                        className="text-xs font-medium text-navy underline"
+                        data-testid="website-analytics-link"
+                      >
+                        Sales analytics
+                      </Link>
+                    </>
                   )}
                 </div>
 
@@ -248,6 +257,30 @@ export default async function StudioPage({
             </li>
           ))}
         </ul>
+      </section>
+
+      <section className="mt-8" aria-labelledby="analytics-heading">
+        <h2 id="analytics-heading" className="text-lg font-semibold text-navy">
+          Sales analytics
+        </h2>
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-white p-4">
+          <div>
+            <p className="text-sm font-semibold text-navy">
+              See what customers are buying
+            </p>
+            <p className="mt-1 text-xs text-slate-600">
+              Review settled sales, top items, payment methods and busiest order
+              times across your shop websites.
+            </p>
+          </div>
+          <Link
+            href="/studio/analytics"
+            className="btn-secondary min-h-11 px-4"
+            data-testid="analytics-link"
+          >
+            Open analytics
+          </Link>
+        </div>
       </section>
 
       <section className="mt-8" aria-labelledby="payments-heading">
