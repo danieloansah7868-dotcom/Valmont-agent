@@ -1,0 +1,77 @@
+# Runtime smoke-test target for the Docker sandbox provider.
+# Mirrors the provider's create-time flags exactly.
+#
+# Run from the repository root after building the image:
+#   docker build -t valmont-sandbox:local -f sandbox/Dockerfile sandbox
+#   docker compose -f compose.sandbox.yaml up --no-start
+#   docker compose -f compose.sandbox.yaml start
+#
+# Then, from another shell:
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox npm --version
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox node --version
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox git --version
+#
+# Verify the tmpfs mounts and their ownership/mode/size (run as the
+# unprivileged user — proving it can traverse the root-owned 0701 /reap
+# mount):
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox \
+#     stat -c '%u %g %a' /reap
+#   # expect: 0 0 701
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox \
+#     stat -c '%u %g %a' /workspace
+#   # expect: 1000 1000 1777
+#
+# /dev/shm is declared explicitly at Docker's 64 MiB default (it is
+# itself a writable tmpfs; making it part of the bounded model):
+#   docker compose -f compose.sandbox.yaml exec -u node sandbox df -m /dev/shm
+#   # expect: Size 64 (MiB)
+#
+# The reaper SCRIPT itself is not in this smoke container: the provider
+# stages it (onto /reap) in each container IT creates and verifies its
+# ownership/mode/type at create time, so its behaviour is covered by the
+# provider's create-time checks rather than this smoke target.
+#
+#   docker compose -f compose.sandbox.yaml down
+services:
+  sandbox:
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+    container_name: valmont-sandbox-smoke
+    # Run as the unprivileged user from CREATE time (matches the
+    # provider's `docker create --user 1000:1000`). No in-container
+    # chown/setpriv bootstrap is possible under cap_drop: ALL, so this
+    # must happen here.
+    user: "1000:1000"
+    # tini as PID 1 reaps zombie children of the validation runs (the
+    # image command itself never waits).
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=default
+    network_mode: "none"
+    cpus: 2
+    mem_limit: 2g
+    memswap_limit: 2g
+    pids_limit: 256
+    # Per-task storage limit, mirrored as a size-capped tmpfs (the kernel
+    # enforces it with ENOSPC). uid=/gid= own the tmpfs root with the
+    # sandbox user, so task code and the provider's `tar` extraction can
+    # write into it without any in-container chown.
+    #
+    # /reap: the provider's second tmpfs — root-owned 0701 (traversable
+    # and readable by the sandbox user, writable by no one), the mount
+    # point the provider stages the validation reaper script onto.
+    #
+    # /dev/shm: Docker's default /dev/shm is itself a writable tmpfs
+    # (64 MiB); it is declared explicitly so the writable-storage model
+    # is exactly these three bounded, per-container mounts.
+    tmpfs:
+      - /workspace:rw,nosuid,nodev,size=2g,uid=1000,gid=1000
+      - /reap:rw,nosuid,nodev,mode=0701,size=1m
+      - /dev/shm:rw,nosuid,nodev,mode=777,size=64m
+    restart: "no"
+    stop_timeout: 5

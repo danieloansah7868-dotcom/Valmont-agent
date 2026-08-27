@@ -103,26 +103,30 @@ export function resolveCommandInvocation(
   };
 }
 
-const DEFAULT_ALLOWED_COMMANDS: Record<string, readonly [string, ...string[]]> =
-  {
-    "npm ci": ["npm", "ci", "--ignore-scripts", "--no-audit", "--fund=false"],
-    "npm test": ["npm", "test"],
-    "npm run lint": ["npm", "run", "lint"],
-    "npm run typecheck": ["npm", "run", "typecheck"],
-    "npm run build": ["npm", "run", "build"],
-    "pnpm install --frozen-lockfile": [
-      "pnpm",
-      "install",
-      "--frozen-lockfile",
-      "--ignore-scripts",
-    ],
-    "pnpm test": ["pnpm", "test"],
-    "pnpm lint": ["pnpm", "lint"],
-    "pnpm typecheck": ["pnpm", "typecheck"],
-    "cargo test": ["cargo", "test"],
-    "go test ./...": ["go", "test", "./..."],
-    pytest: ["pytest", "-q"],
-  };
+// Exported so DockerWorkspaceProvider (workspace-docker.ts) enforces the
+// exact same allowlist as the development adapter.
+export const DEFAULT_ALLOWED_COMMANDS: Record<
+  string,
+  readonly [string, ...string[]]
+> = {
+  "npm ci": ["npm", "ci", "--ignore-scripts", "--no-audit", "--fund=false"],
+  "npm test": ["npm", "test"],
+  "npm run lint": ["npm", "run", "lint"],
+  "npm run typecheck": ["npm", "run", "typecheck"],
+  "npm run build": ["npm", "run", "build"],
+  "pnpm install --frozen-lockfile": [
+    "pnpm",
+    "install",
+    "--frozen-lockfile",
+    "--ignore-scripts",
+  ],
+  "pnpm test": ["pnpm", "test"],
+  "pnpm lint": ["pnpm", "lint"],
+  "pnpm typecheck": ["pnpm", "typecheck"],
+  "cargo test": ["cargo", "test"],
+  "go test ./...": ["go", "test", "./..."],
+  pytest: ["pytest", "-q"],
+};
 
 /**
  * Development-only adapter. Path and command controls reduce accidents, but host processes are not
