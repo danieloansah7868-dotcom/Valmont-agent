@@ -55,7 +55,10 @@ import {
  * - the container runs as the unprivileged user from the start:
  *   `docker create --user <uid>:<gid>` plus `--init` (the runtime's tiny
  *   init reaps zombie children — `sleep infinity` would not), with
- *   `--cap-drop ALL`, no-new-privileges, and the default seccomp profile.
+ *   `--cap-drop ALL`, no-new-privileges, and the daemon's built-in
+ *   default seccomp profile (which applies precisely because no
+ *   explicit `seccomp=` option is passed — an explicit value would name
+ *   a profile file, not select the default).
  *   `uid`/`gid` are the SINGLE source of truth for that identity: the
  *   create-time `--user`, every exec's `--user`, and the tmpfs mount
  *   ownership are all the same numeric pair, so they cannot disagree
@@ -197,9 +200,9 @@ import {
  *   reconstructed start can appear up to ~1 s early — a child spawned
  *   immediately after the boundary can never be missed (see the script
  *   for the over-kill trade-off and the HZ assumption). (PID namespaces
- *   are deliberately not used: seccomp=default allows `unshare` only with
- *   the bare `--user` flag, so no namespace-based teardown is possible
- *   under the default profile.);
+ *   are deliberately not used: the default seccomp profile allows
+ *   `unshare` only with the bare `--user` flag, so no namespace-based
+ *   teardown is possible under it.);
  * - a validation whose cleanup FAILS quarantines the task: the container
  *   is destroyed immediately (best-effort). If the removal succeeds the
  *   task's in-memory flag simply goes with it; if it FAILS, the flag
@@ -1288,8 +1291,13 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       "ALL",
       "--security-opt",
       "no-new-privileges:true",
-      "--security-opt",
-      "seccomp=default",
+      // NOTE: no explicit seccomp option. Docker applies its BUILT-IN
+      // default seccomp profile only when no `--security-opt seccomp=…`
+      // is present; an explicit value is a profile FILE path
+      // (`seccomp=default` makes the daemon try to open a file named
+      // "default" and reject the create — first seen in PR #35's
+      // real-Docker CI run). "Unconfined" would weaken the sandbox and
+      // is deliberately not used either.
       "--network",
       "none",
       "--cpus",

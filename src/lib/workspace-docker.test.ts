@@ -936,7 +936,13 @@ describe("DockerWorkspaceProvider", () => {
     expect(args[args.indexOf("--security-opt") + 1]).toBe(
       "no-new-privileges:true",
     );
-    expect(args).toContain("seccomp=default");
+    // Exactly one --security-opt, and no seccomp option at all: the
+    // daemon's built-in default seccomp profile applies only when none
+    // is passed. An explicit `seccomp=default` is a profile FILE path —
+    // the real daemon rejects the create with "opening seccomp profile
+    // (default) failed" (first seen in PR #35's real-Docker CI run).
+    expect(args.filter((a) => a === "--security-opt")).toHaveLength(1);
+    expect(args.filter((a) => a.startsWith("seccomp"))).toEqual([]);
     expect(args[args.indexOf("--network") + 1]).toBe("none");
     const tmpfs = args.filter((a, i) => args[i - 1] === "--tmpfs");
     expect(tmpfs).toEqual([
