@@ -666,10 +666,22 @@ async function main(): Promise<void> {
           (await containerIds(task("taskq"))).length === 0,
           "destroy removed the container",
         );
+        // The first fresh instance ADOPTED the in-memory quarantine flag
+        // when it observed the marker — documented fail-closed caching
+        // (it rejects again without re-inspecting), so it must STILL
+        // refuse even though another instance destroyed the task.
         await expectReject(
           () => fresh.open(task("taskq")),
+          /quarantined/,
+          "the instance that observed the marker keeps its fail-closed cache",
+        );
+        // A NEW instance — no in-memory state — sees the true durable
+        // state: no marker, no container => plain unavailability.
+        const reborn = mkHost({ instanceId: hostId("d") });
+        await expectReject(
+          () => reborn.open(task("taskq")),
           /unavailable/,
-          "open after destroy",
+          "a fresh instance sees plain unavailability after the destroy",
         );
       },
     );
