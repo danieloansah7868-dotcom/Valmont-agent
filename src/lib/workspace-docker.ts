@@ -3782,29 +3782,43 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   /**
    * Stage the validation reaper script onto the root-owned `/reap` tmpfs.
-   * Every step is a fixed-argv docker operation (a daemon-side `docker cp`
-   * plus root `stat` execs on fixed paths; no shell anywhere), and the
-   * result is verified before the provider continues:
+   * Every step is a fixed-argv operation (a host-side tar of a
+   * provider-owned scratch file, a root `docker exec` extract, and root
+   * `stat` execs on fixed paths; no shell anywhere), and the result is
+   * verified before the provider continues:
    *
-   * 1. `docker cp` of the host temp file (mode 0644, preserved by the
-   *    copy) — the script lands root-owned `0644` on the mount: other-READ
-   *    so the unprivileged reaper (the same uid as the validation tree)
-   *    can read it, but no write path for that uid — no modify, replace,
-   *    unlink, or shadowing. The mount itself is fresh (created with the
+   * 1. Host-side archive (`tar -cf`, fixed argv): the scratch directory
+   *    is a provider-owned mkdtemp (0700) holding exactly one file —
+   *    `validation-reap.mjs`, mode 0644 — so the archive can contain
+   *    nothing else.
+   * 2. Root extract (`docker exec -i --user root … tar -xf -
+   *    --no-same-owner -C /reap`, archive piped on stdin): `--no-same-
+   *    owner` makes the script root-owned (the extracting uid) with the
+   *    archive's mode — root-owned `0644` on the mount: other-READ so the
+   *    unprivileged reaper (the same uid as the validation tree) can read
+   *    it, but no write path for that uid — no modify, replace, unlink,
+   *    or shadowing. The mount itself is fresh (created with the
    *    container) and root-owned `0701`; nothing the source repository
    *    supplied can ever reach it, so there is no task-owned entry to
    *    clear (a root `rm` could not remove a task-owned entry from the
    *    sticky `/workspace` tmpfs without CAP_FOWNER — another reason the
    *    reaper does not live there).
-   * 2. `stat` verification — the mount root must be `0 0 701` (root-owned,
+   *
+   *    `docker cp` is deliberately NOT used: the container is created
+   *    `--read-only`, and the daemon refuses copies INTO such a container
+   *    on that flag alone — "container rootfs is marked read-only"
+   *    (moby#43015) — even when the destination is a writable tmpfs, as
+   *    the first real-Docker smoke run demonstrated. (Reading OUT of a
+   *    read-only container would work; staging in cannot.)
+   * 3. `stat` verification — the mount root must be `0 0 701` (root-owned,
    *    traversable but not listable/writable by the task uid) and the
    *    script `0 0 644 regular file`; any other observation fails
    *    creation.
    *
-   * All steps are capability-free (the cp is a daemon-side operation; the
-   * stats are root DAC reads under --cap-drop ALL). Runs before the git
-   * baseline; the reaper path is outside /workspace, so the git baseline
-   * never sees it.
+   * All steps are capability-free (root owns the 0701 mount, so plain
+   * owner DAC under --cap-drop ALL suffices; the stats are root DAC
+   * reads). Runs before the git baseline; the reaper path is outside
+   * /workspace, so the git baseline never sees it.
    */
   private async installValidationReaper(
     taskId: string,
@@ -3813,24 +3827,60 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   ): Promise<void> {
     void taskId;
     const scratch = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-file-"));
-    const scriptPath = path.join(scratch, "validation-reap.mjs");
+    const archive = `${scratch}.tar`;
     try {
+      const scriptPath = path.join(scratch, "validation-reap.mjs");
       await writeFile(scriptPath, VALIDATION_REAPER_SCRIPT, {
         encoding: "utf8",
         mode: 0o644,
       });
-      // The cp and the verification execs are bound to the IMMUTABLE
-      // container ID (`ref`) and re-assert the fence token first.
-      const copied = await this.fencedDocker(
+      // Host-side archive of exactly that file (fixed argv, no shell).
+      const archived = await this.fencedDocker(
         fence,
-        ["cp", scriptPath, `${ref}:/reap/validation-reap.mjs`],
+        ["-cf", archive, "-C", scratch, "--", "validation-reap.mjs"],
+        this.opTimeout(60_000),
+        20_000,
+        "tar",
+      );
+      if (archived.code !== 0) {
+        throw new Error(
+          `Could not archive the validation reaper: ${archived.stderr.trim() || archived.code}`,
+        );
+      }
+      // The extract and the verification execs are bound to the IMMUTABLE
+      // container ID (`ref`) and re-assert the fence token first. The
+      // archive is piped on stdin; --no-same-owner makes the script the
+      // extracting root's (see the method documentation for why docker cp
+      // cannot be used on this --read-only container).
+      const extracted = await this.fencedDocker(
+        fence,
+        [
+          "exec",
+          "-i",
+          "--user",
+          "root",
+          "--workdir",
+          "/reap",
+          ref,
+          "tar",
+          "-xf",
+          "-",
+          "--no-same-owner",
+          "-C",
+          "/reap",
+        ],
         this.opTimeout(30_000),
         this.outputLimitBytes,
+        "docker",
+        archive,
       );
-      if (copied.code !== 0) {
-        throw new Error("Could not stage the validation reaper");
+      if (extracted.code !== 0) {
+        throw new Error(
+          `Could not stage the validation reaper: ${extracted.stderr.trim() || extracted.code}`,
+        );
       }
     } finally {
+      await rm(archive, { force: true });
       await rm(scratch, { recursive: true, force: true });
     }
     // Verify the staged result as root (fixed argv): the provider refuses
