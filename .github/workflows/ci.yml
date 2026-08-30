@@ -5,7 +5,7 @@ on:
     branches: [main, "arena/**"]
   pull_request:
 
-permissions:
+permissions: 
   contents: read
 
 concurrency:
@@ -95,3 +95,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build --tag valmont-agent:ci .
+      
+  sandbox-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Sandbox fencing smoke test (real Docker daemon + dind second host)
+        run: npm run smoke:sandbox
