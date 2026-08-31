@@ -101,6 +101,12 @@ interface FakeState {
   execDelays: Map<string, number>;
   cpDestinations: string[];
   cpFailures: number;
+  /**
+   * Simulated daemon refusal of the root tar extract INTO /reap: the
+   * real daemon rejects writes into a --read-only container
+   * (moby#43015) — the failure #35's first real-Docker smoke run hit.
+   */
+  reaperExtractFailures: number;
   /** Forced inspect failure (code 1) for a container's Running check. */
   inspectErrors: Map<string, string>;
   /** Simulate the host CLI failing to spawn an exec command (keyed by cmd). */
@@ -177,6 +183,7 @@ function makeState(): FakeState {
     execDelays: new Map(),
     cpDestinations: [],
     cpFailures: 0,
+    reaperExtractFailures: 0,
     inspectErrors: new Map(),
     spawnFail: new Map(),
     idOf: new Map(),
@@ -613,17 +620,32 @@ function makeSpawn(state: FakeState): DockerSpawn {
         } else {
           const cmd = args.slice(args.indexOf(ref) + 1);
           const user = args[args.indexOf("--user") + 1];
-          const failedSpawn = state.spawnFail.get(cmd[0]);
-          if (failedSpawn !== undefined) {
-            // The host-side CLI could not spawn: the provider rejects.
-            return makeErrorChild(failedSpawn);
+          if (
+            user === "root" &&
+            cmd[0] === "tar" &&
+            cmd[cmd.length - 1] === "/reap" &&
+            state.reaperExtractFailures > 0
+          ) {
+            // The real daemon's refusal for writes into a --read-only
+            // container (moby#43015) — the failure #35's first
+            // real-Docker smoke run surfaced.
+            state.reaperExtractFailures -= 1;
+            code = 1;
+            stderr =
+              "Error response from daemon: container rootfs is marked read-only\n";
+          } else {
+            const failedSpawn = state.spawnFail.get(cmd[0]);
+            if (failedSpawn !== undefined) {
+              // The host-side CLI could not spawn: the provider rejects.
+              return makeErrorChild(failedSpawn);
+            }
+            delay = state.execDelays.get(cmd[0]);
+            const override = state.onExec?.(name, cmd, user);
+            const result = override ?? defaultExec(state, cmd);
+            code = result.code;
+            stdout = result.stdout;
+            stderr = result.stderr;
           }
-          delay = state.execDelays.get(cmd[0]);
-          const override = state.onExec?.(name, cmd, user);
-          const result = override ?? defaultExec(state, cmd);
-          code = result.code;
-          stdout = result.stdout;
-          stderr = result.stderr;
         }
       }
     } else if (command === "tar") {
@@ -1206,12 +1228,15 @@ describe("DockerWorkspaceProvider", () => {
     const src = await makeSource({ "app.js": "x", "lib/util.js": "y" });
     await provider.create("task1", src);
     const hostTar = state.calls.filter((c) => c.command === "tar");
-    // source archive + git exclude archive
-    expect(hostTar).toHaveLength(2);
+    // source archive + reaper archive + git exclude archive
+    expect(hostTar).toHaveLength(3);
     expect(hostTar[0].args[0]).toBe("-cf");
     expect(hostTar[0].args).toContain("--");
     expect(hostTar[0].args[hostTar[0].args.indexOf("--") + 1]).toBe(".");
     expect(hostTar[1].args[hostTar[1].args.indexOf("--") + 1]).toBe(
+      "validation-reap.mjs",
+    );
+    expect(hostTar[2].args[hostTar[2].args.indexOf("--") + 1]).toBe(
       ".git/info/exclude",
     );
     const extract = execCalls(state).find((c) => execCmd(c)[0] === "tar")!;
@@ -1233,21 +1258,57 @@ describe("DockerWorkspaceProvider", () => {
     expect(state.stagedTopLevel).not.toContain(".valmont");
   });
 
-  it("stages the reaper onto /reap and uses root stat as its only root exec", async () => {
+  it("stages the reaper onto /reap by root tar extract (docker cp is unusable on a --read-only container)", async () => {
     const state = makeState();
     const provider = makeProvider(state);
     const src = await makeSource({ "app.js": "x" });
     await provider.create("task1", src);
-    const cpCall = state.calls.find(
-      (c) => c.command === "docker" && c.args[0] === "cp",
+    // The provider must never `docker cp` INTO the container: the daemon
+    // refuses writes into a --read-only container ("container rootfs is
+    // marked read-only", moby#43015) even onto writable tmpfs — the first
+    // real-Docker smoke run failed exactly there. Staging goes through a
+    // host-side tar plus a root exec extract instead.
+    expect(
+      state.calls.filter((c) => c.command === "docker" && c.args[0] === "cp"),
+    ).toEqual([]);
+    // The extract exec is bound to the IMMUTABLE container ID, runs as
+    // root, pipes the archive on stdin, and extracts with
+    // --no-same-owner so the script becomes root-owned.
+    const extract = execCalls(state).find(
+      (c) => execCmd(c)[0] === "tar" && execCmd(c).includes("--no-same-owner"),
     )!;
-    // The cp destination is bound to the IMMUTABLE container ID.
-    expect(cpCall.args[2]).toBe(
-      `${state.idOf.get(containerForTask(state, "task1")!)}:/reap/validation-reap.mjs`,
+    expect(extract.args.join(" ")).toContain("--user root");
+    expect(extract.args.join(" ")).toContain("-i");
+    expect(extract.args.join(" ")).toContain("--workdir /reap");
+    expect(extract.args).toContain(
+      state.idOf.get(containerForTask(state, "task1")!)!,
     );
+    expect(extract.stdinPath).toBeDefined();
+    expect(execCmd(extract)).toEqual([
+      "tar",
+      "-xf",
+      "-",
+      "--no-same-owner",
+      "-C",
+      "/reap",
+    ]);
+    // The host side archived exactly the fixed-name script from the
+    // provider's scratch directory.
+    const hostArchives = state.calls.filter((c) => c.command === "tar");
+    expect(hostArchives.length).toBeGreaterThan(1);
+    const reaperArchive = hostArchives.find((c) =>
+      c.args.includes("validation-reap.mjs"),
+    )!;
+    expect(reaperArchive.args).toEqual(
+      expect.arrayContaining(["-cf", "-C", "--", "validation-reap.mjs"]),
+    );
+    // Root execs: exactly the extract plus the two stat verifications,
+    // and the stats target only /reap paths.
     const root = rootExecs(state);
-    expect(root).toHaveLength(2);
-    for (const c of root) {
+    expect(root).toHaveLength(3);
+    const stats = root.filter((c) => execCmd(c)[0] === "stat");
+    expect(stats).toHaveLength(2);
+    for (const c of stats) {
       const cmd = execCmd(c);
       expect(cmd[0]).toBe("stat");
       expect(cmd[cmd.length - 1]).toMatch(/^\/reap(\/|$)/);
@@ -1292,7 +1353,7 @@ describe("DockerWorkspaceProvider", () => {
 
   it("removes the container when reaper staging fails", async () => {
     const state = makeState();
-    state.cpFailures = 1;
+    state.reaperExtractFailures = 1;
     const provider = makeProvider(state);
     const src = await makeSource({ "a.txt": "x" });
     await expect(provider.create("task1", src)).rejects.toThrow(
@@ -2156,7 +2217,7 @@ describe("DockerWorkspaceProvider", () => {
     // Reaper staging fails AND removal fails: create() leaves a
     // half-initialized container (no reaper, no git baseline) that
     // CANNOT be removed.
-    state.cpFailures = 1;
+    state.reaperExtractFailures = 1;
     // Force the rm failure only while the (half-initialized) container
     // actually EXISTS: the pre-cleanup sees no container before the
     // create and skips the rm entirely (rm is bound to a re-inspected
@@ -2628,7 +2689,7 @@ describe("DockerWorkspaceProvider", () => {
     // openable. The new code quarantines UNCONDITIONALLY in the
     // failure catch (the durable epoch-aware record blocks every open
     // even when every docker call is ambiguous).
-    state.cpFailures = 1;
+    state.reaperExtractFailures = 1;
     state.onRm = (name) => {
       const provisional = containerForTask(state, "task1");
       if (provisional && name === provisional && state.containers.has(name)) {
@@ -2660,7 +2721,7 @@ describe("DockerWorkspaceProvider", () => {
     leaseDirs.push(leaseDir);
     const provider = makeProvider(state, { leaseDir });
     const src = await makeSource({ "a.txt": "x" });
-    state.cpFailures = 1;
+    state.reaperExtractFailures = 1;
     // Force the combined inspect after the create to an UNKNOWN result:
     // the old catch consulted the follow-up inspect and skipped
     // quarantine whenever it did not clearly show an existing container,
@@ -2674,9 +2735,17 @@ describe("DockerWorkspaceProvider", () => {
         provisional &&
         state.containers.has(provisional) &&
         // Arm the UNKNOWN only after reaper staging has been reached (the
-        // `cp` call): the create-time verification inspect must still
-        // succeed so the sequence reaches the failing `cp`.
-        state.calls.some((c) => c.command === "docker" && c.args[0] === "cp")
+        // exec-side tar extract targeting /reap): the create-time
+        // verification inspect must still succeed so the sequence reaches
+        // the failing extract.
+        state.calls.some(
+          (c) =>
+            c.command === "docker" &&
+            c.args[0] === "exec" &&
+            c.args.includes("tar") &&
+            c.args.includes("--workdir") &&
+            c.args.includes("/reap"),
+        )
       ) {
         state.inspectErrors.set(
           provisional,

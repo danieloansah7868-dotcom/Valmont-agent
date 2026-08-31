@@ -3912,23 +3912,61 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     void taskId;
     const scratch = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-file-"));
     const scriptPath = path.join(scratch, "validation-reap.mjs");
+    const archive = `${scratch}.tar`;
     try {
       await writeFile(scriptPath, VALIDATION_REAPER_SCRIPT, {
         encoding: "utf8",
         mode: 0o644,
       });
-      // The cp and the verification execs are bound to the IMMUTABLE
-      // container ID (`ref`) and re-assert the fence token first.
-      const copied = await this.fencedDocker(
+      // `docker cp` INTO this container is unusable: the daemon refuses
+      // writes into a --read-only container ("container rootfs is marked
+      // read-only", moby#43015) even onto a writable tmpfs — #35's first
+      // real-Docker smoke run failed exactly there. Stage via a host-side
+      // archive of exactly that file (fixed argv, no shell) extracted by
+      // a root exec with the archive piped on stdin; the extract and the
+      // verification execs are bound to the IMMUTABLE container ID
+      // (`ref`) and re-assert the fence token first.
+      const archived = await this.fencedDocker(
         fence,
-        ["cp", scriptPath, `${ref}:/reap/validation-reap.mjs`],
+        ["-cf", archive, "-C", scratch, "--", "validation-reap.mjs"],
+        this.opTimeout(60_000),
+        20_000,
+        "tar",
+      );
+      if (archived.code !== 0) {
+        throw new Error(
+          `Could not archive the validation reaper: ${archived.stderr.trim() || archived.code}`,
+        );
+      }
+      const extracted = await this.fencedDocker(
+        fence,
+        [
+          "exec",
+          "-i",
+          "--user",
+          "root",
+          "--workdir",
+          "/reap",
+          ref,
+          "tar",
+          "-xf",
+          "-",
+          "--no-same-owner",
+          "-C",
+          "/reap",
+        ],
         this.opTimeout(30_000),
         this.outputLimitBytes,
+        "docker",
+        archive,
       );
-      if (copied.code !== 0) {
-        throw new Error("Could not stage the validation reaper");
+      if (extracted.code !== 0) {
+        throw new Error(
+          `Could not stage the validation reaper: ${extracted.stderr.trim() || extracted.code}`,
+        );
       }
     } finally {
+      await rm(archive, { force: true });
       await rm(scratch, { recursive: true, force: true });
     }
     // Verify the staged result as root (fixed argv): the provider refuses
