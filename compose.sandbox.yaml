@@ -51,7 +51,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-      - seccomp=default
+      # No explicit seccomp option: the daemon's built-in default
+      # profile applies only when none is passed (`seccomp=default`
+      # would name a profile FILE and fail, as in the provider).
     network_mode: "none"
     cpus: 2
     mem_limit: 2g
