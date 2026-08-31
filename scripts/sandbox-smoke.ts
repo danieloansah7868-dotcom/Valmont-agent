@@ -829,8 +829,19 @@ async function main(): Promise<void> {
         await utimes(token, stale, stale);
         // This host must break the stale lock (capture-verify-restore on
         // the shared volume) and complete its operation.
+        //
+        // Staleness is judged by the BREAKER's fenceLockTtlMs (default
+        // 20 min — a -60 s rewind would be perfectly fresh, as the first
+        // real-Docker run demonstrated: the host waited its owner-wait
+        // out and failed closed with contention). Give the breaker a
+        // short TTL so the 60 s-old token is decisively stale. The peer
+        // itself uses the default TTL (heartbeat every 400 s), so no
+        // renewal lands during the scenario — exactly a holder that
+        // stopped renewing.
         const host = mkHost({
           instanceId: hostId("z"),
+          fenceLockTtlMs: 30_000,
+          timeoutMs: 13_000,
           fenceOwnerWaitMs: 8_000,
         });
         await host.create(task("taskzh"), srcBase);
