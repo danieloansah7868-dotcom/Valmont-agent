@@ -1810,6 +1810,14 @@ describe("DockerWorkspaceProvider", () => {
     seedGeneration(state, "old1", { epoch: 1 });
     await internals(provider).reapExpired();
     expect(containerForTask(state, "old1")).toBeUndefined();
+    // The listing must use --no-trunc: row IDs are compared against the
+    // FULL immutable IDs recorded in mappings, and docker's default
+    // 12-char truncation would make every routing comparison fail,
+    // silently skipping reaping (a real-Docker smoke finding).
+    const psCall = state.calls.find(
+      (c) => c.command === "docker" && c.args[0] === "ps",
+    )!;
+    expect(psCall.args).toContain("--no-trunc");
   });
 
   it("never reaps a task with a fresh activity record", async () => {

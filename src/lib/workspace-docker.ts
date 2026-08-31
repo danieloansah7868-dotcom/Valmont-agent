@@ -4565,10 +4565,17 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     try {
       // Six columns: the container ID (the rm target), the task label, the
       // instance label, the generation label, the epoch label, and the name.
+      // --no-trunc is REQUIRED: row IDs are compared (===) against the FULL
+      // immutable container IDs recorded in mappings at create time, but
+      // `docker ps` truncates .ID to 12 characters by default — a truncated
+      // row would never equal the recorded id and every routing comparison
+      // would silently skip the container (the first real-Docker smoke run
+      // of the epoch protocol surfaced exactly that).
       const listed = await this.docker(
         [
           "ps",
           "-a",
+          "--no-trunc",
           "--filter",
           "label=valmont.managed=true",
           "--format",
