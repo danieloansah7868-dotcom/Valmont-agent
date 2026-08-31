@@ -624,11 +624,16 @@ async function main(): Promise<void> {
         check(losers.length === 1, "exactly one concurrent adopter lost");
         const loser = losers[0];
         if (loser.status === "rejected") {
+          // Provider contract (its own race unit test asserts the same
+          // union): the loser fails closed with the ownership error when
+          // it sees the winner's published claim, or with
+          // "state could not be determined" when it observes the
+          // adoption mid-publication — both are fail-closed.
           check(
-            /owned by another/.test(
+            /owned by another|state could not be determined/.test(
               String(loser.reason?.message ?? loser.reason),
             ),
-            `the losing adopter failed closed with the ownership error (got ${JSON.stringify(String(loser.reason?.message ?? loser.reason))})`,
+            `the losing adopter failed closed (got ${JSON.stringify(String(loser.reason?.message ?? loser.reason))})`,
           );
         }
         const winnerIndex = races.findIndex((r) => r.status === "fulfilled");
@@ -1024,6 +1029,16 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
+  // GitHub Actions annotation: `::error` lines surface in the check-run's
+  // API-visible annotations, so the failing assertion is discoverable
+  // without raw log access. Message must be escaped single-line.
+  const firstLine =
+    (error instanceof Error ? error.message : String(error))
+      .split("\n")[0]
+      ?.slice(0, 400) ?? "unknown failure";
+  console.error(
+    `::error title=sandbox-smoke::${firstLine.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")}`,
+  );
   console.error(
     `\nsandbox smoke test FAILED: ${error instanceof Error ? error.stack : String(error)}`,
   );
