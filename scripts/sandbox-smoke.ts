@@ -96,12 +96,13 @@ const hostId = (role: string) => {
   return instanceId;
 };
 /**
- * A run-scoped task id. The provider derives the container NAME from
- * the task id (`valmont-sandbox-<taskId>`, workspace-docker.ts), and
- * create() treats a stopped same-NAME container as replaceable — so a
- * fixed task id could collide with (or destroy) an unrelated
- * container. Scoping the id scopes the name; it stays within the
- * provider's TASK_ID pattern (^[a-zA-Z0-9_-]{3,80}$).
+ * A run-scoped task id. Under the generation/epoch lifecycle protocol
+ * the canonical task-derived name is NEVER created: containers are
+ * generation-scoped (`valmont-sandbox-<taskId>--g-<generation>`) and
+ * selected by the immutable `valmont.task` label, while coordination
+ * state lives in record dirs under `<leaseDir>/{epochs,mappings,leases,quarantines}/<taskId>/`
+ * (workspace-docker.ts). Scoping the id per run scopes every artifact;
+ * it stays within the provider's TASK_ID pattern (^[a-zA-Z0-9_-]{3,80}$).
  */
 const task = (name: string) => `${name}-${RUN_ID}`;
 
@@ -277,17 +278,65 @@ async function main(): Promise<void> {
     const entries = readdirSync(dir).filter((entry) => !entry.startsWith("."));
     return entries.length === 1 ? path.join(dir, entries[0]!) : null;
   };
+  /** Legacy pre-epoch coordination files (migration-only nowadays). */
   const leaseFileOf = (taskId: string) =>
     path.join(leaseDir, `${taskId}.lease`);
-  const markerFileOf = (taskId: string) =>
+  const legacyMarkerFileOf = (taskId: string) =>
     path.join(leaseDir, `${taskId}.quarantined`);
+  /** Epoch-protocol record dirs: <leaseDir>/<kind>/<taskId>/. */
+  const recordDirOf = (
+    kind: "mappings" | "leases" | "quarantines",
+    taskId: string,
+  ) => path.join(leaseDir, kind, taskId);
+  /** Live entries in a record dir (empty when the dir is retired/gone). */
+  const recordEntries = (
+    kind: "mappings" | "leases" | "quarantines",
+    taskId: string,
+  ): string[] => {
+    const dir = recordDirOf(kind, taskId);
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).filter((entry) => !entry.startsWith("."));
+  };
+  /** The task's single authoritative mapping record (asserts uniqueness). */
+  const readTaskMapping = (
+    taskId: string,
+  ): {
+    epoch: number;
+    generation: string;
+    instanceId: string;
+    containerId: string;
+  } => {
+    const entries = recordEntries("mappings", taskId).filter((entry) =>
+      entry.endsWith(".json"),
+    );
+    check(
+      entries.length === 1,
+      `exactly one mapping record exists for the task (got ${entries.length})`,
+    );
+    return JSON.parse(
+      readFileSync(
+        path.join(recordDirOf("mappings", taskId), entries[0]!),
+        "utf8",
+      ),
+    ) as {
+      epoch: number;
+      generation: string;
+      instanceId: string;
+      containerId: string;
+    };
+  };
 
+  // Container discovery is LABEL-based: with generation-scoped
+  // provisional names a `$`-anchored name filter cannot match, while
+  // the immutable `valmont.task` label is stable across renames
+  // (adoption renames the legacy canonical-name container to a
+  // provisional name and keeps its task label).
   const containerIds = async (taskId: string): Promise<string[]> => {
     const { stdout } = await docker([
       "ps",
       "-aq",
       "--filter",
-      `name=valmont-sandbox-${taskId}$`,
+      `label=valmont.task=${taskId}`,
     ]);
     return stdout.split("\n").filter(Boolean);
   };
@@ -296,7 +345,7 @@ async function main(): Promise<void> {
       "ps",
       "-aq",
       "--filter",
-      `name=valmont-sandbox-${taskId}$`,
+      `label=valmont.task=${taskId}`,
     ]);
     return stdout.split("\n").filter(Boolean);
   };
@@ -616,8 +665,12 @@ async function main(): Promise<void> {
           "the abandoned task was reaped",
         );
         check(
+          recordEntries("leases", task("taskreap")).length === 0,
+          "the reaped task's lease records were retired",
+        );
+        check(
           !existsSync(leaseFileOf(task("taskreap"))),
-          "the reaped task's lease was retired",
+          "no legacy lease file remains",
         );
       },
     );
@@ -627,14 +680,30 @@ async function main(): Promise<void> {
       async () => {
         const a = mkHost({ instanceId: hostId("a") });
         await a.create(task("taskq"), srcBase);
-        // A marker written by "any instance" (the durable stop-fallback
-        // state): simulate it by writing the same payload the provider
-        // writes into the shared lease directory.
+        // A marker written by "another instance" (the durable quarantine
+        // state): simulate it by writing the versioned EPOCH-PROTOCOL
+        // record the provider writes into the shared coordination
+        // directory — pinned to the task's CURRENT mapping (epoch,
+        // generation, container id) so it blocks this generation. (A
+        // legacy epoch-less `<taskId>.quarantined` marker must NOT block
+        // here: with a published mapping it is superseded by design.)
+        const mapping = readTaskMapping(task("taskq"));
+        mkdirSync(recordDirOf("quarantines", task("taskq")), {
+          recursive: true,
+        });
+        const quarantineMarker = path.join(
+          recordDirOf("quarantines", task("taskq")),
+          `${randomUUID()}.json`,
+        );
         writeFileSync(
-          markerFileOf(task("taskq")),
+          quarantineMarker,
           JSON.stringify({
+            schemaVersion: 1,
             taskId: task("taskq"),
+            epoch: mapping.epoch,
+            generation: mapping.generation,
             instanceId: "some-other-instance",
+            containerId: mapping.containerId,
             quarantinedAt: Date.now(),
           }),
         );
@@ -644,14 +713,22 @@ async function main(): Promise<void> {
           /quarantined/,
           "fresh instance open",
         );
+        // Handle-op gating is proven with a SEPARATE provider that shares
+        // the OWNER's instance id: a foreign instance's handle op is
+        // rejected with the ownership error before the quarantine check
+        // (identity first), while the owner's own op must fail closed on
+        // the marker. The shell is left empty-handed: a's own object is
+        // not reused, so nothing an observing instance cached can leak
+        // into the destroy below.
+        const ownerShell = mkHost({ instanceId: hostId("a") });
         await expectReject(
           () =>
-            fresh.readFile(
+            ownerShell.readFile(
               { id: task("taskq"), root: "/workspace" },
               "package.json",
             ),
           /quarantined/,
-          "fresh instance handle op",
+          "owner-identity handle op",
         );
         check(
           (await containerIds(task("taskq"))).length === 1,
@@ -659,8 +736,12 @@ async function main(): Promise<void> {
         );
         await a.destroy(task("taskq"));
         check(
-          !existsSync(markerFileOf(task("taskq"))),
-          "destroy cleared the marker",
+          recordEntries("quarantines", task("taskq")).length === 0,
+          "destroy retired the quarantine record",
+        );
+        check(
+          !existsSync(legacyMarkerFileOf(task("taskq"))),
+          "no legacy quarantine marker remains",
         );
         check(
           (await containerIds(task("taskq"))).length === 0,
@@ -875,8 +956,12 @@ async function main(): Promise<void> {
           "the peer cleaned up its own daemon",
         );
         check(
+          recordEntries("leases", task("taskph")).length === 0,
+          "the peer's destroy retired the SHARED lease records",
+        );
+        check(
           !existsSync(leaseFileOf(task("taskph"))),
-          "the peer's destroy retired the SHARED lease file",
+          "no legacy lease file remains",
         );
       },
     );

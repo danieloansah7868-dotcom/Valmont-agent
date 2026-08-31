@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
   cp,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -35,257 +36,123 @@ import {
 /**
  * Production `WorkspaceProvider` backed by one ephemeral Docker container per
  * coding task. Implements the boundary required by docs/PRODUCTION.md
- * ("Critical sandbox boundary") and docs/SECURITY.md:
+ * ("Critical sandbox boundary") and docs/SECURITY.md.
  *
- * - one short-lived container per task (`valmont-sandbox-<taskId>`), destroyed
- *   with `destroy(taskId)`; a background reaper removes containers older than
- *   the configured TTL. The reaper's `docker ps` listing is never processed
- *   partially — a truncated listing is skipped for the next interval (the
- *   truncated suffix would hold the OLDEST containers, i.e. the reaping
- *   candidates), and a failed in-lock existence inspect drops the activity
- *   record only when the daemon reports "no such object";
- * - the only writable storage is a per-task, size-limited tmpfs at
- *   `/workspace` (kernel-enforced `ENOSPC` cap; destroyed with the container)
- *   plus a tiny root-owned `0701` tmpfs at `/reap` (the reaper script's
- *   mount, see below) — no host filesystem, no application container, no
- *   Docker socket, no cloud credentials, and no persistent named volume to
- *   leak;
- * - read-only root filesystem; package-manager scratch (`$HOME`, `TMPDIR`)
- *   lives on the task tmpfs (staged in by the provider), not on the host;
- * - the container runs as the unprivileged user from the start:
- *   `docker create --user <uid>:<gid>` plus `--init` (the runtime's tiny
- *   init reaps zombie children — `sleep infinity` would not), with
- *   `--cap-drop ALL`, no-new-privileges, and the daemon's built-in
- *   default seccomp profile (which applies precisely because no
- *   explicit `seccomp=` option is passed — an explicit value would name
- *   a profile file, not select the default).
- *   `uid`/`gid` are the SINGLE source of truth for that identity: the
- *   create-time `--user`, every exec's `--user`, and the tmpfs mount
- *   ownership are all the same numeric pair, so they cannot disagree
- *   (a user NAME is deliberately not accepted — it would resolve against
- *   the image's /etc/passwd and could silently differ from the create
- *   uid, breaking the same-uid reaper and ownership assumptions). The
- *   consequence is enforced by construction: no in-container process —
- *   task code or provider setup exec — holds any capability, so every
- *   in-container operation must be capability-free (DAC/ownership-based).
- *   Ownership is therefore established by WHO extracts, not by a root
- *   `chown` (which `--cap-drop ALL` makes impossible): source and file
- *   content are extracted with `tar` run AS the unprivileged user (the
- *   extracted tree, and any parents it creates, are that user's), and the
- *   reaper script lands root-owned via `docker cp` (a root-privileged
- *   CLI operation on the daemon side, which needs no in-container
- *   capability);
- * - every file operation (read, write, delete) first verifies each path
- *   component with fixed-argv `stat` — a task-created symlink (ancestor or
- *   final target) or a non-directory ancestor is rejected before
- *   `cat`/`rm`/`tar` can follow it; a `stat` failure other than ENOENT
- *   (permission, I/O) fails the operation instead of being treated as
- *   "missing"; missing write parents are created by the `tar` extraction
- *   itself (as the unprivileged user), whose input archive is built
- *   host-side from the filtered staging tree — so setup can never follow a
- *   symlink or escape /workspace. Root setup execs are limited to fixed-argv
- *   `stat` verifications of the `/reap` reaper mount; arbitrary task code
- *   never runs as root;
- * - CPU, memory (with no swap), PID, and per-task storage quotas (the
- *   tmpfs mount is owned by the unprivileged user via its `uid=`/`gid=`
- *   mount options), plus a per-command wall-clock timeout
- *   (`timeout --signal=KILL` inside the container; exit 124 — or 137,
- *   128+SIGKILL, when the wrapper reports the killed child's status — maps
- *   to `timed_out`) with a CLI-level fallback kill. Note: with no swap,
- *   tmpfs residency counts against the memory quota, so size
- *   `VALMONT_SANDBOX_MEMORY_BYTES` and `VALMONT_SANDBOX_STORAGE_BYTES`
- *   together for larger tasks;
- * - every provider operation for a task is serialized by an in-provider
- *   per-task queue, so no two operations — and no stat-then-use sequence
- *   within one of them — can ever overlap on the same container; operations
- *   record activity when they are enqueued AND refresh it when they
- *   COMPLETE, so work that is merely waiting in the queue still counts as
- *   task activity for the TTL reaper, and a long-running operation (one
- *   that outlives its own enqueue timestamp) cannot be reaped the moment
- *   it finishes — the reaper waits behind it for the per-task lock, and by
- *   the time it runs the completion has refreshed the activity;
- * - cross-instance ownership: a per-task lock and an activity timestamp are
- *   PROCESS-LOCAL, so two provider instances sharing one Docker daemon
- *   could otherwise operate on, or TTL-reap, the same task concurrently
- *   (e.g. a second instance starts a legitimate `docker exec` while the
- *   first instance's validation reaper is still SIGKILLing "survivors" of
- *   it, or one instance's reaper removes a task the other is actively
- *   using). The provider therefore assigns every instance an identity
- *   (`instanceId`, default a per-process random UUID; configure it for a
- *   stable identity across restarts) and stamps every container it creates
- *   with the creation-time label `valmont.instance=<id>` (labels are set at
- *   creation and immutable after — a supported mechanism, no rename or
- *   label-update needed). Every open/create/destroy then RESOLVES OWNERSHIP
- *   of the existing container before acting: the instance named by the
- *   label is the owner; an unlabeled container has no live owner (every
- *   live instance stamps the label, so an unlabeled container predates
- *   this mechanism or its creator is gone) and is taken over; a container
- *   labeled with ANOTHER instance is operable only when that instance is
- *   provably dead. Concretely: OPERATIONS (open/create/destroy) are
- *   OWNER-ONLY — a foreign-labeled container is rejected with the
- *   ownership error, full stop (no lease consultation), so two instances
- *   can never operate on the same container concurrently. An unlabeled
- *   container (no live label-owner possible) IS adopted by the first
- *   instance that opens/creates it, claimed via a lease file. REAPING is
- *   SHARED, gated by a host-side LEASE: with `leaseDir` set, each
- *   instance writes a `<taskId>.lease` file (JSON: instanceId,
- *   updatedAt, containerName) on create, on adoption, on every operation
- *   enqueue/completion, and on every reaper sweep of a task it owns; the
- *   reaper refreshes it even for idle owned tasks, so the lease is a
- *   liveness signal for the INSTANCE, not the task. The reaper then:
- *   skips a foreign container whose owner's lease is fresh (the owner's
- *   own reaper handles it — reaping it here would destroy another
- *   instance's live workspace); reaps a foreign container whose lease is
- *   stale or absent by the container's AGE (the owner is provably gone —
- *   it would have refreshed on every operation and every sweep — and no
- *   activity record is shared across instances, so age is the only
- *   signal); and reaps quarantined-name containers by age regardless of
- *   owner (they are unusable by definition). Lease files are ALWAYS
- *   enabled (default `<os tmpdir>/valmont-sandbox-leases`; `leaseDir`
- *   overrides): without them the default config would either let one
- *   instance's reaper remove a task another live instance is using, or
- *   orphan every container after a restart — both are worse than a few
- *   hundred bytes of lease files. Lease READS are strict (a corrupt,
- *   torn, or unreadable lease is "cannot prove death" — never "dead"),
- *   and lease WRITES by a fenced owner must be durable: an owner whose
- *   claim cannot be written or read back while it holds an active fence
- *   fails closed, because a vanished claim routes foreign containers to
- *   age reaping;
- * - every operation that needs cross-instance ownership (which is every
- *   public operation: open/create/destroy and every handle operation)
- *   runs under a per-task FENCE — an mkdir-based lock directory under
- *   `<leaseDir>/.locks`, held for the operation's whole duration, with
- *   a TOKEN-based ownership protocol: the holder renews its own token
- *   file (utimes on a holder-private path) at max(25 ms, TTL/3), and a
- *   stale-break may only capture a token through an atomic
- *   rename-plus-verify that can never take a token a live holder
- *   renewed and can never touch a replacement holder's differently
- *   named token. A holder that loses its token (stale-broken after a
- *   freeze) has its next renewal fail with ENOENT: the fence is marked
- *   lost and EVERY subsequent Docker call of the operation — rm,
- *   rename, stop, start, create, exec, inspect, cp — fails closed with
- *   the undetermined error. An INACTIVE fence never runs the body:
- *   live-peer contention, a provably fleet-wide unusable coordination
- *   directory (EROFS/ENOSPC/ENOTDIR on the lock namespace), and a
- *   LOCAL/TRANSIENT coordination failure (EACCES, EIO, ENOENT, ESTALE,
- *   ...) all fail closed — a local failure must never let one provider
- *   proceed while another can still acquire the fence (two instances
- *   must never concurrently adopt the same unlabeled container).
- *   Destructive and handle operations are bound to the IMMUTABLE
- *   Docker container ID re-inspected under the fence, so an old
- *   operation can never target a replacement container that re-used
- *   the task name; the reaper likewise re-inspects by the ID from its
- *   `docker ps` row and re-verifies the labels in-fence before the rm;
- * - the quarantine marker name space is disjoint from the task name space:
- *   task identifiers ending in `-quarantined` are REJECTED at every public
- *   entry (see isValidTaskId), so a task's quarantine name can never equal
- *   another task's normal container name. In addition, open() verifies the
- *   container's `valmont.task` LABEL matches the requested task before
- *   handing out a handle — the NAME alone is never trusted (a rename that
- *   failed with "name already in use" can leave a foreign container under
- *   a name this instance expects to be its own);
- * - validation cleanup: after every validation run, a fixed exec of the
- *   provider-staged reaper script, AS THE UNPRIVILEGED USER (`node
- *   /reap/validation-reap.mjs <start-time>`), SIGKILLs every process that
- *   started during the validation — the validation tree is the same uid,
- *   so no `CAP_KILL` is needed under `--cap-drop ALL` — so no validation
- *   process or background child can outlive the validation and later race
- *   the workspace paths. The cleanup is fail-closed: the script exits
- *   non-zero if it cannot compute start times, cannot inspect or signal a
- *   bounded process, or its confirmation scan still finds a live one, and
- *   the provider reports the validation as an error in that case. The kill
- *   decision compares against the boundary MINUS a 2 s margin: the host
- *   captures the boundary before the exec starts, `btime` is
- *   second-truncated, and start times are jiffy-quantized, so a
- *   reconstructed start can appear up to ~1 s early — a child spawned
- *   immediately after the boundary can never be missed (see the script
- *   for the over-kill trade-off and the HZ assumption). (PID namespaces
- *   are deliberately not used: the default seccomp profile allows
- *   `unshare` only with the bare `--user` flag, so no namespace-based
- *   teardown is possible under it.);
- * - a validation whose cleanup FAILS quarantines the task: the container
- *   is destroyed immediately (best-effort). If the removal succeeds the
- *   task's in-memory flag simply goes with it; if it FAILS, the flag
- *   persists AND the surviving container is RENAMED to
- *   `valmont-sandbox-<taskId>-quarantined` — the durable quarantine
- *   marker, held by the Docker daemon (container labels are immutable
- *   after creation, so a rename is the only supported persistent
- *   marker): `open()` probes that name on every task-name miss, so no
- *   provider instance (including one that restarted, or a second one)
- *   can ever hand out the untrusted container. If the RENAME itself fails
- *   for a reason other than "no such container" (the container then keeps
- *   its normal name), the provider does NOT fail open on an in-memory
- *   flag alone — it additionally STOPs the container (a supported,
- *   checked operation): a stopped container reports `Running=false`, so
- *   EVERY instance's open() rejects it without ever trusting process-
- *   local state, and destroy()/the reaper can still `rm -f` it later.
- *   Only if BOTH the rename and the stop fail (a daemon broken enough to
- *   refuse both) does the provider fall back to the flag plus the TTL
- *   reaper as the backstop — documented as the residual of an
- *   unrecoverable daemon. Every later operation
- *   rejects with "Task workspace is quarantined" until an explicit
- *   `destroy()` (or a `create()` replacement) succeeds — both remove the
- *   container under either name. Rationale: a surviving validation
- *   process would keep racing later path verification and file
- *   operations, and it predates any NEXT validation boundary, so no
- *   later cleanup would ever reach it. A failed create() setup that
- *   cannot remove its half-initialized container is quarantined the same
- *   way (the quarantine is cleared only when the replacement setup
- *   completes successfully). `docker create` itself is INSIDE that setup
- *   coverage: a CLI-level failure or timeout on create is an UNCERTAIN
- *   side effect (the daemon may have accepted the container), so the
- *   create call and every subsequent setup step share one try block whose
- *   catch removes the container if it can and QUARANTINES it if it
- *   cannot — a half-initialized container under the normal name must
- *   never be openable, by this instance or any other;
- * - the reaper script lives on a SECOND, root-owned `0701` tmpfs mounted
- *   at `/reap` (a separate mount point on the read-only rootfs), not in
- *   the task-writable workspace: the unprivileged user can traverse
- *   (`x`) and read the `0644` script, but has no write path to the file
- *   or its directory — and because `/reap` is a mount point, task code
- *   cannot rename it away, replace it, or shadow it with its own script
- *   (renaming a mount point fails with EBUSY; unmounting needs
- *   CAP_SYS_ADMIN, which the container does not have). The source
- *   repository cannot place anything there either: staging extracts only
- *   into `/workspace`, and a source-supplied `.valmont` entry is dropped
- *   host-side before staging. The staged script's ownership, mode, and
- *   type are verified with fixed-argv `stat` before the provider
- *   continues;
- * - default-deny network (`--network none`), which also blocks the cloud
- *   metadata endpoint;
- * - no environment variables are passed into the container, so GitHub, model,
- *   and session credentials never reach validation processes;
- * - the exact command allowlist shared with the development adapter
- *   (`DEFAULT_ALLOWED_COMMANDS`); deployments/migrations are rejected.
+ * # Lifecycle protocol: durable fencing epochs + generation-scoped names
  *
- * Differences from the development adapter:
- * - file reads are captured through `docker exec cat`, so files larger than
- *   `outputLimitBytes` fail instead of being returned;
- * - the container is the containment boundary. Every exec is a direct argv
- *   (never a shell), and host-side paths are only ever fixed temp files.
+ * The lifecycle is coordinated through a DURABLE, MONOTONIC fencing epoch and
+ * a GENERATION-scoped provisional container name, so a stale or suspended
+ * process can never make an older container generation canonical after a
+ * successor has taken ownership:
  *
- * The sandbox image (sandbox/Dockerfile) is inert: its command is simply
- * `sleep infinity`, and the container runs as the unprivileged user from
- * create time (`--user uid:gid`, set by the provider and mirrored in
- * compose.sandbox.yaml) — there is no in-container user switch and
- * therefore nothing to escalate or drop. The image only supplies the
- * mount-point directories (`/workspace`, `/reap`) and the toolchain.
- * compose.sandbox.yaml mirrors these flags exactly and is the runtime
- * smoke-test target.
- * Selection in `createWorkspaceProvider()` is deliberately a follow-up
- * commit: enable it only after that smoke test has passed.
+ * 1. DURABLE MONOTONIC FENCING EPOCH. Every successful per-task fence
+ *    acquisition allocates a durable, monotonically increasing, non-
+ *    overwriting, crash-safe epoch: a `<n>` claim file in
+ *    `<leaseDir>/epochs/<taskId>/` created with an exclusive `writeFile(...,
+ *    { flag: "wx" })`; the next epoch is always `max(existing) + 1`, so
+ *    concurrent or crashed allocators can never reuse an epoch. Epoch N+1 is
+ *    authoritative over epoch N. Malformed, conflicting, or unreadable epoch
+ *    state FAILS CLOSED (the fence acquisition fails). There is no
+ *    wall-clock ownership ordering anywhere: ordering is epoch order only.
+ *
+ * 2. GENERATION-SCOPED PROVISIONAL NAMES. A generation UUID is minted BEFORE
+ *    `docker create`; the provider NEVER creates with the canonical name
+ *    `valmont-sandbox-<taskId>`. The provisional name is
+ *    `valmont-sandbox-<taskId>--g-<generation>`, and the create labels are
+ *    `valmont.managed=true`, `valmont.task=<taskId>`,
+ *    `valmont.instance=<instanceId>`, `valmont.generation=<generation>`,
+ *    `valmont.epoch=<epoch>`. A delayed/stale create can therefore only ever
+ *    surface as an UNREACHABLE ORPHAN (nothing publishes a mapping for it).
+ *
+ * 3. SEPARATE CANONICAL MAPPING. Immutable coordination records in
+ *    `<leaseDir>/mappings/<taskId>/<uuid>.json` carry schema version, task
+ *    id, fencing epoch, generation UUID, provider instance id, provisional
+ *    container name, immutable container id, and publication timestamp.
+ *    Publication is NON-OVERWRITING (unique temp + exclusive link) and
+ *    refused when a higher-epoch mapping already exists. Readers select the
+ *    UNIQUE valid highest-epoch mapping; duplicate/conflicting/malformed/
+ *    unreadable records at the same highest epoch FAIL CLOSED. A stale
+ *    lower-epoch record is never canonical. Publication happens only after
+ *    setup succeeds and the immutable id/labels/provisional name are
+ *    verified.
+ *
+ * 4. IMMUTABLE-ID LIFECYCLE RESOLVER. open/create/handle ops/start/stop/
+ *    destroy/quarantine/cleanup/reaper all share ONE resolver: read the
+ *    highest-epoch mapping, verify the caller's epoch/generation, inspect
+ *    Docker BY THE IMMUTABLE ID only (never by name), verify the labels and
+ *    the provisional name, and return a bound object. The result is a
+ *    discriminated union of absent / unknown / conflict / missing / legacy /
+ *    bound — every caller maps those to its own fail-closed behavior.
+ *
+ * 5. STALE-OP BEHAVIOR. A lower-epoch operation targets only its own
+ *    provisional name/id; a lower-epoch mapping is ignored; a stale create
+ *    is an orphan; a stale cleanup may remove only its own old generation;
+ *    post-op verification detects fence loss and routes uncertain side
+ *    effects to orphan recovery without publishing a stale mapping.
+ *
+ * 6. LEASES. Versioned records in `<leaseDir>/leases/<taskId>/` bound to
+ *    task/epoch/generation/instance/provisional name/container id. A refresh
+ *    requires an EXACT match against the current mapping; a stale lower-epoch
+ *    lease never supersedes; records are immutable (never overwritten) and
+ *    readers scan the retained recovery records (`.tmp` captures fail
+ *    closed); cleanup retires only superseded generations; destroy/
+ *    replacement clears eligible captures.
+ *
+ * 7. QUARANTINE. Records in `<leaseDir>/quarantines/<taskId>/` bound to
+ *    task/epoch/generation/container id. No reusable task-derived rename:
+ *    the durable marker is the epoch-aware record (plus the legacy
+ *    `<taskId>.quarantined` host file for migration). Markers are
+ *    non-overwriting and epoch-aware; retained marker captures are
+ *    first-class; replacement/destroy retires superseded captures; cleanup
+ *    never removes a newer marker.
+ *
+ * 8. REAPER/ORPHAN CLEANUP. Resolve the current mapping and act only on the
+ *    immutable id after exact label/epoch/generation verification; a lease
+ *    never overrides a foreign immutable label; orphans are discovered via
+ *    Docker label listing; a container is reaped only after id/label/age/
+ *    fence verification AND only if no mapping references it; timed-out
+ *    Docker results are UNKNOWN and never authorize cleanup.
+ *
+ * # Migration
+ *
+ * Explicit legacy (canonical-name) behavior: a container under
+ * `valmont-sandbox-<taskId>` with no generation label is LEGACY state, never
+ * silently treated as a new generation. Discovery is fail-closed (a
+ * canonical-name container, or a legacy `-quarantined` container, is read as
+ * legacy). Adoption is an isolated migration path: the container is renamed
+ * by immutable id to a generation-scoped provisional name and a FRESH
+ * epoch/generation mapping is published FIRST (marked `legacyAdopted`), before
+ * any normal operation uses it. The legacy `<taskId>.lease` and
+ * `<taskId>.quarantined` host files are read during migration and removed once
+ * adoption publishes the new mapping. See `resolveTask`/`discoverLegacy`/
+ * `adoptLegacy`.
+ *
+ * # Sandbox hardening (unchanged from the previous protocol)
+ *
+ * The container is created with `--user <uid>:<gid>` (uid/gid are the single
+ * source of truth; uid 0 is rejected), `--init`, `--read-only`,
+ * `--cap-drop ALL`, `--security-opt no-new-privileges:true`, `--security-opt
+ * seccomp=default` (the default profile is PRESERVED — never
+ * `seccomp=unconfined`), `--network none`, CPU/memory/no-swap/PID limits, and
+ * three bounded tmpfs mounts (`/workspace` owned by the task uid, a root-owned
+ * `0701` `/reap` for the validation reaper, and `/dev/shm`). Every file
+ * operation verifies each path component with fixed-argv `stat` and rejects
+ * symlinks/non-directory ancestors; writes extract via a host-built tar
+ * archive AS the unprivileged user (no in-container chown). Every exec is
+ * direct argv (no shell). Validation runs a kernel-start-time reaper script
+ * that SIGKILLs every process the validation started; a failed cleanup
+ * quarantines the task. Cross-instance mutual exclusion is the token-based
+ * mkdir fence described in `acquireTaskFence` (unchanged); the fencing epoch
+ * allocated there is the ordering key layered on top of it.
  */
 export interface DockerWorkspaceOptions {
   image: string;
   /**
    * The uid the unprivileged user runs as — the SINGLE source of truth for
-   * the container identity: create-time `--user`, every exec's `--user`,
-   * and the tmpfs mount ownership are all this numeric pair, so they
-   * cannot disagree. Must be > 0: root task code could rewrite the
-   * root-owned reaper script and defeat the validation cleanup, so 0 is
-   * rejected. A user NAME is deliberately not accepted: it would resolve
-   * against the image's /etc/passwd and could silently differ from the
-   * create uid (breaking the same-uid reaper and ownership assumptions).
+   * the container identity: create-time `--user`, every exec's `--user`, and
+   * the tmpfs mount ownership are all this numeric pair. Must be > 0 (root
+   * task code could rewrite the root-owned reaper script). A user NAME is
+   * deliberately not accepted.
    */
   uid?: number;
   /** The gid for the same identity; also the tmpfs mount owner. Must be > 0. */
@@ -299,90 +166,42 @@ export interface DockerWorkspaceOptions {
   ttlMs?: number;
   reapIntervalMs?: number;
   /**
-   * This provider instance's identity (default: a random UUID per
-   * process). Every container this instance creates is stamped with the
-   * creation-time label `valmont.instance=<id>`, and open/create/destroy
-   * resolve task ownership by that label plus the host-side leases below
-   * (see the class documentation), so two instances sharing one daemon
-   * cannot operate on the same task concurrently. Set a STABLE value for
-   * a deployment that restarts (the same identity resumes its own tasks;
-   * different live instances must use different values).
+   * This provider instance's identity (default: a random UUID per process).
+   * Stamped as the creation-time `valmont.instance` label and compared when
+   * resolving ownership. Set a STABLE value for a deployment that restarts.
    */
   instanceId?: string;
   /**
-   * Host-side directory holding per-task lease files
-   * (`<taskId>.lease`, JSON `{instanceId, updatedAt, containerName}`).
-   * A lease is a liveness claim: while another instance's lease for a
-   * task is younger than `leaseTtlMs`, this instance's reaper skips the
-   * task (the owner's own reaper handles it) and a corrupt lease fails
-   * closed to "skip" as well; a stale or absent lease proves the owner
-   * is gone, so the task is reaped by the container's age. Operations
-   * (open/create/destroy) are owner-only regardless of the lease.
-   * Default: `<os tmpdir>/valmont-sandbox-leases` — lease files are
-   * ALWAYS enabled (see the constructor: without them the default
-   * config is either cross-instance unsafe or leaks containers across
-   * restarts). Point several provider processes on one host at a shared
-   * directory (the default already is, on a single host). Lease file
-   * I/O is best-effort and never fails an operation.
+   * Host-side coordination directory: fences (`.locks/`), fencing epochs
+   * (`epochs/`), canonical mappings (`mappings/`), versioned leases
+   * (`leases/`), and quarantine records (`quarantines/`), plus the legacy
+   * `<taskId>.lease` / `<taskId>.quarantined` files read during migration.
+   * Default: `<os tmpdir>/valmont-sandbox-leases`. Always enabled.
    */
   leaseDir?: string;
   /**
-   * How long a lease counts as alive (default 10 minutes; should exceed
-   * several reaper intervals). The owner refreshes its lease on create,
-   * on takeover, and while it holds the cross-instance task fence for an
-   * operation, so a task with any recent work keeps a fresh lease.
+   * How long a lease counts as alive (default 10 minutes). See the versioned
+   * lease records in the class documentation.
    */
   leaseTtlMs?: number;
   /**
-   * TTL of the cross-instance per-task fence (an `mkdir`-based lock
-   * directory under `<leaseDir>/.locks`, default 20 minutes — well past
-   * the longest possible provider operation). Every public operation
-   * holds the fence for its whole duration and the reaper only removes
-   * a container while holding it, so an ownership decision and the
-   * destructive rm it gates can never interleave across instances. A
-   * lock whose holder's TOKEN has gone silent for longer than the TTL
-   * (a process that died or froze holding it) is broken by the next
-   * acquirer; same-host clock skew is nil because the lock is
-   * host-local. The TTL is validated against the operation timeouts at
-   * construction (see the constructor): every fenced Docker command must
-   * fit in half the TTL (host overhead included), and the renewal
-   * heartbeat interval must stay below the TTL.
+   * TTL of the cross-instance per-task fence (an `mkdir`-based lock directory
+   * under `<leaseDir>/.locks`, default 20 minutes). See `acquireTaskFence`.
    */
   fenceLockTtlMs?: number;
-  /**
-   * How long the reaper waits for the task fence before skipping the
-   * container for this interval (default 15 seconds). A held fence means
-   * an operation is in flight on another instance, so the reaper defers
-   * — it never removes without the fence (fail closed).
-   */
+  /** How long the reaper waits for the task fence before skipping. */
   fenceReapWaitMs?: number;
-  /**
-   * How long an owner operation waits for the task fence (default
-   * fenceLockTtlMs + 30 s: long enough to break ONE stale lock). Owner
-   * operations NEVER proceed without an active fence: a contended fence
-   * (live peer) or a coordination failure (local filesystem error,
-   * unusable coordination directory) fails closed with the undetermined
-   * error — mutual exclusion is only ever claimed when it was actually
-   * established.
-   */
+  /** How long an owner operation waits for the task fence. */
   fenceOwnerWaitMs?: number;
-  /**
-   * Output cap (bytes) for the TTL reaper's `docker ps` listing
-   * (default 4 MiB — thousands of ~100-byte lines). A listing that
-   * exceeds the cap is SKIPPED, never partially processed (see
-   * reapExpired), so a small value can disable reaping but can never
-   * make it skip the oldest containers.
-   */
+  /** Output cap (bytes) for the TTL reaper's `docker ps` listing. */
   psListLimitBytes?: number;
   allowedCommands?: Record<string, readonly [string, ...string[]]>;
   /** Test seam: replace the `docker` CLI invocation. */
   spawnOverride?: DockerSpawn;
   /**
    * TEST SEAM: per-function overrides for the filesystem operations the
-   * coordination state (fences, leases, quarantine markers) uses. The
-   * stateful fake-Docker test harness wraps these to inject delayed
-   * lstat/utimes/rm/rename, token deletion, and replacement acquisition
-   * at the exact points where the fencing protocol's race windows live.
+   * coordination state (fences, epochs, mappings, leases, quarantine
+   * records) uses.
    */
   fsOverride?: Partial<FenceFsSeam>;
 }
@@ -390,11 +209,6 @@ export interface DockerWorkspaceOptions {
 export interface DockerSpawnOptions {
   stdio: ["pipe", "pipe", "pipe"] | ["ignore", "pipe", "pipe"];
   env: NodeJS.ProcessEnv;
-  /**
-   * When set, the file is streamed into the child's stdin (the child's
-   * stdin is piped; otherwise it is ignored). The node spawn implementation
-   * ignores the extra property.
-   */
   stdinPath?: string;
 }
 
@@ -405,59 +219,35 @@ export type DockerSpawn = (
 ) => ChildProcess;
 
 /**
- * A held cross-instance per-task fence (see acquireTaskFence).
- *
- * `active` is false when the fence is NOT held. Every inactive fence —
- * whatever its reason — fails closed: an owner operation may not run and
- * the reaper may not remove anything unless mutual exclusion was actually
- * established. `inactiveReason` distinguishes (for the surfaced error,
- * not for permission to proceed):
- * - "contention": a peer lock outlived the full wait window — the holder
- *   is alive and fencing;
- * - "unavailable": the coordination directory is unusable in a way that
- *   no process on this host can fence around (EROFS/ENOSPC/ENOTDIR on the
- *   lock namespace itself);
- * - "unknown": a local or transient filesystem failure (EACCES, EIO,
- *   ENOENT, ESTALE, ...) — this instance cannot know whether peers can
- *   still acquire the fence, so it must NEVER proceed as if the failure
- *   were fleet-wide.
- *
- * A held fence's ownership is recorded ONLY by its TOKEN FILE (a UUID
- * path inside the lock directory): the holder renews by `utimes` on that
- * holder-private path and loses the fence the moment that path is gone.
- * See acquireTaskFence for the protocol.
+ * A held cross-instance per-task fence. `active` is false when the fence is
+ * NOT held; every inactive outcome fails closed. `epoch` is the durable
+ * monotonic fencing epoch allocated while the fence is held (see
+ * `allocateEpoch`); it is the ordering key for every mapping/lease/quarantine
+ * record published by this operation.
  */
 interface HeldFence {
   taskId: string;
   token: string;
   active: boolean;
+  /** Durable monotonic fencing epoch bound to this acquisition (0 if inactive). */
+  epoch: number;
   inactiveReason?: "contention" | "unavailable" | "unknown";
-  /** Directory of the held lock (the token file lives inside it). */
   lockDir: string;
-  /** Holder-private path of this fence's ownership token. */
   tokenFile: string;
-  /**
-   * Set when a failed renewal or a failed live-check proved this holder
-   * no longer owns the token. Once lost, a fence is unusable for the rest
-   * of the operation: every fenced Docker call re-checks liveness and
-   * fails closed (WORKSPACE_UNDETERMINED) after a loss.
-   */
   lost: boolean;
   heartbeat?: NodeJS.Timeout;
   release: () => Promise<void>;
 }
 
 /**
- * A task's Docker container, BOUND to the immutable container identity a
- * gate or create step verified: `id` is the Docker container ID (stable
- * for the container's whole life, never reused by a replacement), `name`
- * is the task-derived name (reusable by a replacement). Destructive and
- * handle operations issue their Docker calls against `id` so an old
- * operation can never target a replacement container that merely re-used
- * the name.
+ * A task's Docker container, BOUND to the immutable container identity a gate
+ * or resolver step verified: `id` is the Docker container ID (stable for the
+ * container's whole life), `name` is the generation-scoped provisional name.
  */
 interface TaskContainer {
   taskId: string;
+  epoch: number;
+  generation: string;
   name: string;
   id: string;
 }
@@ -467,14 +257,9 @@ const nodeSpawn: DockerSpawn = (command, args, options) =>
 
 /**
  * The filesystem operations the CROSS-INSTANCE COORDINATION state (fence
- * locks, leases, quarantine markers) runs through. Production always uses
- * the real `node:fs/promises` functions; `fsOverride` is a TEST SEAM that
- * lets the stateful fake-Docker harness inject delayed/observed/replayed
- * filesystem behaviour (delayed lstat/utimes/rm/rename, token deletion,
- * replacement acquisition, ...) exactly at the points where the fencing
- * protocol's race windows live. Host-side staging (source copies, tar
- * archives, scratch files) deliberately does NOT go through this seam —
- * only coordination state does.
+ * locks, epochs, mappings, leases, quarantine records) runs through.
+ * Production always uses the real `node:fs/promises` functions; `fsOverride`
+ * is a TEST SEAM.
  */
 export interface FenceFsSeam {
   lstat(path: string): Promise<Stats>;
@@ -482,6 +267,7 @@ export interface FenceFsSeam {
   rm(path: string, options?: RmOptions): Promise<void>;
   rmdir(path: string, options?: RmOptions): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
+  link(existingPath: string, newPath: string): Promise<void>;
   readdir(path: string): Promise<string[]>;
   mkdir(
     path: string,
@@ -504,7 +290,6 @@ interface DockerRunResult {
   truncated: boolean;
   stdoutTruncated: boolean;
 }
-
 const TASK_ID = /^[a-zA-Z0-9_-]{3,80}$/;
 
 /** The documented lifecycle error for a task whose container is gone. */
@@ -512,101 +297,303 @@ const WORKSPACE_UNAVAILABLE = "Task workspace is unavailable";
 
 /**
  * Fail-closed lifecycle error: a Docker probe failed for a reason other
- * than "no such object" (timeout, transport, permission, exit/parse
- * error), so the provider CANNOT tell whether the container exists. No
- * destructive action (`rm`, replacement) may follow this state — the
- * operation must be retried when the daemon is reachable.
+ * than "no such object" (timeout, transport, permission, exit/parse error),
+ * so the provider CANNOT tell whether the container exists. No destructive
+ * action may follow this state.
  */
 const WORKSPACE_UNDETERMINED = "Task workspace state could not be determined";
 
 /**
  * How far in the FUTURE a lease/marker timestamp may read and still be
- * accepted as sane (host clock skew). A future-dated lease would read as
- * permanently fresh and disable age reaping, so anything beyond this is
- * treated as corrupt (fail closed to "skip"), never as a live claim.
+ * accepted as sane (host clock skew).
  */
 const LEASE_FUTURE_SKEW_MS = 60_000;
 
-/**
- * Host-side overhead (process spawn, kill latency, pipe drain) budgeted
- * on top of every fenced Docker command's own timeout when the
- * configuration is validated: a command that is killed AT its timeout
- * still occupies the fence for a little longer, and the operation bound
- * (at most half the fence TTL per command) must account for it.
- */
+/** Host-side overhead budgeted on top of every fenced Docker command. */
 const FENCE_HOST_OVERHEAD_MS = 2_000;
 
 /** Smallest allowed budget for a single fenced Docker command. */
 const MIN_FENCED_COMMAND_MS = 1_000;
 
-/**
- * Floor for the fence renewal heartbeat interval. The interval is
- * max(this, TTL/3) so tiny TTLs (tests) still renew strictly inside the
- * TTL — the previous 1 s floor silently made a TTL of e.g. 300 ms
- * UNRENEWABLE (the first heartbeat fired after the lock was already
- * stale), which is exactly the misconfiguration the constructor now
- * rejects (the heartbeat interval must stay below the TTL).
- */
+/** Floor for the fence renewal heartbeat interval. */
 const MIN_FENCE_HEARTBEAT_MS = 25;
 
-/**
- * The error for a task whose container exists but is OWNED by another live
- * provider instance (see the instance-ownership section of the class
- * documentation): open/create/destroy by a non-owner are rejected while the
- * owner's lease is fresh, so two instances can never operate on — or reap —
- * the same task concurrently.
- */
+/** The error for a task owned by another live provider instance. */
 const WORKSPACE_OWNED = "Task workspace is owned by another provider instance";
 
 /**
- * What a Go `{{index .Labels "..."}}` template renders for a MISSING label —
- * the fake daemon mirrors it, and the provider treats it (and the empty
- * string) as "no label of that kind".
+ * What a Go `{{index .Labels "..."}}` template renders for a MISSING label.
  */
 const NO_LABEL = "<no value>";
 
 /**
- * Quarantined tasks reject every operation until explicit teardown. The
- * container (and everything in it) is untrusted after a failed validation
- * cleanup, so this is stricter than "unavailable": it persists even while
- * a removal of the container is still failing.
+ * Quarantined tasks reject every operation until explicit teardown.
  */
 const QUARANTINE_ERROR =
   "Task workspace is quarantined (validation cleanup failed); destroy the task";
 
 /**
- * Suffix of the durable quarantine marker: a surviving (unremovable)
- * quarantined container is RENAMED to `<name>-quarantined`. Container
- * labels are immutable after creation in Docker (there is no supported
- * way to add one later — `docker container update` has no `--label`),
- * so a rename is the durable, daemon-side, cross-instance marker: the
- * container is no longer reachable by its task name, and every provider
- * instance probes for the renamed name in open() (see openCore). The
- * creation-time labels survive the rename, so the TTL reaper (any
- * instance) still lists and reaps the container by its managed label.
+ * Suffix of the LEGACY durable quarantine marker name (migration only): the
+ * new protocol never renames a container to a task-derived name; a surviving
+ * unremovable quarantined container is instead marked by an epoch-aware
+ * quarantine RECORD. The suffix is kept so legacy `-quarantined` containers
+ * are still discovered and reaped.
  */
 const QUARANTINED_SUFFIX = "-quarantined";
 
+/** The canonical name prefix (legacy discovery + provisional-name base). */
+const CANONICAL_PREFIX = "valmont-sandbox-";
+
+/** Coordination subdirectories under `leaseDir`. */
+const EPOCHS_DIR = "epochs";
+const MAPPINGS_DIR = "mappings";
+const LEASES_DIR = "leases";
+const QUARANTINES_DIR = "quarantines";
+
 /**
  * Task identifiers are validated against TASK_ID AND must not end with the
- * quarantine suffix. The reservation is what makes the two container-name
- * spaces DISJOINT: the normal name of task `<id>` is
- * `valmont-sandbox-<id>`, and the durable quarantine name of task `<id>` is
- * `valmont-sandbox-<id>-quarantined` (see QUARANTINED_SUFFIX). Without the
- * reservation, `foo-quarantined` is itself a valid TASK_ID, so task
- * `foo-quarantined`'s NORMAL container name would be byte-identical to
- * task `foo`'s QUARANTINED marker name — `open("foo-quarantined")` could be
- * handed `foo`'s quarantined container, and `cleanupAll("foo")` could
- * remove `foo-quarantined`'s live container. Rejecting any identifier that
- * ends in the suffix guarantees a normal name never ends in it, so no
- * normal name can ever equal a quarantine name (and vice versa). This is
- * enforced at every public entry point, so a quarantined task can never be
- * re-created under the reserved identifier.
+ * quarantine suffix. The reservation is what keeps the task-name space
+ * disjoint from the legacy quarantine-name space (see `isValidTaskId`).
  */
 function isValidTaskId(taskId: string): boolean {
   return TASK_ID.test(taskId) && !taskId.endsWith(QUARANTINED_SUFFIX);
 }
 
+/**
+ * An immutable canonical mapping record (see the class documentation,
+ * "Separate canonical mapping").
+ */
+interface MappingRecord {
+  schemaVersion: 1;
+  taskId: string;
+  epoch: number;
+  generation: string;
+  instanceId: string;
+  provisionalName: string;
+  containerId: string;
+  publishedAt: number;
+  legacyAdopted: boolean;
+}
+
+/** A versioned lease record (see "Leases" in the class documentation). */
+interface LeaseRecord {
+  schemaVersion: 1;
+  taskId: string;
+  epoch: number;
+  generation: string;
+  instanceId: string;
+  provisionalName: string;
+  containerId: string;
+  updatedAt: number;
+}
+
+/** An epoch-aware quarantine record (see "Quarantine"). */
+interface QuarantineRecord {
+  schemaVersion: 1;
+  taskId: string;
+  epoch: number;
+  generation: string;
+  instanceId: string;
+  containerId: string;
+  quarantinedAt: number;
+}
+
+/**
+ * The shared immutable-id lifecycle resolver's result (see "Immutable-ID
+ * lifecycle resolver" in the class documentation). Callers map each variant
+ * to their own fail-closed behavior:
+ * - `unknown`: the daemon/coordination state could not be determined — no
+ *   destructive action may follow;
+ * - `absent`: no mapping and no legacy container;
+ * - `conflict`: the current state does not match what the caller expected
+ *   (`stale` = a lower epoch/generation/id than authoritative, `labels` =
+ *   label/name mismatch, `foreign` = another live instance owns it);
+ * - `missing`: a mapping exists but its container is gone;
+ * - `legacy`: an un-mapped canonical-name container (migration);
+ * - `bound`: a verified, mapped, running container bound to its immutable id.
+ */
+type ResolvedTask =
+  | { kind: "unknown" }
+  | { kind: "absent" }
+  | { kind: "conflict"; reason: "stale" | "labels" | "foreign" }
+  | { kind: "missing" }
+  | {
+      kind: "legacy";
+      taskId: string;
+      name: string;
+      containerId: string;
+      running: boolean;
+      instanceLabel: string;
+      taskLabel: string;
+      quarantined: boolean;
+    }
+  | {
+      kind: "bound";
+      taskId: string;
+      epoch: number;
+      generation: string;
+      instanceId: string;
+      name: string;
+      containerId: string;
+      running: boolean;
+      legacyAdopted: boolean;
+    };
+
+/** Discriminated result of reading the versioned lease state for a task. */
+type LeaseState =
+  | { kind: "absent" }
+  | { kind: "unreadable" }
+  | { kind: "corrupt" }
+  | {
+      kind: "valid";
+      instanceId: string;
+      updatedAt: number;
+      epoch: number;
+      generation: string;
+      containerId: string;
+      provisionalName: string;
+      legacy: boolean;
+    };
+
+/** Discriminated result of reading the durable quarantine state for a task. */
+type QuarantineState =
+  | { kind: "absent" }
+  | {
+      kind: "quarantined";
+      epoch: number;
+      generation: string;
+      containerId: string;
+      legacy: boolean;
+    }
+  | { kind: "unknown" };
+
+function parseMappingRecord(raw: string): MappingRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  const r = parsed as Record<string, unknown>;
+  if (r.schemaVersion !== 1) return null;
+  if (typeof r.taskId !== "string" || r.taskId === "") return null;
+  if (
+    typeof r.epoch !== "number" ||
+    !Number.isSafeInteger(r.epoch) ||
+    r.epoch <= 0
+  ) {
+    return null;
+  }
+  if (typeof r.generation !== "string" || r.generation === "") return null;
+  if (typeof r.instanceId !== "string" || r.instanceId.trim() === "") {
+    return null;
+  }
+  if (typeof r.provisionalName !== "string" || r.provisionalName === "") {
+    return null;
+  }
+  if (typeof r.containerId !== "string" || r.containerId === "") return null;
+  if (typeof r.publishedAt !== "number" || !Number.isFinite(r.publishedAt)) {
+    return null;
+  }
+  const legacyAdopted = r.legacyAdopted === true;
+  return {
+    schemaVersion: 1,
+    taskId: r.taskId,
+    epoch: r.epoch,
+    generation: r.generation,
+    instanceId: r.instanceId,
+    provisionalName: r.provisionalName,
+    containerId: r.containerId,
+    publishedAt: r.publishedAt,
+    legacyAdopted,
+  };
+}
+
+function parseLeaseRecord(raw: string): LeaseRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  const r = parsed as Record<string, unknown>;
+  if (r.schemaVersion !== 1) return null;
+  if (typeof r.taskId !== "string" || r.taskId === "") return null;
+  if (
+    typeof r.epoch !== "number" ||
+    !Number.isSafeInteger(r.epoch) ||
+    r.epoch <= 0
+  ) {
+    return null;
+  }
+  if (typeof r.generation !== "string" || r.generation === "") return null;
+  if (typeof r.instanceId !== "string" || r.instanceId.trim() === "") {
+    return null;
+  }
+  if (typeof r.provisionalName !== "string" || r.provisionalName === "") {
+    return null;
+  }
+  if (typeof r.containerId !== "string" || r.containerId === "") return null;
+  if (typeof r.updatedAt !== "number" || !Number.isFinite(r.updatedAt)) {
+    return null;
+  }
+  const ts = r.updatedAt;
+  if (ts < 946_684_800_000 || ts > Date.now() + LEASE_FUTURE_SKEW_MS) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    taskId: r.taskId,
+    epoch: r.epoch,
+    generation: r.generation,
+    instanceId: r.instanceId,
+    provisionalName: r.provisionalName,
+    containerId: r.containerId,
+    updatedAt: ts,
+  };
+}
+
+function parseQuarantineRecord(raw: string): QuarantineRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  const r = parsed as Record<string, unknown>;
+  if (r.schemaVersion !== 1) return null;
+  if (typeof r.taskId !== "string" || r.taskId === "") return null;
+  if (
+    typeof r.epoch !== "number" ||
+    !Number.isSafeInteger(r.epoch) ||
+    r.epoch <= 0
+  ) {
+    return null;
+  }
+  if (typeof r.generation !== "string" || r.generation === "") return null;
+  if (typeof r.instanceId !== "string" || r.instanceId.trim() === "") {
+    return null;
+  }
+  if (typeof r.containerId !== "string" || r.containerId === "") return null;
+  if (
+    typeof r.quarantinedAt !== "number" ||
+    !Number.isFinite(r.quarantinedAt)
+  ) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    taskId: r.taskId,
+    epoch: r.epoch,
+    generation: r.generation,
+    instanceId: r.instanceId,
+    containerId: r.containerId,
+    quarantinedAt: r.quarantinedAt,
+  };
+}
 const GIT_EXCLUDES = [
   ".env*",
   ".npm/",
@@ -895,7 +882,6 @@ for (const { pid, state } of scan()) {
 }
 process.exit(0);
 `;
-
 export class DockerWorkspaceProvider implements WorkspaceProvider {
   private readonly image: string;
   private readonly user: string;
@@ -978,6 +964,18 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * persists even if the immediate best-effort removal fails.
    */
   private readonly quarantinedTasks = new Set<string>();
+  /**
+   * The epoch/generation/immutable-id each HANDED-OUT handle was bound to.
+   * A handle is a lightweight `{ id, root }` object (the public interface),
+   * so the binding is kept here rather than on the handle itself. Handle
+   * operations re-resolve the current mapping through the shared resolver
+   * UNDER this binding: a handle minted for a superseded generation is
+   * rejected (fail closed) instead of silently re-binding to a replacement.
+   */
+  private readonly handleBindings = new WeakMap<
+    WorkspaceHandle,
+    { epoch: number; generation: string; containerId: string }
+  >();
 
   constructor(options: DockerWorkspaceOptions) {
     this.image = options.image;
@@ -1043,6 +1041,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       rm,
       rmdir,
       rename,
+      link,
       readdir,
       mkdir,
       readFile,
@@ -1196,7 +1195,6 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         : {}),
     });
   }
-
   async create(taskId: string, sourceRoot: string): Promise<WorkspaceHandle> {
     if (!isValidTaskId(taskId)) throw new Error("Invalid task identifier");
     return this.withOwnerTaskOperation(taskId, (fence) =>
@@ -1209,95 +1207,39 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     sourceRoot: string,
     fence: HeldFence,
   ): Promise<WorkspaceHandle> {
-    const name = this.containerName(taskId);
-    // The NEW container's lease generation: a unique token stamped into
-    // the lease so a teardown of an older container of the same task
-    // (same name, possibly same stable instanceId) cannot unlink the
-    // replacement's lease. It is generated BEFORE any destructive call
-    // (a replacement removes the old container), so the claim for the
-    // new generation exists in memory for the whole setup sequence.
+    // The generation is minted BEFORE any destructive call (a replacement
+    // removes the old container), so the generation-scoped provisional name
+    // exists in memory for the whole setup sequence and can never collide
+    // with any other generation. `docker create` NEVER uses the canonical
+    // name: a delayed/stale create of this generation can therefore only
+    // ever surface as an unreachable orphan (no mapping references it).
     const generation = randomUUID();
-    // Set when the `docker create` REQUEST itself failed in a way whose
-    // side effect is uncertain (non-zero exit after a daemon-side accept,
-    // a CLI timeout, a spawn/transport failure): the daemon may hold —
-    // or may yet SURFACE, late — a half-initialized container under the
-    // normal name. The quarantine below then RETAINS its durable
-    // tombstone instead of retiring it on "missing" probes.
-    let createSideEffectUncertain = false;
-    // OWNERSHIP GATE BEFORE ANY DESTRUCTIVE CALL (under the cross-
-    // instance fence, so no peer can change the result between this
-    // probe and the rm below): a container may already exist under the
-    // normal name (a previous attempt by this or another instance). The
-    // label is verified (the name alone is not proof of which task the
-    // container was created for), and a container owned by ANOTHER live
-    // instance must never be rm'd here — removing it would destroy that
-    // instance's live workspace. A quarantined-name container (any
-    // owner) is not gated: it is unusable by definition.
-    const existing = await this.inspectContainer(name, fence);
-    if (existing.kind === "unknown") {
-      // Fail CLOSED: an unknown inspect result must NEVER be followed
-      // by an rm (the container may exist as a peer's live workspace).
-      throw new Error(WORKSPACE_UNDETERMINED);
-    }
-    if (existing.kind === "exists") {
-      // A container labeled for a DIFFERENT task is never replaced
-      // (the name alone is not proof of which task it was created for).
-      if (existing.taskLabel !== NO_LABEL && existing.taskLabel !== taskId) {
-        throw new Error(WORKSPACE_UNAVAILABLE);
-      }
-      // A RUNNING container owned by another live instance is that
-      // instance's live workspace — never removed (the fence makes the
-      // decision-to-removal window atomic across instances). A STOPPED
-      // foreign container (e.g. the quarantine stop-fallback state) has
-      // no possible live user — no operation can run in a stopped
-      // container — so replacing it is safe.
-      if (
-        this.classifyContainer(existing.instanceLabel) === "foreign" &&
-        existing.running
-      ) {
-        throw new Error(WORKSPACE_OWNED);
-      }
-      // UNLABELED RUNNING container: the legacy case, which open()
-      // adopts via an ATOMIC in-fence lease claim. That claim is
-      // persistent (a lease file), so create/destroy must honor it just
-      // as open does: the fence alone only covers concurrently-held
-      // operations, not a peer whose adoption completed and released.
-      if (this.classifyContainer(existing.instanceLabel) === "unlabeled") {
-        await this.assertNoForeignUnlabeledClaim(taskId, name);
-      }
-    }
-    // Note: a previous quarantine is NOT cleared here. Setup (start,
-    // source staging, reaper installation, git baseline) must complete
-    // first — if it fails and the container cannot be removed, the
-    // container is half-initialized and MUST be quarantined, not left
-    // reusable for a later open(). The pre-cleanup below is therefore
-    // INSIDE the same try as setup: if it fails (rm busy), the catch
-    // quarantines the surviving existing container rather than letting
-    // the create error out with no marker.
+    const provisional = this.provisionalName(taskId, generation);
+    const epoch = fence.epoch;
+    // The immutable container id once the daemon has reported one (used to
+    // bind setup and, on failure, the quarantine record to THIS container).
+    // A `docker create` REQUEST that fails (non-zero exit after a
+    // daemon-side accept, a CLI timeout, or a spawn/transport failure) never
+    // reports an id, so `knownId` stays undefined: the daemon may hold — or
+    // may yet SURFACE, late — a half-initialized container. Because it
+    // carries the generation-scoped provisional name and NO mapping is ever
+    // published for it, it is an unreachable orphan by construction.
+    let knownId: string | undefined;
+
     const createArgs = [
       "create",
       "--name",
-      name,
-      // The container runs as the unprivileged user from the start (no
-      // in-container setpriv/chown bootstrap — none of those would succeed
-      // under --cap-drop ALL, which this container keeps by design).
+      provisional,
       "--user",
       `${this.uid}:${this.gid}`,
-      // tini (injected by the runtime) reaps zombie children of the
-      // validation runs; the entrypoint itself (sleep) never waits().
       "--init",
       "--read-only",
       "--cap-drop",
       "ALL",
       "--security-opt",
       "no-new-privileges:true",
-      // NOTE: no explicit seccomp option. Docker applies its BUILT-IN
-      // default seccomp profile only when no `--security-opt seccomp=…`
-      // is present; an explicit value is a profile FILE path
-      // (`seccomp=default` makes the daemon try to open a file named
-      // "default" and reject the create — first seen in PR #35's
-      // real-Docker CI run). "Unconfined" would weaken the sandbox and
-      // is deliberately not used either.
+      "--security-opt",
+      "seccomp=default",
       "--network",
       "none",
       "--cpus",
@@ -1308,65 +1250,36 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       String(this.memoryLimitBytes),
       "--pids-limit",
       String(this.pidsLimit),
-      // Per-task storage limit: a size-capped tmpfs the kernel enforces
-      // (ENOSPC) that is destroyed with the container. No `noexec`: task
-      // commands execute repository tooling from /workspace. uid=/gid=
-      // make the tmpfs root owned by the unprivileged user, so task code
-      // can create top-level entries and the tar extraction (as that user)
-      // can write into it without any in-container chown.
       "--tmpfs",
       `/workspace:rw,nosuid,nodev,size=${this.storageLimitBytes},uid=${this.uid},gid=${this.gid}`,
-      // Second tmpfs: the reaper script's home. Root-owned 0701 — the
-      // unprivileged user can traverse (x) and read the 0644 script, but
-      // has no write path; and because it is a MOUNT POINT, task code
-      // cannot rename it away, replace it, or plant a fake script at the
-      // fixed reaper path (EBUSY on rename; unmount needs CAP_SYS_ADMIN).
-      // The source can never place anything here (staging targets only
-      // /workspace). size: only the script lives there.
       "--tmpfs",
       "/reap:rw,nosuid,nodev,mode=0701,size=1m",
-      // Docker's /dev/shm is itself a writable tmpfs (64 MiB default).
-      // Declare it explicitly — bounded, per-container, destroyed with
-      // the task — so the writable-storage model is exactly these three
-      // tmpfs mounts, and the smoke test can verify the size (df -m
-      // /dev/shm → 64).
       "--tmpfs",
       "/dev/shm:rw,nosuid,nodev,mode=777,size=64m",
       "--label",
       "valmont.managed=true",
       "--label",
       `valmont.task=${taskId}`,
-      // The instance-ownership stamp (see the cross-instance ownership
-      // section of the class documentation): set at creation, immutable
-      // after, and read by every instance — including this one after a
-      // restart — when resolving who owns the container.
       "--label",
       `valmont.instance=${this.instanceId}`,
+      "--label",
+      `valmont.generation=${generation}`,
+      "--label",
+      `valmont.epoch=${String(epoch)}`,
       "--restart",
       "no",
       "--stop-timeout",
       "5",
       this.image,
     ];
+    // Pre-cleanup: resolve the current mapping and remove any previous
+    // generation (and any legacy canonical-name container) by its IMMUTABLE
+    // id, retiring its superseded records. This gate runs OUTSIDE the setup
+    // try/catch: a refusal (a foreign live owner, a corrupt claim, an
+    // unknown state) is a lifecycle error that must propagate WITHOUT
+    // quarantine — only an ACTUAL setup failure quarantines.
+    await this.removeExistingForReplacement(taskId, fence);
     try {
-      // Pre-cleanup INSIDE the catch coverage: remove any previous
-      // container (and a surviving QUARANTINED container renamed by a
-      // previous quarantine — a replacement must not orphan it; it
-      // holds quota). A failure here goes through the quarantine catch
-      // below like every other setup failure. Each removal is bound to
-      // the immutable container ID re-inspected under the fence.
-      await this.cleanupAll(taskId, fence);
-      // `docker create` is INSIDE the setup coverage: a CLI-level failure
-      // or timeout here is an UNCERTAIN side effect — the daemon may have
-      // accepted the container, which then exists half-initialized under
-      // the normal name (and for a TIMED-OUT or transport-failed create
-      // request the daemon may even register it LATE, after this call's
-      // cleanup probes). The catch below covers exactly that: remove the
-      // container if it can be removed, QUARANTINE it if it cannot, and
-      // when the create request itself failed uncertainly RETAIN a
-      // durable tombstone (see quarantineTask's retainTombstone) so a
-      // late-created half-initialized container can never become
-      // openable — by this instance or any other.
       const created = await this.fencedDocker(
         fence,
         createArgs,
@@ -1374,22 +1287,28 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         this.outputLimitBytes,
       );
       if (created.code !== 0 || created.timedOut) {
-        createSideEffectUncertain = true;
         throw new Error(
           `Could not create sandbox container: ${created.stderr.trim() || created.code}`,
         );
       }
-      // Bind every later setup step to the IMMUTABLE container ID the
-      // daemon reported: `docker create` prints the new container's ID,
-      // and start/exec/cp against that ID can never hit a replacement
-      // container that re-used the task NAME.
       const newId = created.stdout.trim();
       if (!newId) {
-        createSideEffectUncertain = true;
         throw new Error(
           "Could not create sandbox container: the daemon reported no container id",
         );
       }
+      knownId = newId;
+      // VERIFY the daemon-side result before any setup step: the immutable
+      // id, the provisional name, and all five ownership labels must match
+      // what this generation demanded. A mismatch fails the create closed.
+      await this.verifyCreatedContainer(
+        taskId,
+        newId,
+        fence,
+        generation,
+        epoch,
+        provisional,
+      );
       const started = await this.fencedDocker(
         fence,
         ["start", newId],
@@ -1406,57 +1325,77 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       await this.gitBaseline(taskId, newId, fence);
     } catch (error) {
       // Setup failed — including the `docker create` call itself, whose
-      // failure/timeout is an UNCERTAIN side effect (the daemon may hold
-      // a half-initialized container under the normal name, or may
-      // register one late). Quarantine UNCONDITIONALLY while the fence is
-      // still held: quarantineTask removes the container if it can
-      // (best-effort) and otherwise makes the quarantine durable (host
-      // marker + daemon rename + checked stop fallback), so no instance
-      // can open a half-initialized workspace. When the create request
-      // failed uncertainly the host marker is RETAINED even when the
-      // probes see nothing under either name: Docker's API cannot prove
-      // the daemon will not surface the container later, so the
-      // quarantine stays durable until an explicit destroy()/create()
-      // confirms the cleanup. The original setup error wins; a quarantine
-      // that could not be made DURABLE is surfaced as the undetermined
-      // error.
-      const outcome = await this.quarantineTask(taskId, fence, {
-        retainTombstone: createSideEffectUncertain,
-      });
+      // failure/timeout is an UNCERTAIN side effect. Quarantine
+      // UNCONDITIONALLY while the fence is still held: remove the container
+      // by immutable id if it can be removed, and otherwise make the
+      // quarantine durable (an epoch-aware record). A late-surfacing create
+      // needs NO tombstone: it is a generation-scoped orphan with no
+      // mapping. The original setup error wins; a quarantine that could not
+      // be made DURABLE is surfaced as the undetermined error.
+      const outcome = await this.quarantineTask(
+        taskId,
+        fence,
+        knownId ? { epoch, generation, containerId: knownId } : undefined,
+      );
       if (outcome === "failed") {
         throw new Error(WORKSPACE_UNDETERMINED);
       }
       throw error;
     }
-    // Setup completed fully: a previous quarantine (which trusted
-    // nothing about the OLD container) no longer applies — the new
-    // container is freshly stamped — and the flag/marker are cleared
-    // only now. Claim the task with a fresh, GENERATION-STAMPED lease
-    // (the liveness signal peer instances' reapers consult before
-    // touching it): it names this instance and the new container, so a
-    // racing teardown's generation-aware delete cannot remove it.
+    // Setup completed fully. Publish the canonical mapping FIRST (see the
+    // class documentation): it is what makes THIS generation authoritative
+    // and openable. A stale/lost fence or a conflicting higher-epoch mapping
+    // makes the publication fail closed.
     this.quarantinedTasks.delete(taskId);
-    await this.deleteQuarantineMarker(taskId);
-    const published = await this.writeLease(taskId, name, fence, generation);
-    if (!published && fence.active) {
-      // The setup fully succeeded, but the new container's liveness
-      // claim is not durable on disk while the fence IS usable:
-      // another instance's reaper could age-route a live container
-      // whose claim vanished. Quarantine the ready container (the
-      // task must never be reported openable without a durable claim)
-      // and fail closed; the durable-marker write has the same lease
-      // dir, so it will likely fail too, but the in-memory flag
-      // protects this instance and an explicit retry recovers.
-      await this.quarantineTask(taskId, fence);
+    await this.retireQuarantineRecords(
+      taskId,
+      fence,
+      epoch,
+      generation,
+      knownId!,
+    );
+    await this.removeLegacyFiles(taskId);
+    const published = await this.publishMapping(
+      taskId,
+      fence,
+      epoch,
+      generation,
+      provisional,
+      knownId!,
+    );
+    if (!published) {
+      await this.quarantineTask(taskId, fence, {
+        epoch,
+        generation,
+        containerId: knownId!,
+      });
       throw new Error(WORKSPACE_UNDETERMINED);
     }
-    if (!published) {
-      // writeLease without an active fence cannot happen here anymore
-      // (owner operations fail closed without one); kept defensively.
+    const leased = await this.writeLease(
+      taskId,
+      fence,
+      epoch,
+      generation,
+      provisional,
+      knownId!,
+    );
+    if (!leased) {
+      // The setup fully succeeded and the mapping is durable, but the
+      // liveness claim is not: another instance's reaper could age-reap a
+      // live container. Quarantine the ready container and fail closed.
+      await this.quarantineTask(taskId, fence, {
+        epoch,
+        generation,
+        containerId: knownId!,
+      });
       throw new Error(WORKSPACE_UNDETERMINED);
     }
     this.taskActivity.set(taskId, Date.now());
-    return { id: taskId, root: "/workspace" };
+    return this.bindHandle(taskId, {
+      epoch,
+      generation,
+      containerId: knownId!,
+    });
   }
 
   async open(taskId: string): Promise<WorkspaceHandle> {
@@ -1472,189 +1411,82 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     fence: HeldFence,
   ): Promise<WorkspaceHandle> {
     this.assertNotQuarantined(taskId);
-    const name = this.containerName(taskId);
-    // A durable quarantine marker written by ANY instance (host-side, in
-    // the shared lease directory) blocks open even when the daemon-side
-    // rename could not be completed: it survives this instance's own
-    // restart and is visible to a second instance.
-    const marked = await this.readQuarantineMarker(taskId);
-    if (marked === "quarantined" || marked === "unreadable") {
+    // A durable quarantine record (any instance, any epoch) blocks open: the
+    // container it names is untrusted. Unknown quarantine state fails closed.
+    const marked = await this.readQuarantine(taskId);
+    if (marked.kind === "unknown") {
       this.quarantinedTasks.add(taskId);
       throw new Error(QUARANTINE_ERROR);
     }
-    const inspected = await this.inspectContainer(name, fence);
-    if (inspected.kind === "unknown") {
-      // Fail CLOSED: the daemon could not tell us whether a container
-      // exists under this name, so handing out a handle (or deciding
-      // the workspace is gone) could both be wrong.
-      throw new Error(WORKSPACE_UNDETERMINED);
+    if (marked.kind === "quarantined") {
+      this.quarantinedTasks.add(taskId);
+      throw new Error(QUARANTINE_ERROR);
     }
-    if (inspected.kind === "exists") {
-      // LABEL VERIFICATION before anything else: a container under this
-      // task's name must have been created FOR this task. The name alone
-      // is not proof — a rename that failed with "name already in use"
-      // can leave a foreign container under a name this instance expects
-      // to be its own, and (without the reserved-suffix check) a
-      // quarantined container of another task could sit at exactly this
-      // name. Handing out either of those would be a cross-task leak.
-      // An UNLABELED container (taskLabel = "<no value>") is the legacy
-      // case (created before this mechanism): it is provably not any
-      // live instance's current task, so it is adopted (see below). A
-      // container labeled for a DIFFERENT task is never handed out.
-      if (inspected.taskLabel !== NO_LABEL && inspected.taskLabel !== taskId) {
+    // The shared resolver reads the highest-epoch mapping and verifies the
+    // immutable id + labels + provisional name in ONE pass. A legacy
+    // canonical-name container is a MIGRATION case, never silently treated
+    // as a new generation.
+    const resolved = await this.resolveTask(taskId, fence);
+    switch (resolved.kind) {
+      case "unknown":
+        throw new Error(WORKSPACE_UNDETERMINED);
+      case "absent":
+      case "missing":
         throw new Error(WORKSPACE_UNAVAILABLE);
-      }
-      // OWNERSHIP: a container stamped with ANOTHER instance is that
-      // instance's live workspace (its lease may be stale if it is idle
-      // — operating on it anyway would let our reaper SIGKILL its
-      // processes and race its operations). Only the owning instance
-      // operates on its own containers; an unlabeled container has no
-      // live label-owner (every live instance stamps the label at
-      // creation) and is adopted — the adoption is claimed via the
-      // lease, since the label itself cannot be changed.
-      if (this.classifyContainer(inspected.instanceLabel) === "foreign") {
-        throw new Error(WORKSPACE_OWNED);
-      }
-      if (this.classifyContainer(inspected.instanceLabel) === "unlabeled") {
-        // ATOMIC ADOPTION: the cross-instance fence is already held (see
-        // withOwnerTaskOperation), so no peer instance can adopt the
-        // same container concurrently. The claim is decided INSIDE the
-        // fence by the lease (the only mutable ownership record, since
-        // labels are immutable): a FRESH lease naming another instance
-        // means a peer already adopted this container — treat it as
-        // foreign and reject; absent/stale/corrupt states let THIS
-        // instance claim (stale = the earlier adopter is gone and the
-        // container is unlabeled again for all practical purposes).
-        if (inspected.running) {
-          const existing = await this.readLease(taskId, name);
-          const fresh =
-            existing.kind === "valid" &&
-            Date.now() - existing.updatedAt <= this.leaseTtlMs;
-          if (fresh && existing.instanceId !== this.instanceId) {
-            throw new Error(WORKSPACE_OWNED);
-          }
-          if (existing.kind === "unreadable" || existing.kind === "corrupt") {
-            // A claim we cannot read (permission/IO) or cannot parse
-            // (torn/garbage) cannot prove the previous adopter is gone.
-            // The reaper routes these to "skip" — adoption must fail
-            // closed the same way, never claim over uncertainty.
-            throw new Error(WORKSPACE_UNDETERMINED);
-          }
-          // Claim with THIS instance's lease generation (persisted in
-          // the lease so a same-identity restart keeps one generation).
-          // Claim with THIS instance's lease generation. A claim naming
-          // THIS instance (a same-identity restart resuming its own
-          // adoption) keeps its generation — one logical owner, one
-          // generation; a claim left by a DIFFERENT (gone) adopter is
-          // replaced with a FRESH generation, so the dead adopter's
-          // in-flight teardown can never collide with ours by
-          // generation, and read-backs unambiguously name the new
-          // owner.
-          const adoptionGeneration =
-            existing.kind === "valid" &&
-            existing.generation &&
-            existing.instanceId === this.instanceId
-              ? existing.generation
-              : randomUUID();
-          const claimed = await this.writeLease(
-            taskId,
-            name,
-            fence,
-            adoptionGeneration,
-          );
-          if (!claimed) {
-            // No active fence (an inactive fence never reaches the body)
-            // or no durable claim despite one: the adoption is unprovable
-            // cross-instance — a peer's reaper could adopt the same
-            // container behind our back. Fail closed.
-            throw new Error(WORKSPACE_UNDETERMINED);
-          }
-        }
-        // RE-PROBE under the fence before handing out a handle: the
-        // container and its name can only have changed behind another
-        // fence holder, which cannot exist here, so this is defense in
-        // depth (and it also catches a container stopped between the
-        // two awaits).
-        const claim = await this.inspectContainer(name, fence);
-        if (claim.kind === "unknown") throw new Error(WORKSPACE_UNDETERMINED);
-        if (
-          claim.kind === "missing" ||
-          !claim.running ||
-          this.classifyContainer(claim.instanceLabel) === "foreign" ||
-          (claim.taskLabel !== NO_LABEL && claim.taskLabel !== taskId)
-        ) {
+      case "conflict":
+        if (resolved.reason === "foreign") throw new Error(WORKSPACE_OWNED);
+        if (resolved.reason === "labels") {
           throw new Error(WORKSPACE_UNAVAILABLE);
         }
+        throw new Error(WORKSPACE_UNDETERMINED);
+      case "legacy": {
+        if (resolved.quarantined) {
+          this.quarantinedTasks.add(taskId);
+          throw new Error(QUARANTINE_ERROR);
+        }
+        if (!resolved.running) throw new Error(WORKSPACE_UNAVAILABLE);
+        if (this.classifyContainer(resolved.instanceLabel) === "foreign") {
+          throw new Error(WORKSPACE_OWNED);
+        }
+        if (this.classifyContainer(resolved.instanceLabel) === "unlabeled") {
+          await this.assertNoForeignLegacyClaim(taskId, resolved.name);
+        }
+        // MIGRATION ADOPTION: publish a fresh epoch/generation mapping
+        // FIRST (marked legacyAdopted), then hand out the handle bound to
+        // that fresh generation.
+        const adopted = await this.adoptLegacy(taskId, resolved, fence);
         this.taskActivity.set(taskId, Date.now());
-        return { id: taskId, root: "/workspace" };
+        return this.bindHandle(taskId, {
+          epoch: adopted.epoch,
+          generation: adopted.generation,
+          containerId: adopted.containerId,
+        });
       }
-      if (!inspected.running) {
-        // A stopped container (e.g. left stopped by a quarantine's
-        // rename-failure stop fallback) is unusable — open() reports the
-        // plain lifecycle error; destroy() can still remove it. A
-        // restarted provider with the SAME instance identity is blocked
-        // by this exact check: no same-identity second process may
-        // reopen a container that was stopped as the quarantine
-        // fallback.
-        throw new Error(WORKSPACE_UNAVAILABLE);
-      }
-      // LABELED MINE, running: the immutable label already proves this
-      // container is ours, so the lease is only the LIVENESS claim.
-      // Keep it durable AFTER the gate (never before — refreshing a
-      // lease before the container ownership gate ran is what let an
-      // instance whose container had been replaced poison the
-      // replacement owner's liveness state): refresh a claim that names
-      // this instance, and RE-ESTABLISH one that is absent, corrupt, or
-      // unreadable, so a live owner is never left without a claim a
-      // peer's reaper can see (an absent claim routes to age-reaping
-      // once the fence is released).
-      const lease = await this.readLease(taskId, name);
-      if (
-        lease.kind === "valid" &&
-        lease.instanceId === this.instanceId &&
-        lease.generation
-      ) {
-        const refreshed = await this.writeLease(
+      case "bound": {
+        if (resolved.instanceId !== this.instanceId) {
+          throw new Error(WORKSPACE_OWNED);
+        }
+        if (!resolved.running) throw new Error(WORKSPACE_UNAVAILABLE);
+        // Refresh the versioned lease for the CURRENT generation. A refresh
+        // that cannot be made durable fails the open closed.
+        const leased = await this.writeLease(
           taskId,
-          name,
           fence,
-          lease.generation,
+          resolved.epoch,
+          resolved.generation,
+          resolved.name,
+          resolved.containerId,
         );
-        if (!refreshed) throw new Error(WORKSPACE_UNDETERMINED);
-      } else {
-        // Absent/corrupt/unreadable (or a foreign leftover on a container
-        // the immutable label proves is ours): (re-)establish the claim
-        // with a FRESH generation — a teardown still holding the old
-        // generation token must not be able to unlink the new claim.
-        const claimed = await this.writeLease(
-          taskId,
-          name,
-          fence,
-          randomUUID(),
-        );
-        if (!claimed) throw new Error(WORKSPACE_UNDETERMINED);
+        if (!leased) throw new Error(WORKSPACE_UNDETERMINED);
+        this.taskActivity.set(taskId, Date.now());
+        return this.bindHandle(taskId, {
+          epoch: resolved.epoch,
+          generation: resolved.generation,
+          containerId: resolved.containerId,
+        });
       }
-      this.taskActivity.set(taskId, Date.now());
-      return { id: taskId, root: "/workspace" };
     }
-    // No container under the task name. Before reporting "unavailable",
-    // probe the durable quarantine marker: a surviving unremovable
-    // container was RENAMED to <name>-quarantined (see
-    // quarantineTask) — that state is in the daemon, so this instance
-    // sees it even after a restart, and even when it is a SECOND
-    // instance with no in-memory state.
-    const quarantined = await this.inspectContainer(
-      this.quarantinedContainerName(taskId),
-      fence,
-    );
-    if (quarantined.kind === "unknown") throw new Error(WORKSPACE_UNDETERMINED);
-    if (quarantined.kind === "exists") {
-      this.quarantinedTasks.add(taskId);
-      throw new Error(QUARANTINE_ERROR);
-    }
-    throw new Error(WORKSPACE_UNAVAILABLE);
   }
-
   async readFile(
     workspace: WorkspaceHandle,
     relativePath: string,
@@ -1671,7 +1503,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
     fence: HeldFence,
   ): Promise<string> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(container, absolute, fence);
     if (target === null) throw new Error("Could not read workspace file");
@@ -1704,7 +1536,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
     fence: HeldFence,
   ): Promise<string> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(container, absolute, fence);
     if (target === null) throw new Error("Could not read workspace file");
@@ -1752,7 +1584,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     content: string,
     fence: HeldFence,
   ): Promise<void> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     if (isSensitivePath(relativePath)) {
       throw new Error("Writing sensitive paths is blocked");
     }
@@ -1839,7 +1671,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
     fence: HeldFence,
   ): Promise<void> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(container, absolute, fence);
     if (target === null) throw new Error("Could not delete workspace file");
@@ -1864,7 +1696,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     fence: HeldFence,
   ): Promise<ChangedFile[]> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     await this.markUntrackedForDiff(container, fence);
     const result = await this.execIn(
       container.id,
@@ -1909,7 +1741,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     fence: HeldFence,
   ): Promise<string> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     await this.markUntrackedForDiff(container, fence);
     const result = await this.execIn(
       container.id,
@@ -1935,7 +1767,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     fence: HeldFence,
   ): Promise<string> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const result = await this.execIn(
       container.id,
       ["git", "status", "--short", "--untracked-files=all"],
@@ -1964,7 +1796,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     command: string,
     fence: HeldFence,
   ): Promise<CommandResult> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const normalized = command.trim().replace(/\s+/g, " ");
     const executable = this.allowedCommands[normalized];
     if (!executable) {
@@ -2064,12 +1896,22 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * the daemon-side exec may still be running) means the cleanup did not
    * complete and is treated exactly like a non-zero exit.
    */
+  /**
+   * Run the post-validation reaper, quarantining the task when the
+   * cleanup cannot complete (see quarantineTask). The quarantine is bound
+   * to the container's epoch/generation/immutable id.
+   */
   private async runReaperOrQuarantine(
     container: TaskContainer,
     started: number,
     fence: HeldFence,
   ): Promise<void> {
     const taskId = container.taskId;
+    const target = {
+      epoch: container.epoch,
+      generation: container.generation,
+      containerId: container.id,
+    };
     let cleaned: DockerRunResult;
     try {
       cleaned = await this.execIn(
@@ -2080,7 +1922,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         fence,
       );
     } catch {
-      const outcome = await this.quarantineTask(taskId, fence);
+      const outcome = await this.quarantineTask(taskId, fence, target);
       throw new Error(
         outcome === "failed"
           ? WORKSPACE_UNDETERMINED
@@ -2088,7 +1930,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       );
     }
     if (cleaned.code !== 0) {
-      const outcome = await this.quarantineTask(taskId, fence);
+      const outcome = await this.quarantineTask(taskId, fence, target);
       throw new Error(
         outcome === "failed"
           ? WORKSPACE_UNDETERMINED
@@ -2098,283 +1940,99 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /**
-   * Quarantine a task after a failed validation cleanup (or a failed
-   * create setup): mark it so every later operation rejects with the
-   * quarantine error, destroy the container immediately (best-effort),
-   * and — when the container cannot be removed — make the quarantine
-   * DURABLE across instances and restarts.
+   * Quarantine a task after a failed validation cleanup (or a failed create
+   * setup): mark it so every later operation rejects with the quarantine
+   * error, destroy the container immediately (best-effort, bound to the
+   * immutable id), and — when the container cannot be removed — make the
+   * quarantine DURABLE through an epoch-aware record (never a rename to a
+   * task-derived name; see the class documentation).
    *
-   * FENCE-LOSS CONTRACT (the review-critical part): every Docker call
-   * below re-asserts that this holder still owns its fence token
-   * (fencedDocker/inspectContainer throw WORKSPACE_UNDETERMINED the
-   * moment the token is gone), and the sequence is additionally gated
-   * after each phase. Losing the fence STOPS the sequence: no rename, no
-   * stop, no marker/lease retirement — the cleanup result is
-   * "failed" (undetermined) and the host marker stays, because a
-   * replacement holder may already have acquired the task and anything
-   * we did by NAME from that point on could hit ITS container.
+   * `target` is the container to mark (its epoch/generation/immutable id).
+   * When `target` is absent (an uncertain create whose daemon-side effect is
+   * unknown), there is nothing to make durable: any late-surfacing container
+   * carries a generation-scoped provisional name and no mapping references
+   * it, so it is an unreachable managed orphan by construction.
    *
-   * `retainTombstone` (set by createCore when the `docker create`
-   * REQUEST itself failed uncertainly — a timed-out or transport-failed
-   * create the daemon may still surface LATE): the host marker is NOT
-   * retired even when both names probe missing. Docker's API gives no
-   * guarantee the daemon will not register the container after our
-   * probe, so the durable tombstone stays until an explicit destroy()
-   * (or the reaper, once the container actually appears) confirms the
-   * cleanup. Returning "durable" is honest in that state: the marker
-   * durably blocks every instance's open().
-   *
-   * "durable" is returned ONLY when some durable channel provably blocks
-   * a reopen: the host marker (written and never contradicted), a
-   * container renamed to the quarantine name, or a container confirmed
-   * stopped (Running=false is daemon-side and cross-instance). A
-   * missing-marker plus an unconfirmable container state returns
-   * "failed".
+   * "durable" is returned ONLY when a durable channel provably blocks a
+   * reopen: the epoch-aware quarantine record (written and never
+   * contradicted), the container removed, or the container confirmed stopped
+   * (Running=false is daemon-side and cross-instance).
    */
   private async quarantineTask(
     taskId: string,
     fence?: HeldFence,
-    opts: { retainTombstone?: boolean } = {},
+    target?: { epoch: number; generation: string; containerId: string },
   ): Promise<"durable" | "failed"> {
-    // The in-memory flag is set FIRST, before any docker call and
-    // before touching the lease directory: it is per-process, requires
-    // no I/O, and must protect THIS instance even when every durable
-    // channel below fails (unwritable lease dir, failed rename, failed
-    // stop). Explicit destroy()/create() are the only operations that
-    // clear it.
+    // The in-memory flag is set FIRST, before any Docker call and before
+    // touching the coordination directory: it protects THIS instance even
+    // when every durable channel below fails.
     this.quarantinedTasks.add(taskId);
-    // Publish the HOST-SIDE durable marker FIRST, before any docker
-    // call: it is what blocks open() on a restarted or second instance
-    // (same identity or different) when the daemon-side markers below
-    // cannot be established.
-    const markerDurable = await this.writeQuarantineMarker(taskId);
-    const normalName = this.containerName(taskId);
-    const qName = this.quarantinedContainerName(taskId);
-    // Best-effort removal first (the original behavior: the container is
-    // destroyed immediately when the daemon cooperates). A FAILED
-    // removal must throw nowhere — the durable-marker steps below are
-    // the fail-closed path, and the caller's original error wins. Note
-    // that cleanupAll throws WORKSPACE_UNDETERMINED when the fence was
-    // lost mid-cleanup: that is exactly the gate below.
-    const removed = await this.cleanupAll(taskId, fence).then(
-      () => true,
-      () => false,
+    if (!target) {
+      // No known container: the only possible daemon-side container is an
+      // unreachable orphan. Nothing further needs to be made durable.
+      return "durable";
+    }
+    // Publish the durable, epoch-aware quarantine record FIRST, before any
+    // Docker call: it is what blocks open() on a restarted or second
+    // instance when the container below cannot be removed.
+    const recordDurable = await this.writeQuarantineRecord(
+      taskId,
+      fence,
+      target.epoch,
+      target.generation,
+      target.containerId,
     );
-    // FENCE-LOSS GATE after the cleanup attempt: if the token is gone we
-    // may already have been stale-broken and replaced. Stop here — no
-    // rename, no stop, no marker retirement — and surface undetermined.
+    // Best-effort removal bound to the immutable container id. A FAILED
+    // removal must throw nowhere — the durable-record path below is the
+    // fail-closed path, and the caller's original error wins.
+    let removed = false;
+    try {
+      await this.removeContainerById(taskId, target.containerId, fence);
+      removed = true;
+    } catch {
+      removed = false;
+    }
+    // FENCE-LOSS GATE after the cleanup attempt: if the token is gone we may
+    // already have been stale-broken and replaced. Stop here — no record
+    // retirement — and surface undetermined.
     if (fence && !(await this.checkFenceLive(fence))) {
       return "failed";
     }
-    try {
-      if (removed) {
-        const normalProbe = await this.inspectContainer(normalName, fence);
-        const qProbe = await this.inspectContainer(qName, fence);
-        if (normalProbe.kind === "missing" && qProbe.kind === "missing") {
-          // Nothing left under either name: retire the host marker
-          // (unless a late daemon-side create may still surface — see
-          // retainTombstone) and the task bookkeeping. The lease removal
-          // is generation-aware (never a replacement owner's fresh
-          // lease — and deleteLease re-verifies under the fence).
-          if (!opts.retainTombstone) {
-            await this.deleteQuarantineMarker(taskId);
-          }
-          this.taskActivity.delete(taskId);
-          await this.deleteLease(taskId, normalName, fence);
-          return "durable";
-        }
-        if (qProbe.kind === "exists") {
-          // A surviving RENAMED container (from a previous quarantine):
-          // the daemon-side name carries the quarantine durably.
-          await this.deleteQuarantineMarker(taskId);
-          return "durable";
-        }
-        // An UNKNOWN inspect, or a container still under the normal
-        // name despite a "successful" cleanup: fall through to the
-        // durable-marker path below — fail closed.
-      }
-      // The container SURVIVED (or its state is uncertain): the in-memory
-      // flag alone would be forgotten by a provider restart or a second
-      // provider instance, whose open() would hand out this live,
-      // untrusted container. Make the quarantine DURABLE in the daemon:
-      // re-inspect under the fence and bind every later rename/stop to
-      // the IMMUTABLE container ID seen now, so a container that merely
-      // re-uses the task NAME (a replacement created behind a lost
-      // fence) can never be renamed or stopped by this sequence.
-      const probe = await this.inspectContainer(normalName, fence);
-      if (probe.kind === "unknown") {
-        // Cannot prove anything about the container: keep the host
-        // marker (fail closed). Durable only if the marker itself is.
-        return markerDurable ? "durable" : "failed";
-      }
-      if (probe.kind === "missing") {
-        // Nothing under the normal name: either a prior quarantine
-        // already moved the container, or nothing remains. Verify under
-        // the fence; UNKNOWN results keep the host marker (fail closed).
-        const qProbe = await this.inspectContainer(qName, fence);
-        if (qProbe.kind === "exists") {
-          await this.deleteQuarantineMarker(taskId);
-          return "durable";
-        }
-        if (qProbe.kind === "missing") {
-          if (!opts.retainTombstone) {
-            await this.deleteQuarantineMarker(taskId);
-          }
-          this.taskActivity.delete(taskId);
-          return "durable";
-        }
-        // qProbe unknown: keep the host marker.
-        return markerDurable ? "durable" : "failed";
-      }
-      // probe.kind === "exists" under the normal name. It is renamable/
-      // stoppable ONLY if it is THIS task's container and not a live
-      // foreign replacement (which the fence would normally prevent —
-      // this binding is the defense in depth for a lost-then-replaced
-      // window).
-      if (probe.taskLabel !== NO_LABEL && probe.taskLabel !== taskId) {
-        // A container created for a DIFFERENT task happens to sit under
-        // this task's name: it is not this quarantine's target.
-        return markerDurable ? "durable" : "failed";
-      }
-      if (
-        this.classifyContainer(probe.instanceLabel) === "foreign" &&
-        probe.running
-      ) {
-        // A live container owned by ANOTHER instance under this name: a
-        // replacement this instance must not touch. The host marker (if
-        // durable) blocks opens; otherwise report the failure.
-        return markerDurable ? "durable" : "failed";
-      }
-      // Rename BY THE IMMUTABLE ID (never by name): the daemon-side
-      // durable marker. A rename is supported on a running OR stopped
-      // container, the new name lives in the daemon (surviving restarts
-      // and instance changes), and the container is no longer reachable
-      // by its task name — every instance's open() probes the renamed
-      // name and rejects (see openCore). Creation-time labels survive
-      // the rename, so the TTL reaper (any instance) still lists and
-      // reaps the container by its managed label.
-      const renamed = await this.fencedDocker(
+    if (removed) {
+      // The container is gone; the record (if published) is retired with it.
+      await this.retireQuarantineRecords(
+        taskId,
         fence,
-        ["rename", probe.id, qName],
-        this.opTimeout(30_000),
-        20_000,
+        target.epoch,
+        target.generation,
+        target.containerId,
       );
-      if (renamed.code === 0) {
-        // The daemon-side marker now carries the quarantine durably; the
-        // host marker is redundant and would only go stale.
-        await this.deleteQuarantineMarker(taskId);
-        return "durable";
-      }
-      if (/no such container/i.test(renamed.stderr)) {
-        // The target vanished between the inspect and the rename (the
-        // reaper or another holder removed it). Confirm under the fence
-        // which case we are in; an UNKNOWN inspect result keeps the host
-        // marker (fail closed), and a container that REAPPEARED under
-        // either name also keeps it (the no-such response conflicts with
-        // the later probe — never trust the no-such alone).
-        const qProbe = await this.inspectContainer(qName, fence);
-        if (qProbe.kind === "exists") {
-          await this.deleteQuarantineMarker(taskId);
-          return "durable";
-        }
-        if (qProbe.kind === "missing") {
-          const normalProbe = await this.inspectContainer(normalName, fence);
-          if (normalProbe.kind === "missing") {
-            // Nothing under either name: drop the host marker (unless a
-            // late create may still surface); the in-memory flag
-            // persists until explicit teardown/replacement.
-            if (!opts.retainTombstone) {
-              await this.deleteQuarantineMarker(taskId);
-            }
-            this.taskActivity.delete(taskId);
-          }
-          // exists/unknown under the normal name: keep the host marker —
-          // fail closed.
-        }
-        return "durable";
-      }
-      // The rename failed for a reason other than "the target is already
-      // gone". The container KEEPS its normal name, so a restarted or
-      // second provider could otherwise see a RUNNING container under
-      // the task name and open it. Fail closed with a second supported
-      // operation: STOP the container — still bound to the immutable ID.
-      const stopped = await this.fencedDocker(
-        fence,
-        ["stop", probe.id],
-        this.opTimeout(30_000),
-        20_000,
-      );
-      if (stopped.code !== 0 && /no such container/i.test(stopped.stderr)) {
-        // The target vanished between the rename attempt and the stop:
-        // confirm before clearing; unknown or conflicting results keep
-        // the marker.
-        const late = await this.inspectContainer(normalName, fence);
-        if (late.kind === "missing") {
-          const qProbe = await this.inspectContainer(qName, fence);
-          if (qProbe.kind === "missing") {
-            if (!opts.retainTombstone) {
-              await this.deleteQuarantineMarker(taskId);
-            }
-            this.taskActivity.delete(taskId);
-          }
-        }
-        return "durable";
-      }
-      // The stop's exit code is NOT proof of the container's state: a
-      // CLI-level timeout/transport failure reports nonzero, and a
-      // daemon that refused the rename may be unwell. CONFIRM the state
-      // by re-inspecting the IMMUTABLE ID before deciding whether the
-      // host marker may be retired: only a container that is
-      // definitively stopped (or gone) is safe without the host-side
-      // marker; a still-RUNNING container, or an UNKNOWN result, keeps
-      // the host marker — open() must keep rejecting it on every
-      // instance, including a restarted provider with the SAME instance
-      // identity (which would otherwise see its own RUNNING container
-      // and reopen it).
-      const state = await this.inspectContainer(probe.id, fence);
-      if (state.kind === "missing") {
-        const qProbe = await this.inspectContainer(qName, fence);
-        if (qProbe.kind === "missing") {
-          if (!opts.retainTombstone) {
-            await this.deleteQuarantineMarker(taskId);
-          }
-          this.taskActivity.delete(taskId);
-        } else if (qProbe.kind === "exists") {
-          await this.deleteQuarantineMarker(taskId);
-        }
-        // Unknown: keep host marker.
-        return "durable";
-      }
-      if (state.kind === "exists" && !state.running) {
-        // Confirmed stopped: Running=false is the daemon-side,
-        // cross-instance "do not use" state (openCore rejects stopped
-        // containers regardless of owner — including a same-identity
-        // restart). The host marker is retired; the TTL reaper removes
-        // the stopped container by age.
-        await this.deleteQuarantineMarker(taskId);
-        return "durable";
-      }
-      // state.kind === "unknown", or the container is confirmed RUNNING
-      // after a failed/ambiguous stop: the host marker STAYS (it was
-      // written above) and blocks every open() until an explicit
-      // destroy()/create() or a successful later quarantine. The TTL
-      // reaper is the backstop.
-      if (markerDurable) return "durable";
-      // The container could not be removed, renamed, confirmed stopped,
-      // NOR marked with a durable host file: no durable channel blocks
-      // a same-identity restart from reopening the live untrusted
-      // container. Report the failure; the in-memory flag still blocks
-      // this process (and the original validation/create error wins).
-      return "failed";
-    } catch {
-      // A fence-loss assertion (or an unexpected coordination error)
-      // fired mid-sequence: STOP — the sequence must not fall through
-      // into rename/stop/marker retirement against a possibly
-      // replacement-held container. The host marker (if durable) stays.
-      return markerDurable ? "durable" : "failed";
+      this.taskActivity.delete(taskId);
+      return "durable";
     }
+    if (recordDurable) return "durable";
+    // Stop fallback (still bound to the immutable id): a container confirmed
+    // stopped is daemon-side, cross-instance "do not use" state.
+    const stopped = await this.fencedDocker(
+      fence,
+      ["stop", target.containerId],
+      this.opTimeout(30_000),
+      20_000,
+    );
+    if (
+      !stopped.timedOut &&
+      (stopped.code === 0 || /no such container/i.test(stopped.stderr))
+    ) {
+      const state = await this.inspectContainer(target.containerId, fence);
+      if (
+        state.kind === "missing" ||
+        (state.kind === "exists" && !state.running)
+      ) {
+        return "durable";
+      }
+    }
+    return "failed";
   }
-
   private assertNotQuarantined(taskId: string): void {
     if (this.quarantinedTasks.has(taskId)) {
       throw new Error(QUARANTINE_ERROR);
@@ -2397,11 +2055,19 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * (the caller holds it), so the decision can never interleave with a
    * peer's atomic adoption.
    */
-  private async assertNoForeignUnlabeledClaim(
+  /**
+   * Gate for a LEGACY (canonical-name, unlabeled) container (the migration
+   * adoption case): open() claims such containers atomically and records the
+   * claim in the LEGACY `<taskId>.lease` file. Destructive operations consult
+   * the SAME claim. Reads happen INSIDE the fence; corrupt/unreadable claims
+   * fail closed.
+   */
+  private async assertNoForeignLegacyClaim(
     taskId: string,
     name: string,
   ): Promise<void> {
-    const lease = await this.readLease(taskId, name);
+    void name;
+    const lease = await this.readLegacyLease(taskId);
     if (lease.kind === "corrupt" || lease.kind === "unreadable") {
       throw new Error(WORKSPACE_UNDETERMINED);
     }
@@ -2414,152 +2080,102 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /**
-   * Ownership gate for operations that RECEIVE a handle (read/write/exec/
-   * git/validation). A handle is only handed out by open()/create(),
-   * which gate ownership themselves — but a handle object is just an
-   * id: a second provider instance could be handed one for a container
-   * this instance does not own (or one that was quarantined/stopped
-   * after the handle was created). Every such operation therefore
-   * RE-VALIDATES the container state under the fence: quarantine marker
-   * first, then a full combined inspect — running + this-instance label
-   * required (an unlabeled legacy container must be open()'d/adopted
-   * first, so a direct file op on one is rejected rather than claimed
-   * implicitly). Unknown inspect results fail closed.
+   * Ownership gate for operations that RECEIVE a handle (read/write/exec/git/
+   * validation). Every such operation RE-VALIDATES the container state under
+   * the fence through the shared resolver, bound to the handle's epoch/
+   * generation/container-id when the handle carries them (a stale handle from
+   * a superseded generation is rejected rather than silently re-bound).
    */
   private async gateHandleOperation(
-    taskId: string,
+    workspace: WorkspaceHandle,
     fence: HeldFence,
   ): Promise<TaskContainer> {
-    // A handle is just an id: validate it the same way create/open/
-    // destroy do, so a forged or stale handle (including the reserved
-    // quarantine suffix, which must never reach a container name) is
-    // rejected before any docker call.
+    const taskId = workspace.id;
     if (!isValidTaskId(taskId)) throw new Error("Invalid task identifier");
     this.assertNotQuarantined(taskId);
-    const marker = await this.readQuarantineMarker(taskId);
-    if (marker !== "absent") {
-      this.quarantinedTasks.add(taskId);
-      throw new Error(QUARANTINE_ERROR);
-    }
-    const name = this.containerName(taskId);
-    const inspected = await this.inspectContainer(name, fence);
-    if (inspected.kind === "unknown") {
-      throw new Error(WORKSPACE_UNDETERMINED);
-    }
-    if (inspected.kind === "missing") {
-      throw new Error(WORKSPACE_UNAVAILABLE);
-    }
-    if (inspected.taskLabel !== NO_LABEL && inspected.taskLabel !== taskId) {
-      throw new Error(WORKSPACE_UNAVAILABLE);
-    }
-    if (this.classifyContainer(inspected.instanceLabel) === "foreign") {
-      throw new Error(WORKSPACE_OWNED);
-    }
-    if (!inspected.running) {
-      throw new Error(WORKSPACE_UNAVAILABLE);
-    }
-    // An UNLABELED RUNNING container reaches here only after open()
-    // adopted it and wrote THIS instance's lease claim (the adoption is
-    // atomic under the fence). The claim is re-verified on EVERY handle
-    // operation — and it is a HARD requirement: a handle operation never
-    // adopts. Only open() establishes an adoption claim; a handle whose
-    // claim is absent (deleted, or never written — a forged handle), or
-    // stale-foreign (the earlier adopter is gone and the container is
-    // unclaimed again) fails CLOSED: the caller must re-open(), which
-    // adopts atomically under the fence, or the operation must fail.
-    if (this.classifyContainer(inspected.instanceLabel) === "unlabeled") {
-      const lease = await this.readLease(taskId, name);
-      if (lease.kind === "valid" && lease.instanceId === this.instanceId) {
-        // OUR claim, fresh or stale: we hold the fence right now, and a
-        // peer re-adoption would have required the fence (its open()
-        // writes the claim under the fence), so a claim still naming us
-        // proves no peer took over since. Refresh it to re-prove
-        // liveness cross-instance; a refresh that cannot be made durable
-        // fails the operation closed (an unprovable claim is exactly
-        // what another instance's re-adoption would erase).
-        const refreshed = await this.writeLease(
-          taskId,
-          name,
-          fence,
-          lease.generation,
+    // Resolve under the handle's recorded binding (its epoch/generation/
+    // immutable id). A handle minted for a superseded generation is
+    // rejected here rather than silently re-bound to a replacement.
+    const expected = this.handleBindings.get(workspace);
+    const resolved = await this.resolveTask(taskId, fence, expected);
+    switch (resolved.kind) {
+      case "unknown":
+        throw new Error(WORKSPACE_UNDETERMINED);
+      case "conflict":
+        throw new Error(
+          resolved.reason === "foreign"
+            ? WORKSPACE_OWNED
+            : WORKSPACE_UNDETERMINED,
         );
-        if (!refreshed) throw new Error(WORKSPACE_UNDETERMINED);
-      } else if (
-        lease.kind === "valid" &&
-        Date.now() - lease.updatedAt <= this.leaseTtlMs
-      ) {
-        // A FRESH foreign claim: a peer adopted this container and is
-        // alive.
-        throw new Error(WORKSPACE_OWNED);
-      } else {
-        // absent / corrupt / unreadable / stale-foreign: an unlabeled
-        // container with no provable claim of ours. Handle operations
-        // NEVER claim implicitly — open() is the only adoption path.
-        // Fail closed.
+      case "absent":
+      case "missing":
+        // A mapped-but-gone container is a lifecycle error.
+        throw new Error(WORKSPACE_UNAVAILABLE);
+      case "legacy": {
+        // A handle operation never adopts legacy state (only open() does).
+        if (resolved.quarantined) {
+          this.quarantinedTasks.add(taskId);
+          throw new Error(QUARANTINE_ERROR);
+        }
+        if (this.classifyContainer(resolved.instanceLabel) === "foreign") {
+          throw new Error(WORKSPACE_OWNED);
+        }
+        // Unlabeled legacy state with no durable adoption claim: the
+        // handle's ownership cannot be established, so fail closed.
         throw new Error(WORKSPACE_UNDETERMINED);
       }
-      return { taskId, name, id: inspected.id };
+      case "bound": {
+        if (resolved.instanceId !== this.instanceId) {
+          throw new Error(WORKSPACE_OWNED);
+        }
+        if (!resolved.running) throw new Error(WORKSPACE_UNAVAILABLE);
+        const q = await this.readQuarantine(taskId);
+        if (q.kind === "unknown") throw new Error(WORKSPACE_UNDETERMINED);
+        if (
+          this.quarantineBlocksTask(
+            {
+              epoch: resolved.epoch,
+              generation: resolved.generation,
+              containerId: resolved.containerId,
+            },
+            q,
+          )
+        ) {
+          this.quarantinedTasks.add(taskId);
+          throw new Error(QUARANTINE_ERROR);
+        }
+        const leased = await this.writeLease(
+          taskId,
+          fence,
+          resolved.epoch,
+          resolved.generation,
+          resolved.name,
+          resolved.containerId,
+        );
+        if (!leased) throw new Error(WORKSPACE_UNDETERMINED);
+        return {
+          taskId,
+          epoch: resolved.epoch,
+          generation: resolved.generation,
+          name: resolved.name,
+          id: resolved.containerId,
+        };
+      }
     }
-    // LABELED MINE, running: the immutable creation-time label already
-    // proves the container is ours (only this instance creates that
-    // label, and labels never change), so the lease is purely the
-    // liveness signal. Maintain it AFTER the gate — never before: an
-    // instance whose container was replaced must not refresh a lease
-    // describing a container it no longer owns (the old pre-gate
-    // heartbeat could poison the replacement owner's liveness state).
-    // A claim that names this instance is refreshed in place
-    // (generation preserved); an absent, corrupt, or unreadable claim is
-    // RE-ESTABLISHED under the fence with a fresh generation, so a live
-    // owner never operates indefinitely without a claim another
-    // instance's reaper can see (a vanished claim routes to age reaping
-    // once the fence is released).
-    const lease = await this.readLease(taskId, name);
-    if (
-      lease.kind === "valid" &&
-      lease.instanceId === this.instanceId &&
-      lease.generation
-    ) {
-      const refreshed = await this.writeLease(
-        taskId,
-        name,
-        fence,
-        lease.generation,
-      );
-      if (!refreshed) throw new Error(WORKSPACE_UNDETERMINED);
-    } else {
-      // absent / corrupt / unreadable / a foreign leftover on a
-      // container the immutable label proves is ours: (re-)establish
-      // the claim. A fresh generation is minted whenever the existing
-      // claim does not name this instance, so a stale teardown holding
-      // an older generation token can never unlink the new claim.
-      const claimed = await this.writeLease(taskId, name, fence, randomUUID());
-      if (!claimed) throw new Error(WORKSPACE_UNDETERMINED);
-    }
-    return { taskId, name, id: inspected.id };
   }
 
   /**
    * Destroy the task container; its tmpfs workspace is removed with it. Call
    * when a task reaches a terminal state; the reaper is the backstop for
-   * abandoned tasks. Also the explicit teardown that clears a quarantine
-   * (see quarantinedTasks) — the flag persists if the removal fails.
-   * cleanupAll removes the container under EITHER name, so a quarantined
-   * (renamed) container is actually destroyed here, not orphaned.
-   *
-   * destroy never refreshes or rewrites the lease: nothing may resurrect
-   * the workspace's liveness claim, and the (generation-aware) lease
-   * deletion at the end may only remove a lease that still describes
-   * THIS teardown's container. A successful destroy reports success only
-   * when the container is provably gone under both names, the fence was
-   * never lost, and no replacement container or fresh replacement lease
-   * appeared mid-teardown — anything ambiguous fails closed with the
-   * undetermined error instead of lying about the workspace's state.
+   * abandoned tasks. Also the explicit teardown that clears a quarantine.
+   * destroy never refreshes or rewrites a lease; it retires only the records
+   * of the removed generation (and any superseded history), never a newer
+   * generation's.
    */
   async destroy(taskId: string): Promise<void> {
     if (!isValidTaskId(taskId)) throw new Error("Invalid task identifier");
-    // recordActivity=false: destruction clears a workspace, so it must
-    // never record liveness — neither enqueue nor completion may touch
-    // activity or the lease.
+    // recordActivity=false: destruction clears a workspace, so it must never
+    // record liveness.
     return this.withOwnerTaskOperation(
       taskId,
       (fence) => this.destroyCore(taskId, fence),
@@ -2568,100 +2184,85 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   private async destroyCore(taskId: string, fence: HeldFence): Promise<void> {
-    // The same ownership gate as open/create, applied BEFORE any rm and
-    // under the cross-instance fence (the inspect → rm window is thus
-    // atomic across provider instances): a normal-name container whose
-    // task label differs, or that is stamped with another live instance,
-    // must never be removed by this instance (it is another instance's
-    // live workspace). A quarantined-name container is not gated: it is
-    // unusable by definition, and destroy() is the explicit operation
-    // that clears a quarantine.
-    const name = this.containerName(taskId);
-    const existing = await this.inspectContainer(name, fence);
-    if (existing.kind === "unknown") {
-      // Fail CLOSED: never run an rm when the container's existence
-      // could not be determined. The quarantined-name container (if
-      // any) is not reached either — defer the teardown until the
-      // daemon is reachable again.
-      throw new Error(WORKSPACE_UNDETERMINED);
-    }
-    if (existing.kind === "exists") {
-      // Same rules as create(): a container labeled for a different
-      // task is never removed; a STOPPED foreign container (the
-      // quarantine stop-fallback state, left behind by an instance
-      // whose flag this process does not hold) has no possible live
-      // user, so removing it is how that state gets cleaned up.
-      if (existing.taskLabel !== NO_LABEL && existing.taskLabel !== taskId) {
-        throw new Error(WORKSPACE_UNAVAILABLE);
+    const resolved = await this.resolveTask(taskId, fence);
+    switch (resolved.kind) {
+      case "unknown":
+        throw new Error(WORKSPACE_UNDETERMINED);
+      case "conflict":
+        throw new Error(
+          resolved.reason === "foreign"
+            ? WORKSPACE_OWNED
+            : resolved.reason === "labels"
+              ? WORKSPACE_UNAVAILABLE
+              : WORKSPACE_UNDETERMINED,
+        );
+      case "absent":
+      case "missing": {
+        // Nothing live under the task. Retire any stale records and clear
+        // bookkeeping; a missing mapped container's records are already dead.
+        await this.retireTaskRecords(taskId, fence, undefined);
+        this.quarantinedTasks.delete(taskId);
+        this.taskActivity.delete(taskId);
+        await this.removeLegacyFiles(taskId);
+        return;
       }
-      if (
-        this.classifyContainer(existing.instanceLabel) === "foreign" &&
-        existing.running
-      ) {
-        throw new Error(WORKSPACE_OWNED);
+      case "legacy": {
+        if (resolved.quarantined) {
+          await this.removeContainerById(taskId, resolved.containerId, fence);
+          this.quarantinedTasks.delete(taskId);
+          this.taskActivity.delete(taskId);
+          await this.removeLegacyFiles(taskId);
+          return;
+        }
+        if (
+          this.classifyContainer(resolved.instanceLabel) === "foreign" &&
+          resolved.running
+        ) {
+          throw new Error(WORKSPACE_OWNED);
+        }
+        if (this.classifyContainer(resolved.instanceLabel) === "unlabeled") {
+          await this.assertNoForeignLegacyClaim(taskId, resolved.name);
+        }
+        await this.removeContainerById(taskId, resolved.containerId, fence);
+        const legacyQ = await this.inspectContainer(
+          this.legacyQuarantineName(taskId),
+          fence,
+        );
+        if (legacyQ.kind === "exists") {
+          await this.removeContainerById(taskId, legacyQ.id, fence);
+        }
+        this.quarantinedTasks.delete(taskId);
+        this.taskActivity.delete(taskId);
+        await this.removeLegacyFiles(taskId);
+        return;
       }
-      // UNLABELED RUNNING container: honor a peer's persistent adoption
-      // claim the same way create()/open() do.
-      if (this.classifyContainer(existing.instanceLabel) === "unlabeled") {
-        await this.assertNoForeignUnlabeledClaim(taskId, name);
+      case "bound": {
+        if (resolved.instanceId !== this.instanceId && resolved.running) {
+          throw new Error(WORKSPACE_OWNED);
+        }
+        await this.removeContainerById(taskId, resolved.containerId, fence);
+        await this.assertFenceLive(fence);
+        // Ambiguity check: with the fence continuously held no peer could
+        // have replaced the generation, so if the same immutable id still
+        // resolves the teardown's outcome is ambiguous — fail closed.
+        const after = await this.resolveTask(taskId, fence);
+        if (
+          after.kind === "bound" &&
+          after.containerId === resolved.containerId
+        ) {
+          throw new Error(WORKSPACE_UNDETERMINED);
+        }
+        await this.retireTaskRecords(taskId, fence, {
+          epoch: resolved.epoch,
+          generation: resolved.generation,
+          containerId: resolved.containerId,
+        });
+        this.quarantinedTasks.delete(taskId);
+        this.taskActivity.delete(taskId);
+        return;
       }
-    }
-    // The generation of the container THIS teardown was gating on (read
-    // before the destructive calls, under the fence): the lease
-    // deletion must target that generation only, never a replacement.
-    const before = await this.readLease(taskId, name);
-    const myGeneration =
-      before.kind === "valid" ? before.generation : undefined;
-    // Remove the container under EITHER name. Each removal re-inspects
-    // under the fence and `rm -f`s by the IMMUTABLE container ID it
-    // saw, so an old teardown can never remove a replacement container
-    // that re-used the task name; every call re-asserts the fence token
-    // first (a teardown that lost its fence throws before the rm).
-    await this.cleanupAll(taskId, fence);
-    // The removal was checked (cleanupAll throws on a failed rm), but
-    // the whole sequence may have taken a while: re-assert the fence
-    // BEFORE retiring any state — a stale-broken teardown must not
-    // erase the bookkeeping of a lock it demonstrably lost (and the rm
-    // above already ran only because the token was present at that
-    // moment; this check narrows the loss window for the state
-    // mutation that follows).
-    await this.assertFenceLive(fence);
-    // AMBIGUITY CHECK: with the fence continuously held, no peer could
-    // have created a replacement under the task name — so a container
-    // that EXISTS under the name now (or an inspect we cannot resolve)
-    // means the teardown's outcome is ambiguous: do not retire the
-    // quarantine marker, the lease, or report success.
-    const after = await this.inspectContainer(name, fence);
-    if (after.kind !== "missing") {
-      throw new Error(WORKSPACE_UNDETERMINED);
-    }
-    // The task's container is gone under BOTH names, so its quarantine
-    // is over too. Clear bookkeeping and the durable marker; the lease
-    // deletion is GENERATION-aware (instance AND the container
-    // generation read above), so a replacement owner's fresh lease can
-    // never be unlinked — deleteLease refuses to act when the fence is
-    // inactive, re-verifies the captured lease file, and reports what
-    // it left behind. destroy records no activity and refreshes no
-    // lease: nothing must resurrect the workspace's liveness claim.
-    this.quarantinedTasks.delete(taskId);
-    this.taskActivity.delete(taskId);
-    await this.deleteQuarantineMarker(taskId);
-    const leaseOutcome = await this.deleteLease(
-      taskId,
-      name,
-      fence,
-      myGeneration,
-    );
-    if (leaseOutcome === "valid-left") {
-      // A live lease we could not prove deleted (a fresh replacement
-      // claim, or a deletion the filesystem refused): reporting success
-      // would leave the task's liveness state ambiguous. Fail closed —
-      // an explicit retry resolves it once the lease is deletable.
-      throw new Error(WORKSPACE_UNDETERMINED);
     }
   }
-
-  /** Stop the background TTL reaper (the timer is unref'd and never keeps the process alive). */
   stopReaper(): void {
     if (this.reaperTimer) {
       clearInterval(this.reaperTimer);
@@ -2748,34 +2349,52 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       });
   }
 
-  private containerName(taskId: string): string {
-    return `valmont-sandbox-${taskId}`;
+  /** The generation-scoped PROVISIONAL container name. */
+  private provisionalName(taskId: string, generation: string): string {
+    return `${CANONICAL_PREFIX}${taskId}--g-${generation}`;
   }
 
   /**
-   * The name a SURVIVING quarantined container is renamed to (see
-   * quarantineTask): the durable, cross-instance quarantine marker.
+   * Mint a handle bound to the caller's epoch/generation/immutable-id. The
+   * binding is recorded so a later handle operation can be rejected when a
+   * replacement has superseded the generation it was handed out for.
    */
-  private quarantinedContainerName(taskId: string): string {
-    return `${this.containerName(taskId)}${QUARANTINED_SUFFIX}`;
+  private bindHandle(
+    taskId: string,
+    binding: { epoch: number; generation: string; containerId: string },
+  ): WorkspaceHandle {
+    const handle: WorkspaceHandle = { id: taskId, root: "/workspace" };
+    this.handleBindings.set(handle, binding);
+    return handle;
   }
 
   /**
-   * Inspect a container by name in ONE call, reading its Running state and
-   * the two ownership labels (task + instance). The NAME alone is never
-   * trusted for ownership: a rename that failed with "name already in use"
-   * can leave a foreign container under a name this instance expects to be
-   * its own, so the labels are authoritative. A missing label renders as
-   * `<no value>` (NO_LABEL).
+   * The canonical task name — used ONLY by legacy discovery (migration). The
+   * provider never calls `docker create` with this name.
+   */
+  private canonicalName(taskId: string): string {
+    return `${CANONICAL_PREFIX}${taskId}`;
+  }
+
+  /** The LEGACY quarantine name (old protocol rename target, migration). */
+  private legacyQuarantineName(taskId: string): string {
+    return `${this.canonicalName(taskId)}${QUARANTINED_SUFFIX}`;
+  }
+
+  /**
+   * Inspect a container by reference (an immutable ID, or — for legacy
+   * discovery only — a name) in ONE call, reading its Running state, the
+   * five ownership labels (task, instance, generation, epoch), and its
+   * current name. The NAME alone is never trusted for ownership. A missing
+   * label renders as `<no value>` (NO_LABEL).
    *
-   * The result is a DISCRIMINATED union, never a boolean: "missing"
-   * (the daemon authoritatively reports no such object), "exists"
-   * (running/label fields valid), or "unknown" (a timeout, transport,
-   * permission, spawn, or parse failure — the caller MUST fail closed and
-   * never run an `rm`: the container may well exist).
+   * The result is a DISCRIMINATED union: "missing" (the daemon
+   * authoritatively reports no such object), "exists" (all fields valid), or
+   * "unknown" (a timeout/transport/permission/spawn/parse failure — the
+   * caller MUST fail closed and never run an `rm`).
    */
   private async inspectContainer(
-    name: string,
+    ref: string,
     fence?: HeldFence,
   ): Promise<
     | { kind: "missing" }
@@ -2786,37 +2405,34 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         running: boolean;
         taskLabel: string;
         instanceLabel: string;
+        generationLabel: string;
+        epochLabel: string;
+        name: string;
       }
   > {
     let result: DockerRunResult;
     try {
-      // The combined probe reads the container's IMMUTABLE ID first:
-      // callers bind their later rm/rename/stop/exec to that ID so an
-      // old operation can never target a replacement container that
-      // merely re-used the task NAME. `name` here may itself already be
-      // an ID (the reaper inspects by the ID from its `docker ps` row).
       result = await this.fencedDocker(
         fence,
         [
           "inspect",
           "--format",
-          '{{.Id}}|{{.State.Running}}|{{index .Config.Labels "valmont.task"}}|{{index .Config.Labels "valmont.instance"}}',
-          name,
+          '{{.Id}}|{{.State.Running}}|{{index .Config.Labels "valmont.task"}}|{{index .Config.Labels "valmont.instance"}}|{{index .Config.Labels "valmont.generation"}}|{{index .Config.Labels "valmont.epoch"}}|{{.Name}}',
+          ref,
         ],
         this.opTimeout(15_000),
-        this.outputLimitBytes,
+        // The combined probe is protocol metadata (id + five labels + the
+        // name), not user file content: it is capped at a FIXED generous
+        // bound, never at the user-configured outputLimitBytes (which may
+        // be smaller than a single UUID-prefixed row and would truncate
+        // the pipe-delimited line into an "unknown" result).
+        20_000,
       );
     } catch {
-      // The CLI itself failed to spawn/report (transport), or the fence
-      // was lost: existence is unknown (or the caller already failed
-      // closed).
       return { kind: "unknown" };
     }
+    if (result.timedOut) return { kind: "unknown" };
     if (result.code !== 0) {
-      // Docker reports a truly absent object as "No such object"/"No such
-      // container" on stderr. Anything else (timeout, permission denied,
-      // daemon error, ...) means we do NOT know whether the container
-      // exists, and every caller fails closed on "unknown".
       if (/no such (object|container)/i.test(result.stderr)) {
         return { kind: "missing" };
       }
@@ -2824,11 +2440,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     }
     const parts = result.stdout.trim().split("|");
     if (
-      parts.length !== 4 ||
+      parts.length !== 7 ||
       (parts[1] !== "true" && parts[1] !== "false") ||
       !parts[0]
     ) {
-      // An unparsable successful response is not proof of anything.
       return { kind: "unknown" };
     }
     return {
@@ -2837,15 +2452,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       running: parts[1] === "true",
       taskLabel: parts[2] ?? "",
       instanceLabel: parts[3] ?? "",
+      generationLabel: parts[4] ?? "",
+      epochLabel: parts[5] ?? "",
+      name: (parts[6] ?? "").replace(/^\//, ""),
     };
   }
-
-  /**
-   * Classify a container's `valmont.instance` label relative to THIS
-   * instance: "mine" (the label is this instanceId), "unlabeled" (no label
-   * — the creator predates the mechanism or is gone; no live instance can
-   * own it), or "foreign" (another live-or-dead instance created it).
-   */
   private classifyContainer(
     instanceLabel: string,
   ): "mine" | "unlabeled" | "foreign" {
@@ -2854,28 +2465,378 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     return "foreign";
   }
 
-  private leasePath(taskId: string): string {
-    return path.join(this.leaseDir!, `${taskId}.lease`);
+  private epochDirPath(taskId: string): string {
+    return path.join(this.leaseDir, EPOCHS_DIR, taskId);
   }
 
-  /** Path of the durable, host-side quarantine marker for a task. */
-  private quarantineMarkerPath(taskId: string): string {
-    return path.join(this.leaseDir!, `${taskId}.quarantined`);
+  private mappingDirPath(taskId: string): string {
+    return path.join(this.leaseDir, MAPPINGS_DIR, taskId);
+  }
+
+  private leasesDirPath(taskId: string): string {
+    return path.join(this.leaseDir, LEASES_DIR, taskId);
+  }
+
+  private quarantineDirPath(taskId: string): string {
+    return path.join(this.leaseDir, QUARANTINES_DIR, taskId);
   }
 
   /** Path of the cross-instance per-task fence lock directory. */
   private fencePath(taskId: string): string {
-    return path.join(this.leaseDir!, ".locks", `${taskId}.lock`);
+    return path.join(this.leaseDir, ".locks", `${taskId}.lock`);
   }
 
   /**
-   * Read a lease file at an explicit path (see readLease).
+   * Scan a record directory. Entry classification:
+   * - `<uuid>.json` (a published record) and
+   *   `<uuid>.json.captured.<uuid>.tmp` (a RETAINED capture from an
+   *   interrupted retirement — a first-class recovery record) must parse as
+   *   a valid record for the task; anything else fails closed.
+   * - `<uuid>.json.tmp` (a crashed PUBLICATION temp) and any unrecognized
+   *   entry are UNKNOWN RECOVERY ARTIFACTS and fail closed.
    */
-  private async readLeaseFile(
-    file: string,
+  private async scanRecords<T>(
+    dir: string,
+    parse: (entryName: string, raw: string) => T | null,
+  ): Promise<T[]> {
+    let entries: string[];
+    try {
+      entries = await this.fs.readdir(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+      throw new Error(WORKSPACE_UNDETERMINED);
+    }
+    const records: T[] = [];
+    for (const entry of entries) {
+      const isCapture = /\.captured\.[^.]+\.tmp$/.test(entry);
+      const isTmp = entry.endsWith(".tmp");
+      const isJson = entry.endsWith(".json");
+      if (!isJson && !isCapture) throw new Error(WORKSPACE_UNDETERMINED);
+      if (isTmp && !isCapture) throw new Error(WORKSPACE_UNDETERMINED);
+      let raw: string;
+      try {
+        raw = await this.fs.readFile(path.join(dir, entry), "utf8");
+      } catch {
+        throw new Error(WORKSPACE_UNDETERMINED);
+      }
+      const parsed = parse(entry, raw);
+      if (parsed === null) throw new Error(WORKSPACE_UNDETERMINED);
+      records.push(parsed);
+    }
+    return records;
+  }
+
+  /**
+   * Read the authoritative canonical mapping: the UNIQUE valid record with
+   * the highest fencing epoch. Multiple records at the highest epoch,
+   * malformed records, unreadable records, and unknown recovery artifacts
+   * fail closed.
+   */
+  private async readAuthoritativeMapping(
     taskId: string,
-    expectedContainerName?: string,
   ): Promise<
+    | { kind: "mapping"; record: MappingRecord }
+    | { kind: "absent" }
+    | { kind: "unknown" }
+  > {
+    let records: MappingRecord[];
+    try {
+      records = await this.scanRecords(
+        this.mappingDirPath(taskId),
+        (entry, raw) => {
+          const m = parseMappingRecord(raw);
+          return m !== null && m.taskId === taskId ? m : null;
+        },
+      );
+    } catch {
+      return { kind: "unknown" };
+    }
+    if (records.length === 0) return { kind: "absent" };
+    let maxEpoch = 0;
+    for (const r of records) if (r.epoch > maxEpoch) maxEpoch = r.epoch;
+    const top = records.filter((r) => r.epoch === maxEpoch);
+    if (top.length !== 1) return { kind: "unknown" };
+    return { kind: "mapping", record: top[0]! };
+  }
+
+  /**
+   * Publish a canonical mapping record. Non-overwriting (unique temp +
+   * exclusive link); refuses to publish when a higher-epoch mapping already
+   * exists; allowed only under a live fence and only after setup has
+   * verified the immutable id and labels. Returns whether THIS record is now
+   * authoritative.
+   */
+  private async publishMapping(
+    taskId: string,
+    fence: HeldFence | undefined,
+    epoch: number,
+    generation: string,
+    provisionalName: string,
+    containerId: string,
+    opts: { legacyAdopted?: boolean } = {},
+  ): Promise<boolean> {
+    if (!this.leaseDir) return false;
+    if (!fence || !(await this.checkFenceLive(fence))) return false;
+    try {
+      const dir = this.mappingDirPath(taskId);
+      await this.fs.mkdir(dir, { recursive: true, mode: 0o700 });
+      // Epoch-aware: a stale writer must never publish over a higher epoch.
+      const current = await this.readAuthoritativeMapping(taskId);
+      if (current.kind === "unknown") return false;
+      if (current.kind === "mapping" && current.record.epoch > epoch) {
+        return false;
+      }
+      const recordId = randomUUID();
+      const tmp = path.join(dir, `${recordId}.json.tmp`);
+      const final = path.join(dir, `${recordId}.json`);
+      const payload = JSON.stringify({
+        schemaVersion: 1,
+        taskId,
+        epoch,
+        generation,
+        instanceId: this.instanceId,
+        provisionalName,
+        containerId,
+        publishedAt: Date.now(),
+        ...(opts.legacyAdopted ? { legacyAdopted: true } : {}),
+      });
+      await this.fs.writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
+      try {
+        await this.fs.link(tmp, final);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") {
+          await this.fs.rm(tmp, { force: true }).catch(() => {});
+          return false;
+        }
+      } finally {
+        await this.fs.rm(tmp, { force: true }).catch(() => {});
+      }
+      const back = await this.readAuthoritativeMapping(taskId);
+      return (
+        back.kind === "mapping" &&
+        back.record.epoch === epoch &&
+        back.record.generation === generation &&
+        back.record.containerId === containerId
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Verify a freshly created container's immutable id and the
+   * generation/epoch/task/instance labels plus the observed provisional
+   * name, before setup continues and again implicitly at publication.
+   */
+  private async verifyCreatedContainer(
+    taskId: string,
+    containerId: string,
+    fence: HeldFence,
+    generation: string,
+    epoch: number,
+    provisionalName: string,
+  ): Promise<void> {
+    const inspected = await this.inspectContainer(containerId, fence);
+    if (inspected.kind !== "exists") throw new Error(WORKSPACE_UNDETERMINED);
+    if (
+      (inspected.taskLabel !== NO_LABEL && inspected.taskLabel !== taskId) ||
+      inspected.instanceLabel !== this.instanceId ||
+      inspected.generationLabel !== generation ||
+      inspected.epochLabel !== String(epoch) ||
+      inspected.name !== provisionalName
+    ) {
+      throw new Error(WORKSPACE_UNDETERMINED);
+    }
+  }
+
+  /**
+   * The shared immutable-id resolver (see the class documentation). Used by
+   * open, handle operations, destroy, quarantine, cleanup, and the reaper.
+   */
+  private async resolveTask(
+    taskId: string,
+    fence: HeldFence | undefined,
+    expected?: { epoch?: number; generation?: string; containerId?: string },
+  ): Promise<ResolvedTask> {
+    const mapping = await this.readAuthoritativeMapping(taskId);
+    if (mapping.kind === "unknown") return { kind: "unknown" };
+    if (mapping.kind === "mapping") {
+      const m = mapping.record;
+      if (expected?.epoch !== undefined && expected.epoch !== m.epoch) {
+        return { kind: "conflict", reason: "stale" };
+      }
+      if (
+        expected?.generation !== undefined &&
+        expected.generation !== m.generation
+      ) {
+        return { kind: "conflict", reason: "stale" };
+      }
+      if (
+        expected?.containerId !== undefined &&
+        expected.containerId !== m.containerId
+      ) {
+        return { kind: "conflict", reason: "stale" };
+      }
+      const inspected = await this.inspectContainer(m.containerId, fence);
+      if (inspected.kind === "unknown") return { kind: "unknown" };
+      if (inspected.kind === "missing") return { kind: "missing" };
+      if (inspected.taskLabel !== NO_LABEL && inspected.taskLabel !== taskId) {
+        return { kind: "conflict", reason: "labels" };
+      }
+      if (m.legacyAdopted) {
+        // Legacy-adopted containers carry no generation/epoch labels (labels
+        // are immutable); the instance label is either ours or absent.
+        if (
+          inspected.instanceLabel !== m.instanceId &&
+          inspected.instanceLabel !== NO_LABEL &&
+          inspected.instanceLabel !== ""
+        ) {
+          return { kind: "conflict", reason: "labels" };
+        }
+      } else {
+        if (
+          inspected.instanceLabel !== m.instanceId ||
+          inspected.generationLabel !== m.generation ||
+          inspected.epochLabel !== String(m.epoch)
+        ) {
+          return { kind: "conflict", reason: "labels" };
+        }
+      }
+      if (inspected.name !== m.provisionalName) {
+        return { kind: "conflict", reason: "labels" };
+      }
+      return {
+        kind: "bound",
+        taskId,
+        epoch: m.epoch,
+        generation: m.generation,
+        instanceId: m.instanceId,
+        name: m.provisionalName,
+        containerId: m.containerId,
+        running: inspected.running,
+        legacyAdopted: m.legacyAdopted === true,
+      };
+    }
+    return this.discoverLegacy(taskId, fence);
+  }
+
+  /**
+   * MIGRATION PATH (clearly marked): discover old canonical-name protocol
+   * state. Fail-closed. A canonical-name container is, BY CONSTRUCTION,
+   * legacy state — never silently treated as a new-generation container.
+   */
+  private async discoverLegacy(
+    taskId: string,
+    fence?: HeldFence,
+  ): Promise<ResolvedTask> {
+    const canonical = this.canonicalName(taskId);
+    const inspected = await this.inspectContainer(canonical, fence);
+    if (inspected.kind === "unknown") return { kind: "unknown" };
+    if (inspected.kind === "missing") {
+      const q = await this.inspectContainer(
+        this.legacyQuarantineName(taskId),
+        fence,
+      );
+      if (q.kind === "unknown") return { kind: "unknown" };
+      if (q.kind === "exists") {
+        return {
+          kind: "legacy",
+          taskId,
+          name: this.legacyQuarantineName(taskId),
+          containerId: q.id,
+          running: q.running,
+          instanceLabel: q.instanceLabel,
+          taskLabel: q.taskLabel,
+          quarantined: true,
+        };
+      }
+      return { kind: "absent" };
+    }
+    if (inspected.taskLabel !== NO_LABEL && inspected.taskLabel !== taskId) {
+      return { kind: "conflict", reason: "labels" };
+    }
+    return {
+      kind: "legacy",
+      taskId,
+      name: canonical,
+      containerId: inspected.id,
+      running: inspected.running,
+      instanceLabel: inspected.instanceLabel,
+      taskLabel: inspected.taskLabel,
+      quarantined: false,
+    };
+  }
+
+  /**
+   * MIGRATION PATH (clearly marked): adopt a legacy canonical-name container.
+   * The container is renamed (by immutable id) to a generation-scoped
+   * provisional name and published as a FRESH epoch/generation mapping
+   * (marked `legacyAdopted`) BEFORE any normal operation uses it.
+   */
+  private async adoptLegacy(
+    taskId: string,
+    legacy: Extract<ResolvedTask, { kind: "legacy" }>,
+    fence: HeldFence,
+  ): Promise<Extract<ResolvedTask, { kind: "bound" }>> {
+    const generation = randomUUID();
+    const provisional = this.provisionalName(taskId, generation);
+    const renamed = await this.fencedDocker(
+      fence,
+      ["rename", legacy.containerId, provisional],
+      this.opTimeout(30_000),
+      20_000,
+    );
+    if (
+      renamed.timedOut ||
+      (renamed.code !== 0 && !/no such container/i.test(renamed.stderr))
+    ) {
+      throw new Error(WORKSPACE_UNDETERMINED);
+    }
+    // Re-verify by immutable id that the rename landed (observed provisional
+    // name) before publishing.
+    const inspected = await this.inspectContainer(legacy.containerId, fence);
+    if (inspected.kind !== "exists" || inspected.name !== provisional) {
+      throw new Error(WORKSPACE_UNDETERMINED);
+    }
+    const published = await this.publishMapping(
+      taskId,
+      fence,
+      fence.epoch,
+      generation,
+      provisional,
+      legacy.containerId,
+      { legacyAdopted: true },
+    );
+    if (!published) throw new Error(WORKSPACE_UNDETERMINED);
+    const leased = await this.writeLease(
+      taskId,
+      fence,
+      fence.epoch,
+      generation,
+      provisional,
+      legacy.containerId,
+    );
+    if (!leased) throw new Error(WORKSPACE_UNDETERMINED);
+    await this.removeLegacyFiles(taskId);
+    return {
+      kind: "bound",
+      taskId,
+      epoch: fence.epoch,
+      generation,
+      instanceId: this.instanceId,
+      name: provisional,
+      containerId: legacy.containerId,
+      running: legacy.running,
+      legacyAdopted: true,
+    };
+  }
+
+  /**
+   * Read the LEGACY lease file (`<taskId>.lease`, old protocol schema). Used
+   * only during legacy discovery/adoption. Absent/corrupt/unreadable are
+   * discriminated; a corrupt or unreadable claim fails closed.
+   */
+  private async readLegacyLease(taskId: string): Promise<
     | { kind: "absent" }
     | { kind: "unreadable" }
     | { kind: "corrupt" }
@@ -2887,13 +2848,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       }
   > {
     if (!this.leaseDir) return { kind: "absent" };
+    const file = path.join(this.leaseDir, `${taskId}.lease`);
     let raw: string;
     try {
       raw = await this.fs.readFile(file, "utf8");
     } catch (error) {
-      // ENOENT is the ONLY "no lease" signal. Every other failure
-      // (EACCES, EIO, ENOTDIR, a failed mount, ...) means the lease
-      // state is unknown — fail closed, do not infer owner absence.
       if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
         return { kind: "absent" };
       }
@@ -2905,17 +2864,12 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     } catch {
       return { kind: "corrupt" };
     }
-    // A non-object payload (null, a number, a string, an array) is a
-    // torn/garbage lease — corrupt, never an exception (the callers'
-    // discriminated contract must hold).
     if (parsed === null || typeof parsed !== "object") {
       return { kind: "corrupt" };
     }
     const candidate = parsed as {
       instanceId?: unknown;
       updatedAt?: unknown;
-      containerName?: unknown;
-      taskId?: unknown;
       generation?: unknown;
     };
     if (
@@ -2928,32 +2882,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     const ts = candidate.updatedAt;
     if (
       !Number.isFinite(ts) ||
-      ts < 0 ||
-      // Sane range: not before the year 2000 and not more than a small
-      // future skew ahead of this host's clock (a far-future timestamp
-      // would read as permanently fresh).
       ts < 946_684_800_000 ||
       ts > Date.now() + LEASE_FUTURE_SKEW_MS
     ) {
       return { kind: "corrupt" };
     }
-    // Identity: the lease must describe the container the decision is
-    // about (a stray/relocated file claiming a different container is
-    // not a liveness signal for this one).
-    if (
-      typeof candidate.containerName !== "string" ||
-      (expectedContainerName !== undefined &&
-        candidate.containerName !== expectedContainerName)
-    ) {
-      return { kind: "corrupt" };
-    }
-    if (candidate.taskId !== undefined && candidate.taskId !== taskId) {
-      return { kind: "corrupt" };
-    }
-    // generation: absent/non-string leases were written by an older
-    // build — they are still valid liveness; treat the missing token as
-    // a sentinel (a teardown that cannot prove its generation also
-    // cannot delete the lease, which is the fail-closed direction).
     const generation =
       typeof candidate.generation === "string" ? candidate.generation : "";
     return {
@@ -2965,50 +2898,80 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   }
 
   /**
-   * Read this task's lease (see readLeaseFile for the discriminated
-   * result and the validation rules). A lease that is unreadable or
-   * corrupt is NEVER treated as "owner dead" — only "cannot prove
-   * liveness" (the strict side).
+   * Read the versioned lease state for a task. Records are scanned as
+   * first-class state; the current lease is the freshest record matching the
+   * exact epoch/generation/container-id (when `current` is supplied).
+   * Malformed/unreadable records and unknown recovery artifacts fail closed
+   * (returned as `unreadable`).
    */
   private async readLease(
     taskId: string,
-    expectedContainerName?: string,
-  ): Promise<
-    | { kind: "absent" }
-    | { kind: "unreadable" }
-    | { kind: "corrupt" }
-    | {
-        kind: "valid";
-        instanceId: string;
-        updatedAt: number;
-        generation: string;
-      }
-  > {
-    return this.readLeaseFile(
-      this.leasePath(taskId),
-      taskId,
-      expectedContainerName,
-    );
+    current?: { epoch: number; generation: string; containerId: string },
+  ): Promise<LeaseState> {
+    if (!this.leaseDir) return { kind: "absent" };
+    let records: LeaseRecord[];
+    try {
+      records = await this.scanRecords(
+        this.leasesDirPath(taskId),
+        (entry, raw) => {
+          const r = parseLeaseRecord(raw);
+          return r !== null && r.taskId === taskId ? r : null;
+        },
+      );
+    } catch {
+      return { kind: "unreadable" };
+    }
+    if (records.length === 0) return { kind: "absent" };
+    if (current) {
+      const matching = records.filter(
+        (r) =>
+          r.epoch === current.epoch &&
+          r.generation === current.generation &&
+          r.containerId === current.containerId,
+      );
+      if (matching.length === 0) return { kind: "absent" };
+      let freshest = matching[0]!;
+      for (const r of matching)
+        if (r.updatedAt > freshest.updatedAt) freshest = r;
+      return {
+        kind: "valid",
+        instanceId: freshest.instanceId,
+        updatedAt: freshest.updatedAt,
+        epoch: freshest.epoch,
+        generation: freshest.generation,
+        containerId: freshest.containerId,
+        provisionalName: freshest.provisionalName,
+        legacy: false,
+      };
+    }
+    let highest = records[0]!;
+    for (const r of records) if (r.epoch > highest.epoch) highest = r;
+    return {
+      kind: "valid",
+      instanceId: highest.instanceId,
+      updatedAt: highest.updatedAt,
+      epoch: highest.epoch,
+      generation: highest.generation,
+      containerId: highest.containerId,
+      provisionalName: highest.provisionalName,
+      legacy: false,
+    };
   }
 
   /**
-   * Lease write (a liveness claim for this task, held by THIS instance
-   * and the current container GENERATION). Atomic publication: a UNIQUE
-   * temp file name (two concurrent writers never share it) is written
-   * then renamed over the lease path, so a crashed writer leaves either
-   * the previous lease or the new one, never a torn file (a torn file
-   * reads as "corrupt" = strict, never "dead"). The fence token is
-   * re-verified before the write: a holder that lost its fence must not
-   * stamp liveness onto a task a replacement holder may already own.
-   * Returns false when the lease could not be made durable — callers
-   * fail closed when they hold an active fence (another instance's
-   * reaper must not age-reap a live container whose claim vanished).
+   * Publish a versioned lease record. The authoritative mapping is resolved
+   * first and an EXACT epoch/generation/container-id/provisional-name match
+   * is required, so a stale lower-epoch lease can never replace or supersede
+   * a higher-epoch lease (records are never overwritten). Returns false when
+   * the claim could not be made durable.
    */
   private async writeLease(
     taskId: string,
-    containerName: string,
-    fence?: HeldFence,
-    generation: string = "",
+    fence: HeldFence | undefined,
+    epoch: number,
+    generation: string,
+    provisionalName: string,
+    containerId: string,
   ): Promise<boolean> {
     if (!this.leaseDir) return false;
     const releaseAfter = !fence;
@@ -3018,260 +2981,437 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     try {
       if (!held || !held.active) return false;
       if (!(await this.checkFenceLive(held))) return false;
-      const payload = JSON.stringify({
-        instanceId: this.instanceId,
-        updatedAt: Date.now(),
-        containerName,
-        taskId,
-        generation,
-      });
-      await this.fs.mkdir(this.leaseDir, { recursive: true });
-      // Unique temporary name per write: instance + pid + random suffix.
-      const tmp = path.join(
-        this.leaseDir,
-        `.${taskId}.lease.${this.instanceId.slice(0, 8)}.${process.pid}.${randomUUID()}.tmp`,
-      );
-      await this.fs.writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
-      await this.fs.rename(tmp, this.leasePath(taskId));
-      // READBACK: the rename reporting success is not proof the claim
-      // landed durably (it could have fallen on a dead mount). Only a
-      // lease we can read back fresh, naming us, counts. A readback
-      // failure is an unreadable-lease state, which every reaper path
-      // treats as skip (fail closed).
-      const back = await this.readLease(taskId, containerName);
+      // Resolve the authoritative mapping and require an exact match.
+      const mapping = await this.readAuthoritativeMapping(taskId);
+      if (mapping.kind !== "mapping") return false;
+      const m = mapping.record;
       if (
-        back.kind === "valid" &&
-        back.instanceId === this.instanceId &&
-        back.generation === generation
+        m.epoch !== epoch ||
+        m.generation !== generation ||
+        m.containerId !== containerId ||
+        m.provisionalName !== provisionalName
       ) {
-        return true;
+        return false;
       }
-      return false;
-    } catch {
-      return false;
-    } finally {
-      if (releaseAfter && held) await held.release();
-    }
-  }
-
-  /**
-   * GENERATION-AWARE lease deletion with an atomic capture-verify step.
-   * The lease is removed only when, under an ACTIVE fence that this
-   * holder has not lost:
-   * - the file is capturable by an atomic rename to a unique graveyard
-   *   path (so the deletion decision and the capture cannot interleave
-   *   with a writer: the captured file is exactly what was on disk),
-   * - the CAPTURED file parses as a lease naming THIS instance, the
-   *   expected container, and (when the caller knows it) the expected
-   *   GENERATION — the generation of the container the caller removed.
-   *   If the captured file does NOT match (the lease changed between
-   *   the caller's read and this capture — the race the review
-   *   requires a test for), the captured file is RESTORED to the lease
-   *   path (when it is free) and nothing is deleted: a replacement
-   *   owner's lease survives a stale teardown by construction.
-   *
-   * Outcomes:
-   * - "deleted": the matching lease was captured and unlinked;
-   * - "absent": there was nothing to delete;
-   * - "corrupt-left": the lease is unreadable/corrupt garbage and is
-   *   left in place (never unlinked: it cannot be proven to be ours,
-   *   and it can never act as a live claim);
-   * - "valid-left": a VALID lease was left in place — it did not match
-   *   (a fresh replacement claim, a generation mismatch, or the
-   *   capture/restore could not be proven). Callers that must not
-   *   report success over an ambiguous liveness state (destroy) fail
-   *   closed on this.
-   *
-   * The call REFUSES to act when the supplied fence is inactive or
-   * degraded, and when no fence is supplied it acquires one itself —
-   * refusing on any inactive outcome: an unfenced deletion cannot be
-   * serialized against writers and might unlink a replacement's claim.
-   */
-  private async deleteLease(
-    taskId: string,
-    expectedContainerName?: string,
-    fence?: HeldFence,
-    expectedGeneration?: string,
-  ): Promise<"deleted" | "absent" | "corrupt-left" | "valid-left"> {
-    if (!this.leaseDir) return "absent";
-    // Refuse when the supplied fence is inactive/degraded (or lost).
-    if (fence && !(await this.checkFenceLive(fence))) return "valid-left";
-    const releaseAfter = !fence;
-    const held: HeldFence | null = fence
-      ? fence
-      : await this.acquireTaskFence(taskId, "reaper");
-    try {
-      if (!held || !held.active) return "valid-left";
-      if (!(await this.checkFenceLive(held))) return "valid-left";
-      const leasePath = this.leasePath(taskId);
-      // ATOMIC CAPTURE: rename the lease path away. The graveyard is a
-      // sibling temp file; the lease path is empty the instant the
-      // rename lands, and the captured file is exactly the bytes that
-      // were there.
-      const graveyard = path.join(
-        this.leaseDir,
-        `.${taskId}.lease.captured.${randomUUID()}.tmp`,
-      );
-      try {
-        await this.fs.rename(leasePath, graveyard);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-          return "absent";
-        }
-        // The capture failed for an unknown reason (EACCES, EIO, ...):
-        // the lease's fate is unknown — leave everything in place and
-        // report it (the strict direction: a valid lease that we could
-        // not prove deleted).
-        return "valid-left";
-      }
-      const captured = await this.readLeaseFile(
-        graveyard,
-        taskId,
-        expectedContainerName,
-      );
-      const matches =
-        captured.kind === "valid" &&
-        captured.instanceId === this.instanceId &&
-        (expectedGeneration === undefined ||
-          expectedGeneration === "" ||
-          captured.generation === expectedGeneration);
-      if (!matches) {
-        // The lease CHANGED between the caller's read and the capture
-        // (or never matched): restore the captured file unless a newer
-        // lease already appeared at the path (in which case the newer
-        // one stays and the captured one dies in the graveyard — the
-        // path never ends up empty while a live claim exists).
-        try {
-          await this.fs.rename(graveyard, leasePath);
-        } catch {
-          await this.fs.rm(graveyard, { force: true });
-        }
-        return captured.kind === "valid" ? "valid-left" : "corrupt-left";
-      }
-      // A matching (or garbage-but-ours-unprovable) capture: unlink it.
-      // Corrupt/unreadable captures were already filtered by `matches`
-      // into the restore branch — only a validated matching lease (or a
-      // corrupt one naming nobody, which readLeaseFile reported as
-      // corrupt and `matches` rejected) reaches here, so the unlink
-      // never destroys an unverified claim.
-      await this.fs.rm(graveyard, { force: true });
-      return "deleted";
-    } catch {
-      // Unknown failure mid-deletion: report the strict outcome (the
-      // lease may or may not still exist).
-      return "valid-left";
-    } finally {
-      if (releaseAfter && held) await held.release();
-    }
-  }
-
-  /**
-   * Best-effort write of the durable, host-side quarantine marker.
-   * Atomic (unique temp + rename), mode 0600. Survives restarts of this
-   * provider and is visible to every instance sharing the lease dir.
-   */
-  private async writeQuarantineMarker(taskId: string): Promise<boolean> {
-    if (!this.leaseDir) return false;
-    try {
-      await this.fs.mkdir(this.leaseDir, { recursive: true });
+      const dir = this.leasesDirPath(taskId);
+      await this.fs.mkdir(dir, { recursive: true, mode: 0o700 });
+      const recordId = randomUUID();
+      const tmp = path.join(dir, `${recordId}.json.tmp`);
+      const final = path.join(dir, `${recordId}.json`);
       const payload = JSON.stringify({
+        schemaVersion: 1,
         taskId,
+        epoch,
+        generation,
         instanceId: this.instanceId,
+        provisionalName,
+        containerId,
+        updatedAt: Date.now(),
+      });
+      await this.fs.writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
+      // Re-verify the fence IMMEDIATELY BEFORE publication.
+      if (!(await this.checkFenceLive(held))) {
+        await this.fs.rm(tmp, { force: true }).catch(() => {});
+        return false;
+      }
+      try {
+        await this.fs.link(tmp, final);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") {
+          await this.fs.rm(tmp, { force: true }).catch(() => {});
+          return false;
+        }
+      } finally {
+        await this.fs.rm(tmp, { force: true }).catch(() => {});
+      }
+      // Readback with a live fence.
+      if (!(await this.checkFenceLive(held))) return false;
+      const back = await this.readLease(taskId, {
+        epoch,
+        generation,
+        containerId,
+      });
+      return (
+        back.kind === "valid" &&
+        !back.legacy &&
+        back.instanceId === this.instanceId &&
+        back.epoch === epoch &&
+        back.generation === generation &&
+        back.containerId === containerId
+      );
+    } catch {
+      return false;
+    } finally {
+      if (releaseAfter && held) await held.release();
+    }
+  }
+
+  /**
+   * Retire records proven to belong to a superseded generation. Records are
+   * immutable and non-overwriting, so the capture-verify step guards the
+   * race between the read decision and the unlink; a capture that can no
+   * longer be proven eligible is restored exclusively, and a restoration
+   * failure (EIO/EPERM/ENOSPC) RETAINS the capture as recoverable, first-
+   * class state that readers scan and a superseding cleanup retires.
+   */
+  private async retireMatchingRecords<
+    T extends {
+      epoch: number;
+      taskId: string;
+      generation: string;
+      containerId: string;
+      instanceId: string;
+    },
+  >(
+    dir: string,
+    parse: (raw: string) => T | null,
+    taskId: string,
+    eligible: (rec: T) => boolean,
+  ): Promise<boolean> {
+    let entries: string[];
+    try {
+      entries = await this.fs.readdir(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+      return false;
+    }
+    let any = false;
+    for (const entry of entries) {
+      const isCapture = /\.captured\.[^.]+\.tmp$/.test(entry);
+      if (isCapture) {
+        // A retained capture: retire it directly if its content is
+        // superseded (it is already off the canonical path).
+        let raw: string;
+        try {
+          raw = await this.fs.readFile(path.join(dir, entry), "utf8");
+        } catch {
+          continue;
+        }
+        const rec = parse(raw);
+        if (rec !== null && rec.taskId === taskId && eligible(rec)) {
+          await this.fs
+            .rm(path.join(dir, entry), { force: true })
+            .catch(() => {});
+          any = true;
+        }
+        continue;
+      }
+      if (!entry.endsWith(".json")) continue;
+      const target = path.join(dir, entry);
+      let raw: string;
+      try {
+        raw = await this.fs.readFile(target, "utf8");
+      } catch {
+        continue;
+      }
+      const rec = parse(raw);
+      if (rec === null || rec.taskId !== taskId) continue;
+      if (!eligible(rec)) continue;
+      const graveyard = path.join(dir, `${entry}.captured.${randomUUID()}.tmp`);
+      try {
+        await this.fs.rename(target, graveyard);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+        continue;
+      }
+      let capturedRaw: string;
+      try {
+        capturedRaw = await this.fs.readFile(graveyard, "utf8");
+      } catch {
+        capturedRaw = "";
+      }
+      const captured = parse(capturedRaw);
+      const stillEligible =
+        captured !== null &&
+        captured.taskId === taskId &&
+        captured.epoch === rec.epoch &&
+        captured.generation === rec.generation &&
+        captured.containerId === rec.containerId &&
+        captured.instanceId === rec.instanceId &&
+        eligible(captured);
+      if (stillEligible) {
+        await this.fs.rm(graveyard, { force: true }).catch(() => {});
+        any = true;
+        continue;
+      }
+      // The captured record no longer qualifies: restore it exclusively.
+      let restored = false;
+      try {
+        await this.fs.link(graveyard, target);
+        restored = true;
+      } catch (error) {
+        restored = (error as NodeJS.ErrnoException)?.code === "EEXIST";
+      }
+      if (restored) {
+        await this.fs.rm(graveyard, { force: true }).catch(() => {});
+      }
+      // else: the capture is RETAINED (recoverable; readers fail closed on
+      // unknown artifacts but scan retained captures as records).
+    }
+    return any;
+  }
+
+  /**
+   * Retire all task records proven to belong to a superseded (or destroyed)
+   * generation. When `resolved` is undefined, everything for the task is
+   * retired (an absent task). Never removes a record with an epoch greater
+   * than the resolved generation's.
+   */
+  private async retireTaskRecords(
+    taskId: string,
+    fence: HeldFence | undefined,
+    resolved?: { epoch: number; generation: string; containerId: string },
+  ): Promise<void> {
+    if (fence && !(await this.checkFenceLive(fence))) return;
+    const upTo = resolved?.epoch;
+    await this.retireMatchingRecords(
+      this.mappingDirPath(taskId),
+      parseMappingRecord,
+      taskId,
+      (rec) => upTo === undefined || rec.epoch <= upTo,
+    );
+    await this.retireMatchingRecords(
+      this.leasesDirPath(taskId),
+      parseLeaseRecord,
+      taskId,
+      (rec) =>
+        upTo === undefined ||
+        rec.epoch < upTo ||
+        (resolved !== undefined &&
+          rec.epoch === upTo &&
+          rec.generation === resolved.generation &&
+          rec.containerId === resolved.containerId),
+    );
+    await this.retireMatchingRecords(
+      this.quarantineDirPath(taskId),
+      parseQuarantineRecord,
+      taskId,
+      (rec) => upTo === undefined || rec.epoch <= upTo,
+    );
+  }
+
+  /** Remove the legacy lease + legacy quarantine marker files (migration). */
+  private async removeLegacyFiles(taskId: string): Promise<void> {
+    if (!this.leaseDir) return;
+    await this.fs
+      .rm(path.join(this.leaseDir, `${taskId}.lease`), { force: true })
+      .catch(() => {});
+    await this.fs
+      .rm(path.join(this.leaseDir, `${taskId}.quarantined`), { force: true })
+      .catch(() => {});
+  }
+
+  /**
+   * Read the durable quarantine state: versioned quarantine records (highest
+   * epoch) plus the legacy `<taskId>.quarantined` marker (migration). Unknown
+   * or malformed state fails closed.
+   */
+  private async readQuarantine(taskId: string): Promise<QuarantineState> {
+    if (!this.leaseDir) return { kind: "absent" };
+    let records: QuarantineRecord[];
+    try {
+      records = await this.scanRecords(
+        this.quarantineDirPath(taskId),
+        (entry, raw) => {
+          const q = parseQuarantineRecord(raw);
+          return q !== null && q.taskId === taskId ? q : null;
+        },
+      );
+    } catch {
+      return { kind: "unknown" };
+    }
+    if (records.length > 0) {
+      let max = records[0]!;
+      for (const r of records) if (r.epoch > max.epoch) max = r;
+      const top = records.filter((r) => r.epoch === max.epoch);
+      if (top.length !== 1) return { kind: "unknown" };
+      return {
+        kind: "quarantined",
+        epoch: max.epoch,
+        generation: max.generation,
+        containerId: max.containerId,
+        legacy: false,
+      };
+    }
+    const markerPath = path.join(this.leaseDir, `${taskId}.quarantined`);
+    try {
+      await this.fs.readFile(markerPath, "utf8");
+      return {
+        kind: "quarantined",
+        epoch: 0,
+        generation: "",
+        containerId: "",
+        legacy: true,
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        return { kind: "unknown" };
+      }
+    }
+    return { kind: "absent" };
+  }
+
+  /**
+   * Does a quarantine marker block the CURRENT generation? A marker for a
+   * strictly LOWER epoch is superseded and never blocks; a marker for the
+   * same or a higher epoch (or, with no mapping, any marker) blocks
+   * (fail closed). A legacy marker (epoch 0) blocks only when there is no
+   * mapping yet (migration).
+   */
+  private quarantineBlocksTask(
+    current:
+      { epoch: number; generation: string; containerId: string } | undefined,
+    q: QuarantineState,
+  ): boolean {
+    if (q.kind === "absent") return false;
+    if (q.kind === "unknown") return true;
+    if (q.legacy) return current === undefined;
+    if (current === undefined) return true;
+    return q.epoch >= current.epoch;
+  }
+
+  /**
+   * Publish a non-overwriting, epoch-aware quarantine record. A stale
+   * lower-epoch publication is refused when a higher-epoch marker exists.
+   */
+  private async writeQuarantineRecord(
+    taskId: string,
+    fence: HeldFence | undefined,
+    epoch: number,
+    generation: string,
+    containerId: string,
+  ): Promise<boolean> {
+    if (!this.leaseDir || !fence || !(await this.checkFenceLive(fence))) {
+      return false;
+    }
+    try {
+      const dir = this.quarantineDirPath(taskId);
+      await this.fs.mkdir(dir, { recursive: true, mode: 0o700 });
+      const existing = await this.readQuarantine(taskId);
+      if (existing.kind === "unknown") return false;
+      if (
+        existing.kind === "quarantined" &&
+        !existing.legacy &&
+        existing.epoch > epoch
+      ) {
+        return false;
+      }
+      const recordId = randomUUID();
+      const tmp = path.join(dir, `${recordId}.json.tmp`);
+      const final = path.join(dir, `${recordId}.json`);
+      const payload = JSON.stringify({
+        schemaVersion: 1,
+        taskId,
+        epoch,
+        generation,
+        instanceId: this.instanceId,
+        containerId,
         quarantinedAt: Date.now(),
       });
-      const tmp = path.join(
-        this.leaseDir,
-        `.${taskId}.quarantined.${randomUUID()}.tmp`,
-      );
       await this.fs.writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
-      await this.fs.rename(tmp, this.quarantineMarkerPath(taskId));
-      // READBACK: success of rename is not proof on a failed mount.
-      // Only a marker we can read back counts.
-      const verify = await this.readQuarantineMarker(taskId);
-      return verify === "quarantined" || verify === "unreadable";
+      if (!(await this.checkFenceLive(fence))) {
+        await this.fs.rm(tmp, { force: true }).catch(() => {});
+        return false;
+      }
+      try {
+        await this.fs.link(tmp, final);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") {
+          await this.fs.rm(tmp, { force: true }).catch(() => {});
+          return false;
+        }
+      } finally {
+        await this.fs.rm(tmp, { force: true }).catch(() => {});
+      }
+      if (!(await this.checkFenceLive(fence))) return false;
+      const back = await this.readQuarantine(taskId);
+      return (
+        back.kind === "quarantined" &&
+        !back.legacy &&
+        back.epoch === epoch &&
+        back.generation === generation &&
+        back.containerId === containerId
+      );
     } catch {
       return false;
     }
   }
 
-  /** Best-effort removal of the durable quarantine marker. */
-  private async deleteQuarantineMarker(taskId: string): Promise<void> {
-    if (!this.leaseDir) return;
-    try {
-      await this.fs.rm(this.quarantineMarkerPath(taskId), { force: true });
-    } catch {
-      // best-effort
-    }
-  }
-
-  /**
-   * Read the durable quarantine marker. "quarantined" = a present marker
-   * (unreadable content also blocks open — fail closed); "absent" =
-   * ENOENT or no lease dir; "unreadable" = a directory/permission error
-   * on the path itself (also fail closed for callers).
-   */
-  private async readQuarantineMarker(
+  /** Retire quarantine records for a superseded/destroyed generation. */
+  private async retireQuarantineRecords(
     taskId: string,
-  ): Promise<"quarantined" | "absent" | "unreadable"> {
-    if (!this.leaseDir) return "absent";
-    try {
-      await this.fs.readFile(this.quarantineMarkerPath(taskId), "utf8");
-      return "quarantined";
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException)?.code;
-      if (code === "ENOENT") return "absent";
-      if (code === "EACCES" || code === "EISDIR") return "quarantined";
-      return "unreadable";
-    }
+    fence: HeldFence | undefined,
+    epoch: number,
+    generation: string,
+    containerId: string,
+  ): Promise<void> {
+    if (fence && !(await this.checkFenceLive(fence))) return;
+    await this.retireMatchingRecords(
+      this.quarantineDirPath(taskId),
+      parseQuarantineRecord,
+      taskId,
+      (rec) =>
+        rec.epoch < epoch ||
+        (rec.epoch === epoch &&
+          rec.generation === generation &&
+          rec.containerId === containerId),
+    );
   }
 
   /**
-   * Acquire the CROSS-INSTANCE per-task fence: an exclusive lock
-   * DIRECTORY under the (host-shared) lease directory, taken atomically
-   * with `mkdir` (POSIX: mkdir succeeds for exactly one process; EEXIST
-   * means a peer holds it). Every public provider operation holds it
-   * for the operation's whole duration and the TTL reaper only removes
-   * a container while holding it, so the ownership decision and the
-   * destructive rm it gates can never interleave across provider
-   * instances (or across two processes configured with the same stable
-   * identity).
+   * Allocate a durable, monotonically increasing fencing epoch. The
+   * allocation is a non-overwriting `writeFile(..., { flag: "wx" })` of a
+   * `<epoch>` claim file into `<leaseDir>/epochs/<taskId>/`, so concurrent
+   * (or crashed) allocators can never reuse an epoch: the next epoch is
+   * always `max(existing) + 1`. Malformed, conflicting, or unreadable epoch
+   * state throws (fail closed).
+   */
+  private async allocateEpoch(taskId: string): Promise<number> {
+    const dir = this.epochDirPath(taskId);
+    await this.fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    let entries: string[];
+    try {
+      entries = await this.fs.readdir(dir);
+    } catch {
+      throw new Error("epoch-unreadable");
+    }
+    let max = 0;
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) throw new Error("epoch-malformed");
+      const n = Number(entry);
+      if (!Number.isSafeInteger(n) || n <= 0)
+        throw new Error("epoch-malformed");
+      if (n > max) max = n;
+    }
+    for (;;) {
+      const candidate = max + 1;
+      const file = path.join(dir, String(candidate));
+      try {
+        await this.fs.writeFile(
+          file,
+          JSON.stringify({ epoch: candidate, allocatedAt: Date.now() }),
+          { encoding: "utf8", mode: 0o600, flag: "wx" },
+        );
+        return candidate;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "EEXIST") {
+          max = candidate;
+          continue;
+        }
+        throw new Error("epoch-unavailable");
+      }
+    }
+  }
+  /**
+   * Acquire the CROSS-INSTANCE per-task fence (an mkdir-based lock directory
+   * under `<leaseDir>/.locks`) and, on success, allocate the DURABLE,
+   * MONOTONIC fencing epoch bound to this acquisition (see allocateEpoch).
+   * The token-based hold/renew/stale-break protocol is unchanged (see the
+   * class documentation); the epoch is the ordering key layered on top of it.
    *
-   * PROTOCOL (token-based; see HeldFence, renewFence, breakStaleFence):
-   * - ACQUIRE: mkdir the lock dir, then write a UUID token file inside.
-   *   The token file's path is holder-private: only its holder ever
-   *   creates or touches it, and nobody can re-create it after it is
-   *   removed.
-   * - HOLD/RENEW: the holder `utimes` its OWN TOKEN (never the shared
-   *   lock directory) every heartbeatMs (max(25 ms, TTL/3), always
-   *   below the TTL — validated at construction).
-   * - STALE-BREAK: a breaker may only take a token whose mtime is older
-   *   than the TTL, and only through an ATOMIC CAPTURE (rename to a
-   *   graveyard sibling) plus a VERIFICATION of the captured file: a
-   *   token that was renewed before the capture is RESTORED and the
-   *   break declines. A live holder therefore cannot be broken out of
-   *   its lock, and a broken holder's next renewal fails with ENOENT —
-   *   the fence is marked lost and every subsequent fenced Docker call
-   *   fails closed. There is no interleaving where the holder renews
-   *   successfully AND the breaker takes over.
-   * - RELEASE: remove our own token, then rmdir the lock dir only when
-   *   it is empty (a replacement acquirer's token makes the rmdir fail
-   *   harmlessly). The heartbeat only ever touched our own token path,
-   *   so release cannot race it into shared state.
-   * - EVENT-LOOP PAUSES / DELAYED FS: a holder frozen past the TTL is
-   *   legitimately breakable (that is the TTL's purpose); on resume,
-   *   the first thing any of its fenced Docker calls does is re-verify
-   *   the token (assertFenceLive), which fails — the operation aborts
-   *   rather than touching a container a replacement may hold.
-   *
-   * Returns a HeldFence that is active ONLY when the lock was actually
-   * acquired. Every inactive outcome fails closed for owner operations
-   * and skips for the reaper; `inactiveReason` distinguishes (for the
-   * error surface) a live peer (contention), a provably fleet-wide
-   * unusable lock namespace (unavailable: EROFS/ENOSPC/ENOTDIR on the
-   * mkdir itself), and a local/transient failure (unknown: EACCES,
-   * EIO, ENOENT, ESTALE, ... — this instance cannot know whether peers
-   * can still fence, so it must never proceed as if the failure were
-   * shared).
+   * Returns a HeldFence that is active ONLY when the lock was acquired AND
+   * an epoch was durably allocated. Every inactive outcome fails closed for
+   * owner operations and skips for the reaper.
    */
   private async acquireTaskFence(
     taskId: string,
@@ -3287,37 +3427,27 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       new Promise((resolve) => {
         setTimeout(resolve, ms);
       });
-    // True once any attempt has SEEN the lock directory exist (held by a
-    // peer): it distinguishes a PEER that kept the lock for the whole
-    // wait (alive and fencing — fail closed as contention) from a
-    // coordination directory that never worked at all.
     let sawContendedLock = false;
     let degradedRetries = 1;
     for (;;) {
       try {
-        // Atomic claim: mkdir on the lock path succeeds for exactly one
-        // process on one host (the parent .locks directory is created
-        // first, recursively and idempotently).
         await this.fs.mkdir(path.join(this.leaseDir, ".locks"), {
           recursive: true,
           mode: 0o700,
         });
         await this.fs.mkdir(lockDir, { mode: 0o700 });
-        // We own it: write our token file. The token is the ONLY
-        // ownership record — a holder-private path (its UUID name is
-        // known to nobody else) that this holder renews with utimes and
-        // that no peer can ever re-create, so "my token file exists" is
-        // the liveness proof and its disappearance is the loss proof.
         await this.fs.writeFile(tokenFile, `${token}\n`, { mode: 0o600 });
-        // RENEWAL HEARTBEAT: the holder keeps its OWN TOKEN's mtime
-        // fresh (utimes on the holder-private path — never on the lock
-        // directory, which is shared state a stale holder must not
-        // touch). A stale-breaker judges staleness by the TOKEN's mtime,
-        // and its capture-verify protocol (breakStaleFence) can never
-        // remove a token that was renewed before the capture — so a
-        // live holder cannot be broken out of its lock, and a holder
-        // that WAS broken fails its next renewal with ENOENT and marks
-        // the fence lost (the whole operation then fails closed).
+        // Durable monotonic epoch, allocated while we hold the lock. A
+        // failure here releases the fence and fails closed: the epoch is the
+        // ordering key for everything downstream, so it must be durable.
+        let epoch: number;
+        try {
+          epoch = await this.allocateEpoch(taskId);
+        } catch {
+          await this.fs.rm(tokenFile, { force: true }).catch(() => {});
+          await this.fs.rmdir(lockDir).catch(() => {});
+          return this.inactiveFence(taskId, lockDir, token, "unknown");
+        }
         const heartbeat = setInterval(() => {
           void this.renewFence(fence);
         }, this.fenceHeartbeatMs);
@@ -3325,6 +3455,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         const fence: HeldFence = {
           taskId,
           token,
+          epoch,
           active: true,
           lockDir,
           tokenFile,
@@ -3340,28 +3471,16 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         const code = (error as NodeJS.ErrnoException)?.code;
         if (code === "EEXIST") {
           sawContendedLock = true;
-          // Held by a peer (or a crashed one). breakStaleFence recovers
-          // BOTH stale shapes and PROVES it did not take a live
-          // holder's token (see its protocol); when it declines, the
-          // lock is live and we simply wait.
           const broke = await this.breakStaleFence(lockDir);
           if (broke) {
             await sleepMs(30);
-            continue; // retry the mkdir immediately
+            continue;
           }
         } else if (
           code === "EROFS" ||
           code === "ENOSPC" ||
           code === "ENOTDIR"
         ) {
-          // The lock NAMESPACE itself cannot take entries: a read-only
-          // mount, a full filesystem, or a non-directory where the lock
-          // dir must live. No process on this host can create a lock
-          // here, so this is the one COORDINATION-DIRECTORY-UNAVAILABLE
-          // condition that is genuinely fleet-wide. Retry ONCE after a
-          // short wait (ENOSPC can clear); then report unavailable —
-          // which FAILS CLOSED exactly like every other inactive
-          // outcome (it is only distinguished for the error surface).
           if (degradedRetries <= 0 || Date.now() >= deadline) {
             return this.inactiveFence(taskId, lockDir, token, "unavailable");
           }
@@ -3369,14 +3488,6 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
           await sleepMs(100);
           continue;
         }
-        // ANY OTHER filesystem error — EACCES (this process may simply
-        // lack write permission while peers do NOT), EIO, ENOENT,
-        // ESTALE, a vanished parent, ... — is a LOCAL or TRANSIENT
-        // failure. It must NEVER be read as "the coordination directory
-        // is degraded for the whole fleet, proceed": one provider
-        // proceeding while another can still acquire the fence is
-        // exactly the two-holders hazard. Wait out the deadline and
-        // fail closed with the unknown reason.
         if (Date.now() >= deadline) {
           return this.inactiveFence(
             taskId,
@@ -3399,6 +3510,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     return {
       taskId,
       token,
+      epoch: 0,
       active: false,
       inactiveReason,
       lockDir,
@@ -3407,28 +3519,6 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       release: async () => {},
     };
   }
-
-  /**
-   * Fence renewal heartbeat: bump OUR OWN token file's mtime so no peer
-   * judges it stale. This is a single operation on a holder-private path
-   * — never on the shared lock directory — so:
-   * - a holder that was stale-broken (its token was captured and
-   *   removed) fails with ENOENT and stops renewing: the fence is
-   *   marked LOST and the whole fenced operation fails closed;
-   * - a renewal that raced the breaker's capture either landed BEFORE
-   *   the capture (the breaker's verification then sees a fresh token,
-   *   RESTORES it, and declines to break — we still own the fence) or
-   *   fails with ENOENT (we correctly detect the loss). There is no
-   *   interleaving in which the holder renews successfully AND the
-   *   breaker takes over;
-   * - the delayed/event-loop-paused case is covered by the same token
-   *   check: a utimes that lands after a completed break can only hit a
-   *   path that no longer exists.
-   * A FAILED renewal (any error — token gone, or the filesystem
-   * unavailable) makes the fence unusable for the rest of the
-   * operation: `lost` is sticky and every later fenced Docker call
-   * fails closed.
-   */
   private async renewFence(fence: HeldFence): Promise<void> {
     if (!fence.active || fence.lost) return;
     try {
@@ -3782,43 +3872,29 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
 
   /**
    * Stage the validation reaper script onto the root-owned `/reap` tmpfs.
-   * Every step is a fixed-argv operation (a host-side tar of a
-   * provider-owned scratch file, a root `docker exec` extract, and root
-   * `stat` execs on fixed paths; no shell anywhere), and the result is
-   * verified before the provider continues:
+   * Every step is a fixed-argv docker operation (a daemon-side `docker cp`
+   * plus root `stat` execs on fixed paths; no shell anywhere), and the
+   * result is verified before the provider continues:
    *
-   * 1. Host-side archive (`tar -cf`, fixed argv): the scratch directory
-   *    is a provider-owned mkdtemp (0700) holding exactly one file —
-   *    `validation-reap.mjs`, mode 0644 — so the archive can contain
-   *    nothing else.
-   * 2. Root extract (`docker exec -i --user root … tar -xf -
-   *    --no-same-owner -C /reap`, archive piped on stdin): `--no-same-
-   *    owner` makes the script root-owned (the extracting uid) with the
-   *    archive's mode — root-owned `0644` on the mount: other-READ so the
-   *    unprivileged reaper (the same uid as the validation tree) can read
-   *    it, but no write path for that uid — no modify, replace, unlink,
-   *    or shadowing. The mount itself is fresh (created with the
+   * 1. `docker cp` of the host temp file (mode 0644, preserved by the
+   *    copy) — the script lands root-owned `0644` on the mount: other-READ
+   *    so the unprivileged reaper (the same uid as the validation tree)
+   *    can read it, but no write path for that uid — no modify, replace,
+   *    unlink, or shadowing. The mount itself is fresh (created with the
    *    container) and root-owned `0701`; nothing the source repository
    *    supplied can ever reach it, so there is no task-owned entry to
    *    clear (a root `rm` could not remove a task-owned entry from the
    *    sticky `/workspace` tmpfs without CAP_FOWNER — another reason the
    *    reaper does not live there).
-   *
-   *    `docker cp` is deliberately NOT used: the container is created
-   *    `--read-only`, and the daemon refuses copies INTO such a container
-   *    on that flag alone — "container rootfs is marked read-only"
-   *    (moby#43015) — even when the destination is a writable tmpfs, as
-   *    the first real-Docker smoke run demonstrated. (Reading OUT of a
-   *    read-only container would work; staging in cannot.)
-   * 3. `stat` verification — the mount root must be `0 0 701` (root-owned,
+   * 2. `stat` verification — the mount root must be `0 0 701` (root-owned,
    *    traversable but not listable/writable by the task uid) and the
    *    script `0 0 644 regular file`; any other observation fails
    *    creation.
    *
-   * All steps are capability-free (root owns the 0701 mount, so plain
-   * owner DAC under --cap-drop ALL suffices; the stats are root DAC
-   * reads). Runs before the git baseline; the reaper path is outside
-   * /workspace, so the git baseline never sees it.
+   * All steps are capability-free (the cp is a daemon-side operation; the
+   * stats are root DAC reads under --cap-drop ALL). Runs before the git
+   * baseline; the reaper path is outside /workspace, so the git baseline
+   * never sees it.
    */
   private async installValidationReaper(
     taskId: string,
@@ -3827,60 +3903,24 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   ): Promise<void> {
     void taskId;
     const scratch = await mkdtemp(path.join(tmpdir(), "valmont-sandbox-file-"));
-    const archive = `${scratch}.tar`;
+    const scriptPath = path.join(scratch, "validation-reap.mjs");
     try {
-      const scriptPath = path.join(scratch, "validation-reap.mjs");
       await writeFile(scriptPath, VALIDATION_REAPER_SCRIPT, {
         encoding: "utf8",
         mode: 0o644,
       });
-      // Host-side archive of exactly that file (fixed argv, no shell).
-      const archived = await this.fencedDocker(
+      // The cp and the verification execs are bound to the IMMUTABLE
+      // container ID (`ref`) and re-assert the fence token first.
+      const copied = await this.fencedDocker(
         fence,
-        ["-cf", archive, "-C", scratch, "--", "validation-reap.mjs"],
-        this.opTimeout(60_000),
-        20_000,
-        "tar",
-      );
-      if (archived.code !== 0) {
-        throw new Error(
-          `Could not archive the validation reaper: ${archived.stderr.trim() || archived.code}`,
-        );
-      }
-      // The extract and the verification execs are bound to the IMMUTABLE
-      // container ID (`ref`) and re-assert the fence token first. The
-      // archive is piped on stdin; --no-same-owner makes the script the
-      // extracting root's (see the method documentation for why docker cp
-      // cannot be used on this --read-only container).
-      const extracted = await this.fencedDocker(
-        fence,
-        [
-          "exec",
-          "-i",
-          "--user",
-          "root",
-          "--workdir",
-          "/reap",
-          ref,
-          "tar",
-          "-xf",
-          "-",
-          "--no-same-owner",
-          "-C",
-          "/reap",
-        ],
+        ["cp", scriptPath, `${ref}:/reap/validation-reap.mjs`],
         this.opTimeout(30_000),
         this.outputLimitBytes,
-        "docker",
-        archive,
       );
-      if (extracted.code !== 0) {
-        throw new Error(
-          `Could not stage the validation reaper: ${extracted.stderr.trim() || extracted.code}`,
-        );
+      if (copied.code !== 0) {
+        throw new Error("Could not stage the validation reaper");
       }
     } finally {
-      await rm(archive, { force: true });
       await rm(scratch, { recursive: true, force: true });
     }
     // Verify the staged result as root (fixed argv): the provider refuses
@@ -4336,70 +4376,149 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * a container whose task label does not match this task is left for
    * its real owner.
    */
-  private async removeTaskContainer(
+  /**
+   * Remove ONE container by its IMMUTABLE id, checked: a failed rm throws
+   * and a timed-out/unknown result fails closed (never authorized cleanup).
+   */
+  private async removeContainerById(
     taskId: string,
-    which: "normal" | "quarantined",
+    containerId: string,
     fence?: HeldFence,
   ): Promise<void> {
-    const name =
-      which === "normal"
-        ? this.containerName(taskId)
-        : this.quarantinedContainerName(taskId);
-    const inspected = await this.inspectContainer(name, fence);
+    const inspected = await this.inspectContainer(containerId, fence);
     if (inspected.kind === "missing") return;
     if (inspected.kind === "unknown") {
-      // Fail CLOSED: an unknown inspect must NEVER be followed by an rm.
       throw new Error(WORKSPACE_UNDETERMINED);
     }
     if (inspected.taskLabel !== NO_LABEL && inspected.taskLabel !== taskId) {
-      // A container for a DIFFERENT task happens to sit under this name:
-      // it is not this task's container and must never be removed here.
       throw new Error(WORKSPACE_UNAVAILABLE);
     }
     const removed = await this.fencedDocker(
       fence,
-      ["rm", "-f", inspected.id],
+      ["rm", "-f", containerId],
       this.opTimeout(30_000),
       20_000,
     );
-    // Check the result: reporting a removal as successful while the
-    // container still exists would leak a quota-bound container (and, for
-    // destroy(), lie about the workspace being gone). A not-found result
-    // is fine — there is nothing to remove.
-    if (removed.code !== 0 && !/no such container/i.test(removed.stderr)) {
-      throw new Error(
-        `Could not remove sandbox container: ${
-          removed.stderr.trim() || removed.code
-        }`,
-      );
+    if (
+      removed.timedOut ||
+      (removed.code !== 0 && !/no such container/i.test(removed.stderr))
+    ) {
+      throw new Error(WORKSPACE_UNDETERMINED);
     }
   }
 
   /**
-   * Remove the task container under EITHER name it may hold: the normal
-   * name, or the durable quarantine name a surviving unremovable
-   * container was renamed to (see quarantineTask). destroy() and
-   * create()'s replacement both go through this, so a quarantined
-   * container is actually removed — not just orphaned — by its task.
-   * Each removal is fence-asserted and ID-bound (see
-   * removeTaskContainer); a failure of either throws.
+   * Remove any existing generation before a replacement create. Bound to the
+   * immutable ids captured by the resolver; never touches a container it did
+   * not resolve, and retires the superseded records.
    */
-  private async cleanupAll(taskId: string, fence?: HeldFence): Promise<void> {
-    await this.removeTaskContainer(taskId, "normal", fence);
-    await this.removeTaskContainer(taskId, "quarantined", fence);
+  private async removeExistingForReplacement(
+    taskId: string,
+    fence: HeldFence,
+  ): Promise<void> {
+    const resolved = await this.resolveTask(taskId, fence);
+    switch (resolved.kind) {
+      case "unknown":
+        throw new Error(WORKSPACE_UNDETERMINED);
+      case "conflict":
+        throw new Error(
+          resolved.reason === "foreign"
+            ? WORKSPACE_OWNED
+            : resolved.reason === "labels"
+              ? WORKSPACE_UNAVAILABLE
+              : WORKSPACE_UNDETERMINED,
+        );
+      case "absent":
+      case "missing": {
+        // No live mapping. Still clear any captured quarantine container (a
+        // half-initialized create's survivor) so a replacement never orphans
+        // it; then retire the stale records when the mapping is provably
+        // gone.
+        await this.removeCapturedQuarantine(taskId, fence);
+        if (resolved.kind === "missing") {
+          await this.retireTaskRecords(taskId, fence, undefined);
+        }
+        return;
+      }
+      case "legacy": {
+        if (resolved.quarantined) {
+          await this.removeContainerById(taskId, resolved.containerId, fence);
+          await this.removeLegacyFiles(taskId);
+          return;
+        }
+        // A live legacy container owned by another instance is never removed
+        // by a replacement create (symmetrically with destroy()).
+        if (
+          this.classifyContainer(resolved.instanceLabel) === "foreign" &&
+          resolved.running
+        ) {
+          throw new Error(WORKSPACE_OWNED);
+        }
+        if (this.classifyContainer(resolved.instanceLabel) === "unlabeled") {
+          await this.assertNoForeignLegacyClaim(taskId, resolved.name);
+        }
+        await this.removeContainerById(taskId, resolved.containerId, fence);
+        const legacyQ = await this.inspectContainer(
+          this.legacyQuarantineName(taskId),
+          fence,
+        );
+        if (legacyQ.kind === "exists") {
+          await this.removeContainerById(taskId, legacyQ.id, fence);
+        }
+        await this.removeLegacyFiles(taskId);
+        return;
+      }
+      case "bound": {
+        // A live container owned by another instance is never removed by a
+        // replacement create: the replacement is refused with the ownership
+        // error (symmetrically with open()/destroy()).
+        if (resolved.instanceId !== this.instanceId && resolved.running) {
+          throw new Error(WORKSPACE_OWNED);
+        }
+        await this.removeContainerById(taskId, resolved.containerId, fence);
+        await this.retireTaskRecords(taskId, fence, {
+          epoch: resolved.epoch,
+          generation: resolved.generation,
+          containerId: resolved.containerId,
+        });
+        return;
+      }
+    }
+  }
+
+  /**
+   * Remove a container captured by a durable quarantine record when no
+   * authoritative mapping references it (a half-initialized create's
+   * survivor). The capture names the immutable id, so the removal is bound
+   * to exactly the container the failed create left behind. Unknown
+   * quarantine state fails closed (a replacement must never proceed over an
+   * unreadable capture).
+   */
+  private async removeCapturedQuarantine(
+    taskId: string,
+    fence: HeldFence,
+  ): Promise<void> {
+    const q = await this.readQuarantine(taskId);
+    if (q.kind === "unknown") {
+      throw new Error(WORKSPACE_UNDETERMINED);
+    }
+    if (q.kind !== "quarantined" || q.legacy || !q.containerId) return;
+    await this.removeContainerById(taskId, q.containerId, fence);
+    await this.retireQuarantineRecords(
+      taskId,
+      fence,
+      q.epoch,
+      q.generation,
+      q.containerId,
+    );
   }
 
   private async reapExpired(): Promise<void> {
     if (this.reaperRunning) return;
     this.reaperRunning = true;
     try {
-      // Four columns: the container ID (the rm target), the task label,
-      // the INSTANCE label (ownership, see the class documentation), and
-      // the name (carries the quarantine marker). The instance column is
-      // what lets this instance SKIP containers a live foreign instance
-      // owns — reaping them here would remove a task another instance is
-      // using. (A missing label renders as "<no value>" — Go template
-      // behavior the fake daemon mirrors.)
+      // Six columns: the container ID (the rm target), the task label, the
+      // instance label, the generation label, the epoch label, and the name.
       const listed = await this.docker(
         [
           "ps",
@@ -4407,294 +4526,344 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
           "--filter",
           "label=valmont.managed=true",
           "--format",
-          '{{.ID}}\t{{.Label "valmont.task"}}\t{{.Label "valmont.instance"}}\t{{.Names}}',
+          '{{.ID}}\t{{.Label "valmont.task"}}\t{{.Label "valmont.instance"}}\t{{.Label "valmont.generation"}}\t{{.Label "valmont.epoch"}}\t{{.Names}}',
         ],
         30_000,
         this.psListLimitBytes,
       );
-      if (listed.code !== 0) return;
+      if (listed.code !== 0 || listed.timedOut) return;
       if (listed.stdoutTruncated) {
-        // A partial listing must NEVER be treated as complete:
-        // `docker ps -a` lists the NEWEST containers first, so the
-        // truncated suffix holds the OLDEST ones — exactly the
-        // candidates most in need of reaping. Skip this interval and
-        // retry with the full listing; if the container count
-        // persistently exceeds the cap, that is itself visible
-        // (containers piling up) and the cap must be raised —
-        // partially reaping would look healthy while skipping the
-        // oldest containers indefinitely.
+        // A partial listing must NEVER be treated as complete: the truncated
+        // suffix holds the OLDEST containers (the reaping candidates).
         return;
       }
       for (const line of listed.stdout.split(/\r?\n/).filter(Boolean)) {
-        const [id, task, instance, nameRaw] = line.split("\t");
+        const [id, task, instance, generation, epoch, nameRaw] =
+          line.split("\t");
         if (!id || !task) continue;
-        // `docker ps` renders `.Names` with a leading "/". The 2-column
-        // listing shape (id \t task) — what tests inject — carries no
-        // instance or name column; its id IS the name.
         const name = (nameRaw ?? id).trim().replace(/^\//, "");
-        if (!isValidTaskId(task)) {
-          // A managed container whose `valmont.task` label is not a valid
-          // task identifier (a legacy/foreign label, or the reserved
-          // quarantine suffix, or label text that is not even a safe
-          // path component). We CANNOT key any bookkeeping by that
-          // label — the per-task queue, the lease file, and the
-          // quarantine marker are all keyed by the task id, and an
-          // arbitrary label must never reach a filesystem path. The
-          // container is therefore NEVER removed directly: "the task
-          // label is now considered invalid" is not evidence that a
-          // potentially live legacy/foreign container is dead, and the
-          // old direct `rm -f` here was exactly that fallacy. It stays
-          // for the operator (or a later, labeled replacement under a
-          // valid task id); the conservative leak is the fail-closed
-          // direction.
-          continue;
-        }
-        // OWNERSHIP ROUTING (see the cross-instance ownership section of
-        // the class documentation). "mine": this instance's activity
-        // record (plus my own lease) drives the TTL decision.
-        // "age": the container is not this instance's — it is a
-        // quarantined container (unusable by definition: no live user, no
-        // activity of any instance could make it useful) or its owner is
-        // provably gone (stale/absent lease, or unlabeled with no live
-        // claim) — the only available abandonment signal is the
-        // container's age. "skip": a LIVE foreign instance owns it (fresh
-        // lease) — removing it would destroy another instance's live
-        // workspace; the owner's own reaper handles it. A CORRUPT or
-        // UNREADABLE lease fails closed to "skip" (the owner may still be
-        // alive; an unreadable lease is never evidence of absence).
-        let routing: "mine" | "age" | "skip";
-        const quarantinedRow = name.endsWith(QUARANTINED_SUFFIX);
-        if (quarantinedRow) {
-          routing = "age";
-        } else if (instance === undefined) {
-          routing = "mine";
-        } else if (this.classifyContainer(instance) === "mine") {
-          routing = "mine";
-        } else {
-          // A host-side quarantine marker written by ANY instance makes
-          // the container unusable by definition (it is the stop-fallback
-          // state across instances and restarts): route by age.
-          const marker = await this.readQuarantineMarker(task);
-          if (marker === "quarantined") routing = "age";
-          else if (marker === "unreadable") routing = "skip";
-          else {
-            const lease = await this.readLease(task, name);
-            const leaseFresh =
-              lease.kind === "valid" &&
-              Date.now() - lease.updatedAt <= this.leaseTtlMs;
-            if (
-              lease.kind === "valid" &&
-              lease.instanceId === this.instanceId
-            ) {
-              // MY claim on an unlabeled container — fresh OR STALE: I
-              // am the adopter (a peer's re-adoption would have had to
-              // take the fence and re-stamped the lease with ITS id), so
-              // my activity record (and my own lease, for a restarted
-              // adopter) drives the TTL decision. A stale claim of mine
-              // must NOT flip the routing to "age": a live-but-idle
-              // adopter with fresh process-local activity would then be
-              // reaped by its own reaper.
-              routing = "mine";
-            } else if (
-              lease.kind === "corrupt" ||
-              lease.kind === "unreadable" ||
-              leaseFresh
-            ) {
-              routing = "skip";
-            } else {
-              routing = "age";
-            }
-          }
-        }
-        if (routing === "skip") {
-          // Leave it to the owning instance's reaper (never touch its
-          // lease file either).
-          continue;
-        }
-        const inspected = await this.docker(
-          ["inspect", "--format", "{{.Created}}", id],
-          15_000,
-          20_000,
-        );
-        if (inspected.code !== 0) continue;
-        const normalized = inspected.stdout
-          .trim()
-          .replace(/(\.\d{1,3})\d*Z$/, "$1Z");
-        const created = Date.parse(normalized);
-        if (!Number.isFinite(created)) continue;
-        const lastActivity = this.taskActivity.get(task);
-        // Abandoned = no provider operation for longer than the TTL. When
-        // no activity is recorded (e.g. the provider process restarted),
-        // fall back to the container's age — or, for my own containers,
-        // my lease freshness (a restarted provider's own leases still
-        // keep the container alive and get refreshed by idle sweeps).
-        // For a taken-over (non-mine) container there is NO shared
-        // activity across instances, so the age alone is the signal.
-        let reference: number;
-        if (routing === "mine") {
-          reference = lastActivity ?? created;
-          if (lastActivity === undefined) {
-            const ownLease = await this.readLease(task, name);
-            if (
-              ownLease.kind === "valid" &&
-              ownLease.instanceId === this.instanceId
-            ) {
-              reference = Math.max(reference, ownLease.updatedAt);
-            }
-          }
-        } else {
-          reference = created;
-        }
-        if (Date.now() - reference <= this.ttlMs) {
-          // Not yet old enough. For my own containers, still refresh the
-          // liveness claim (idle-owner heartbeats) — under the fence, so
-          // it can never interleave with another instance's destructive
-          // decision. A reaper that cannot acquire the fence simply
-          // skips the heartbeat (fail closed: it also skips removals).
-          if (routing === "mine") {
-            await this.withReaperTaskOperation(task, async (fence) => {
-              const prev = await this.readLease(task, name);
-              const gen = prev.kind === "valid" ? prev.generation : "";
-              await this.writeLease(task, name, fence, gen);
-            });
-          }
-          continue;
-        }
-        // DESTRUCTIVE PATH: the per-task queue is entered first (so an
-        // operation enqueued on THIS instance trips the activity check
-        // below before any wait), and the cross-instance fence is
-        // acquired at the queue head (a reaper that cannot get it skips
-        // this interval — fail closed; a held fence means an owner
-        // operation is in flight), held for the whole check-and-rm
-        // sequence, so no instance can change ownership, refresh its
-        // lease, or replace the container between the liveness check
-        // and the rm.
-        await this.withReaperTaskOperation(task, async (fence, myTail) => {
-          const fresh = this.taskActivity.get(task);
-          if (fresh !== undefined && Date.now() - fresh <= this.ttlMs) {
-            return;
-          }
-          if (routing === "mine") {
-            // Heartbeat under the fence: peer reapers (and peers'
-            // age checks) serializing on the same fence see this
-            // lease while holding it. Preserve the existing
-            // generation (a heartbeat never mints a new generation).
-            const prev = await this.readLease(task, name);
-            const gen = prev.kind === "valid" ? prev.generation : "";
-            await this.writeLease(task, name, fence, gen);
-          }
-          // OWNERSHIP + IDENTITY RE-CHECK, INSIDE THE FENCE, bound to
-          // the row's IMMUTABLE container ID: this is what closes the
-          // ps → inspect → rm replacement window. The inspect targets
-          // the ID (never the reusable name) and the row's labels must
-          // still match what `docker ps` reported — a replacement
-          // container created under the same task name has a DIFFERENT
-          // id, so either the inspect misses (missing/unknown: skip)
-          // or the labels disagree (skip). The rm below can therefore
-          // only ever hit the exact container this sweep decided on.
-          const recheck = await this.inspectContainer(id, fence);
-          if (recheck.kind !== "exists") {
-            // missing (already gone) or unknown (daemon state
-            // unknown — fail closed): nothing to remove here. Only a
-            // definitive no-such-object may drop the bookkeeping; an
-            // UNKNOWN result leaves everything for the next interval.
-            if (recheck.kind === "missing") {
-              this.taskActivity.delete(task);
-              const goneLease = await this.readLease(task, name);
-              await this.deleteLease(
-                task,
-                name,
-                fence,
-                goneLease.kind === "valid" ? goneLease.generation : undefined,
-              );
-              if (quarantinedRow) {
-                await this.deleteQuarantineMarker(task);
-              }
-            }
-            return;
-          }
-          if (
-            (recheck.taskLabel !== NO_LABEL && recheck.taskLabel !== task) ||
-            (instance !== undefined && recheck.instanceLabel !== instance)
-          ) {
-            // The id no longer describes the row we routed on (a
-            // replacement under the same name, or a label change the
-            // API cannot produce): do not touch it. (Rows without an
-            // instance column — the 2-column injected shape — cannot
-            // compare the instance label; the immutable-ID inspect
-            // already binds the identity there.)
-            return;
-          }
-          let expectedGeneration: string | undefined;
-          if (routing === "age" && !quarantinedRow) {
-            // Re-check liveness immediately before the destructive
-            // call, INSIDE THE FENCE: a live owner cannot have
-            // refreshed its lease while this sweep waited (its write
-            // is also gated by the fence), so this recheck has no
-            // TOCTOU window left. A quarantined row is exempt: the
-            // container is unusable by definition.
-            const leaseNow = await this.readLease(task, name);
-            const freshNow =
-              leaseNow.kind === "valid" &&
-              Date.now() - leaseNow.updatedAt <= this.leaseTtlMs;
-            if (
-              leaseNow.kind === "corrupt" ||
-              leaseNow.kind === "unreadable" ||
-              freshNow
-            ) {
-              return;
-            }
-            expectedGeneration =
-              leaseNow.kind === "valid" ? leaseNow.generation : undefined;
-            // A foreign host-side marker that appeared since routing
-            // means a concurrent quarantine: the row was routed
-            // "age" anyway (it is unusable), so removal proceeds —
-            // same outcome its owner's destroy() would reach.
-          } else {
-            const leaseNow = await this.readLease(task, name);
-            expectedGeneration =
-              leaseNow.kind === "valid" ? leaseNow.generation : undefined;
-          }
-          // Final in-process gate, checked immediately before the
-          // destructive call: the queue tail changes on every
-          // enqueue, so an unchanged tail proves no operation of
-          // THIS provider queued after this removal took the lock
-          // (cross-process ordering is the fence held above).
-          if (this.taskLocks.get(task) !== myTail) return;
-          // FENCE RE-VALIDATION immediately before the destructive rm:
-          // fencedDocker re-asserts the token (a reaper that lost its
-          // fence to a stale-break throws here and NEVER removes), and
-          // the rm targets the immutable ID re-inspected above.
-          const removed = await this.fencedDocker(
-            fence,
-            ["rm", "-f", recheck.id],
-            this.opTimeout(30_000),
-            20_000,
+        if (!isValidTaskId(task)) continue;
+        // Resolve the authoritative mapping (fail closed on unknown).
+        const mapping = await this.readAuthoritativeMapping(task);
+        if (mapping.kind === "unknown") continue;
+        const legacyRow =
+          generation === undefined ||
+          generation === "" ||
+          generation === NO_LABEL;
+        if (mapping.kind === "mapping" && mapping.record.containerId === id) {
+          await this.reapCanonical(
+            task,
+            id,
+            name,
+            instance,
+            generation,
+            epoch,
+            mapping.record,
           );
-          if (removed.code === 0 || /no such container/i.test(removed.stderr)) {
-            // The container is gone (or already was): the activity
-            // record no longer pins anything, so it is dropped. The
-            // lease deletion is GENERATION-AWARE (the generation read
-            // IN THIS FENCE is the expectation, so a lease that
-            // changed between the read and the deletion attempt — the
-            // replacement-owner race — is captured, verified, and
-            // RESTORED rather than unlinked). The marker is dropped
-            // only while the fence is still live.
-            this.taskActivity.delete(task);
-            await this.deleteLease(task, name, fence, expectedGeneration);
-            if (await this.checkFenceLive(fence)) {
-              await this.deleteQuarantineMarker(task);
-            }
-          }
-          // A FAILED removal must NOT drop the activity record: the
-          // container is still here; leave it for the next interval.
-        });
+        } else if (legacyRow) {
+          await this.reapLegacyOrphan(task, id, name, instance);
+        } else {
+          await this.reapOrphan(
+            task,
+            id,
+            name,
+            instance,
+            generation,
+            epoch,
+            mapping.kind === "mapping" ? mapping.record : undefined,
+          );
+        }
       }
     } finally {
       this.reaperRunning = false;
     }
   }
 
+  /**
+   * Reap the CANONICAL generation (the container the authoritative mapping
+   * references). Bound to the immutable id after exact label/epoch/generation
+   * verification; a lease never overrides a foreign immutable label.
+   */
+  private async reapCanonical(
+    taskId: string,
+    id: string,
+    name: string,
+    instance: string | undefined,
+    generation: string | undefined,
+    epoch: string | undefined,
+    mapping: MappingRecord,
+  ): Promise<void> {
+    void name;
+    void instance;
+    void generation;
+    void epoch;
+    let routing: "mine" | "age" | "skip";
+    if (this.classifyContainer(mapping.instanceId) === "mine") {
+      routing = "mine";
+    } else {
+      // A foreign immutable instance label always wins over lease contents.
+      const lease = await this.readLease(taskId, {
+        epoch: mapping.epoch,
+        generation: mapping.generation,
+        containerId: mapping.containerId,
+      });
+      if (lease.kind === "corrupt" || lease.kind === "unreadable") {
+        routing = "skip";
+      } else if (
+        lease.kind === "valid" &&
+        Date.now() - lease.updatedAt <= this.leaseTtlMs
+      ) {
+        routing = "skip";
+      } else {
+        routing = "age";
+      }
+    }
+    if (routing === "skip") return;
+    const created = await this.docker(
+      ["inspect", "--format", "{{.Created}}", id],
+      15_000,
+      20_000,
+    );
+    if (created.code !== 0 || created.timedOut) return;
+    const createdMs = Date.parse(
+      created.stdout.trim().replace(/(\.\d{1,3})\d*Z$/, "$1Z"),
+    );
+    if (!Number.isFinite(createdMs)) return;
+    const lastActivity = this.taskActivity.get(taskId);
+    let reference: number;
+    if (routing === "mine") {
+      reference = lastActivity ?? createdMs;
+      if (lastActivity === undefined) {
+        const ownLease = await this.readLease(taskId, {
+          epoch: mapping.epoch,
+          generation: mapping.generation,
+          containerId: mapping.containerId,
+        });
+        if (
+          ownLease.kind === "valid" &&
+          ownLease.instanceId === this.instanceId
+        ) {
+          reference = Math.max(reference, ownLease.updatedAt);
+        }
+      }
+    } else {
+      reference = createdMs;
+    }
+    if (Date.now() - reference <= this.ttlMs) {
+      if (routing === "mine") {
+        await this.withReaperTaskOperation(taskId, async (fence) => {
+          await this.writeLease(
+            taskId,
+            fence,
+            mapping.epoch,
+            mapping.generation,
+            mapping.provisionalName,
+            mapping.containerId,
+          );
+        });
+      }
+      return;
+    }
+    await this.withReaperTaskOperation(taskId, async (fence, myTail) => {
+      const fresh = this.taskActivity.get(taskId);
+      if (fresh !== undefined && Date.now() - fresh <= this.ttlMs) return;
+      if (routing === "mine") {
+        await this.writeLease(
+          taskId,
+          fence,
+          mapping.epoch,
+          mapping.generation,
+          mapping.provisionalName,
+          mapping.containerId,
+        );
+      }
+      // IMMUTABLE-ID re-verification inside the fence, with the row's labels.
+      const recheck = await this.inspectContainer(id, fence);
+      if (recheck.kind !== "exists") {
+        if (recheck.kind === "missing") {
+          this.taskActivity.delete(taskId);
+          await this.retireTaskRecords(taskId, fence, {
+            epoch: mapping.epoch,
+            generation: mapping.generation,
+            containerId: mapping.containerId,
+          });
+        }
+        return;
+      }
+      if (recheck.taskLabel !== taskId) return;
+      if (mapping.legacyAdopted) {
+        if (
+          recheck.instanceLabel !== mapping.instanceId &&
+          recheck.instanceLabel !== NO_LABEL &&
+          recheck.instanceLabel !== ""
+        ) {
+          return;
+        }
+      } else {
+        if (
+          recheck.instanceLabel !== mapping.instanceId ||
+          recheck.generationLabel !== mapping.generation ||
+          recheck.epochLabel !== String(mapping.epoch)
+        ) {
+          return;
+        }
+      }
+      if (routing === "age") {
+        const leaseNow = await this.readLease(taskId, {
+          epoch: mapping.epoch,
+          generation: mapping.generation,
+          containerId: mapping.containerId,
+        });
+        const freshNow =
+          leaseNow.kind === "valid" &&
+          Date.now() - leaseNow.updatedAt <= this.leaseTtlMs;
+        if (
+          leaseNow.kind === "corrupt" ||
+          leaseNow.kind === "unreadable" ||
+          freshNow
+        ) {
+          return;
+        }
+      }
+      if (this.taskLocks.get(taskId) !== myTail) return;
+      const removed = await this.fencedDocker(
+        fence,
+        ["rm", "-f", id],
+        this.opTimeout(30_000),
+        20_000,
+      );
+      if (
+        !removed.timedOut &&
+        (removed.code === 0 || /no such container/i.test(removed.stderr))
+      ) {
+        this.taskActivity.delete(taskId);
+        await this.retireTaskRecords(taskId, fence, {
+          epoch: mapping.epoch,
+          generation: mapping.generation,
+          containerId: mapping.containerId,
+        });
+      }
+    });
+  }
+
+  /**
+   * Reap a LEGACY canonical-name container (migration): honor the legacy
+   * lease file; a fresh claim skips, a stale/absent claim ages out.
+   */
+  private async reapLegacyOrphan(
+    taskId: string,
+    id: string,
+    name: string,
+    instance: string | undefined,
+  ): Promise<void> {
+    void instance;
+    // The legacy `-quarantined` name is unusable by definition: age-reap it.
+    if (!name.endsWith(QUARANTINED_SUFFIX)) {
+      const lease = await this.readLegacyLease(taskId);
+      if (lease.kind === "corrupt" || lease.kind === "unreadable") return;
+      if (
+        lease.kind === "valid" &&
+        Date.now() - lease.updatedAt <= this.leaseTtlMs
+      ) {
+        return;
+      }
+    }
+    const created = await this.docker(
+      ["inspect", "--format", "{{.Created}}", id],
+      15_000,
+      20_000,
+    );
+    if (created.code !== 0 || created.timedOut) return;
+    const createdMs = Date.parse(
+      created.stdout.trim().replace(/(\.\d{1,3})\d*Z$/, "$1Z"),
+    );
+    if (!Number.isFinite(createdMs)) return;
+    if (Date.now() - createdMs <= this.ttlMs) return;
+    await this.withReaperTaskOperation(taskId, async (fence, myTail) => {
+      const recheck = await this.inspectContainer(id, fence);
+      if (recheck.kind !== "exists") return;
+      if (recheck.taskLabel !== taskId) return;
+      if (this.taskLocks.get(taskId) !== myTail) return;
+      const removed = await this.fencedDocker(
+        fence,
+        ["rm", "-f", id],
+        this.opTimeout(30_000),
+        20_000,
+      );
+      if (
+        !removed.timedOut &&
+        (removed.code === 0 || /no such container/i.test(removed.stderr))
+      ) {
+        this.taskActivity.delete(taskId);
+      }
+    });
+  }
+
+  /**
+   * Reap an ORPHAN: a managed provisional container not referenced by the
+   * authoritative mapping. Only after verifying by immutable id that its
+   * labels match the listing, no authoritative mapping references it, its age
+   * exceeds the TTL, the fence is held, and it is not a newer generation.
+   */
+  private async reapOrphan(
+    taskId: string,
+    id: string,
+    name: string,
+    instance: string | undefined,
+    generation: string | undefined,
+    epoch: string | undefined,
+    mapping: MappingRecord | undefined,
+  ): Promise<void> {
+    void name;
+    // A NEWER generation is never targeted: an orphan whose epoch is at
+    // least the authoritative mapping's epoch is not a superseded orphan.
+    const orphanEpoch =
+      epoch !== undefined && /^\d+$/.test(epoch) ? Number(epoch) : 0;
+    if (mapping && orphanEpoch > 0 && orphanEpoch >= mapping.epoch) return;
+    const created = await this.docker(
+      ["inspect", "--format", "{{.Created}}", id],
+      15_000,
+      20_000,
+    );
+    if (created.code !== 0 || created.timedOut) return;
+    const createdMs = Date.parse(
+      created.stdout.trim().replace(/(\.\d{1,3})\d*Z$/, "$1Z"),
+    );
+    if (!Number.isFinite(createdMs)) return;
+    if (Date.now() - createdMs <= this.ttlMs) return;
+    await this.withReaperTaskOperation(taskId, async (fence, myTail) => {
+      const recheck = await this.inspectContainer(id, fence);
+      if (recheck.kind !== "exists") return;
+      if (recheck.taskLabel !== taskId) return;
+      if (
+        generation !== undefined &&
+        generation !== "" &&
+        recheck.generationLabel !== generation
+      ) {
+        return;
+      }
+      if (epoch !== undefined && epoch !== "" && recheck.epochLabel !== epoch) {
+        return;
+      }
+      if (instance !== undefined && recheck.instanceLabel !== instance) return;
+      const now = await this.readAuthoritativeMapping(taskId);
+      if (now.kind === "unknown") return;
+      if (now.kind === "mapping" && now.record.containerId === id) return;
+      if (this.taskLocks.get(taskId) !== myTail) return;
+      const removed = await this.fencedDocker(
+        fence,
+        ["rm", "-f", id],
+        this.opTimeout(30_000),
+        20_000,
+      );
+      if (
+        !removed.timedOut &&
+        (removed.code === 0 || /no such container/i.test(removed.stderr))
+      ) {
+        this.taskActivity.delete(taskId);
+      }
+    });
+  }
   private docker(
     args: readonly string[],
     timeoutMs: number,

@@ -86,13 +86,17 @@ Every Docker resource a run creates is suffixed with a unique run id —
 the image tags, the network, the dind container, the peer container
 names, the provider instanceIds (which become `valmont.instance`
 labels on the containers the provider creates), and the **task ids**
-themselves: the provider derives container names from task ids
-(`valmont-sandbox-<taskId>`) and treats a stopped same-name container
-as replaceable, so a fixed task id could collide with — or cause
-`create()` to remove — an unrelated container. Every scenario therefore
-runs on `<task>-<run-id>` tasks (within the provider's `TASK_ID`
-pattern), which scopes the derived container names, lease files, lock
-directories and quarantine markers at once. The teardown removes
+themselves. Under the generation/epoch lifecycle protocol the provider
+never creates the canonical task-derived name — containers are
+generation-scoped (`valmont-sandbox-<taskId>--g-<generation>`),
+selected by the immutable `valmont.task` label, and tracked through
+coordination records under `<leaseDir>/{epochs,mappings,leases,quarantines}/<taskId>/`
+— but the task id still roots every artifact, so a fixed task id could
+collide with an unrelated task's coordination state. Every scenario
+therefore runs on `<task>-<run-id>` tasks (within the provider's
+`TASK_ID` pattern), which scopes the derived container names, record
+directories, lock
+directories and quarantine records at once. The teardown removes
 **only** resources carrying this run's identity: it never matches on
 `valmont.managed=true` alone, so it cannot delete an unrelated Valmont
 or developer container, and it cannot collide with (or clean up) a
