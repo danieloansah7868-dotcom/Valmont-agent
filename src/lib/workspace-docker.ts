@@ -131,9 +131,12 @@ import {
  *
  * The container is created with `--user <uid>:<gid>` (uid/gid are the single
  * source of truth; uid 0 is rejected), `--init`, `--read-only`,
- * `--cap-drop ALL`, `--security-opt no-new-privileges:true`, `--security-opt
- * seccomp=default` (the default profile is PRESERVED — never
- * `seccomp=unconfined`), `--network none`, CPU/memory/no-swap/PID limits, and
+ * `--cap-drop ALL`, `--security-opt no-new-privileges:true`, NO explicit
+ * seccomp option (so Docker's BUILT-IN default profile applies — an explicit
+ * value is a profile FILE path: `seccomp=default` makes the daemon try to
+ * open a file named "default" and reject the create, first seen in PR #35's
+ * real-Docker CI run; `seccomp=unconfined` would weaken the sandbox and is
+ * never used), `--network none`, CPU/memory/no-swap/PID limits, and
  * three bounded tmpfs mounts (`/workspace` owned by the task uid, a root-owned
  * `0701` `/reap` for the validation reaper, and `/dev/shm`). Every file
  * operation verifies each path component with fixed-argv `stat` and rejects
@@ -1238,8 +1241,13 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       "ALL",
       "--security-opt",
       "no-new-privileges:true",
-      "--security-opt",
-      "seccomp=default",
+      // NOTE: no explicit seccomp option. Docker applies its BUILT-IN
+      // default seccomp profile only when no `--security-opt seccomp=…`
+      // is present; an explicit value is a profile FILE path
+      // (`seccomp=default` makes the daemon try to open a file named
+      // "default" and reject the create — carried over from #35's
+      // real-Docker CI fix). "unconfined" would weaken the sandbox and
+      // is deliberately not used either.
       "--network",
       "none",
       "--cpus",
