@@ -105,11 +105,29 @@ does the caching.
 
 ### CI status
 
-The intended wiring is a `sandbox-smoke` job in
-`.github/workflows/ci.yml` (checkout + Node 22 + `npm ci` +
-`npm run smoke:sandbox`, 25-minute timeout). The automation token that
-pushes this branch is not permitted to modify workflow files, so the
-exact job YAML is attached to the pull request as a comment for a
-maintainer to apply. **Until that job is present in the default
-workflow and green, the real-Docker evidence above is provisional:
-run `npm run smoke:sandbox` manually on any Docker-capable machine.**
+The `sandbox-smoke` job in `.github/workflows/ci.yml` (checkout + Node 22
+
+- `npm ci` + `npm run smoke:sandbox`, 25-minute timeout) runs on every
+  push and pull request, alongside `validate` and `container`. The job
+  was added by the repository owner (the automation token that pushes
+  this branch cannot modify workflow files), and it is **green** — all
+  twelve scenarios pass against the real daemon (~3 minutes).
+
+Its first three runs each surfaced exactly the class of issue it
+exists to catch — things a fake daemon cannot reproduce:
+
+1. `--security-opt seccomp=default` is a profile _file path_, not a
+   way to select the default profile; the real daemon refused the
+   create. (Docker's built-in default seccomp profile applies when no
+   seccomp option is passed.)
+2. `docker cp` cannot write into a `--read-only` container — the
+   daemon refuses on that flag alone (moby#43015), even onto writable
+   tmpfs. The reaper is now staged by a host-built tar extracted
+   in-container as root.
+3. Fence semantics that the scenario harness itself had wrong
+   (quarantine flag caching; staleness being judged by the _breaker's_
+   TTL, default 20 min) — the provider behaved as designed each time;
+   the scenarios now assert the documented behavior.
+
+Anyone with Docker can also run it locally:
+`npm ci && npm run smoke:sandbox`.
