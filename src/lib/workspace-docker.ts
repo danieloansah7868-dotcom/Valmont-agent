@@ -964,6 +964,18 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * persists even if the immediate best-effort removal fails.
    */
   private readonly quarantinedTasks = new Set<string>();
+  /**
+   * The epoch/generation/immutable-id each HANDED-OUT handle was bound to.
+   * A handle is a lightweight `{ id, root }` object (the public interface),
+   * so the binding is kept here rather than on the handle itself. Handle
+   * operations re-resolve the current mapping through the shared resolver
+   * UNDER this binding: a handle minted for a superseded generation is
+   * rejected (fail closed) instead of silently re-binding to a replacement.
+   */
+  private readonly handleBindings = new WeakMap<
+    WorkspaceHandle,
+    { epoch: number; generation: string; containerId: string }
+  >();
 
   constructor(options: DockerWorkspaceOptions) {
     this.image = options.image;
@@ -1379,7 +1391,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       throw new Error(WORKSPACE_UNDETERMINED);
     }
     this.taskActivity.set(taskId, Date.now());
-    return { id: taskId, root: "/workspace" };
+    return this.bindHandle(taskId, {
+      epoch,
+      generation,
+      containerId: knownId!,
+    });
   }
 
   async open(taskId: string): Promise<WorkspaceHandle> {
@@ -1436,10 +1452,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
           await this.assertNoForeignLegacyClaim(taskId, resolved.name);
         }
         // MIGRATION ADOPTION: publish a fresh epoch/generation mapping
-        // FIRST (marked legacyAdopted), then hand out the handle.
-        await this.adoptLegacy(taskId, resolved, fence);
+        // FIRST (marked legacyAdopted), then hand out the handle bound to
+        // that fresh generation.
+        const adopted = await this.adoptLegacy(taskId, resolved, fence);
         this.taskActivity.set(taskId, Date.now());
-        return { id: taskId, root: "/workspace" };
+        return this.bindHandle(taskId, {
+          epoch: adopted.epoch,
+          generation: adopted.generation,
+          containerId: adopted.containerId,
+        });
       }
       case "bound": {
         if (resolved.instanceId !== this.instanceId) {
@@ -1458,7 +1479,11 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         );
         if (!leased) throw new Error(WORKSPACE_UNDETERMINED);
         this.taskActivity.set(taskId, Date.now());
-        return { id: taskId, root: "/workspace" };
+        return this.bindHandle(taskId, {
+          epoch: resolved.epoch,
+          generation: resolved.generation,
+          containerId: resolved.containerId,
+        });
       }
     }
   }
@@ -1478,7 +1503,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
     fence: HeldFence,
   ): Promise<string> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(container, absolute, fence);
     if (target === null) throw new Error("Could not read workspace file");
@@ -1511,7 +1536,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
     fence: HeldFence,
   ): Promise<string> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(container, absolute, fence);
     if (target === null) throw new Error("Could not read workspace file");
@@ -1559,7 +1584,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     content: string,
     fence: HeldFence,
   ): Promise<void> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     if (isSensitivePath(relativePath)) {
       throw new Error("Writing sensitive paths is blocked");
     }
@@ -1646,7 +1671,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     relativePath: string,
     fence: HeldFence,
   ): Promise<void> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const absolute = this.safeContainerPath(relativePath);
     const target = await this.verifyPathComponents(container, absolute, fence);
     if (target === null) throw new Error("Could not delete workspace file");
@@ -1671,7 +1696,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     fence: HeldFence,
   ): Promise<ChangedFile[]> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     await this.markUntrackedForDiff(container, fence);
     const result = await this.execIn(
       container.id,
@@ -1716,7 +1741,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     fence: HeldFence,
   ): Promise<string> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     await this.markUntrackedForDiff(container, fence);
     const result = await this.execIn(
       container.id,
@@ -1742,7 +1767,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     workspace: WorkspaceHandle,
     fence: HeldFence,
   ): Promise<string> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const result = await this.execIn(
       container.id,
       ["git", "status", "--short", "--untracked-files=all"],
@@ -1771,7 +1796,7 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
     command: string,
     fence: HeldFence,
   ): Promise<CommandResult> {
-    const container = await this.gateHandleOperation(workspace.id, fence);
+    const container = await this.gateHandleOperation(workspace, fence);
     const normalized = command.trim().replace(/\s+/g, " ");
     const executable = this.allowedCommands[normalized];
     if (!executable) {
@@ -2062,12 +2087,16 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
    * a superseded generation is rejected rather than silently re-bound).
    */
   private async gateHandleOperation(
-    taskId: string,
+    workspace: WorkspaceHandle,
     fence: HeldFence,
-    expected?: { epoch?: number; generation?: string; containerId?: string },
   ): Promise<TaskContainer> {
+    const taskId = workspace.id;
     if (!isValidTaskId(taskId)) throw new Error("Invalid task identifier");
     this.assertNotQuarantined(taskId);
+    // Resolve under the handle's recorded binding (its epoch/generation/
+    // immutable id). A handle minted for a superseded generation is
+    // rejected here rather than silently re-bound to a replacement.
+    const expected = this.handleBindings.get(workspace);
     const resolved = await this.resolveTask(taskId, fence, expected);
     switch (resolved.kind) {
       case "unknown":
@@ -2323,6 +2352,20 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
   /** The generation-scoped PROVISIONAL container name. */
   private provisionalName(taskId: string, generation: string): string {
     return `${CANONICAL_PREFIX}${taskId}--g-${generation}`;
+  }
+
+  /**
+   * Mint a handle bound to the caller's epoch/generation/immutable-id. The
+   * binding is recorded so a later handle operation can be rejected when a
+   * replacement has superseded the generation it was handed out for.
+   */
+  private bindHandle(
+    taskId: string,
+    binding: { epoch: number; generation: string; containerId: string },
+  ): WorkspaceHandle {
+    const handle: WorkspaceHandle = { id: taskId, root: "/workspace" };
+    this.handleBindings.set(handle, binding);
+    return handle;
   }
 
   /**

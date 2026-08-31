@@ -22,6 +22,7 @@ import {
   rm,
   mkdtemp,
   link as fsLink,
+  readFile as fsReadFile,
   rename as fsRename,
   utimes as fsUtimes,
   writeFile as fsWriteFile,
@@ -4988,6 +4989,371 @@ describe("DockerWorkspaceProvider", () => {
     const leases = readRecords(leaseDir, "leases", "taskN");
     expect(leases).toHaveLength(1);
     expect(leases[0]!.epoch).toBe(2);
+  });
+
+  it("an old handle from a superseded generation is rejected after a replacement (never silently re-bound)", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+    const ws1 = await provider.create("taskOldH", src);
+    // A replacement (fresh generation/epoch) supersedes the handle's.
+    await provider.destroy("taskOldH");
+    const ws2 = await provider.create("taskOldH", src);
+    state.statResults.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "regular file\n",
+      stderr: "",
+    });
+    state.fileContents.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "x\n",
+      stderr: "",
+    });
+    // The CURRENT handle operates on the replacement generation.
+    expect(await provider.readFile(ws2, "a.txt")).toBe("x\n");
+    // The OLD handle is rejected (fail closed) instead of silently
+    // re-binding to the replacement's container.
+    await expect(provider.readFile(ws1, "a.txt")).rejects.toThrow(
+      /could not be determined/,
+    );
+  });
+
+  it("losing the fence between the pre-spawn check and docker create leaves an unreachable orphan, never a mapping", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, { leaseDir });
+    const src = await makeSource({ "a.txt": "x" });
+    const lockDir = path.join(leaseDir, ".locks", "taskSpawn.lock");
+    state.onCreate = () => {
+      // The fence was LIVE at the final pre-spawn check; it is broken away
+      // at the exact instant the create is issued to the daemon.
+      rmSync(lockDir, { recursive: true, force: true });
+    };
+    await expect(provider.create("taskSpawn", src)).rejects.toThrow(
+      /could not be determined/,
+    );
+    // The daemon-side create DID land (the spawn happened), but it is an
+    // unreachable orphan: no canonical mapping was ever published for it.
+    expect(containerForTask(state, "taskSpawn")).toBeDefined();
+    expect(readAuthoritativeMapping(leaseDir, "taskSpawn")).toBeUndefined();
+    // A fresh instance cannot open it (no mapping => unavailable), and the
+    // reaper removes the orphan by its immutable id, never by a mapping.
+    const fresh = makeProvider(state, { leaseDir });
+    await expect(fresh.open("taskSpawn")).rejects.toThrow(/unavailable/);
+    await internals(fresh).reapExpired();
+    expect(containerForTask(state, "taskSpawn")).toBeUndefined();
+  });
+
+  it("a delayed stale create surfacing after a replacement took ownership stays an unreachable orphan", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, { leaseDir });
+    const src = await makeSource({ "a.txt": "x" });
+    // The FIRST create request times out client-side; the daemon defers
+    // registering the half-initialized (generation g1) container.
+    let g1Name: string | undefined;
+    state.onCreate = (name) => {
+      if (g1Name === undefined) {
+        g1Name = name;
+        state.lateCreates.set(name, { labels: {}, pending: false });
+      }
+    };
+    await expect(provider.create("taskLate", src)).rejects.toThrow(/create/);
+    expect(g1Name).toBeDefined();
+    // A REPLACEMENT takes ownership (generation g2) and is destroyed.
+    const ws = await provider.create("taskLate", src);
+    const g2Name = containerForTask(state, "taskLate")!;
+    expect(g2Name).not.toBe(g1Name);
+    const g2Mapping = readAuthoritativeMapping(leaseDir, "taskLate");
+    expect(g2Mapping).toBeDefined();
+    // The daemon finishes the STALE create LATE — after the successor owns
+    // the task. It surfaces under its own g1 provisional name.
+    expect(flushLateCreate(state, g1Name!)).toBe(true);
+    // The g1 container is NOT canonical: the authoritative mapping still
+    // names the successor, and open()/handles resolve g2, never g1.
+    expect(
+      (
+        readAuthoritativeMapping(leaseDir, "taskLate") as Record<
+          string,
+          unknown
+        >
+      ).containerId,
+    ).toBe(g2Mapping!.containerId);
+    state.statResults.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "regular file\n",
+      stderr: "",
+    });
+    state.fileContents.set("/workspace/a.txt", {
+      code: 0,
+      stdout: "x\n",
+      stderr: "",
+    });
+    expect(await provider.readFile(ws, "a.txt")).toBe("x\n");
+    // The stale g1 orphan is reaped (by id/label/age verification), while
+    // the successor's container and mapping are untouched.
+    await internals(provider).reapExpired();
+    expect(state.containers.has(g1Name!)).toBe(false);
+    expect(state.containers.has(g2Name)).toBe(true);
+    expect(
+      (
+        readAuthoritativeMapping(leaseDir, "taskLate") as Record<
+          string,
+          unknown
+        >
+      ).containerId,
+    ).toBe(g2Mapping!.containerId);
+  });
+
+  it("a fence lost at the mapping-publication instant refuses publication (create fails closed)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    let broke = false;
+    const provider = makeProvider(state, {
+      leaseDir,
+      fsOverride: {
+        link: async (existingPath, newPath) => {
+          if (
+            newPath.includes(`${path.sep}mappings${path.sep}`) &&
+            newPath.endsWith(".json")
+          ) {
+            // The fence is broken away and the link fails (EIO, not
+            // EEXIST) at the publication instant: the mapping is refused.
+            broke = true;
+            const lockDir = path.join(leaseDir, ".locks", "taskMapPub.lock");
+            for (const entry of readdirSync(lockDir)) {
+              rmSync(path.join(lockDir, entry), { force: true });
+            }
+            rmSync(lockDir, { recursive: true, force: true });
+            throw errnoFailure("EIO");
+          }
+          return fsLink(existingPath, newPath);
+        },
+      },
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    await expect(provider.create("taskMapPub", src)).rejects.toThrow(
+      /could not be determined/,
+    );
+    expect(broke).toBe(true);
+    // No canonical mapping was ever published; the half-initialized
+    // container survives as a reaper-discoverable orphan (recovery
+    // evidence), never as canonical state.
+    expect(readRecords(leaseDir, "mappings", "taskMapPub")).toHaveLength(0);
+    expect(containerForTask(state, "taskMapPub")).toBeDefined();
+  });
+
+  it("a stale publisher refuses to publish over a higher-epoch mapping (publication conflict fails closed)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, { leaseDir });
+    const src = await makeSource({ "a.txt": "x" });
+    // A peer publishes a HIGHER-epoch mapping the instant this create is
+    // issued. The stale (lower-epoch) publisher must refuse to publish and
+    // fail closed rather than clobber the authoritative mapping.
+    state.onCreate = () => {
+      writeCoordRecord(leaseDir, "mappings", "taskPubC", {
+        taskId: "taskPubC",
+        epoch: 99,
+        generation: "peer-generation",
+        instanceId: "inst-peer",
+        provisionalName: "valmont-sandbox-taskPubC--g-peer-generation",
+        containerId: "fakeid-peer",
+        publishedAt: Date.now(),
+      });
+    };
+    await expect(provider.create("taskPubC", src)).rejects.toThrow(
+      /could not be determined/,
+    );
+    // The higher-epoch mapping is untouched; this provider never published.
+    const records = readRecords(leaseDir, "mappings", "taskPubC");
+    expect(records).toHaveLength(1);
+    expect(records[0]!.epoch).toBe(99);
+    // The just-created container was quarantined/removed, never canonical.
+    expect(containerForTask(state, "taskPubC")).toBeUndefined();
+  });
+
+  it("an unreadable (EIO) mapping record fails closed, never treated as absent", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const dir = path.join(leaseDir, "mappings", "taskUnread");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path.join(dir, "x.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        taskId: "taskUnread",
+        epoch: 1,
+        generation: "g1",
+        instanceId: "inst-a",
+        provisionalName: "valmont-sandbox-taskUnread--g-g1",
+        containerId: "fakeid-u",
+        publishedAt: Date.now(),
+      }),
+    );
+    // A mapping read that fails with EIO is NOT "absent": it fails closed.
+    const rigged = makeProvider(state, {
+      leaseDir,
+      fsOverride: {
+        readFile: async (p, encoding) => {
+          if (
+            p.includes(`${path.sep}mappings${path.sep}`) &&
+            p.endsWith(".json")
+          ) {
+            throw errnoFailure("EIO");
+          }
+          return fsReadFile(p, encoding);
+        },
+      },
+    });
+    await expect(rigged.open("taskUnread")).rejects.toThrow(
+      /could not be determined/,
+    );
+  });
+
+  it("a failed QUARANTINE-marker restore (EIO, not EEXIST) retains the marker (recoverable, never lost)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    makeProvider(state, { instanceId: "inst-a", leaseDir });
+    // Seed a quarantine marker for the superseded generation.
+    writeCoordRecord(leaseDir, "quarantines", "taskQM", {
+      taskId: "taskQM",
+      epoch: 1,
+      generation: "g1",
+      instanceId: "inst-a",
+      containerId: "fakeid-q1",
+      quarantinedAt: Date.now(),
+    });
+    // A replacement owner's (newer) marker lands between the teardown's
+    // read and its capture, AND the restore link fails with EIO: the
+    // capture must be RETAINED as a first-class recovery record.
+    const replacement = JSON.stringify({
+      schemaVersion: 1,
+      taskId: "taskQM",
+      epoch: 2,
+      generation: "g2",
+      instanceId: "inst-b",
+      containerId: "fakeid-q2",
+      quarantinedAt: Date.now(),
+    });
+    const rigged = makeProvider(state, {
+      instanceId: "inst-a",
+      leaseDir,
+      fsOverride: {
+        rename: async (oldPath, newPath) => {
+          if (
+            newPath.includes(".captured.") &&
+            oldPath.includes(`${path.sep}quarantines${path.sep}`)
+          ) {
+            await fsWriteFile(oldPath, replacement);
+          }
+          return fsRename(oldPath, newPath);
+        },
+        link: async (existingPath, newPath) => {
+          if (
+            newPath.endsWith(".json") &&
+            existingPath.includes(".captured.")
+          ) {
+            throw errnoFailure("EIO");
+          }
+          return fsLink(existingPath, newPath);
+        },
+      },
+    });
+    const intern = rigged as unknown as {
+      retireQuarantineRecords(
+        taskId: string,
+        fence: unknown,
+        epoch: number,
+        generation: string,
+        containerId: string,
+      ): Promise<void>;
+    };
+    await intern.retireQuarantineRecords(
+      "taskQM",
+      undefined,
+      1,
+      "g1",
+      "fakeid-q1",
+    );
+    const entries = recordEntries(leaseDir, "quarantines", "taskQM");
+    expect(entries.some((e) => e.includes(".captured."))).toBe(true);
+  });
+
+  it("a retained capture is cleaned up once a later retirement proves it superseded", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    const provider = makeProvider(state, { leaseDir });
+    const dir = path.join(leaseDir, "leases", "taskRC");
+    mkdirSync(dir, { recursive: true });
+    // A retained capture (a prior restore failed) holding an epoch-1 lease.
+    writeFileSync(
+      path.join(dir, "retained.json.captured.abc.tmp"),
+      JSON.stringify({
+        schemaVersion: 1,
+        taskId: "taskRC",
+        epoch: 1,
+        generation: "g1",
+        instanceId: "inst-a",
+        provisionalName: "valmont-sandbox-taskRC--g-g1",
+        containerId: "fakeid-r1",
+        updatedAt: Date.now(),
+      }),
+    );
+    // A replacement generation (epoch 2) retires the superseded capture.
+    const intern = internals(provider) as unknown as {
+      retireTaskRecords(
+        taskId: string,
+        fence: unknown,
+        resolved?: { epoch: number; generation: string; containerId: string },
+      ): Promise<void>;
+    };
+    await intern.retireTaskRecords("taskRC", undefined, {
+      epoch: 2,
+      generation: "g2",
+      containerId: "fakeid-r2",
+    });
+    expect(recordEntries(leaseDir, "leases", "taskRC")).toHaveLength(0);
+  });
+
+  it("destroy and quarantine remove by the immutable container id, never a reusable name", async () => {
+    const state = makeState();
+    const provider = makeProvider(state);
+    const src = await makeSource({ "a.txt": "x" });
+
+    // Destroy path: the removal is bound to the container's immutable id.
+    await provider.create("taskId1", src);
+    const name1 = containerForTask(state, "taskId1")!;
+    const id1 = state.idOf.get(name1)!;
+    await provider.destroy("taskId1");
+
+    // Quarantine path: a setup failure leaves the container, and the
+    // quarantine removes it by its immutable id too.
+    state.onExec = (_n, cmd) =>
+      cmd[0] === "git"
+        ? { code: 1, stdout: "", stderr: "git: boom\n" }
+        : undefined;
+    await expect(provider.create("taskId2", src)).rejects.toThrow(/initialise/);
+    state.onExec = undefined;
+
+    const rmTargets = state.calls
+      .filter((c) => c.command === "docker" && c.args[0] === "rm")
+      .map((c) => c.args[c.args.length - 1]);
+    // Destroy removed exactly id1 (the immutable id), never the name.
+    expect(rmTargets).toContain(id1);
+    expect(rmTargets).not.toContain(name1);
+    // Every removal (destroy + quarantine) targeted an immutable id.
+    expect(rmTargets.length).toBeGreaterThanOrEqual(2);
+    for (const target of rmTargets) {
+      expect(target).toMatch(/^fakeid-\d+$/);
+    }
   });
 });
 
