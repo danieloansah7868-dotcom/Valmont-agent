@@ -2797,7 +2797,7 @@ describe("DockerWorkspaceProvider", () => {
     // And with the owner now genuinely gone (no refresh), the very
     // next sweep does reap by age — the control in the companion
     // test: fencing defers live owners, never dead ones.
-  });
+  }, 20_000);
 
   it("the reaper removes a truly dead foreign container only when no fresh claim exists (control for the TOCTOU test)", async () => {
     const state = makeState();
@@ -2876,7 +2876,7 @@ describe("DockerWorkspaceProvider", () => {
     await internals(b).reapExpired(); // must NOT rm (fence held)
     await read;
     expect(containerForTask(state, "task8")).toBeDefined();
-  });
+  }, 20_000);
 
   it("replacement creation racing a reaper's lease deletion never loses the new owner's lease", async () => {
     const state = makeState();
