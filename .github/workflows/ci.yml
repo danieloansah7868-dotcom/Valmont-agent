@@ -5,7 +5,7 @@ on:
     branches: [main, "arena/**"]
   pull_request:
 
-permissions: 
+permissions:
   contents: read
 
 concurrency:
