@@ -4,6 +4,7 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { getChatStore } from "@/lib/chat-store";
 import { assertCsrf } from "@/lib/security";
+import { BadRequestError } from "@/lib/api-errors";
 
 const branchPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const chatInput = z
@@ -45,10 +46,11 @@ export async function POST(request: NextRequest) {
       const selected = repositories.find(
         (item) => item.id === input.repositoryId,
       );
-      if (!selected) throw new Error("Select an authorized repository");
+      if (!selected)
+        throw new BadRequestError("Select an authorized repository");
       const branches = await github.listBranches(selected.owner, selected.name);
       if (!branches.includes(input.baseBranch)) {
-        throw new Error("Select a valid base branch");
+        throw new BadRequestError("Select a valid base branch");
       }
       repository = {
         id: selected.id,

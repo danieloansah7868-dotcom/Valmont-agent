@@ -4,6 +4,7 @@ import { githubCredentialsConfigured } from "@/lib/config";
 import { GitHubApiProvider } from "@/lib/github/github";
 import type { GitHubProvider } from "@/lib/github/types";
 import { decryptSessionValue } from "@/lib/security";
+import { NotConnectedError } from "@/lib/api-errors";
 
 export interface SessionUser {
   id: string;
@@ -24,12 +25,7 @@ interface GitHubSessionPayload {
 export const NOT_CONNECTED_MESSAGE =
   "Connect GitHub to continue. Valmont runs against your real repositories.";
 
-export class NotConnectedError extends Error {
-  constructor(message = NOT_CONNECTED_MESSAGE) {
-    super(message);
-    this.name = "NotConnectedError";
-  }
-}
+export { NotConnectedError };
 
 export function githubConfigured(): boolean {
   return githubCredentialsConfigured();

@@ -11,6 +11,9 @@
  * commits and the studio half really fails, which is the exact condition
  * `PartialImportError` exists to describe. That needs no PostgreSQL server, so
  * unlike the staged-import suite this file always runs.
+ *
+ * IMPORTANT: Preserve ApiError identity — do not use vi.resetModules with partial
+ * mocks of security/API modules. Use hoisted mocks instead.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
@@ -26,6 +29,10 @@ import { buildBackup, BACKUP_VERSION } from "./backup";
 
 const owner: SessionUser = { id: "9001", login: "ama", name: "Ama" };
 let currentUser: SessionUser | null = owner;
+
+const backupMocks = vi.hoisted(() => ({
+  shouldThrowPartial: false,
+}));
 
 vi.mock("next/headers", () => ({
   cookies: async () => ({
@@ -48,6 +55,22 @@ vi.mock("next/headers", () => ({
 vi.mock("@/lib/security", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/security")>();
   return { ...actual, decryptSessionValue: (value: string) => value };
+});
+
+vi.mock("@/lib/studio/backup", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/studio/backup")>();
+  return {
+    ...actual,
+    importBackup: async (...args: Parameters<typeof actual.importBackup>) => {
+      if (backupMocks.shouldThrowPartial) {
+        throw new actual.PartialImportError(new Error("connection reset"), {
+          chat: true,
+          studio: false,
+        });
+      }
+      return actual.importBackup(...args);
+    },
+  };
 });
 
 const CSRF = "a-sixteen-plus-character-token";
@@ -116,6 +139,7 @@ async function seed() {
 
 beforeEach(() => {
   currentUser = owner;
+  backupMocks.shouldThrowPartial = false;
   delete process.env.DATABASE_URL;
   process.env.GITHUB_CLIENT_ID = "test-client-id";
   process.env.GITHUB_CLIENT_SECRET = "test-client-secret";
@@ -125,6 +149,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  backupMocks.shouldThrowPartial = false;
   setSqliteChatStoreForTests(null);
   delete process.env.DATABASE_URL;
   for (const dir of dirs.splice(0))
@@ -163,7 +188,6 @@ describe("POST /api/backup/import", () => {
     expect(body.memories).toBe(0);
     expect(body.skippedMemories).toBe(1);
     expect(body.notice).toMatch(/not restored/i);
-    // The owner is told the file still holds it, so they do not delete it.
     expect(body.notice).toMatch(/backup file still contains/i);
   });
 
@@ -172,18 +196,13 @@ describe("POST /api/backup/import", () => {
     const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
     freshDatabase();
 
-    // Nothing listens on this port, so the studio side genuinely fails.
     process.env.DATABASE_URL = "postgres://postgres:hunter2@127.0.0.1:1/none";
 
     const { POST } = await import("@/app/api/backup/import/route");
     const response = await POST(importRequest(file));
     const text = JSON.stringify(await response.json());
 
-    // A driver outage is a server fault. A 400 would tell the owner their
-    // backup file was bad, which would not be true.
     expect(response.status).toBe(500);
-    // The statement, its bound parameters and the connection string must not
-    // escape to the browser.
     expect(text).not.toContain("hunter2");
     expect(text).not.toContain("127.0.0.1");
     expect(text).not.toMatch(/insert into/i);
@@ -194,24 +213,8 @@ describe("POST /api/backup/import", () => {
   });
 
   it("answers 500 and names the committed halves when even rollback failed", async () => {
-    // PartialImportError is the exceptional outcome: the import failed and
-    // rolling it back also failed. Real behaviour is covered against live
-    // engines in postgres-backup.test.ts; this test proves the route turns it
-    // into an honest HTTP answer rather than a generic 500.
-    vi.resetModules();
-    vi.doMock("@/lib/studio/backup", async (importOriginal) => {
-      const actual =
-        await importOriginal<typeof import("@/lib/studio/backup")>();
-      return {
-        ...actual,
-        importBackup: async () => {
-          throw new actual.PartialImportError(new Error("connection reset"), {
-            chat: true,
-            studio: false,
-          });
-        },
-      };
-    });
+    // Use hoisted mock to trigger PartialImportError without breaking ApiError identity
+    backupMocks.shouldThrowPartial = true;
 
     await seed();
     const file = JSON.parse(JSON.stringify(await buildBackup(owner)));
@@ -222,13 +225,8 @@ describe("POST /api/backup/import", () => {
     expect(response.status).toBe(500);
     expect(body.partial).toBe(true);
     expect(body.committed).toEqual({ chat: true, studio: false });
-    // The owner is told which half is known to have landed and that recovery
-    // will roll it back, so retrying is an informed choice.
     expect(body.error).toMatch(/recovery/i);
     expect(JSON.stringify(body)).not.toContain("connection reset");
-
-    vi.doUnmock("@/lib/studio/backup");
-    vi.resetModules();
   });
 
   it("rejects an unauthenticated import before touching any store", async () => {
@@ -255,5 +253,6 @@ describe("POST /api/backup/import", () => {
     const response = await POST(request);
     expect(response.status).toBeGreaterThanOrEqual(400);
     expect(response.status).not.toBe(500);
+    expect(response.status).toBe(403);
   });
 });

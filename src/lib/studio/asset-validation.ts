@@ -56,8 +56,9 @@ function matchesMagic(bytes: Buffer, mime: string): boolean {
   return options.some((sig) => startsWithMagic(bytes, sig));
 }
 
-export class UploadRejected extends Error {
-  readonly status = 400;
+import { BadRequestError } from "@/lib/api-errors";
+
+export class UploadRejected extends BadRequestError {
   constructor(message: string) {
     super(message);
     this.name = "UploadRejected";

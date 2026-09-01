@@ -16,6 +16,7 @@ import {
   normalizeCustomerEmail,
   verifyCustomerPassword,
 } from "@/lib/customer-password";
+import { CustomerAccountExistsError } from "@/lib/api-errors";
 
 export type CustomerTokenPurpose = "verify_email" | "reset_password";
 
@@ -34,14 +35,7 @@ export interface CustomerSession {
   expiresAt: string;
 }
 
-export class CustomerAccountExistsError extends Error {
-  readonly status = 409;
-
-  constructor() {
-    super("An account with that email already exists.");
-    this.name = "CustomerAccountExistsError";
-  }
-}
+export { CustomerAccountExistsError };
 
 function toAccount(input: {
   id: string;

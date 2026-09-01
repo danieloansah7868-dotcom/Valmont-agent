@@ -7,6 +7,7 @@ import type {
   RepositoryFile,
 } from "@/lib/github/types";
 import type { RepositorySummary } from "@/lib/types";
+import { BadRequestError, GitHubApiError } from "@/lib/api-errors";
 
 interface GitHubConfig {
   accessToken: string;
@@ -25,22 +26,15 @@ interface GitHubRepository {
   owner: { login: string };
 }
 
-export class GitHubApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-  ) {
-    super(message);
-    this.name = "GitHubApiError";
-  }
-}
+export { GitHubApiError };
 
 export class GitHubApiProvider implements GitHubProvider {
   private readonly token: string;
   private readonly fetcher: typeof fetch;
 
   constructor(config: GitHubConfig) {
-    if (!config.accessToken) throw new Error("GitHub access token is required");
+    if (!config.accessToken)
+      throw new BadRequestError("GitHub access token is required");
     this.token = config.accessToken;
     this.fetcher = config.fetcher ?? fetch;
   }
@@ -50,13 +44,13 @@ export class GitHubApiProvider implements GitHubProvider {
   ): Promise<RepositorySummary> {
     validateSlug(input.name, "repository name");
     if (input.name.length > 100 || input.name === "." || input.name === "..") {
-      throw new Error("Invalid repository name");
+      throw new BadRequestError("Invalid repository name");
     }
     if (input.description && input.description.length > 350) {
-      throw new Error("Repository description is too long");
+      throw new BadRequestError("Repository description is too long");
     }
     if (input.visibility !== "private" && input.visibility !== "public") {
-      throw new Error("Invalid repository visibility");
+      throw new BadRequestError("Invalid repository visibility");
     }
     const repository = await this.request<GitHubRepository>("/user/repos", {
       method: "POST",
@@ -126,11 +120,15 @@ export class GitHubApiProvider implements GitHubProvider {
     if (!response.ok) await this.throwGitHubError(response);
     const declaredSize = Number(response.headers.get("content-length") ?? 0);
     if (declaredSize > 50 * 1024 * 1024) {
-      throw new Error("Repository archive exceeds the 50 MB workspace limit");
+      throw new BadRequestError(
+        "Repository archive exceeds the 50 MB workspace limit",
+      );
     }
     const archive = new Uint8Array(await response.arrayBuffer());
     if (archive.byteLength > 50 * 1024 * 1024) {
-      throw new Error("Repository archive exceeds the 50 MB workspace limit");
+      throw new BadRequestError(
+        "Repository archive exceeds the 50 MB workspace limit",
+      );
     }
     return archive;
   }
@@ -145,7 +143,7 @@ export class GitHubApiProvider implements GitHubProvider {
     validateSlug(repository, "repository");
     validateRef(ref);
     if (isSensitivePath(filePath))
-      throw new Error("Sensitive repository path is blocked");
+      throw new BadRequestError("Sensitive repository path is blocked");
     const encodedPath = filePath
       .split("/")
       .map((segment) => encodeURIComponent(segment))
@@ -159,7 +157,7 @@ export class GitHubApiProvider implements GitHubProvider {
       `/repos/${owner}/${repository}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`,
     );
     if (file.encoding !== "base64")
-      throw new Error("Unsupported GitHub content encoding");
+      throw new BadRequestError("Unsupported GitHub content encoding");
     return {
       path: file.path,
       sha: file.sha,
@@ -203,14 +201,14 @@ export class GitHubApiProvider implements GitHubProvider {
     validateSlug(repository, "repository");
     validateAgentBranch(branch);
     if (files.length === 0 || files.length > 100)
-      throw new Error("Commit must contain 1–100 files");
+      throw new BadRequestError("Commit must contain 1–100 files");
     for (const file of files) {
       if (
         isSensitivePath(file.path) ||
         file.path.includes("..") ||
         file.path.startsWith("/")
       ) {
-        throw new Error(`Unsafe commit path: ${file.path}`);
+        throw new BadRequestError(`Unsafe commit path: ${file.path}`);
       }
     }
     const ref = await this.request<{ object: { sha: string } }>(
@@ -352,7 +350,7 @@ function repositorySummary(repository: GitHubRepository): RepositorySummary {
 
 function validateSlug(value: string, label: string): void {
   if (!/^[A-Za-z0-9_.-]{1,100}$/.test(value))
-    throw new Error(`Invalid GitHub ${label}`);
+    throw new BadRequestError(`Invalid GitHub ${label}`);
 }
 
 function validateRef(value: string): void {
@@ -360,13 +358,15 @@ function validateRef(value: string): void {
     !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(value) ||
     value.includes("..")
   ) {
-    throw new Error("Invalid Git reference");
+    throw new BadRequestError("Invalid Git reference");
   }
 }
 
 function validateAgentBranch(value: string): void {
   validateRef(value);
   if (!value.startsWith("valmont/")) {
-    throw new Error("Valmont Agent only writes to valmont/* working branches");
+    throw new BadRequestError(
+      "Valmont Agent only writes to valmont/* working branches",
+    );
   }
 }

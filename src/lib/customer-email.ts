@@ -1,30 +1,24 @@
-export class CustomerEmailDeliveryError extends Error {
-  readonly status = 502;
+import {
+  CustomerEmailConfigurationError,
+  CustomerEmailDeliveryError,
+} from "@/lib/api-errors";
+import {
+  getResendConfigState,
+  getValidatedResendConfig,
+} from "@/lib/resend-config";
 
-  constructor() {
-    super("Customer email delivery is temporarily unavailable.");
-    this.name = "CustomerEmailDeliveryError";
-  }
-}
-
-export class CustomerEmailConfigurationError extends Error {
-  readonly status = 503;
-
-  constructor() {
-    super("Customer email delivery is not configured for this deployment.");
-    this.name = "CustomerEmailConfigurationError";
-  }
-}
+export { CustomerEmailDeliveryError, CustomerEmailConfigurationError };
 
 export function customerEmailDeliveryConfigured(): boolean {
-  return Boolean(process.env.RESEND_API_KEY && process.env.NOTIFY_EMAIL_FROM);
+  return getResendConfigState() === "configured";
 }
 
 export function assertCustomerEmailDeliveryReady(): void {
-  if (
-    process.env.NODE_ENV === "production" &&
-    !customerEmailDeliveryConfigured()
-  ) {
+  const state = getResendConfigState();
+  if (state === "invalid") {
+    throw new CustomerEmailConfigurationError();
+  }
+  if (process.env.NODE_ENV === "production" && state === "not_configured") {
     throw new CustomerEmailConfigurationError();
   }
 }
@@ -62,32 +56,80 @@ function escapeHtml(value: string): string {
 export async function sendCustomerEmail(
   input: CustomerEmailInput,
 ): Promise<CustomerEmailResult> {
-  const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.NOTIFY_EMAIL_FROM;
-  if (apiKey && from) {
-    let response: Response;
+  const state = getResendConfigState();
+  if (state === "invalid") {
+    throw new CustomerEmailConfigurationError();
+  }
+
+  const validated = getValidatedResendConfig();
+  if (validated) {
+    const { apiKey, from } = validated;
+    const controller = new AbortController();
+    const timeoutMs = 10_000;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    const startTimeout = () => {
+      timeout = setTimeout(() => {
+        try {
+          controller.abort();
+        } catch {
+          // ignore abort errors
+        }
+      }, timeoutMs);
+    };
+
+    const clear = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = undefined;
+      }
+    };
+
     try {
-      response = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          from,
-          to: [input.to],
-          subject: input.subject,
-          text: input.text,
-          html: input.html,
-        }),
-      });
-    } catch {
+      startTimeout();
+      let response: Response;
+      try {
+        response = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            from,
+            to: [input.to],
+            subject: input.subject,
+            text: input.text,
+            html: input.html,
+          }),
+          signal: controller.signal,
+        });
+      } catch (error) {
+        // Normalize timeout/abort and network failures to delivery error.
+        // Do not leak provider details.
+        if (error instanceof CustomerEmailConfigurationError) throw error;
+        throw new CustomerEmailDeliveryError();
+      } finally {
+        clear();
+      }
+
+      if (!response.ok) {
+        throw new CustomerEmailDeliveryError();
+      }
+      return { delivered: true };
+    } catch (error) {
+      clear();
+      if (error instanceof CustomerEmailConfigurationError) {
+        throw error;
+      }
+      if (error instanceof CustomerEmailDeliveryError) {
+        throw error;
+      }
+      // Any other error (including AbortError) becomes delivery failure
       throw new CustomerEmailDeliveryError();
+    } finally {
+      clear();
     }
-    if (!response.ok) {
-      throw new CustomerEmailDeliveryError();
-    }
-    return { delivered: true };
   }
 
   // Never return authentication links in production. A production deployment

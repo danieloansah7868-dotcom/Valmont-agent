@@ -8,19 +8,11 @@ import { assertCsrf } from "@/lib/security";
 import { publicGetDraft } from "@/lib/studio/draft-public";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { customerAccountsEnabled } from "@/lib/studio/site-brief/schema";
+import { InvalidOrderClaimError } from "@/lib/api-errors";
 
 const claimSchema = z.object({
   accessCode: z.string().trim().min(16).max(128),
 });
-
-class InvalidOrderClaimError extends Error {
-  readonly status = 400;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "InvalidOrderClaimError";
-  }
-}
 
 export async function POST(request: NextRequest) {
   try {

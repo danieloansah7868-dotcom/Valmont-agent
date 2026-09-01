@@ -11,6 +11,7 @@ import { getDatabase } from "@/db";
 import { studioDrafts } from "@/db/schema";
 import { and, eq, desc, sql } from "drizzle-orm";
 import { getSqliteChatStore, type SqliteChatStore } from "@/lib/chat-store";
+import { ConflictError, NotFoundError } from "@/lib/api-errors";
 
 export const STUDIO_SCHEMA_VERSION = 1;
 
@@ -143,8 +144,7 @@ export function ensureStudioSchema(db: DatabaseSync): void {
  * Raised when a write loses an optimistic-concurrency race. Callers map this to
  * HTTP 409 by type, never by matching the message text.
  */
-export class DraftConflictError extends Error {
-  readonly status = 409;
+export class DraftConflictError extends ConflictError {
   constructor(
     message = "This draft was changed somewhere else. Reload to see the latest version.",
   ) {
@@ -158,8 +158,7 @@ export class DraftConflictError extends Error {
  * cases deliberately produce the identical error so a signed-in user cannot
  * probe for the existence of another owner's drafts.
  */
-export class DraftNotFoundError extends Error {
-  readonly status = 404;
+export class DraftNotFoundError extends NotFoundError {
   constructor(message = "Draft not found") {
     super(message);
     this.name = "DraftNotFoundError";

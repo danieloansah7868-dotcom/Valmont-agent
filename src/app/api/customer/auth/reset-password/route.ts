@@ -4,21 +4,13 @@ import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
 import { assertCsrf } from "@/lib/security";
 import { getCustomerAccountStore } from "@/lib/customer-account-store";
+import { InvalidPasswordResetError } from "@/lib/api-errors";
 
 const BODY_LIMIT_BYTES = 16_000;
 const resetSchema = z.object({
   token: z.string().trim().min(32).max(200),
   password: z.string().min(10).max(128),
 });
-
-class InvalidPasswordResetError extends Error {
-  readonly status = 400;
-
-  constructor() {
-    super("This password-reset link is invalid or has expired.");
-    this.name = "InvalidPasswordResetError";
-  }
-}
 
 export async function POST(request: NextRequest) {
   try {

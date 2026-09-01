@@ -6,6 +6,7 @@ import { createModelProvider } from "@/lib/models";
 import { assertCsrf } from "@/lib/security";
 import { getTaskStore } from "@/lib/task-store";
 import { TaskWorkflowService } from "@/lib/workflow";
+import { BadRequestError } from "@/lib/api-errors";
 
 const taskInput = z.object({
   title: z.string().trim().min(5).max(160),
@@ -34,13 +35,14 @@ export async function POST(request: NextRequest) {
     const repository = repositories.find(
       (item) => item.id === input.repositoryId,
     );
-    if (!repository) throw new Error("Select an authorized repository");
+    if (!repository)
+      throw new BadRequestError("Select an authorized repository");
     const branches = await github.listBranches(
       repository.owner,
       repository.name,
     );
     if (!branches.includes(input.baseBranch))
-      throw new Error("Select a valid base branch");
+      throw new BadRequestError("Select a valid base branch");
     const model = createModelProvider();
     const workflow = new TaskWorkflowService(getTaskStore(user), github, model);
     const task = await workflow.create({

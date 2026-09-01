@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
+import { BadRequestError } from "@/lib/api-errors";
 
 export async function GET(
   _request: Request,
@@ -12,7 +13,8 @@ export async function GET(
     const provider = await getGitHubProvider();
     const repositories = await provider.listRepositories();
     const repository = repositories.find((item) => item.id === id);
-    if (!repository) throw new Error("Select an authorized repository");
+    if (!repository)
+      throw new BadRequestError("Select an authorized repository");
 
     const branches = await provider.listBranches(
       repository.owner,

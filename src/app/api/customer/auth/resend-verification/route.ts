@@ -13,6 +13,7 @@ import {
   sendCustomerEmail,
 } from "@/lib/customer-email";
 import { assertCsrf } from "@/lib/security";
+import { CustomerEmailDeliveryError } from "@/lib/api-errors";
 
 const resendSchema = z.object({
   email: z.string().trim().email().max(254),
@@ -28,6 +29,7 @@ export async function POST(request: NextRequest) {
     const { email: submittedEmail } = resendSchema.parse(body);
     const email = normalizeCustomerEmail(submittedEmail);
     assertCustomerRateLimit(request, "customer-resend-verification", email, 5);
+    // Validate production config before lookup for consistent 503 on broken sender.
     assertCustomerEmailDeliveryReady();
     const store = getCustomerAccountStore();
     const account = await store.getByEmail(email);
@@ -41,21 +43,29 @@ export async function POST(request: NextRequest) {
       );
       const link = new URL("/api/customer/auth/verify", request.nextUrl.origin);
       link.searchParams.set("token", token);
-      const delivery = await sendCustomerEmail({
-        to: account.email,
-        name: account.name,
-        subject: "Verify your Valmont customer account",
-        text: `Verify your Valmont customer account: ${link.toString()}`,
-        html: customerEmailHtml(
-          "Verify your Valmont account",
-          account.name,
-          "Here is a fresh link to verify your email address.",
-          "Verify email address",
-          link.toString(),
-        ),
-        developmentLink: link.toString(),
-      });
-      verificationLink = delivery.developmentLink;
+      try {
+        const delivery = await sendCustomerEmail({
+          to: account.email,
+          name: account.name,
+          subject: "Verify your Valmont customer account",
+          text: `Verify your Valmont customer account: ${link.toString()}`,
+          html: customerEmailHtml(
+            "Verify your Valmont account",
+            account.name,
+            "Here is a fresh link to verify your email address.",
+            "Verify email address",
+            link.toString(),
+          ),
+          developmentLink: link.toString(),
+        });
+        verificationLink = delivery.developmentLink;
+      } catch (error) {
+        if (error instanceof CustomerEmailDeliveryError) {
+          // Suppress only delivery failures for anti-enumeration.
+        } else {
+          throw error;
+        }
+      }
     }
 
     return NextResponse.json({

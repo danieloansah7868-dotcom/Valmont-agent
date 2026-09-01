@@ -8,6 +8,8 @@
  * instead of inventing output.
  */
 
+import { getResendConfigState } from "@/lib/resend-config";
+
 export type RuntimeEnv = Record<string, string | undefined>;
 
 export function githubCredentialsConfigured(
@@ -31,7 +33,7 @@ export function databaseConfigured(env: RuntimeEnv = process.env): boolean {
 export function customerEmailConfigured(
   env: RuntimeEnv = process.env,
 ): boolean {
-  return Boolean(env.RESEND_API_KEY && env.NOTIFY_EMAIL_FROM);
+  return getResendConfigState(env) === "configured";
 }
 
 export interface RuntimeReadiness {
@@ -68,8 +70,24 @@ export function missingCustomerEmailRequirements(
   env: RuntimeEnv = process.env,
 ): string[] {
   if (env.NODE_ENV !== "production") return [];
-  const missing: string[] = [];
-  if (!env.RESEND_API_KEY) missing.push("RESEND_API_KEY");
-  if (!env.NOTIFY_EMAIL_FROM) missing.push("NOTIFY_EMAIL_FROM");
-  return missing;
+  const state = getResendConfigState(env);
+  if (state !== "configured") {
+    // In production, both variables must be valid together. Partial, blank,
+    // malformed, or missing config is reported as missing so health is degraded.
+    const missing: string[] = [];
+    if (!env.RESEND_API_KEY || (env.RESEND_API_KEY ?? "").trim() === "") {
+      missing.push("RESEND_API_KEY");
+    }
+    if (!env.NOTIFY_EMAIL_FROM || (env.NOTIFY_EMAIL_FROM ?? "").trim() === "") {
+      missing.push("NOTIFY_EMAIL_FROM");
+    }
+    // If both are present but invalid (malformed/injection), still report both
+    // as required to avoid leaking validation detail, but ensure health is degraded.
+    if (missing.length === 0) {
+      missing.push("RESEND_API_KEY");
+      missing.push("NOTIFY_EMAIL_FROM");
+    }
+    return missing;
+  }
+  return [];
 }

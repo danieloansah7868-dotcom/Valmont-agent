@@ -5,6 +5,7 @@ import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
 import { assertCsrf } from "@/lib/security";
 import { getTaskStore } from "@/lib/task-store";
 import { TaskWorkflowService } from "@/lib/workflow";
+import { TaskNotFoundError } from "@/lib/api-errors";
 
 const actionInput = z.discriminatedUnion("action", [
   z.object({ action: z.literal("approve_plan") }),
@@ -25,7 +26,7 @@ export async function POST(
     const user = await requireApiSessionUser();
     const store = getTaskStore(user);
     const existing = await store.get(id);
-    if (!existing) throw new Error("Task not found");
+    if (!existing) throw new TaskNotFoundError();
     const github = await getGitHubProvider();
     const workflow = new TaskWorkflowService(store, github);
     const task =

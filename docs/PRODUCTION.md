@@ -13,7 +13,52 @@ docker compose up --build -d
 curl https://your-domain.example/api/health
 ```
 
-The compose migration mount initializes a new PostgreSQL volume. For an existing database, review and apply migrations manually with `npm run db:migrate` from a controlled release job. Valmont never runs production migrations from an agent task. The default persistent `/app/.data` volume also retains chat SQLite data. If `CHAT_STORE_PATH` or `CHAT_SQLITE_PATH` points outside that directory, mount the custom parent directory into the app container; leaving `CHAT_SQLITE_PATH` unset derives a sibling SQLite file next to the legacy JSON input.
+### Database migrations — controlled, verified, never automatic
+
+Valmont **never runs production migrations automatically**. There is no migration-runner service in Compose and the web container does not apply migrations on boot.
+
+**Fresh volume behaviour (historic base only):**
+
+- `compose.yaml` mounts two Docker-init scripts into `docker-entrypoint-initdb.d`:
+  - `0000_lazy_leopardon.sql` — the immutable base schema (lexically first).
+  - `0001_bootstrap_ledger.sql` — inserts the corresponding row into `drizzle.__drizzle_migrations` with the exact hash `3bdd1e6fd184d9325d3db2b38b6ed7287fa7fde65c42bb87d15f96f176a7f249` and journal timestamp `1786700718887` derived from `src/db/migrations/0000_lazy_leopardon.sql` and `meta/_journal.json`. This makes a brand-new volume report `migrations.status: complete` for the historic base without pretending later migrations are applied.
+- The bootstrap is idempotent (`WHERE NOT EXISTS`) and runs only on first init of an empty data directory.
+
+**Existing volume without compatible ledger:**
+
+- If `DATABASE_URL` points at a volume that was initialized before the ledger bootstrap or was manually altered, the readiness probe reports `migrations.status: incomplete` and `/api/health` returns **degraded 503** with `dependencies.migrations: { status: "incomplete", expected, applied }`. The application does **not** hide the problem or silently rewrite history — it fails closed until an operator runs the controlled migration.
+
+**Controlled release procedure (required for every deploy that adds migrations):**
+
+```bash
+# From a release job / operator machine, never from the app container:
+npm run db:verify:local   # no DB — validates journal structure, ordering, SHA-256, file existence
+npm run db:migrate        # requires DATABASE_URL — advisory lock, validates full journal, applies missing in journal order, re-verifies
+npm run db:verify         # read-only — validates ledger membership against journal
+```
+
+- `db:verify:local` — validates the **complete** checked-in Drizzle journal `src/db/migrations/meta/_journal.json`: structure, `version`/`dialect`, sequential `idx` 0..n-1 matching array position, unique `tag`/`idx`, numeric `when`, `breakpoints` boolean, SQL file existence, SHA-256 hash non-empty, and regression check that journal order is authoritative (e.g. `0007_studio_domains` when `1787573273009` < `0006_studio_settings` when `1787616000000` but idx 7 > 6).
+- `db:migrate` — controlled runner: requires `DATABASE_URL` with a generic safe error if missing (no leak), takes an advisory transaction lock (`72707369`), ensures `drizzle` schema and `__drizzle_migrations` table exist, loads manifest, validates journal, fetches ledger, **fails closed** on `unexpected` ledger rows (unknown hash), `altered` hashes/timestamps, or duplicate hashes/timestamps, applies **only missing** migrations in journal order splitting on `-->` statement-breakpoint, inserts ledger rows with hash and journal `when`, then re-verifies ledger.
+- `db:verify` — read-only: attempts advisory lock (fails open for read), loads manifest, fetches ledger, verifies exact membership by hash+`created_at`, reports missing/unexpected/altered/duplicate.
+
+**Why not timestamp ordering:**
+
+- Drizzle's journal carries both `idx` and `when`. `when` is wall-clock and can regress (see `0007` earlier than `0006`). The system **never** uses timestamp ordering; journal `idx` order is authoritative. The regression test `src/lib/db/migration-bootstrap.test.ts` asserts this invariant and that the bootstrap ledger SQL contains the expected hash/timestamp derived from source.
+
+**Health probe:**
+
+- `GET /api/health` uses `checkMigrationReadiness()` which probes without leaking driver details:
+  - `not_configured` → `DATABASE_URL` unset → degraded 503 (or healthy in SQLite mode if applicable)
+  - `unavailable` → cannot connect → degraded 503
+  - `incomplete` → ledger missing/altered/unexpected → degraded 503
+  - `complete` → ledger exactly matches journal → healthy 200
+- Response includes `dependencies.migrations: { status, expected, applied }` and `missingConfiguration` when relevant. No internal error messages or connection strings are returned.
+
+**CI verification:**
+
+- `.github/workflows/ci.yml` provides a throwaway PostgreSQL 16 service. It runs `db:migrate` → `db:verify` → `npm test` → `npm run build`. This proves the controlled runner works against a real engine and that the test suite runs only after migrations are verified.
+
+The default persistent `/app/.data` volume also retains chat SQLite data. If `CHAT_STORE_PATH` or `CHAT_SQLITE_PATH` points outside that directory, mount the custom parent directory into the app container; leaving `CHAT_SQLITE_PATH` unset derives a sibling SQLite file next to the legacy JSON input.
 
 The compose port binds only to `127.0.0.1`. Put Caddy on the host in front of it:
 
@@ -34,6 +79,27 @@ After the DNS record points to the server, Caddy obtains and renews HTTPS automa
 - OpenAI-compatible model endpoint/key/name with structured JSON output support
 - PostgreSQL with TLS and backups
 - Reverse proxy with request-body limits, HTTPS, and execution-friendly timeouts
+
+### Email delivery (Resend)
+
+Customer account emails (verification, password reset) require **both**:
+
+- `RESEND_API_KEY` — non-empty, no CR/LF, no surrounding whitespace only
+- `NOTIFY_EMAIL_FROM` — valid sender, either plain `noreply@example.com` or display-name `Valmont <noreply@example.com>`, no CR/LF, no angle-bracket injection, must contain `@`
+
+Validation is **all-or-nothing**:
+
+- Both unset → `not_configured` → development returns clearly local-only one-time links, production fails closed with typed 503 `CustomerEmailConfigurationError`.
+- One set, other unset/blank/malformed → `invalid` → same fail-closed 503.
+- Malformed/injection (`\r`, `\n`, `<script>`, missing `@`) → `invalid` → 503.
+- Both present and valid → `configured`.
+
+Delivery:
+
+- Uses `fetch` with `AbortController` + `setTimeout` 10s (portable, not runtime-specific helper), timer cleared in `finally` to avoid leaks.
+- Provider non-ok responses (400/500 etc.) and fetch rejections/timeouts are normalized to typed 502 `CustomerEmailDeliveryError` with generic message `"Email delivery is temporarily unavailable. Please try again."` — **no** provider bodies, keys, or status texts leak.
+- Anti-enumeration: `assertCustomerEmailDeliveryReady()` checks config **before** any account lookup. `forgot-password` and `resend-verification` routes suppress only `CustomerEmailDeliveryError` after lookup, preserving neutral `ok:true` responses. Configuration errors (503) are **not** suppressed, so misconfiguration is visible to operators but does not leak existence.
+- Compose passes `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` through to the app container.
 
 ## Critical sandbox boundary
 
@@ -56,9 +122,10 @@ Before exposing Valmont to customers, organizations you do not control, or publi
 3. Use managed session storage/KMS token encryption and distributed rate limiting.
 4. Ship audit events to append-only centralized storage.
 5. Add workspace TTL cleanup, storage quotas, alerts, and backup restoration tests.
-6. Keep `/api/health` on an internal monitoring check.
+6. Keep `/api/health` on an internal monitoring check — it now reports `degraded` 503 when migrations are incomplete/unavailable.
 7. Review failed validations and diffs; never bypass final approval.
 8. Keep branch protection and mandatory GitHub reviews enabled.
+9. For every release with new migrations: run `db:migrate` and `db:verify` from a controlled job, not from the app.
 
 Valmont intentionally has no merge or deployment method. Your existing reviewed CI/CD process should deploy only after a human merges the pull request in GitHub.
 
@@ -95,6 +162,8 @@ refused, and repeated restarts are a no-op. PostgreSQL rows carry
 legacy-JSON chat migration writes `<legacy path>.pre-sqlite-backup` first,
 using `COPYFILE_EXCL` so an existing backup is never overwritten, and records a
 `legacy-json-migrated` marker only after the migrated rows are committed.
+
+PostgreSQL's authoritative migration ledger is `drizzle.__drizzle_migrations` with full journal verification as described above — not just most recent timestamp.
 
 ### Backups
 

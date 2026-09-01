@@ -43,9 +43,10 @@ export const BACKUP_VERSION = 2 as const;
 export const CHAT_SECTION_VERSION = 1 as const;
 export const STUDIO_SECTION_VERSION = 1 as const;
 
+import { BadRequestError } from "@/lib/api-errors";
+
 /** Raised for input the import route must refuse *before* writing anything. */
-export class BackupValidationError extends Error {
-  readonly status = 400;
+export class BackupValidationError extends BadRequestError {
   constructor(message: string) {
     super(message);
     this.name = "BackupValidationError";
@@ -656,7 +657,7 @@ export interface ImportSummary {
  * this error escape, naming exactly which half is known to have committed so
  * the owner is told what may have landed.
  */
-export class PartialImportError extends Error {
+export class PartialImportError extends BadRequestError {
   readonly status = 500;
   readonly committed: { chat: boolean; studio: boolean };
   constructor(cause: unknown, committed: { chat: boolean; studio: boolean }) {
@@ -669,6 +670,8 @@ export class PartialImportError extends Error {
     this.name = "PartialImportError";
     this.committed = committed;
     this.cause = cause;
+    // Override status to 500 (BadRequestError defaults 400)
+    Object.defineProperty(this, "status", { value: 500, writable: false });
   }
 }
 
@@ -677,7 +680,7 @@ export class PartialImportError extends Error {
  * already happened was rolled back. Both stores are back to their exact
  * previous state, so this is a plain failure — never a partial success.
  */
-export class ImportFailedError extends Error {
+export class ImportFailedError extends BadRequestError {
   readonly status = 500;
   constructor(cause: unknown) {
     super(
@@ -686,6 +689,7 @@ export class ImportFailedError extends Error {
     );
     this.name = "ImportFailedError";
     this.cause = cause;
+    Object.defineProperty(this, "status", { value: 500, writable: false });
   }
 }
 

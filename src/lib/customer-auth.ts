@@ -5,17 +5,11 @@ import {
   type CustomerAccount,
   type CustomerSession,
 } from "@/lib/customer-account-store";
+import { CustomerNotConnectedError } from "@/lib/api-errors";
 
 export const CUSTOMER_SESSION_COOKIE = "valmont_customer_session";
 
-export class CustomerNotConnectedError extends Error {
-  readonly status = 401;
-
-  constructor(message = "Please sign in to continue.") {
-    super(message);
-    this.name = "CustomerNotConnectedError";
-  }
-}
+export { CustomerNotConnectedError };
 
 export function safeCustomerReturnPath(value: unknown, fallback = "/account") {
   if (typeof value !== "string") return fallback;

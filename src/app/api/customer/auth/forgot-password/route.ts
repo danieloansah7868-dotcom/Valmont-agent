@@ -13,6 +13,7 @@ import {
   customerEmailHtml,
   sendCustomerEmail,
 } from "@/lib/customer-email";
+import { CustomerEmailDeliveryError } from "@/lib/api-errors";
 
 const BODY_LIMIT_BYTES = 16_000;
 const forgotSchema = z.object({
@@ -29,6 +30,9 @@ export async function POST(request: NextRequest) {
     const parsed = forgotSchema.parse(body);
     const email = normalizeCustomerEmail(parsed.email);
     assertCustomerRateLimit(request, "customer-forgot-password", email, 5);
+    // Validate required production configuration BEFORE account lookup so a
+    // broken sender fails clearly and consistently with 503 for both known
+    // and unknown addresses.
     assertCustomerEmailDeliveryReady();
     const store = getCustomerAccountStore();
     const account = await store.getByEmail(email);
@@ -48,21 +52,32 @@ export async function POST(request: NextRequest) {
         request.nextUrl.origin,
       );
       resetLink.searchParams.set("token", token);
-      const delivery = await sendCustomerEmail({
-        to: account.email,
-        name: account.name,
-        subject: "Reset your Valmont customer password",
-        text: `Reset your Valmont customer password: ${resetLink.toString()}`,
-        html: customerEmailHtml(
-          "Reset your Valmont password",
-          account.name,
-          "We received a request to reset the password for your customer account.",
-          "Choose a new password",
-          resetLink.toString(),
-        ),
-        developmentLink: resetLink.toString(),
-      });
-      developmentLink = delivery.developmentLink;
+      try {
+        const delivery = await sendCustomerEmail({
+          to: account.email,
+          name: account.name,
+          subject: "Reset your Valmont customer password",
+          text: `Reset your Valmont customer password: ${resetLink.toString()}`,
+          html: customerEmailHtml(
+            "Reset your Valmont password",
+            account.name,
+            "We received a request to reset the password for your customer account.",
+            "Choose a new password",
+            resetLink.toString(),
+          ),
+          developmentLink: resetLink.toString(),
+        });
+        developmentLink = delivery.developmentLink;
+      } catch (error) {
+        // Suppress only expected typed delivery failures to prevent account
+        // enumeration. Configuration failures (503) and programming errors must
+        // NOT be swallowed.
+        if (error instanceof CustomerEmailDeliveryError) {
+          // Remain neutral — still return ok.
+        } else {
+          throw error;
+        }
+      }
     }
 
     return NextResponse.json({

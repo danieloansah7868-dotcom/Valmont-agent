@@ -1,4 +1,4 @@
-import { PayloadTooLargeError } from "@/lib/api";
+import { BadRequestError, PayloadTooLargeError } from "@/lib/api-errors";
 
 /** Body size ceilings. Draft edits are small; a complete backup is not. */
 export const DRAFT_BODY_LIMIT_BYTES = 1_000_000; // 1 MB
@@ -23,7 +23,7 @@ export async function readBoundedJson(
     return JSON.parse(text);
   } catch {
     // Never echo the body back — it may hold private business details.
-    throw new Error("Request body is not valid JSON");
+    throw new BadRequestError("Invalid request");
   }
 }
 
