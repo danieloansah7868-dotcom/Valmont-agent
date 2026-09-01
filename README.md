@@ -115,14 +115,44 @@ Chat sessions are separate from coding tasks. A session can be general, or it ca
 
 Reopenable sessions, messages, FTS retrieval data, and long-term memories are stored locally in SQLite. `CHAT_STORE_PATH` remains the backward-compatible legacy JSON input (default `.data/chat-store.json`), while `CHAT_SQLITE_PATH` selects the SQLite destination. When `CHAT_SQLITE_PATH` is omitted, Valmont derives a distinct sibling destination by replacing the legacy path extension with `.sqlite` (for example `.data/chat-store.json` becomes `.data/chat-store.sqlite`), so a configured persistent legacy directory remains in use. Before migration, Valmont creates `<legacy path>.pre-sqlite-backup`, migrates transactionally, and records completion only with the migrated rows. Never point both variables at the same file; the legacy JSON source is never opened as SQLite or overwritten. High-confidence secret patterns are redacted before messages are sent or persisted, but chat history is still sensitive local data: do not paste credentials, restrict filesystem access, and include the store in an intentional backup/deletion policy. Retrieved repository files are not persisted in the chat store.
 
-### PostgreSQL
+### PostgreSQL — controlled migrations, never automatic
 
 ```bash
 createdb valmont
-npm run db:migrate
+npm run db:verify:local   # no DB — validates full journal, SHA-256, ordering
+npm run db:migrate        # requires DATABASE_URL — advisory lock, applies missing in journal order, re-verifies
+npm run db:verify         # read-only — verifies ledger membership against journal
 ```
 
-Migrations are in `src/db/migrations`. When `DATABASE_URL` is set, Valmont automatically selects the session-scoped PostgreSQL task store and persists tasks, events, approvals, tool executions, validations, diffs, and pull-request records. Without it, tasks fall back to an ignored local JSON store so the application remains runnable during setup.
+Migrations live in `src/db/migrations` with journal `meta/_journal.json`. The system validates the **complete** journal, not just the latest timestamp:
+
+- structure (`version`/`dialect`), sequential `idx` 0..n-1 matching array position, unique `tag`/`idx`, numeric `when`, `breakpoints` boolean, SQL file existence, SHA-256 hash.
+- journal order is authoritative — never timestamp ordering (regression: `0007_studio_domains` when `1787573273009` < `0006_studio_settings` when `1787616000000` but idx 7 > 6).
+- ledger verification checks exact membership by hash + `created_at` against `drizzle.__drizzle_migrations`, failing closed on missing/altered/duplicate/unexpected rows.
+
+**Fresh Docker volume:** `compose.yaml` mounts `0000_lazy_leopardon.sql` (base schema, lexical first) and `0001_bootstrap_ledger.sql` (inserts ledger row with hash `3bdd1e6fd184d9325d3db2b38b6ed7287fa7fde65c42bb87d15f96f176a7f249` timestamp `1786700718887` derived from source). This makes a new volume report `migrations.status: complete` for the historic base only.
+
+**Existing volume without compatible ledger:** `/api/health` returns degraded 503 with `dependencies.migrations: { status: "incomplete", expected, applied }` until an operator runs `db:migrate`.
+
+Valmont never runs prod migrations automatically. CI provides a throwaway PostgreSQL 16 service and runs `db:migrate` → `db:verify` → `npm test` → `build`.
+
+When `DATABASE_URL` is set, Valmont selects the session-scoped PostgreSQL task store and persists tasks, events, approvals, tool executions, validations, diffs, and pull-request records. Without it, tasks fall back to an ignored local JSON store so the application remains runnable during setup.
+
+### Customer email delivery (Resend)
+
+Customer account emails (verification, password reset, order notifications) require **both** `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` — validated together, all-or-nothing:
+
+- both unset → `not_configured` → dev returns clearly local-only one-time links, prod fails closed 503.
+- one set / blank / malformed / CR-LF / angle-bracket injection → `invalid` → 503.
+- both valid (plain `noreply@example.com` or `Valmont <noreply@example.com>`) → `configured`.
+
+Delivery uses `fetch` with portable `AbortController` + 10s timeout (timer cleared in `finally`), provider failures normalized to typed 502 `CustomerEmailDeliveryError` with generic message (no bodies/keys leak). Config check runs **before** account lookup for anti-enumeration; `forgot-password`/`resend-verification` suppress only 502 after lookup, preserving neutral `ok:true`. See `src/lib/resend-config.ts` and `src/lib/customer-email.ts`.
+
+### Strict typed API errors
+
+`src/lib/api-errors.ts` defines explicit `ApiError` subclasses with intentional statuses: 400 `BadRequestError`, 401 `UnauthorizedError`/`NotConnectedError`, 403 `ForbiddenError`, 404 `NotFoundError`/`ChatNotFoundError`/etc, 409 `ConflictError`/`DraftConflictError`/`ImportInProgressError`, 413 `PayloadTooLargeError`, 429 `RateLimitError`, 502 `CustomerEmailDeliveryError`/`GitHubApiError`, 503 `CustomerEmailConfigurationError`.
+
+`safeApiError` in `src/lib/api.ts` trusts **only** `ApiError` instances. Zod errors → generic 400, JSON syntax → generic 400, arbitrary `Error("Task not found")`, plain objects with `status`, driver/network errors → opaque 500. No message-text heuristics. Tests preserve a single shared `ApiError` identity (no `vi.resetModules` with partial mocks).
 
 ## Scripts
 
@@ -132,10 +162,12 @@ npm run format:check   # verify formatting
 npm run lint           # ESLint (Next.js core web vitals + TypeScript)
 npm run typecheck      # strict TypeScript
 npm test               # Vitest suite
+npm run db:verify:local # validate journal + hashes, no DB
+npm run db:migrate     # controlled migrate: advisory lock, apply missing in journal order, re-verify
+npm run db:verify      # read-only ledger verification
 npm run build          # production Next.js build
 npm run validate       # all checks above plus build
 npm run db:generate    # generate a migration from Drizzle schema
-npm run db:migrate     # apply PostgreSQL migrations
 ```
 
 ## Project map

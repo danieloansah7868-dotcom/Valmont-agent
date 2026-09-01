@@ -1,7 +1,35 @@
 import { createHash } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
-import { NotConnectedError } from "@/lib/auth";
+import { ZodError } from "zod";
+import { ApiError, RateLimitError } from "@/lib/api-errors";
 import { checkRateLimit } from "@/lib/security";
+
+// Re-export typed errors so existing imports from "@/lib/api" continue to work.
+export { ApiError } from "@/lib/api-errors";
+export {
+  BadRequestError,
+  UnauthorizedError,
+  ForbiddenError,
+  NotFoundError,
+  ConflictError,
+  PayloadTooLargeError,
+  RateLimitError,
+  EmailDeliveryError,
+  ConfigurationError,
+  CustomerEmailDeliveryError,
+  CustomerEmailConfigurationError,
+  CustomerAccountExistsError,
+  InvalidCustomerCredentialsError,
+  InvalidOrderClaimError,
+  InvalidPasswordResetError,
+  CustomerNotConnectedError,
+  NotConnectedError,
+  ChatNotFoundError,
+  TaskNotFoundError,
+  MemoryNotFoundError,
+  RepositoryNotFoundError,
+  GitHubApiError,
+} from "@/lib/api-errors";
 
 /**
  * Returns a request bucket key only when the deployment explicitly trusts its
@@ -74,42 +102,6 @@ export function assertOwnerRateLimit(
 }
 
 /**
- * Errors that carry their own HTTP status. Preferring an explicit status over
- * matching words in a message means a reworded message can never silently
- * change a 409 into a 400.
- */
-export interface StatusCarryingError extends Error {
-  status: number;
-}
-
-function hasStatus(error: unknown): error is StatusCarryingError {
-  return (
-    error instanceof Error &&
-    typeof (error as Partial<StatusCarryingError>).status === "number" &&
-    (error as StatusCarryingError).status >= 400 &&
-    (error as StatusCarryingError).status <= 599
-  );
-}
-
-export class RateLimitError extends Error {
-  readonly status = 429;
-  constructor(
-    message = "Rate limit exceeded. Please wait before trying again.",
-  ) {
-    super(message);
-    this.name = "RateLimitError";
-  }
-}
-
-export class PayloadTooLargeError extends Error {
-  readonly status = 413;
-  constructor(message = "Request body too large") {
-    super(message);
-    this.name = "PayloadTooLargeError";
-  }
-}
-
-/**
  * Text that must never reach a browser. A database driver puts the failing
  * statement, its bound parameter values and the host it dialled into
  * `error.message`; returning that verbatim hands an attacker the schema and
@@ -137,49 +129,44 @@ function leaksInternals(message: string): boolean {
 const GENERIC_FAILURE =
   "Something went wrong handling that request. Please try again.";
 
+const GENERIC_BAD_REQUEST = "Invalid request";
+
 export function safeApiError(error: unknown) {
-  if (hasStatus(error)) {
-    // A deliberate status still gets its message screened: a wrapped driver
-    // error could otherwise carry statement text out with it.
-    return NextResponse.json(
-      {
-        error: leaksInternals(error.message) ? GENERIC_FAILURE : error.message,
-      },
-      { status: leaksInternals(error.message) ? 500 : error.status },
-    );
+  // Strict: only explicit ApiError instances are trusted for status/message.
+  if (error instanceof ApiError) {
+    const message = error.message;
+    // Even deliberate errors get screened for accidental internal leakage.
+    if (leaksInternals(message)) {
+      return NextResponse.json({ error: GENERIC_FAILURE }, { status: 500 });
+    }
+    return NextResponse.json({ error: message }, { status: error.status });
+  }
+
+  // Zod validation failures are generic 400, never echoing field details that
+  // might contain business data.
+  if (error instanceof ZodError) {
+    return NextResponse.json({ error: GENERIC_BAD_REQUEST }, { status: 400 });
   }
 
   const message =
     error instanceof Error ? error.message : "Unexpected request failure";
+
+  // Bounded JSON helper throws "Request body is not valid JSON" on SyntaxError.
+  if (
+    error instanceof SyntaxError ||
+    (typeof message === "string" &&
+      message.toLowerCase().includes("not valid json"))
+  ) {
+    return NextResponse.json({ error: GENERIC_BAD_REQUEST }, { status: 400 });
+  }
 
   // Unrecognised failures that expose internals become an opaque 500.
   if (leaksInternals(message)) {
     return NextResponse.json({ error: GENERIC_FAILURE }, { status: 500 });
   }
 
-  // Legacy fallback, inherited from before typed errors existed. Matching on
-  // message text is the very pattern the Studio code was corrected away from,
-  // and it is wrong in the same way: reword "Task not found" and the status
-  // silently becomes 400. It survives here only because pre-existing chat and
-  // task routes still throw bare `Error`s that rely on it, and re-typing those
-  // is outside Website Studio's scope. Recorded in NEXT-STEPS.md.
-  //
-  // An earlier version of this comment claimed no Studio path reaches the
-  // fallback. That was wrong, and an independent review caught it: the draft
-  // routes call `siteBriefSchemaV1.parse`, and a Zod validation failure is a
-  // bare `ZodError` with no `status`, so it lands here and is answered 400.
-  // That is the correct status for malformed input, so the behaviour is right
-  // even though the old justification was not. The hazard is unchanged —
-  // anything reaching this branch gets its status from message text.
-  const status =
-    error instanceof NotConnectedError
-      ? 401
-      : message === "Task not found" || message === "Chat not found"
-        ? 404
-        : message.includes("CSRF") || message.includes("Cross-origin")
-          ? 403
-          : message.includes("Rate limit")
-            ? 429
-            : 400;
-  return NextResponse.json({ error: message }, { status });
+  // Everything else — arbitrary Errors, plain objects with status, DB errors,
+  // network errors, stack traces — is opaque 500. This prevents
+  // status-property injection and message-text heuristics.
+  return NextResponse.json({ error: GENERIC_FAILURE }, { status: 500 });
 }

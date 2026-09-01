@@ -161,8 +161,15 @@ describe("readBoundedJson", () => {
     );
 
     expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toBe("Request body is not valid JSON");
+    // Strict error handling maps JSON syntax errors to generic 400 without echoing body
+    expect((error as Error).message).toBe("Invalid request");
     expect((error as Error).message).not.toContain(secret);
+
+    const { safeApiError } = await import("@/lib/api");
+    const response = safeApiError(error);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).not.toContain(secret);
   });
 
   it("uses 1 MB for draft edits and 25 MB for backup imports", () => {

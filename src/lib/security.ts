@@ -5,6 +5,7 @@ import {
   randomBytes,
 } from "node:crypto";
 import type { NextRequest } from "next/server";
+import { ForbiddenError } from "@/lib/api-errors";
 
 export { redactSecrets, redactPaymentData } from "./redact";
 
@@ -60,7 +61,7 @@ export function assertSameOrigin(request: NextRequest): void {
   try {
     originUrl = new URL(origin);
   } catch {
-    throw new Error("Cross-origin mutation rejected");
+    throw new ForbiddenError("Cross-origin mutation rejected");
   }
   // Reverse proxies may rewrite request.nextUrl to an internal host. Trust only the concrete Host
   // values supplied by Next/the proxy, never an arbitrary allowlist from user input.
@@ -75,14 +76,14 @@ export function assertSameOrigin(request: NextRequest): void {
     ),
   );
   if (!acceptedHosts.has(originUrl.host))
-    throw new Error("Cross-origin mutation rejected");
+    throw new ForbiddenError("Cross-origin mutation rejected");
   const forwardedProtocol = request.headers
     .get("x-forwarded-proto")
     ?.split(",")[0]
     ?.trim();
   if (forwardedHost && originUrl.host === forwardedHost && forwardedProtocol) {
     if (originUrl.protocol !== `${forwardedProtocol}:`) {
-      throw new Error("Cross-origin mutation rejected");
+      throw new ForbiddenError("Cross-origin mutation rejected");
     }
   }
 }
@@ -92,7 +93,7 @@ export function assertCsrf(request: NextRequest): void {
   const cookie = request.cookies.get("valmont_csrf")?.value;
   const header = request.headers.get("x-valmont-csrf");
   if (!cookie || !header || cookie !== header || cookie.length < 16) {
-    throw new Error("Invalid CSRF token");
+    throw new ForbiddenError("Invalid CSRF token");
   }
 }
 

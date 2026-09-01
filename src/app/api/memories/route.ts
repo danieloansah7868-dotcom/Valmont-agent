@@ -4,6 +4,7 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
 import { getChatStore } from "@/lib/chat-store";
 import { assertCsrf, redactSecrets } from "@/lib/security";
+import { BadRequestError } from "@/lib/api-errors";
 
 const memoryInput = z.object({
   content: z.string().trim().min(1).max(1000),
@@ -31,7 +32,7 @@ export async function POST(request: NextRequest) {
     const input = memoryInput.parse(await request.json());
     const content = redactSecrets(input.content);
     if (/\[REDACTED/.test(content))
-      throw new Error("Memories cannot contain secrets");
+      throw new BadRequestError("Memories cannot contain secrets");
     const now = new Date().toISOString();
     const memory = {
       id: crypto.randomUUID(),

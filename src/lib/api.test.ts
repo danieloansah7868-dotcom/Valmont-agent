@@ -1,21 +1,28 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   safeApiError,
   RateLimitError,
   PayloadTooLargeError,
+  BadRequestError,
+  ForbiddenError,
+  NotFoundError,
   assertOwnerRateLimit,
 } from "./api";
 import { NotConnectedError } from "./auth";
 import { resetRateLimitForTests } from "./security";
+import {
+  ChatNotFoundError,
+  TaskNotFoundError,
+  CustomerEmailDeliveryError,
+  CustomerEmailConfigurationError,
+} from "./api-errors";
 
 async function body(response: Response) {
   return (await response.json()) as { error: string };
 }
 
 describe("safeApiError keeps internal detail out of responses", () => {
-  // Found while testing the backup import route: a database outage returned
-  // the failing statement AND its bound parameter values to the browser, with
-  // a 400 that blamed the user's file for a server fault.
   it("replaces a driver error with a generic 500", async () => {
     const response = safeApiError(
       new Error(
@@ -47,18 +54,32 @@ describe("safeApiError keeps internal detail out of responses", () => {
   });
 
   it("screens a status-carrying error that wraps driver text", async () => {
-    class Wrapped extends Error {
-      readonly status = 400;
-    }
-    const response = safeApiError(
-      new Wrapped('Failed query: select * from "studio_drafts"'),
-    );
-    // Blaming the request would be wrong, and the schema must not leak.
+    // Arbitrary object with status should NOT control response — must be ApiError instance
+    const fake = {
+      message: 'Failed query: select * from "studio_drafts"',
+      status: 400,
+    };
+    const response = safeApiError(fake);
     expect(response.status).toBe(500);
     expect((await body(response)).error).not.toMatch(/studio_drafts/);
   });
 
-  it("still passes through deliberate, safe messages", async () => {
+  it("arbitrary message-bearing errors remain opaque 500", async () => {
+    const arbitrary = new Error("Task not found");
+    const response = safeApiError(arbitrary);
+    expect(response.status).toBe(500);
+    expect((await body(response)).error).toBe(
+      "Something went wrong handling that request. Please try again.",
+    );
+  });
+
+  it("does not trust plain object with status property", async () => {
+    const obj = { status: 404, message: "Not found" };
+    const response = safeApiError(obj);
+    expect(response.status).toBe(500);
+  });
+
+  it("still passes through deliberate typed ApiError instances", async () => {
     const rate = safeApiError(new RateLimitError());
     expect(rate.status).toBe(429);
     expect((await body(rate)).error).toMatch(/rate limit/i);
@@ -69,15 +90,47 @@ describe("safeApiError keeps internal detail out of responses", () => {
     const auth = safeApiError(new NotConnectedError());
     expect(auth.status).toBe(401);
 
-    const missing = safeApiError(new Error("Chat not found"));
-    expect(missing.status).toBe(404);
+    const chatMissing = safeApiError(new ChatNotFoundError());
+    expect(chatMissing.status).toBe(404);
 
-    const csrf = safeApiError(new Error("Invalid CSRF token"));
-    expect(csrf.status).toBe(403);
+    const taskMissing = safeApiError(new TaskNotFoundError());
+    expect(taskMissing.status).toBe(404);
 
-    const validation = safeApiError(new Error("Business name is required"));
-    expect(validation.status).toBe(400);
-    expect((await body(validation)).error).toBe("Business name is required");
+    const forbidden = safeApiError(new ForbiddenError("Invalid CSRF token"));
+    expect(forbidden.status).toBe(403);
+
+    const bad = safeApiError(new BadRequestError("Invalid request"));
+    expect(bad.status).toBe(400);
+
+    const notFound = safeApiError(new NotFoundError("Custom not found"));
+    expect(notFound.status).toBe(404);
+
+    const emailDelivery = safeApiError(new CustomerEmailDeliveryError());
+    expect(emailDelivery.status).toBe(502);
+
+    const emailConfig = safeApiError(new CustomerEmailConfigurationError());
+    expect(emailConfig.status).toBe(503);
+  });
+
+  it("returns generic 400 for Zod validation failures", async () => {
+    const schema = z.object({ name: z.string() });
+    try {
+      schema.parse({ name: 123 });
+    } catch (error) {
+      const response = safeApiError(error);
+      expect(response.status).toBe(400);
+      const text = (await body(response)).error;
+      expect(text).toBe("Invalid request");
+    }
+  });
+
+  it("returns generic 400 for JSON syntax failures", async () => {
+    const response = safeApiError(new SyntaxError("Unexpected token"));
+    expect(response.status).toBe(400);
+    expect((await body(response)).error).toBe("Invalid request");
+
+    const response2 = safeApiError(new Error("Request body is not valid JSON"));
+    expect(response2.status).toBe(400);
   });
 
   it("rate-limits an authenticated owner independently of other owners", () => {
@@ -102,5 +155,19 @@ describe("safeApiError keeps internal detail out of responses", () => {
     );
     expect(response.status).toBe(500);
     expect((await body(response)).error).not.toContain("/app/src");
+  });
+
+  it("does not expose transport/network details", async () => {
+    const response = safeApiError(new Error("ETIMEDOUT connecting to db"));
+    expect(response.status).toBe(500);
+    expect(JSON.stringify(await body(response))).not.toMatch(/ETIMEDOUT/);
+  });
+
+  it("does not expose stack/path details", async () => {
+    const response = safeApiError(
+      new Error("Error at /home/user/app/src/secret.ts:123:45"),
+    );
+    expect(response.status).toBe(500);
+    expect((await body(response)).error).not.toContain("/home/user");
   });
 });

@@ -3,6 +3,7 @@ import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
 import { getChatStore } from "@/lib/chat-store";
 import { assertCsrf } from "@/lib/security";
+import { BadRequestError, ChatNotFoundError } from "@/lib/api-errors";
 
 export async function GET(
   _request: Request,
@@ -12,7 +13,7 @@ export async function GET(
     const { id } = await context.params;
     const user = await requireApiSessionUser();
     const session = await getChatStore().get(id, user.id);
-    if (!session) throw new Error("Chat not found");
+    if (!session) throw new ChatNotFoundError();
     return NextResponse.json({ session });
   } catch (error) {
     return safeApiError(error);
@@ -29,7 +30,7 @@ export async function DELETE(
     const { id } = await context.params;
     const user = await requireApiSessionUser();
     const deleted = await getChatStore().delete(id, user.id);
-    if (!deleted) throw new Error("Chat not found");
+    if (!deleted) throw new ChatNotFoundError();
     return new NextResponse(null, { status: 204 });
   } catch (error) {
     return safeApiError(error);
@@ -44,11 +45,12 @@ export async function PATCH(
     assertCsrf(request);
     assertApiRateLimit(request, "archive-chat", 20);
     const { action } = (await request.json()) as { action?: string };
-    if (action !== "archive") throw new Error("Unsupported chat action");
+    if (action !== "archive")
+      throw new BadRequestError("Unsupported chat action");
     const { id } = await context.params;
     const user = await requireApiSessionUser();
     if (!(await getChatStore().archive(id, user.id)))
-      throw new Error("Chat not found");
+      throw new ChatNotFoundError();
     return new NextResponse(null, { status: 204 });
   } catch (error) {
     return safeApiError(error);

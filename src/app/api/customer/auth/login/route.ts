@@ -9,6 +9,7 @@ import {
 } from "@/lib/customer-auth";
 import { getCustomerAccountStore } from "@/lib/customer-account-store";
 import { normalizeCustomerEmail } from "@/lib/customer-password";
+import { InvalidCustomerCredentialsError } from "@/lib/api-errors";
 
 const BODY_LIMIT_BYTES = 16_000;
 const loginSchema = z.object({
@@ -16,15 +17,6 @@ const loginSchema = z.object({
   password: z.string().min(1).max(128),
   next: z.string().max(500).optional(),
 });
-
-class InvalidCustomerCredentialsError extends Error {
-  readonly status = 401;
-
-  constructor() {
-    super("The email or password is incorrect.");
-    this.name = "InvalidCustomerCredentialsError";
-  }
-}
 
 export async function POST(request: NextRequest) {
   try {

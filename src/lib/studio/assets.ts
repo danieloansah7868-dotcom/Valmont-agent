@@ -48,8 +48,9 @@ export interface AssetState {
 
 export const emptyAssets: AssetState = { logo: null, photos: [] };
 
-export class AssetError extends Error {
-  readonly status = 400;
+import { BadRequestError } from "@/lib/api-errors";
+
+export class AssetError extends BadRequestError {
   constructor(message: string) {
     super(message);
     this.name = "AssetError";

@@ -18,35 +18,38 @@ Valmont must not read or transmit `.env` files, credentials, private keys, payme
 ## Trust boundaries
 
 1. **Browser ↔ Next.js:** browser input is untrusted. Mutations require same origin, a double-submit CSRF token, Zod validation, and rate checks.
-2. **Customer account ↔ Next.js:** customer passwords are scrypt-hashed, session cookies are opaque HttpOnly/SameSite values, and the database stores only session/token hashes. Verification and reset tokens are one-time and expire; guest-order linking is deferred until the email is verified. Customer accounts are an explicit per-website opt-in (`features.customerAccounts`, default off): websites without it expose no account link, never attach a session at checkout, refuse order claims, and hide claimed orders from `/account`. Backups carry customer accounts as hashes only (scrypt envelopes, SHA-256 token digests — never plaintext); a restore inserts with or-ignore semantics and never overwrites an existing account's password hash.
+2. **Customer account ↔ Next.js:** customer passwords are scrypt-hashed, session cookies are opaque HttpOnly/SameSite values, and the database stores only session/token hashes. Verification and reset tokens are one-time and expire; guest-order linking is deferred until the email is verified. Customer accounts are an explicit per-website opt-in (`features.customerAccounts`, default off): websites without it expose no account link, never attach a session at checkout, refuse order claims, and hide claimed orders from `/account`. Backups carry customer accounts as hashes only (scrypt envelopes, SHA-256 token digests — never plaintext); a restore inserts with or-ignore semantics and never overwrites an existing account's password hash. Email delivery uses Resend only when `RESEND_API_KEY` + `NOTIFY_EMAIL_FROM` are both present and valid; partial/malformed/injection values fail closed with typed 503.
 3. **Next.js ↔ GitHub/model:** credentials are server-only. OAuth session payloads are AES-256-GCM encrypted and placed in short-lived HttpOnly cookies. Production should store token ciphertext in PostgreSQL/KMS-backed storage and keep only an opaque hashed session ID in the cookie.
 4. **Repository creation ↔ GitHub:** creation is an explicit authenticated form mutation, not a model capability. The server fixes the GitHub host, endpoint, authenticated owner, and README initialization; the user controls only validated metadata and private/public visibility.
 5. **Repository ↔ retrieval/model:** repository content is adversarial, including prompt injection. Path exclusion, content bounds, lexical selection, redaction, structured output, tool validation, and capability gates apply independently of model instructions. Chat marks repository excerpts as untrusted and exposes no write tools.
 6. **Chat ↔ coding workflow:** a chat has no workspace or GitHub mutation capability. Its only handoff is an editable task-form draft; task creation and both approval gates remain separate server-side operations.
 7. **Agent ↔ workspace:** generated paths and commands are adversarial. Only explicit provider methods are exposed. There is no arbitrary shell tool.
 8. **Workspace ↔ host/network:** the included local adapter is not a secure isolation boundary. Production must replace it.
+9. **Database migrations ↔ operator:** migrations are a controlled operator action (`npm run db:migrate` / `db:verify`), never automatic. The full Drizzle journal `meta/_journal.json` is validated (structure, ordering, SHA-256, existence) and ledger membership is checked by hash+timestamp. Timestamp ordering is never used; journal idx is authoritative (regression: `0007` when earlier than `0006` but idx later).
 
 ## Threats and MVP controls
 
-| Threat                                  | Controls                                                                                                                                                |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Credential leakage to browser/model/log | server-only env variables; sensitive path exclusion; redaction; no raw repository context in persistence; local chat-history access controls            |
-| OAuth CSRF/session tampering            | random OAuth state; AES-GCM authenticated encryption; HttpOnly, SameSite, Secure-in-production cookies; expiry                                          |
-| Customer credential/session compromise  | scrypt password hashing; opaque random session cookies; SHA-256 token/session storage; expiry, sign-out revocation, and reset revocation                |
-| Customer order takeover                 | customer id filter on history; checkout email match; one-time access-code claim; claim deferred until the account email is verified                     |
-| Cross-site mutation                     | same-origin check; double-submit CSRF token; JSON APIs                                                                                                  |
-| Unauthorized repository creation        | authenticated session; fixed GitHub endpoint/owner; Zod validation; creation-specific rate limit; no model tool or deletion/settings method             |
-| Accidental public repository            | private client/server default; explicit private/public selection; visibility echoed after creation                                                      |
-| Path traversal/symlink escape           | absolute-path and NUL rejection; resolved-root prefix check; `realpath` verification; symlink component rejection; workspace roots under generated base |
-| Arbitrary command execution             | exact command-to-argv map; `shell: false`; no command interpolation; timeout; process-group kill; output cap; deployment/migration denylist             |
-| Malicious repository script             | npm lifecycle hooks disabled where possible; **not fully mitigated locally**—requires container sandbox and egress policy                               |
-| Prompt injection                        | retrieved content is data, not authority; state machine and tools enforce approvals/capabilities outside prompts                                        |
-| Sensitive repository content            | explicit `.env`, key, credential, customer/payment, binary, generated, VCS, dependency exclusions; byte/size checks                                     |
-| Unauthorized PR                         | state must be `awaiting_final_approval`; latest final approval must be approved; only `valmont/*`; force false                                          |
-| Auto-merge/deploy                       | capabilities absent from provider interfaces; no merge/deploy methods; validations deny migrations/deployments                                          |
-| Audit manipulation                      | append-style events with actor/timestamp/metadata; production should add DB constraints and external append-only export                                 |
-| Abuse/DoS                               | request and file/output limits; in-process rate limiting; production requires distributed limiter and quotas                                            |
-| SSRF                                    | provider base URL is server configuration, not user input; GitHub host is fixed; production should allowlist provider hosts and sandbox egress          |
+| Threat                                  | Controls                                                                                                                                                                                                  |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Credential leakage to browser/model/log | server-only env variables; sensitive path exclusion; redaction; no raw repository context in persistence; local chat-history access controls; Resend API key and provider bodies never echoed (typed 502) |
+| OAuth CSRF/session tampering            | random OAuth state; AES-GCM authenticated encryption; HttpOnly, SameSite, Secure-in-production cookies; expiry                                                                                            |
+| Customer credential/session compromise  | scrypt password hashing; opaque random session cookies; SHA-256 token/session storage; expiry, sign-out revocation, and reset revocation                                                                  |
+| Customer order takeover                 | customer id filter on history; checkout email match; one-time access-code claim; claim deferred until the account email is verified                                                                       |
+| Cross-site mutation                     | same-origin check; double-submit CSRF token; JSON APIs                                                                                                                                                    |
+| Unauthorized repository creation        | authenticated session; fixed GitHub endpoint/owner; Zod validation; creation-specific rate limit; no model tool or deletion/settings method                                                               |
+| Accidental public repository            | private client/server default; explicit private/public selection; visibility echoed after creation                                                                                                        |
+| Path traversal/symlink escape           | absolute-path and NUL rejection; resolved-root prefix check; `realpath` verification; symlink component rejection; workspace roots under generated base                                                   |
+| Arbitrary command execution             | exact command-to-argv map; `shell: false`; no command interpolation; timeout; process-group kill; output cap; deployment/migration denylist                                                               |
+| Malicious repository script             | npm lifecycle hooks disabled where possible; **not fully mitigated locally**—requires container sandbox and egress policy                                                                                 |
+| Prompt injection                        | retrieved content is data, not authority; state machine and tools enforce approvals/capabilities outside prompts                                                                                          |
+| Sensitive repository content            | explicit `.env`, key, credential, customer/payment, binary, generated, VCS, dependency exclusions; byte/size checks                                                                                       |
+| Unauthorized PR                         | state must be `awaiting_final_approval`; latest final approval must be approved; only `valmont/*`; force false                                                                                            |
+| Auto-merge/deploy                       | capabilities absent from provider interfaces; no merge/deploy methods; validations deny migrations/deployments                                                                                            |
+| Audit manipulation                      | append-style events with actor/timestamp/metadata; production should add DB constraints and external append-only export                                                                                   |
+| Abuse/DoS                               | request and file/output limits; in-process rate limiting; production requires distributed limiter and quotas; email delivery has 10s timeout with timer cleanup                                           |
+| SSRF                                    | provider base URL is server configuration, not user input; GitHub host is fixed; Resend host fixed; production should allowlist provider hosts and sandbox egress                                         |
+| Migration tampering                     | full journal validation, SHA-256 per file, exact ledger membership, advisory lock, fail-closed on altered/unexpected/duplicate, no timestamp ordering                                                     |
+| Email header injection                  | CR/LF rejected in `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM`, angle-bracket injection rejected, sender validated as plain email or display-name format                                                      |
 
 ## Approval semantics
 
@@ -81,20 +84,21 @@ A production `WorkspaceProvider` must use:
 
 The schema contains `encrypted_access_token`, never raw token. Production should use envelope encryption (KMS/HSM), per-record nonces, key IDs/versioning, rotation, access logging, and a separate application role. Session cookies should contain only a random identifier; store its hash with expiry and revoke on sign-out.
 
-Use TLS, backups, point-in-time recovery, row ownership checks, and migration review. Valmont never runs production database migrations automatically.
+Use TLS, backups, point-in-time recovery, row ownership checks, and migration review. Valmont never runs production database migrations automatically — they are a controlled `db:migrate` + `db:verify` operator step with full journal verification, advisory locking, and fail-closed on altered/unexpected/duplicate ledger entries.
 
 ## Operational checklist
 
 - [ ] GitHub App with minimum selected-repository permissions
 - [ ] external sandbox implementation and egress policy
-- [ ] managed PostgreSQL and migrations applied manually
+- [ ] managed PostgreSQL and migrations applied via controlled `db:migrate` + `db:verify` (never automatic)
 - [ ] KMS-backed token encryption and 32+ byte session secret
 - [ ] distributed CSRF-aware sessions and rate limiting
-- [ ] secret scanning in CI and log sink redaction
+- [ ] secret scanning in CI and log sink redaction (Resend keys/bodies never leak)
 - [ ] CSP reviewed for deployed provider/observability endpoints
-- [ ] immutable audit export and alerts for failed gates
+- [ ] immutable audit export and alerts for failed gates and `migrations.status: incomplete` health
 - [ ] dependency/image scanning and regular rotation
 - [ ] penetration test focused on repo prompt injection and sandbox escape
+- [ ] Resend `RESEND_API_KEY` + `NOTIFY_EMAIL_FROM` validated together, anti-enumeration config check before lookup
 
 ## Website Studio Phase 1 Security
 
@@ -118,13 +122,18 @@ and owner scoping only. They take no body and change nothing, so CSRF and body
 limits do not apply; they are also **not** rate limited, which is a gap worth
 closing if these endpoints are ever exposed beyond a signed-in session.
 
-### Internal error detail
+### Internal error detail — strict typed ApiError
 
-`safeApiError` screens every message before it is returned. A database driver
-puts the failing statement, its bound parameter values and the host it dialled
-into `error.message`; any message matching those shapes is replaced with a
-generic sentence and reported as **500**, never as a 400 that would wrongly
-blame the caller's input. This is covered by `src/lib/api.test.ts`.
+`safeApiError` is **strict**: it trusts only explicit `ApiError` subclass instances defined in `src/lib/api-errors.ts`. All other errors — arbitrary `Error("Task not found")`, plain objects with `status`, Zod errors, JSON syntax errors, driver/network errors — are mapped to generic responses without leaking internal detail:
+
+- `ApiError` instance → its intentional status (400/401/403/404/409/413/429/502/503) and safe message, screened for internal patterns (`select * from`, `insert into`, `params:`, `ECONNREFUSED`, connection strings, stack frames). If it leaks, it becomes opaque 500.
+- `ZodError` → generic 400 `Invalid request`.
+- `SyntaxError` / message containing `not valid json` → generic 400 `Invalid request` (bounded JSON never echoes body).
+- Everything else → opaque 500 `Something went wrong handling that request. Please try again.`
+
+This removes the old message-text heuristics (`Task not found` → 404, `CSRF` → 403, `Rate limit` → 429, arbitrary `status` property). Intentional statuses are now typed: `BadRequestError` 400, `UnauthorizedError`/`NotConnectedError`/`CustomerNotConnectedError` 401, `ForbiddenError` 403, `NotFoundError`/`ChatNotFoundError`/`TaskNotFoundError`/etc 404, `ConflictError`/`DraftConflictError`/`ImportInProgressError`/`ImportLostLeaseError` 409, `PayloadTooLargeError` 413, `RateLimitError` 429, `CustomerEmailDeliveryError`/`EmailDeliveryError`/`GitHubApiError` 502, `CustomerEmailConfigurationError`/`ConfigurationError` 503.
+
+Tests in `src/lib/api.test.ts` assert that arbitrary message-bearing errors, plain objects with status, driver errors, and network errors remain opaque 500, while typed `ApiError` instances preserve their intentional statuses. Tests never use `vi.resetModules` with partial mocks of `security`/`api` modules, preserving a single shared `ApiError` class identity.
 
 ### Owner isolation
 
@@ -191,18 +200,11 @@ writer's changes are discarded without the owner being told.
 
 ### Error and log hygiene
 
-`safeApiError` maps known error types to status codes. Backup-import failures
-go through `parseBackup`, which reduces Zod issues to at most five field
-**paths** and never echoes submitted values, business details, or imported file
-contents.
-
-**Known limitation:** `safeApiError` forwards `error.message` for errors it does
-not recognise, so an unanticipated database or library message can still reach
-the client with a 400. Draft `POST`/`PATCH` validate with
-`siteBriefSchemaV1.parse`, whose raw Zod message is returned on failure. That
-message names field paths and constraints rather than the user's own data, but
-it is not the short generic string this section previously claimed. Existing
-secret-redaction patterns still apply to everything written to the store.
+- `safeApiError` strict typed errors as described above; no message heuristics.
+- Backup-import failures go through `parseBackup`, which reduces Zod issues to at most five field **paths** and never echoes submitted values.
+- `readBoundedJson` returns generic `Invalid request` on JSON syntax errors, never echoing body (covered by `src/lib/bounded-json.test.ts`).
+- Customer email: `sendCustomerEmail` normalizes all provider failures to generic 502 `CustomerEmailDeliveryError` without leaking provider bodies, keys, or status texts; config failures are typed 503 `CustomerEmailConfigurationError`. Both covered by `src/lib/customer-email.test.ts` including injection cases and timeout cleanup.
+- Resend config: `src/lib/resend-config.ts` validates `RESEND_API_KEY` + `NOTIFY_EMAIL_FROM` together, rejects blank/partial/malformed/CR-LF/angle-bracket injection, accepts plain and display-name senders. Covered by `src/lib/resend-config.test.ts`.
 
 ### Backup imports
 
@@ -290,6 +292,15 @@ number is replaced with `[REDACTED_CARD_NUMBER]` before the value is stored.
 Nobody should be encouraged to paste payment details on the strength of this.
 The correct control remains not collecting them, and Phase 1 asks for none.
 
+### Customer email delivery hardening
+
+- `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` are validated together: both unset → `not_configured`, one set / blank / malformed / CR-LF / injection → `invalid`, both valid → `configured`. See `src/lib/resend-config.ts`.
+- `assertCustomerEmailDeliveryReady()` checks config **before** any account lookup, preserving anti-enumeration: known and unknown emails get same 503 when misconfigured.
+- `sendCustomerEmail()` uses portable `AbortController` + `setTimeout` 10s, timer cleared in `finally` (no leaks, no unhandled rejections).
+- Provider non-ok and fetch rejections/timeouts → typed 502 `CustomerEmailDeliveryError` with generic message, no body/key leak.
+- `forgot-password` and `resend-verification` routes suppress **only** `CustomerEmailDeliveryError` after lookup, returning neutral `ok:true`; configuration errors (503) are not suppressed.
+- Tests cover config cases, provider rejection, timeout/abort, 502/503 contracts, anti-enumeration, and no-leak assertions.
+
 ### Test credentials
 
 The end-to-end tests mint a real encrypted `valmont_session` cookie using the
@@ -307,10 +318,10 @@ you want a clean slate.
 Security claims are only worth what has actually been executed. Do not treat a
 past total as a permanent fact — use the latest CI run on the pull request.
 
-| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit + integration (`npm test`) | Run in CI against a real PostgreSQL 16 service (`STUDIO_TEST_DATABASE_URL`), with the Drizzle migrations applied first. The coordinated-import suite injects a failure at every checkpoint and covers lease locking, expired-lease recovery, obsolete-token fencing, monotonic generations, and — with deterministic latches, no sleeps — both orderings of the PostgreSQL fence race (replacement fence first, and obsolete transaction winning the fence row lock). Without that variable the PostgreSQL files are reported as skipped, never as passed. |
-| End-to-end (`npm run test:e2e`) | Playwright schedules **11 tests across 2 projects (22 scheduled tests)** — `desktop-chromium` and `iphone` — against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests, the Nigeria/NGN/Africa/Lagos reopen test, and a no-sideways-scroll assertion in both projects. The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs this suite.                                                                                                                                                    |
+| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit + integration (`npm test`) | Run in CI against a real PostgreSQL 16 service (`STUDIO_TEST_DATABASE_URL`), with the Drizzle migrations applied first via controlled `db:migrate` + `db:verify` (full journal validation, no timestamp ordering). The coordinated-import suite injects a failure at every checkpoint and covers lease locking, expired-lease recovery, obsolete-token fencing, monotonic generations, and — with deterministic latches, no sleeps — both orderings of the PostgreSQL fence race (replacement fence first, and obsolete transaction winning the fence row lock). Without that variable the PostgreSQL files are reported as skipped, never as passed. Additional coverage: `resend-config`, `customer-email` (config, rejection, timeout, 502/503, anti-enumeration, no-leak), `api` (opaque 500 for arbitrary errors, typed statuses, Zod 400, JSON 400), `bounded-json` (no echo), `migration-bootstrap` (hash/timestamp sync, journal order regression). |
+| End-to-end (`npm run test:e2e`) | Playwright schedules **11 tests across 2 projects (22 scheduled tests)** — `desktop-chromium` and `iphone` — against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests, the Nigeria/NGN/Africa/Lagos reopen test, and a no-sideways-scroll assertion in both projects. The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs this suite.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 CI runs the unit, integration, PostgreSQL, Playwright and container-build jobs
 on every push and pull request via `.github/workflows/ci.yml`; there is no

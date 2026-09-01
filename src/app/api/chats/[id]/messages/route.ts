@@ -10,6 +10,7 @@ import {
 } from "@/lib/github-retrieval";
 import { createModelProvider } from "@/lib/models";
 import { assertCsrf } from "@/lib/security";
+import { BadRequestError, ChatNotFoundError } from "@/lib/api-errors";
 
 const messageInput = z.object({
   content: z.string().trim().min(1).max(8_000),
@@ -27,7 +28,7 @@ export async function POST(
     const user = await requireApiSessionUser();
     const store = getChatStore();
     const session = await store.get(id, user.id);
-    if (!session) throw new Error("Chat not found");
+    if (!session) throw new ChatNotFoundError();
 
     let repositoryContext;
     if (session.repository) {
@@ -44,7 +45,8 @@ export async function POST(
             ),
             new Promise<never>((_, reject) => {
               setTimeout(
-                () => reject(new Error("Repository context timed out")),
+                () =>
+                  reject(new BadRequestError("Repository context timed out")),
                 15_000,
               );
             }),

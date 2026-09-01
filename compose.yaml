@@ -9,6 +9,7 @@ services:
     volumes:
       - valmont-postgres:/var/lib/postgresql/data
       - ./src/db/migrations/0000_lazy_leopardon.sql:/docker-entrypoint-initdb.d/0000_valmont.sql:ro
+      - ./scripts/docker-init/0001_bootstrap_ledger.sql:/docker-entrypoint-initdb.d/0001_valmont_ledger.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U valmont -d valmont"]
       interval: 10s
@@ -33,6 +34,8 @@ services:
       MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.openai.com/v1}
       MODEL_API_KEY: ${MODEL_API_KEY:-}
       MODEL_NAME: ${MODEL_NAME:-gpt-4.1-mini}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      NOTIFY_EMAIL_FROM: ${NOTIFY_EMAIL_FROM:-}
       # CHAT_STORE_PATH remains a legacy JSON input; CHAT_SQLITE_PATH can select
       # a distinct destination. Mount any custom parent directory as well.
       CHAT_STORE_PATH: ${CHAT_STORE_PATH:-}

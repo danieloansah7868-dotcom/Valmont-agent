@@ -16,6 +16,10 @@ import {
 import { publicGetDraft } from "@/lib/studio/draft-public";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { customerAccountsEnabled } from "@/lib/studio/site-brief/schema";
+import {
+  CustomerAccountExistsError,
+  InvalidOrderClaimError,
+} from "@/lib/api-errors";
 
 const BODY_LIMIT_BYTES = 16_000;
 
@@ -25,15 +29,6 @@ const registerSchema = z.object({
   password: z.string().min(10).max(128),
   claimAccessCode: z.string().trim().max(128).optional().or(z.literal("")),
 });
-
-class InvalidOrderClaimError extends Error {
-  readonly status = 400;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "InvalidOrderClaimError";
-  }
-}
 
 export async function POST(request: NextRequest) {
   try {
@@ -80,10 +75,7 @@ export async function POST(request: NextRequest) {
 
     const store = getCustomerAccountStore();
     if (await store.getByEmail(email)) {
-      return NextResponse.json(
-        { error: "An account with that email already exists." },
-        { status: 409 },
-      );
+      throw new CustomerAccountExistsError();
     }
 
     const account = await store.createAccount({

@@ -128,12 +128,13 @@ export interface StartedImportJob {
   lease: ImportLockLease;
 }
 
+import { ConflictError } from "@/lib/api-errors";
+
 /**
  * Another complete-backup import is already running for this owner, or a
  * previous import could not be rolled back and still holds the owner lock.
  */
-export class ImportInProgressError extends Error {
-  readonly status = 409;
+export class ImportInProgressError extends ConflictError {
   constructor(
     message = "An import is already in progress for this account. Wait for it to finish.",
   ) {
@@ -147,8 +148,7 @@ export class ImportInProgressError extends Error {
  * after expiry (or the lock was released). The caller must stop writing and
  * must not sanitize or release the replacement lock.
  */
-export class ImportLostLeaseError extends Error {
-  readonly status = 409;
+export class ImportLostLeaseError extends ConflictError {
   constructor(message = "This import is no longer holding the owner lock.") {
     super(message);
     this.name = "ImportLostLeaseError";
