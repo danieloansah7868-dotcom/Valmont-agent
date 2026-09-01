@@ -47,10 +47,19 @@ jobs:
       - run: npm run format:check
       - run: npm run lint
       - run: npm run typecheck
+      - run: npm run db:verify:local
 
-      # Apply the Drizzle migrations to the throwaway database.
+      # Apply the Drizzle migrations to the throwaway database using the
+      # controlled migration runner (validates full journal, advisory lock,
+      # re-verifies ledger).
       - name: Apply database migrations
         run: npm run db:migrate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/valmont_test
+
+      # Verify the full migration ledger (exact journal membership, no timestamp ordering shortcut).
+      - name: Verify migration ledger
+        run: npm run db:verify
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/valmont_test
 
