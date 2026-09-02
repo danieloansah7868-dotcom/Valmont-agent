@@ -21,7 +21,10 @@ import {
   isPaymentMethodId,
 } from "@/lib/studio/site-brief/schema";
 import { notifyMerchantNewOrder } from "@/lib/studio/notifications";
-import { isValidGhanaMobile, normalizeGhanaMobile } from "@/lib/studio/bundles";
+import {
+  validateGhanaMobile,
+  normalizeGhanaMobile,
+} from "@/lib/studio/bundles";
 
 const CHECKOUT_BODY_LIMIT_BYTES = 100_000;
 
@@ -50,6 +53,7 @@ const checkoutSchema = z.object({
 });
 
 function accessCode(): string {
+  // 32 lowercase hex chars — unguessable, URL-safe, no ambiguous characters.
   return randomBytes(16).toString("hex");
 }
 
@@ -90,6 +94,7 @@ export async function POST(
       );
     }
 
+    // The chosen method must be one the shop has switched on.
     if (
       !isPaymentMethodId(payload.paymentMethod) ||
       !payments.methods.includes(payload.paymentMethod)
@@ -100,36 +105,21 @@ export async function POST(
       );
     }
 
-    // Ghana mobile validation for data-bundles sites: 02x/05x only, saved as 0240000001, landline 030 refuses
+    // Ghana mobile validation for data-bundles sites: 02x/05x only, saved as 0240000001, landline 030 refused
+    // Uses single explainer from bundles.ts — no duplicated regexes.
     const isBundleSite = draft.brief.category === "data-bundles";
     let normalizedPhone = payload.customerPhone.trim();
     if (isBundleSite) {
-      if (!isValidGhanaMobile(payload.customerPhone)) {
-        const cleaned = payload.customerPhone.replace(/[\s\-()]/g, "");
-        const isLandline =
-          /^(?:\+?233|0)3\d{8}$/.test(cleaned) ||
-          /^(?:\+?233|0)3\d{7}$/.test(cleaned);
-        if (isLandline) {
-          return NextResponse.json(
-            {
-              error:
-                "Landline numbers (030) are not supported. Please use a Ghana mobile number starting with 02x or 05x.",
-            },
-            { status: 400 },
-          );
-        }
-        return NextResponse.json(
-          {
-            error:
-              "Please enter a Ghana mobile number starting with 02x or 05x, e.g. 0240000001",
-          },
-          { status: 400 },
-        );
+      const validationError = validateGhanaMobile(payload.customerPhone);
+      if (validationError) {
+        return NextResponse.json({ error: validationError }, { status: 400 });
       }
       const norm = normalizeGhanaMobile(payload.customerPhone);
       if (norm) normalizedPhone = norm;
     }
 
+    // Re-price every line from the server-side catalogue. A line whose item is
+    // unknown or has no price is rejected — never silently priced at zero.
     const catalogue = new Map(draft.brief.items.map((item) => [item.id, item]));
     const lines: OrderLine[] = [];
     const pricedLines: PricedLine[] = [];
@@ -158,6 +148,7 @@ export async function POST(
       freeDeliveryAbove: payments.delivery.freeDeliveryAbove,
     });
 
+    // Enforce the minimum order on the goods subtotal, before delivery.
     if (
       !isBundleSite &&
       payments.delivery.minimumOrder > 0 &&
@@ -171,6 +162,7 @@ export async function POST(
       );
     }
 
+    // A delivery order needs somewhere to deliver to.
     if (
       !isBundleSite &&
       payments.delivery.enabled &&
@@ -182,10 +174,18 @@ export async function POST(
       );
     }
 
+    // Cash on delivery and manual methods (bank/momo without Valmont Pay) take
+    // no online payment now: the customer is sent straight to a confirmation
+    // page with instructions.
     const needsOnlinePayment =
       payload.paymentMethod === "valmont_pay" ||
       payload.paymentMethod === "card";
 
+    // Decide the payment rail BEFORE the order row exists. When the merchant
+    // has selected Live but the setup is incomplete, the simulator must not
+    // quietly take over (its confirmation would be refused by the fail-closed
+    // webhook and the order would sit at "pending" forever), so online
+    // methods are refused with a clear message instead of creating an orphan.
     const availability = await onlinePaymentAvailability();
     if (needsOnlinePayment && !availability.available) {
       return NextResponse.json(
@@ -193,10 +193,15 @@ export async function POST(
         { status: 409 },
       );
     }
+    // Manual and cash orders are real goods for real money regardless of the
+    // simulator, so only online orders inherit the test marker.
     const paymentMode = needsOnlinePayment ? availability.mode : "live";
 
     const code = accessCode();
     const isCod = payload.paymentMethod === "cod";
+    // Customer accounts are an owner opt-in per website; when the website has
+    // not enabled them, checkout stays purely guest and never reads a session.
+    // An account-store outage must never take guest checkout down with it.
     const accountsEnabled = customerAccountsEnabled(draft.brief);
     const customerSession = accountsEnabled
       ? await getCustomerSession().catch(() => null)
@@ -232,6 +237,8 @@ export async function POST(
       merchantNote: payload.note || undefined,
     });
 
+    // Absolute links (merchant alert, Valmont Pay callback) must use the
+    // deployment's public origin, never the bind address or Host header.
     const origin = publicOrigin(request.url);
 
     void notifyMerchantNewOrder({

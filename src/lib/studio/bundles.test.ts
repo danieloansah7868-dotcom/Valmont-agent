@@ -355,4 +355,86 @@ describe("Ghana mobile validation", () => {
     const ok = checkRecipientNetworkMatch("0240000001", "mtn");
     expect(ok.matches).toBe(true);
   });
+
+  it("validateGhanaMobile single source of truth", async () => {
+    const { validateGhanaMobile } = await import("./bundles");
+    expect(validateGhanaMobile("")).toBe("Phone number is required");
+    expect(validateGhanaMobile("030 123 4567")).toMatch(/Landline/);
+    expect(validateGhanaMobile("0240000001")).toBeNull();
+    expect(validateGhanaMobile("+44 7700 900123")).toMatch(/Ghana mobile/);
+  });
+});
+
+describe("category switch trap", () => {
+  it("leaving data-bundles strips bundle and stays valid", () => {
+    const bundleBrief = baseBrief({
+      category: "data-bundles",
+      items: [
+        {
+          id: "bundle-01",
+          name: "MTN 1GB",
+          price: 10,
+          bundle: { network: "mtn", dataMb: 1024 },
+        },
+      ],
+    });
+    expect(siteBriefSchemaV1.safeParse(bundleBrief).success).toBe(true);
+    const stripped = {
+      ...bundleBrief,
+      category: "business-profile",
+      selectedTemplate: "classic-hero",
+      items: bundleBrief.items.map((i: any) => {
+        const { bundle: _b, ...rest } = i;
+        void _b;
+        return rest;
+      }),
+    };
+    expect(siteBriefSchemaV1.safeParse(stripped).success).toBe(true);
+  });
+
+  it("entering data-bundles enriches priced items and stays valid", async () => {
+    const { guessNetworkFromItem, guessDataMbFromItem } =
+      await import("./bundles");
+    const businessBrief = {
+      schemaVersion: 1,
+      businessName: "Adom Fabrics",
+      category: "business-profile",
+      selectedPackage: "starter",
+      selectedTheme: "clean-corporate",
+      selectedTemplate: "classic-hero",
+      adminEmail: "ama@adomfabrics.com",
+      phone: "+233201234567",
+      items: [
+        { id: "item-1", name: "MTN 5GB", price: 30 },
+        { id: "item-2", name: "Shirt", price: 50 },
+      ],
+    };
+    const enriched = {
+      ...businessBrief,
+      category: "data-bundles",
+      selectedTemplate: "bundle-shop",
+      items: businessBrief.items.map((item: any) => ({
+        ...item,
+        bundle: {
+          network: guessNetworkFromItem(item) ?? "mtn",
+          dataMb: guessDataMbFromItem(item) ?? 1024,
+        },
+      })),
+    };
+    expect(siteBriefSchemaV1.safeParse(enriched).success).toBe(true);
+  });
+
+  it("price 0 is invalid for bundle", () => {
+    const brief = baseBrief({
+      items: [
+        {
+          id: "bundle-01",
+          name: "MTN 1GB",
+          price: 0,
+          bundle: { network: "mtn", dataMb: 1024 },
+        },
+      ],
+    });
+    expect(siteBriefSchemaV1.safeParse(brief).success).toBe(false);
+  });
 });

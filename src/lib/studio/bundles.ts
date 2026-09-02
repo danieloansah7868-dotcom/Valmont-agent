@@ -197,26 +197,34 @@ export function mergeStarterBundles(
 /**
  * Ghana mobile validation — only 02x and 05x, saved as 0240000001 (10 digits, leading 0).
  * Accepts E.164 +233, local 0xxxxxxxxx, or spaced/dashed variants.
+ * Single source of truth for landline/invalid explainer (used by storefront and checkout route).
  */
-export function isValidGhanaMobile(input: string): boolean {
+export function validateGhanaMobile(input: string): string | null {
   const trimmed = input.trim();
-  if (!trimmed) return false;
+  if (!trimmed) return "Phone number is required";
   const cleaned = trimmed.replace(/[\s\-()]/g, "");
+
+  // Landline detection — 030 / 03x is not mobile, show specific message
+  if (/^(?:\+?233|0)3\d{7,8}$/.test(cleaned)) {
+    return "Landline numbers (030) are not supported. Please use a mobile number starting with 02x or 05x.";
+  }
+
+  // Valid Ghana mobile: 0 + 2x/5x + 7 digits, or 233 + 2x/5x + 7, or +233 + 2x/5x + 7
   if (cleaned.startsWith("+233")) {
     const local = cleaned.slice(4);
-    if (!/^(?:2[0-9]|5[0-9])\d{7}$/.test(local)) return false;
-    return true;
-  }
-  if (cleaned.startsWith("233")) {
+    if (/^(?:2[0-9]|5[0-9])\d{7}$/.test(local)) return null;
+  } else if (cleaned.startsWith("233")) {
     const local = cleaned.slice(3);
-    if (!/^(?:2[0-9]|5[0-9])\d{7}$/.test(local)) return false;
-    return true;
+    if (/^(?:2[0-9]|5[0-9])\d{7}$/.test(local)) return null;
+  } else if (cleaned.startsWith("0")) {
+    if (/^0(?:2[0-9]|5[0-9])\d{7}$/.test(cleaned)) return null;
   }
-  if (cleaned.startsWith("0")) {
-    if (!/^0(?:2[0-9]|5[0-9])\d{7}$/.test(cleaned)) return false;
-    return true;
-  }
-  return false;
+
+  return "Please enter a Ghana mobile number starting with 02x or 05x, e.g. 0240000001";
+}
+
+export function isValidGhanaMobile(input: string): boolean {
+  return validateGhanaMobile(input) === null;
 }
 
 export function normalizeGhanaMobile(input: string): string | null {

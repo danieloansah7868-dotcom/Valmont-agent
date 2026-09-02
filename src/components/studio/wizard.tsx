@@ -49,6 +49,8 @@ import {
   mergeStarterBundles,
   formatDataMb,
   bundleNetworkLabel,
+  guessNetworkFromItem,
+  guessDataMbFromItem,
 } from "@/lib/studio/bundles";
 
 const STEPS = [
@@ -68,6 +70,7 @@ type SaveState =
 
 const AUTOSAVE_DELAY_MS = 600;
 
+/** Comma-separated text <-> list of trimmed values. */
 function toList(text: string): string[] {
   return text
     .split(",")
@@ -84,25 +87,54 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     at: initial.updatedAt,
   });
   const [deleting, setDeleting] = useState(false);
+  // Deleting a brief is irreversible, so the button asks first. This is an
+  // in-page confirmation rather than window.confirm(): it is reachable by
+  // screen readers, testable, and cannot be suppressed by the browser.
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [categoryNotice, setCategoryNotice] = useState<string | null>(null);
+  /** Both versions kept side by side while the person decides. */
   const [conflictPair, setConflictPair] = useState<{
     mine: SiteBriefV1;
     theirs: SiteBriefV1;
   } | null>(null);
+  /** Number of unsaved field changes, tracked in state so render stays pure. */
   const [pendingCount, setPendingCount] = useState(0);
+  /**
+   * Current server-confirmed revision, mirrored from revisionRef so the
+   * AssetUploader (which renders during the main render) can read it without
+   * touching a ref inside render.
+   */
   const [serverRevision, setServerRevision] = useState<number>(
     initial.revision,
   );
 
+  /**
+   * Everything the save loop needs lives in refs so the loop never restarts
+   * mid-flight and never captures a stale copy of the Brief.
+   */
   const revisionRef = useRef<number>(initial.revision);
+  /** The version last confirmed by the server — the base for any merge. */
   const savedBriefRef = useRef<SiteBriefV1>(initial.brief);
+  /** Latest on-screen version waiting to be written. */
   const pendingRef = useRef<SiteBriefV1 | null>(null);
+  /** True while a request is in flight: this is what serializes saving. */
   const inFlightRef = useRef(false);
+  /**
+   * True from the moment overlapping edits are detected until the owner picks a
+   * version. While set, no save may leave this component. Without it, typing
+   * anything while the choice is on screen would autosave the whole on-screen
+   * version over the other tab's work — the exact loss the choice exists to
+   * prevent. A ref rather than state because the save loop reads it
+   * synchronously and must never act on a stale render.
+   */
   const awaitingConflictChoiceRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Lets the save loop re-enter itself without becoming its own dependency. */
   const flushRef = useRef<() => Promise<void>>(async () => {});
   const unmountedRef = useRef(false);
+  /** The confirmation panel, so focus can be moved into and kept inside it. */
   const deleteDialogRef = useRef<HTMLDivElement | null>(null);
+  /** Where focus was before the dialog opened, so it can be handed back. */
   const deleteTriggerRef = useRef<HTMLElement | null>(null);
 
   useEffect(
@@ -113,14 +145,26 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     [],
   );
 
+  /**
+   * Keyboard and screen-reader behaviour for the delete confirmation.
+   *
+   * The trigger button is removed from the page when the dialog opens, so focus
+   * would otherwise fall back to the top of a long form. Focus is moved to the
+   * safe option, held inside the dialog while it is open, and returned to where
+   * it started once the dialog closes. Escape cancels, matching what a dialog
+   * is expected to do.
+   */
   useEffect(() => {
     if (!confirmingDelete) return;
     const dialog = deleteDialogRef.current;
     if (!dialog) return;
+
+    // Land on "Keep this draft" — the non-destructive choice.
     const cancelButton = dialog.querySelector<HTMLButtonElement>(
       '[data-testid="delete-draft-cancel"]',
     );
     cancelButton?.focus();
+
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -134,6 +178,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       if (focusable.length === 0) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
+      // Wrap at both ends so Tab cannot walk out into the page behind.
       if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
@@ -142,9 +187,11 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         first.focus();
       }
     };
+
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
+      // Hand focus back to whatever opened the dialog, when it still exists.
       const trigger = deleteTriggerRef.current;
       if (trigger && document.body.contains(trigger)) trigger.focus();
     };
@@ -155,6 +202,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     if (result.success) return { ok: true as const, issues: [] };
     return {
       ok: false as const,
+      // Field paths and Zod's own wording only — never the value entered.
       issues: result.error.issues.map((issue) => ({
         field: issue.path.join(".") || "form",
         message: issue.message,
@@ -164,6 +212,13 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
 
   const completeness = useMemo(() => computeBriefCompleteness(brief), [brief]);
 
+  /**
+   * A 409 means somebody else saved first. We fetch their version, then try to
+   * replay our pending edit on top of it. If the two edits touched different
+   * fields the replay is safe and happens automatically. If they touched the
+   * same field we stop and ask, because either answer would throw away real
+   * work. Nothing is discarded without the person choosing.
+   */
   const handleConflict = useCallback(
     async (mine: SiteBriefV1): Promise<void> => {
       let latest: StudioDraft;
@@ -182,7 +237,12 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         });
         return;
       }
+
       revisionRef.current = latest.revision;
+      // The freshest local state, not the snapshot that was sent: the owner
+      // may have typed while the failed save and this fetch were in flight.
+      // Rebasing from that state means the automatic replay below and the
+      // conflict choice both carry the newest typing.
       const latestLocal = pendingRef.current ?? mine;
       const outcome = mergeBriefs(
         savedBriefRef.current,
@@ -190,11 +250,17 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         latest.brief,
       );
       savedBriefRef.current = latest.brief;
+
       if (outcome.merged) {
+        // Safe: replay our fields on their version and retry exactly once.
         setBrief(outcome.merged);
         pendingRef.current = outcome.merged;
         return;
       }
+
+      // Overlapping edits: show both options rather than pick for them.
+      // Freeze saving first, so an edit made while the choice is on screen
+      // cannot escape and overwrite the other version.
       awaitingConflictChoiceRef.current = true;
       setConflictPair({ mine: latestLocal, theirs: latest.brief });
       setSaveState({
@@ -205,19 +271,30 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     [id],
   );
 
+  /**
+   * Sends exactly one save at a time. If edits arrive while a request is in
+   * flight they queue in `pendingRef` and are written by the next pass, so
+   * requests can never overtake one another and clobber a newer value.
+   */
   const flush = useCallback(async (): Promise<void> => {
     const outgoing = pendingRef.current;
+    // The rule itself lives in save-gate.ts so it can be unit tested. An
+    // unresolved conflict freezes saving: the edit stays queued and is written
+    // only after the owner chooses which version to keep.
     const decision = evaluateSaveGate({
       inFlight: inFlightRef.current,
       awaitingConflictChoice: awaitingConflictChoiceRef.current,
       hasPendingEdit: outgoing !== null,
+      // Never send something the server would reject; wait for it to be valid.
       isValid:
         outgoing !== null && siteBriefSchemaV1.safeParse(outgoing).success,
     });
     if (!decision.send || !outgoing) return;
+
     inFlightRef.current = true;
     pendingRef.current = null;
     setSaveState({ kind: "saving" });
+
     try {
       const updated = await apiPatch<StudioDraft>(`/api/studio/drafts/${id}`, {
         ...outgoing,
@@ -233,15 +310,20 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     } catch (cause) {
       const message =
         cause instanceof Error ? cause.message : "Could not save your changes.";
+      // Branch on the HTTP status, never on the message text: rewording a
+      // server message must not turn a conflict into a retry loop, and a 500
+      // that happens to contain the word "conflict" must not trigger a merge.
       const isConflict = cause instanceof ApiError && cause.status === 409;
       if (isConflict) {
         await handleConflict(outgoing);
       } else if (!unmountedRef.current) {
+        // Keep the edit queued so it is retried on the next change or retry.
         pendingRef.current = pendingRef.current ?? outgoing;
         setSaveState({ kind: "error", message });
       }
     } finally {
       inFlightRef.current = false;
+      // A newer edit may have queued while we were saving.
       if (pendingRef.current && !unmountedRef.current) {
         void flushRef.current();
       }
@@ -252,6 +334,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     flushRef.current = flush;
   }, [flush]);
 
+  /** Queue an edit and restart the debounce window. */
   const update = useCallback(
     (patch: Partial<SiteBriefV1>) => {
       setBrief((current) => {
@@ -269,6 +352,12 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     [flush],
   );
 
+  /**
+   * Leaving via "Done" must not outrun the autosave debounce. The unmount
+   * cleanup only clears the pending timer, so navigating within the debounce
+   * window would silently drop the last edit. Write it first, and stay on the
+   * page if the write did not land so the error or conflict stays visible.
+   */
   const finishAndLeave = useCallback(async (): Promise<void> => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
@@ -280,23 +369,107 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     }
   }, [flush, router]);
 
+  /**
+   * Changing the website type may make the chosen layout unsuitable. Only the
+   * layout is adjusted — every business detail is left exactly as it was.
+   */
   const changeCategory = useCallback(
     (categoryId: string) => {
       if (!isCategoryId(categoryId)) return;
+      const leavingBundles =
+        brief.category === "data-bundles" && categoryId !== "data-bundles";
+      const enteringBundles =
+        brief.category !== "data-bundles" && categoryId === "data-bundles";
+
+      if (leavingBundles) {
+        // Strip bundle metadata so the brief stays valid for non-bundle sites
+        const stripped = (brief.items ?? []).map((item) => {
+          const { bundle: _bundle, ...rest } = item as CatalogItem & {
+            bundle?: unknown;
+          };
+          void _bundle;
+          return rest;
+        });
+        update({
+          category: categoryId,
+          selectedTemplate: reconcileTemplate(
+            categoryId,
+            brief.selectedTemplate,
+          ),
+          ecomSubcategory:
+            (categoryId as string) === "online-shop"
+              ? brief.ecomSubcategory
+              : undefined,
+          items: stripped as CatalogItem[],
+        });
+        setCategoryNotice(null);
+        return;
+      }
+
+      if (enteringBundles) {
+        const enriched = (brief.items ?? []).map((item) => {
+          const priced = (item as CatalogItem).price !== undefined;
+          if (!priced) return item;
+          const existing = (item as CatalogItem).bundle;
+          if (existing?.network && existing?.dataMb) return item;
+          return {
+            ...item,
+            bundle: {
+              network:
+                existing?.network ??
+                guessNetworkFromItem(item as CatalogItem) ??
+                "mtn",
+              dataMb:
+                existing?.dataMb ??
+                guessDataMbFromItem(item as CatalogItem) ??
+                1024,
+              validity: existing?.validity,
+            },
+          } as CatalogItem;
+        });
+        update({
+          category: categoryId,
+          selectedTemplate: reconcileTemplate(
+            categoryId,
+            brief.selectedTemplate,
+          ),
+          ecomSubcategory:
+            (categoryId as string) === "online-shop"
+              ? brief.ecomSubcategory
+              : undefined,
+          items: enriched as CatalogItem[],
+        });
+        setCategoryNotice("Check the network and size of your existing items");
+        return;
+      }
+
       update({
         category: categoryId,
         selectedTemplate: reconcileTemplate(categoryId, brief.selectedTemplate),
         ecomSubcategory:
           categoryId === "online-shop" ? brief.ecomSubcategory : undefined,
       });
+      setCategoryNotice(null);
     },
-    [brief.ecomSubcategory, brief.selectedTemplate, update],
+    [
+      brief.category,
+      brief.ecomSubcategory,
+      brief.items,
+      brief.selectedTemplate,
+      update,
+    ],
   );
 
   const keepMine = useCallback(() => {
     if (!conflictPair) return;
     awaitingConflictChoiceRef.current = false;
     setConflictPair(null);
+    // “Keep what is on this screen” means exactly that: the newest on-screen
+    // state, including anything typed after the warning appeared. The conflict
+    // snapshot is only the fallback when nothing has been typed since. The
+    // save below carries the newest revision and goes through the normal
+    // conflict loop, so the latest local state is rebased onto the newest
+    // server revision before it is written.
     const latest = pendingRef.current ?? conflictPair.mine;
     pendingRef.current = latest;
     setSaveState({ kind: "unsaved" });
@@ -444,6 +617,11 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   </option>
                 ))}
               </select>
+              {categoryNotice && (
+                <p className="rounded bg-amber-50 p-2 text-xs text-amber-800">
+                  {categoryNotice}
+                </p>
+              )}
 
               {brief.category === "online-shop" && (
                 <>
@@ -507,6 +685,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   </span>
                 </label>
               ))}
+              <p className="text-xs text-slate-500">
+                The package is separate from the website type. Changing it does
+                not affect anything else you have filled in.
+              </p>
             </fieldset>
           )}
 
@@ -592,7 +774,9 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                         at: new Date().toISOString(),
                       });
                     }}
-                    onError={() => {}}
+                    onError={() => {
+                      /* error is shown inside the uploader */
+                    }}
                   />
                 </div>
               </section>
@@ -632,6 +816,13 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 onChange={(value) => update({ adminEmail: value })}
                 hint="Where Valmont will contact you about this website."
               />
+              {/*
+                The public contact address. It is deliberately separate from the
+                admin email: that one is how Valmont reaches the owner and must
+                never be published, so the preview and the eventual site read
+                this field instead. Without an input for it the preview could
+                only ever say "Not provided yet".
+              */}
               <TextField
                 id="email"
                 label="Email shown to customers"
@@ -750,6 +941,8 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 </div>
                 <p className="text-xs text-slate-500">
                   Ghana, GHS (GH₵) and Africa/Accra are the starting defaults.
+                  The alternatives are planning choices only — nothing is
+                  priced, charged or generated from them in Phase 1.
                 </p>
               </fieldset>
 
@@ -761,6 +954,14 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 hint="e.g. Mon–Sat 8am–6pm"
               />
 
+              <TextField
+                id="services"
+                label="Services you offer"
+                value={brief.services.join(", ")}
+                onChange={(value) => update({ services: toList(value) })}
+                hint="Separate each one with a comma."
+              />
+
               {isBundleSite ? (
                 <BundleTable
                   items={brief.items}
@@ -768,14 +969,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 />
               ) : (
                 <>
-                  <TextField
-                    id="services"
-                    label="Services you offer"
-                    value={brief.services.join(", ")}
-                    onChange={(value) => update({ services: toList(value) })}
-                    hint="Separate each one with a comma."
-                  />
-
                   <TextArea
                     id="products"
                     label="Products you sell"
@@ -867,9 +1060,8 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   </span>
                 </label>
                 <p className="text-xs text-slate-600">
-                  {isBundleSite
-                    ? "Turn on checkout so customers can buy bundles with Mobile Money."
-                    : "Add prices to your products in Step 4 so customers can add them to a basket and pay."}
+                  Add prices to your products in Step 4 so customers can add
+                  them to a basket and pay.
                 </p>
               </fieldset>
 
@@ -895,6 +1087,12 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                     Let customers create an account to track their orders
                   </span>
                 </label>
+                <p className="text-xs text-slate-600">
+                  Customers can always order as guests. When this is on, your
+                  public website shows an Account link and customers can sign in
+                  to see their orders. Turn it off at any time — your orders
+                  stay safe in Website Studio.
+                </p>
               </fieldset>
 
               {brief.payments.enabled && (
@@ -1115,6 +1313,12 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             </div>
           )}
 
+          {/*
+            Sequential controls. The numbered buttons above allow jumping to any
+            step, but nothing signalled how to move on, so the wizard read as a
+            dead end after each screen. Autosave already persists every change,
+            so moving between steps needs no explicit save.
+          */}
           <nav
             aria-label="Step navigation"
             className="mt-6 flex items-center justify-between gap-3 border-t border-line pt-4"
@@ -1336,6 +1540,34 @@ function BundleTable({
   onChange: (items: CatalogItem[]) => void;
 }) {
   const idCounterRef = useRef(items.length);
+  const [displayUnits, setDisplayUnits] = useState<Record<string, "MB" | "GB">>(
+    () => {
+      const init: Record<string, "MB" | "GB"> = {};
+      for (const item of items) {
+        const mb = item.bundle?.dataMb ?? 1024;
+        init[item.id] = mb % 1024 === 0 ? "GB" : "MB";
+      }
+      return init;
+    },
+  );
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDisplayUnits((prev) => {
+      const next = { ...prev };
+      for (const item of items) {
+        if (!(item.id in next)) {
+          const mb = item.bundle?.dataMb ?? 1024;
+          next[item.id] = mb % 1024 === 0 ? "GB" : "MB";
+        }
+      }
+      // Remove stale ids
+      for (const key of Object.keys(next)) {
+        if (!items.some((i) => i.id === key)) delete next[key];
+      }
+      return next;
+    });
+  }, [items]);
 
   const addBundle = useCallback(() => {
     idCounterRef.current += 1;
@@ -1369,15 +1601,24 @@ function BundleTable({
     ) => {
       const next = items.map((it) => {
         if (it.id !== id) return it;
+        // Ensure we never produce { network } without dataMb — fill from existing or defaults
+        const existingBundle = it.bundle ?? {
+          network: "mtn" as BundleNetworkId,
+          dataMb: 1024,
+        };
         const nextBundle = patch.bundle
-          ? { ...(it.bundle ?? {}), ...patch.bundle }
-          : it.bundle;
+          ? {
+              network: (patch.bundle.network ??
+                existingBundle.network ??
+                "mtn") as BundleNetworkId,
+              dataMb: patch.bundle.dataMb ?? existingBundle.dataMb ?? 1024,
+              validity: patch.bundle.validity ?? existingBundle.validity,
+            }
+          : existingBundle;
         let name = it.name;
         if (patch.bundle?.network || patch.bundle?.dataMb !== undefined) {
-          const network = (patch.bundle?.network ??
-            it.bundle?.network ??
-            "mtn") as BundleNetworkId;
-          const mb = patch.bundle?.dataMb ?? it.bundle?.dataMb ?? 1024;
+          const network = (nextBundle.network ?? "mtn") as BundleNetworkId;
+          const mb = nextBundle.dataMb ?? 1024;
           name = `${bundleNetworkLabel(network)} ${formatDataMb(mb)}`;
         }
         if (patch.name) name = patch.name;
@@ -1453,9 +1694,10 @@ function BundleTable({
                 const network = (item.bundle?.network ??
                   "mtn") as BundleNetworkId;
                 const dataMb = item.bundle?.dataMb ?? 1024;
-                const isGb = dataMb % 1024 === 0;
-                const displayValue = isGb ? dataMb / 1024 : dataMb;
-                const displayUnit = isGb ? "GB" : "MB";
+                const displayUnit =
+                  displayUnits[item.id] ?? (dataMb % 1024 === 0 ? "GB" : "MB");
+                const displayValue =
+                  displayUnit === "GB" ? dataMb / 1024 : dataMb;
                 return (
                   <tr key={item.id} className="border-b last:border-0">
                     <td className="p-1">
@@ -1505,21 +1747,11 @@ function BundleTable({
                         value={displayUnit}
                         onChange={(e) => {
                           const newUnit = e.target.value as "MB" | "GB";
-                          // Convert current displayValue to new unit's MB
-                          const currentMb = dataMb;
-                          let newMb: number;
-                          if (newUnit === "GB") {
-                            // If switching to GB, convert MB to GB rounded to 0.5
-                            newMb =
-                              (Math.round((currentMb / 1024) * 2) / 2) * 1024;
-                            if (newMb < 1024) newMb = 1024;
-                          } else {
-                            // GB to MB: keep same MB
-                            newMb = currentMb;
-                          }
-                          updateItem(item.id, {
-                            bundle: { dataMb: Math.round(newMb) },
-                          });
+                          // Unit switch must only change display, never dataMb
+                          setDisplayUnits((prev) => ({
+                            ...prev,
+                            [item.id]: newUnit,
+                          }));
                         }}
                         className="rounded border border-line px-1 py-1 text-xs"
                         data-testid={`bundle-unit-${item.id}`}
@@ -1531,14 +1763,28 @@ function BundleTable({
                     <td className="p-1">
                       <input
                         type="number"
-                        min={0}
+                        min={0.01}
                         step={0.01}
-                        value={item.price ?? 0}
+                        value={item.price ?? ""}
+                        placeholder="10"
                         onChange={(e) => {
-                          const price = Number(e.target.value);
+                          const val = e.target.value;
+                          if (val === "") return;
+                          const price = Number(val);
+                          if (!Number.isFinite(price) || price <= 0) return;
                           updateItem(item.id, {
-                            price: Number.isFinite(price) ? price : 0,
+                            price,
                           });
+                        }}
+                        onBlur={(e) => {
+                          // If left empty, keep previous price
+                          if (
+                            e.target.value === "" &&
+                            item.price !== undefined
+                          ) {
+                            // force re-render by keeping value
+                            e.target.value = String(item.price);
+                          }
                         }}
                         className="w-20 rounded border border-line px-1 py-1 text-xs"
                         data-testid={`bundle-price-${item.id}`}

@@ -344,3 +344,121 @@ describe("checkout payment rail", () => {
     );
   });
 });
+
+describe("checkout data-bundles Ghana mobile validation", () => {
+  const bundleDraft = {
+    ...draft,
+    brief: {
+      ...draft.brief,
+      category: "data-bundles",
+      businessName: "Ghana Bundles Shop",
+      items: [
+        {
+          id: "bundle-00",
+          name: "MTN 1GB",
+          price: 10,
+          category: "mtn",
+          bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: {
+          enabled: false,
+          fee: 0,
+          minimumOrder: 0,
+          freeDeliveryAbove: 0,
+        },
+      },
+    },
+  };
+
+  function bundleRequest(phone: string) {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "bundle-00", quantity: 1 }],
+          customerName: "Kwame Buyer",
+          customerPhone: phone,
+          paymentMethod: "valmont_pay",
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "/pay/simulated",
+      live: false,
+    });
+    mocks.internalGetDraftForCheckout.mockResolvedValue(bundleDraft);
+    mocks.getCustomerSession.mockResolvedValue(null);
+    mocks.getOrdersStore.mockReturnValue({ create: mocks.create });
+    mocks.computeTotals.mockReturnValue({
+      subtotal: 10,
+      deliveryFee: 0,
+      total: 10,
+    });
+    mocks.create.mockResolvedValue({ ...createdOrder, status: "pending" });
+    mocks.notifyMerchantNewOrder.mockResolvedValue({
+      email: "skipped",
+      whatsapp: "skipped",
+    });
+  });
+
+  it("accepts +233 24 000 0001 and normalizes to 0240000001 with payment link", async () => {
+    const response = await POST(bundleRequest("+233 24 000 0001"), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ customerPhone: "0240000001" }),
+    );
+    expect(mocks.createPaymentLink).toHaveBeenCalledWith(
+      expect.objectContaining({ customerPhone: "0240000001" }),
+    );
+  });
+
+  it.each(["030 123 4567", "+44 7700 900123", "02412345"])(
+    "rejects %s with 400 and never creates order",
+    async (badPhone) => {
+      const response = await POST(bundleRequest(badPhone), params());
+
+      expect(response.status).toBe(400);
+      expect(mocks.create).not.toHaveBeenCalled();
+      expect(mocks.createPaymentLink).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts landline 0301234567 for non-bundle shop (unchanged)", async () => {
+    mocks.internalGetDraftForCheckout.mockResolvedValue(draft);
+    const req = new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "item-1", quantity: 1 }],
+          customerName: "Ama Mensah",
+          customerPhone: "0301234567",
+          paymentMethod: "cod",
+          customerAddress: "12 Independence Avenue",
+        }),
+      },
+    );
+    const response = await POST(req, params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalled();
+  });
+});

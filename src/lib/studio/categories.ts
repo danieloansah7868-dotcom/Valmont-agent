@@ -43,7 +43,7 @@ export interface CategoryManifest {
   preferredTemplate?: string;
 }
 
-export const CATEGORY_REGISTRY_VERSION = 1;
+export const CATEGORY_REGISTRY_VERSION = 2;
 
 export const categories: CategoryManifest[] = [
   {

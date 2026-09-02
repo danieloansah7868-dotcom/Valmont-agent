@@ -607,6 +607,13 @@ export const siteBriefSchemaV1 = baseSiteBriefV1.superRefine((brief, ctx) => {
     for (let i = 0; i < brief.items.length; i += 1) {
       const item = brief.items[i];
       if (item.price === undefined) continue;
+      if (item.price <= 0) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["items", i, "price"],
+          message: "Bundle price must be greater than 0",
+        });
+      }
       if (!item.bundle) {
         ctx.addIssue({
           code: "custom",

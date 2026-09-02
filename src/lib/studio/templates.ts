@@ -39,7 +39,7 @@ export interface TemplateManifest {
   compatibleCategories: readonly CategoryId[] | "*";
 }
 
-export const TEMPLATE_REGISTRY_VERSION = 1;
+export const TEMPLATE_REGISTRY_VERSION = 2;
 
 export const templates: TemplateManifest[] = [
   {
