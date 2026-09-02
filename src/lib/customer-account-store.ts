@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, eq, gt, isNotNull, isNull, lt, or } from "drizzle-orm";
 import { getDatabase } from "@/db";
 import {
   customerAccounts,
@@ -89,6 +89,13 @@ export interface CustomerAccountStore {
     token: string,
     purpose: CustomerTokenPurpose,
   ): Promise<ConsumedCustomerToken | null>;
+  /**
+   * Deletes expired sessions and expired or already-used one-time tokens.
+   * Expiry is enforced on every read, so this is hygiene rather than
+   * security: it keeps the tables from growing without bound and removes
+   * stale hashed material that has no further use.
+   */
+  purgeExpired(now?: Date): Promise<{ sessions: number; tokens: number }>;
 }
 
 export interface ConsumedCustomerToken {
@@ -100,6 +107,34 @@ export interface ConsumedCustomerToken {
 export const CUSTOMER_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const CUSTOMER_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 export const CUSTOMER_RESET_TTL_MS = 60 * 60 * 1000;
+
+/** Minimum gap between opportunistic purges triggered by session creation. */
+const PURGE_INTERVAL_MS = 60 * 60 * 1000;
+let lastPurgeAt = 0;
+
+/**
+ * Runs {@link CustomerAccountStore.purgeExpired} at most once an hour per
+ * process, from the hot path that creates new rows. Failures are swallowed —
+ * housekeeping must never break a sign-in — and the timer is reset so a
+ * transient database error does not turn into a purge storm.
+ */
+export async function purgeExpiredCustomerRowsOpportunistically(
+  store: CustomerAccountStore,
+  now = new Date(),
+): Promise<void> {
+  if (now.getTime() - lastPurgeAt < PURGE_INTERVAL_MS) return;
+  lastPurgeAt = now.getTime();
+  try {
+    await store.purgeExpired(now);
+  } catch {
+    // Hygiene only; expiry is still enforced on every read.
+  }
+}
+
+/** Test seam: forget the last purge time so the next call runs immediately. */
+export function resetCustomerPurgeClockForTests(): void {
+  lastPurgeAt = 0;
+}
 
 interface SqliteAccountRow {
   id: string;
@@ -252,6 +287,7 @@ export class SqliteCustomerAccountStore implements CustomerAccountStore {
   async createSession(accountId: string): Promise<CustomerSession> {
     const token = createCustomerToken();
     const now = new Date();
+    await purgeExpiredCustomerRowsOpportunistically(this, now);
     const expiresAt = new Date(now.getTime() + CUSTOMER_SESSION_TTL_MS);
     this.db
       .prepare(
@@ -299,6 +335,24 @@ export class SqliteCustomerAccountStore implements CustomerAccountStore {
     this.db
       .prepare("DELETE FROM customer_sessions WHERE account_id = ?")
       .run(accountId);
+  }
+
+  async purgeExpired(
+    now = new Date(),
+  ): Promise<{ sessions: number; tokens: number }> {
+    const cutoff = now.toISOString();
+    const sessions = this.db
+      .prepare("DELETE FROM customer_sessions WHERE expires_at <= ?")
+      .run(cutoff);
+    const tokens = this.db
+      .prepare(
+        "DELETE FROM customer_tokens WHERE expires_at <= ? OR used_at IS NOT NULL",
+      )
+      .run(cutoff);
+    return {
+      sessions: Number(sessions.changes),
+      tokens: Number(tokens.changes),
+    };
   }
 
   async createToken(
@@ -467,7 +521,9 @@ export class PostgresCustomerAccountStore implements CustomerAccountStore {
 
   async createSession(accountId: string): Promise<CustomerSession> {
     const token = createCustomerToken();
-    const expiresAt = new Date(Date.now() + CUSTOMER_SESSION_TTL_MS);
+    const now = new Date();
+    await purgeExpiredCustomerRowsOpportunistically(this, now);
+    const expiresAt = new Date(now.getTime() + CUSTOMER_SESSION_TTL_MS);
     const [row] = await getDatabase()
       .insert(customerSessions)
       .values({
@@ -514,6 +570,22 @@ export class PostgresCustomerAccountStore implements CustomerAccountStore {
     await getDatabase()
       .delete(customerSessions)
       .where(eq(customerSessions.accountId, accountId));
+  }
+
+  async purgeExpired(
+    now = new Date(),
+  ): Promise<{ sessions: number; tokens: number }> {
+    const sessions = await getDatabase()
+      .delete(customerSessions)
+      .where(lt(customerSessions.expiresAt, now))
+      .returning({ id: customerSessions.id });
+    const tokens = await getDatabase()
+      .delete(customerTokens)
+      .where(
+        or(lt(customerTokens.expiresAt, now), isNotNull(customerTokens.usedAt)),
+      )
+      .returning({ id: customerTokens.id });
+    return { sessions: sessions.length, tokens: tokens.length };
   }
 
   async createToken(

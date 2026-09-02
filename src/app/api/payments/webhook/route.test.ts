@@ -44,6 +44,8 @@ function request(body: unknown) {
 describe("payment webhook customer notifications", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
     mocks.getOrdersStore.mockReturnValue(mocks);
     mocks.verifyWebhookSignature.mockResolvedValue(true);
     mocks.getByAccessCode.mockResolvedValue(pendingOrder);
@@ -65,7 +67,7 @@ describe("payment webhook customer notifications", () => {
     expect(mocks.markPaid).toHaveBeenCalledWith(accessCode, undefined);
     expect(mocks.notifyCustomerOrderStatus).toHaveBeenCalledWith({
       order: { ...pendingOrder, status: "paid" },
-      origin: "http://localhost",
+      origin: "https://shop.example",
     });
   });
 
@@ -76,7 +78,7 @@ describe("payment webhook customer notifications", () => {
     expect(mocks.markFailed).toHaveBeenCalledWith(accessCode);
     expect(mocks.notifyCustomerOrderStatus).toHaveBeenCalledWith({
       order: { ...pendingOrder, status: "payment_failed" },
-      origin: "http://localhost",
+      origin: "https://shop.example",
     });
   });
 
@@ -91,6 +93,54 @@ describe("payment webhook customer notifications", () => {
 
     expect(response.status).toBe(200);
     expect(mocks.notifyCustomerOrderStatus).not.toHaveBeenCalled();
+  });
+
+  it("links the customer to APP_URL even when the callback arrives on the bind address", async () => {
+    const response = await POST(
+      new NextRequest(
+        `http://0.0.0.0:3000/api/payments/webhook?access_code=${accessCode}`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            host: "attacker.example",
+          },
+          body: JSON.stringify({ event: "payment.success" }),
+        },
+      ),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.notifyCustomerOrderStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ origin: "https://shop.example" }),
+    );
+  });
+
+  it("stops reading an oversized body and answers 413 before any verification", async () => {
+    const response = await POST(request({ pad: "x".repeat(60_000) }));
+
+    expect(response.status).toBe(413);
+    expect(mocks.verifyWebhookSignature).not.toHaveBeenCalled();
+    expect(mocks.getByAccessCode).not.toHaveBeenCalled();
+  });
+
+  it("answers 400 for a malformed JSON body without leaking detail", async () => {
+    const response = await POST(
+      new NextRequest(
+        `http://localhost/api/payments/webhook?access_code=${accessCode}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{not json",
+        },
+      ),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid request",
+    });
+    expect(mocks.markPaid).not.toHaveBeenCalled();
   });
 
   it("rejects an unsigned webhook before touching the order", async () => {

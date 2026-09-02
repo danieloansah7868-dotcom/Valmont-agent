@@ -43,6 +43,8 @@ const SUCCESS_FIELDS = [
   "skippedCustomerAccounts",
   "customerSessions",
   "customerTokens",
+  "customDomains",
+  "skippedDomains",
   "atomicity",
   "notice",
 ] as const;

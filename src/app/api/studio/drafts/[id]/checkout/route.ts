@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { publicOrigin } from "@/lib/auth-redirect";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
@@ -11,6 +12,8 @@ import { getOrdersStore, type OrderLine } from "@/lib/studio/orders";
 import {
   computeTotals,
   createPaymentLink,
+  ONLINE_PAYMENT_UNAVAILABLE_MESSAGE,
+  onlinePaymentAvailability,
   type PricedLine,
 } from "@/lib/studio/valmont-pay";
 import {
@@ -152,6 +155,29 @@ export async function POST(
       );
     }
 
+    // Cash on delivery and manual methods (bank/momo without Valmont Pay) take
+    // no online payment now: the customer is sent straight to a confirmation
+    // page with instructions.
+    const needsOnlinePayment =
+      payload.paymentMethod === "valmont_pay" ||
+      payload.paymentMethod === "card";
+
+    // Decide the payment rail BEFORE the order row exists. When the merchant
+    // has selected Live but the setup is incomplete, the simulator must not
+    // quietly take over (its confirmation would be refused by the fail-closed
+    // webhook and the order would sit at "pending" forever), so online
+    // methods are refused with a clear message instead of creating an orphan.
+    const availability = await onlinePaymentAvailability();
+    if (needsOnlinePayment && !availability.available) {
+      return NextResponse.json(
+        { error: ONLINE_PAYMENT_UNAVAILABLE_MESSAGE },
+        { status: 409 },
+      );
+    }
+    // Manual and cash orders are real goods for real money regardless of the
+    // simulator, so only online orders inherit the test marker.
+    const paymentMode = needsOnlinePayment ? availability.mode : "live";
+
     const code = accessCode();
     const isCod = payload.paymentMethod === "cod";
     // Customer accounts are an owner opt-in per website; when the website has
@@ -188,23 +214,21 @@ export async function POST(
       customerAddress: payload.customerAddress || undefined,
       customerAccountId,
       paymentMethod: payload.paymentMethod,
+      paymentMode,
       merchantNote: payload.note || undefined,
     });
+
+    // Absolute links (merchant alert, Valmont Pay callback) must use the
+    // deployment's public origin, never the bind address or Host header.
+    const origin = publicOrigin(request.url);
 
     void notifyMerchantNewOrder({
       order,
       brief: draft.brief,
-      origin: request.nextUrl.origin,
+      origin,
     }).catch(() => {
       /* Never fail checkout because a notification did not send. */
     });
-
-    // Cash on delivery and manual methods (bank/momo without Valmont Pay) take
-    // no online payment now: the customer is sent straight to a confirmation
-    // page with instructions.
-    const needsOnlinePayment =
-      payload.paymentMethod === "valmont_pay" ||
-      payload.paymentMethod === "card";
 
     if (!needsOnlinePayment) {
       return NextResponse.json({
@@ -215,7 +239,6 @@ export async function POST(
       });
     }
 
-    const origin = request.nextUrl.origin;
     const payment = await createPaymentLink({
       accessCode: code,
       amount: totals.total,

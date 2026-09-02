@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { readBoundedJson } from "@/lib/bounded-json";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
@@ -29,7 +30,7 @@ export async function POST(request: NextRequest) {
     assertCsrf(request);
     assertApiRateLimit(request, "memory-write", 20);
     const user = await requireApiSessionUser();
-    const input = memoryInput.parse(await request.json());
+    const input = memoryInput.parse(await readBoundedJson(request, 8_000));
     const content = redactSecrets(input.content);
     if (/\[REDACTED/.test(content))
       throw new BadRequestError("Memories cannot contain secrets");
@@ -57,7 +58,7 @@ export async function PATCH(request: NextRequest) {
     const user = await requireApiSessionUser();
     const { enabled } = z
       .object({ enabled: z.boolean() })
-      .parse(await request.json());
+      .parse(await readBoundedJson(request, 8_000));
     await getChatStore().setMemoryEnabled(user.id, enabled);
     return new NextResponse(null, { status: 204 });
   } catch (error) {

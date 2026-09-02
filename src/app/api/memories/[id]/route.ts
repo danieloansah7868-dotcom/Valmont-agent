@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { readBoundedJson } from "@/lib/bounded-json";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
@@ -16,7 +17,7 @@ export async function PATCH(
     const { id } = await context.params;
     const { content } = z
       .object({ content: z.string().trim().min(1).max(1000) })
-      .parse(await request.json());
+      .parse(await readBoundedJson(request, 8_000));
     if (!(await getChatStore().updateMemory(id, user.id, content)))
       throw new MemoryNotFoundError();
     return new NextResponse(null, { status: 204 });

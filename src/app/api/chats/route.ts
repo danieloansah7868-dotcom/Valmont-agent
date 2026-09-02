@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { readBoundedJson } from "@/lib/bounded-json";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
@@ -35,7 +36,7 @@ export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
     assertApiRateLimit(request, "create-chat", 15);
-    const input = chatInput.parse(await request.json());
+    const input = chatInput.parse(await readBoundedJson(request, 16_000));
     const user = await requireApiSessionUser();
     const store = getChatStore();
     let repository;

@@ -973,7 +973,10 @@ export function setRestoreFenceBarrierForTests(
  *    with the snapshot; once this advance commits, the obsolete transaction
  *    can no longer commit at all. A *newer* fence throws ImportLostLeaseError
  *    and rolls everything back.
- * 2. Delete the owner's drafts and re-insert the snapshot rows.
+ * 2. Delete only the drafts the import added (ids absent from the snapshot)
+ *    and upsert the snapshot rows in place. Deleting every draft and
+ *    re-inserting would cascade to the drafts' orders and custom domains —
+ *    rows the import never wrote — so pre-existing drafts keep their ids.
  * 3. Conditionally touch the fence as the last statement before COMMIT, so
  *    the restore itself is also protected against being obsolete.
  *
@@ -987,18 +990,25 @@ export async function restoreStudioState(
   assertOwnsImportLease(lease);
   const { getDatabase } = await import("@/db");
   const { studioDrafts } = await import("@/db/schema");
-  const { eq } = await import("drizzle-orm");
+  const { and, eq, notInArray } = await import("drizzle-orm");
   const { advanceStudioImportFenceInTx, touchStudioImportFenceInTx } =
     await import("./import-fence");
   await getDatabase().transaction(async (tx) => {
     await restoreFenceBarrierForTests?.();
     await advanceStudioImportFenceInTx(tx, lease);
+    const keep = pre.drafts.map((draft) => draft.id);
     await tx
       .delete(studioDrafts)
-      .where(eq(studioDrafts.ownerId, lease.ownerId));
+      .where(
+        keep.length === 0
+          ? eq(studioDrafts.ownerId, lease.ownerId)
+          : and(
+              eq(studioDrafts.ownerId, lease.ownerId),
+              notInArray(studioDrafts.id, keep),
+            ),
+      );
     for (const draft of pre.drafts) {
-      await tx.insert(studioDrafts).values({
-        id: draft.id,
+      const row = {
         ownerId: lease.ownerId,
         schemaVersion: draft.schemaVersion,
         templateVersion: draft.templateRegistryVersion,
@@ -1007,7 +1017,11 @@ export async function restoreStudioState(
         createdAt: new Date(draft.createdAt),
         updatedAt: new Date(draft.updatedAt),
         brief: draft.brief,
-      });
+      };
+      await tx
+        .insert(studioDrafts)
+        .values({ id: draft.id, ...row })
+        .onConflictDoUpdate({ target: studioDrafts.id, set: row });
     }
     await touchStudioImportFenceInTx(tx, lease);
   });

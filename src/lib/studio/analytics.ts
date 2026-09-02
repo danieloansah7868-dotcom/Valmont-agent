@@ -40,6 +40,12 @@ const ACCRA_HOUR_FORMATTER = new Intl.DateTimeFormat("en-GB", {
 export interface StudioAnalytics {
   /** Settled orders only; refunded orders are not counted here. */
   paidOrders: number;
+  /**
+   * Orders placed through the local payment simulator (test mode). They are
+   * never counted in any figure above or below; the count is reported so the
+   * merchant knows practice orders exist and were deliberately left out.
+   */
+  excludedTestOrders: number;
   /** Net sales: settled sales less full refunds. */
   paidRevenue: number;
   /** Sales before subtracting full refunds. */
@@ -162,8 +168,13 @@ export function filterAnalyticsOrders(
  * refund amount.
  */
 export function summariseOrders(
-  orders: readonly OrderRecord[],
+  allOrders: readonly OrderRecord[],
 ): StudioAnalytics {
+  // Simulator orders represent no money. They are dropped before any
+  // counting so a merchant practising in test mode cannot mistake pretend
+  // payments for sales.
+  const orders = allOrders.filter((order) => order.paymentMode !== "test");
+  const excludedTestOrders = allOrders.length - orders.length;
   const settled = orders.filter((order) =>
     isOneOfStatuses(order.status, SETTLED_STATUSES),
   );
@@ -203,6 +214,7 @@ export function summariseOrders(
 
   return {
     paidOrders: settled.length,
+    excludedTestOrders,
     paidRevenue,
     grossRevenue,
     refundedRevenue,

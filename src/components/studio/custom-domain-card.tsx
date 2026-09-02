@@ -3,12 +3,29 @@
 import { useState, useEffect } from "react";
 import { apiMutation, apiDelete, ApiError } from "@/lib/client-api";
 
+interface DomainView {
+  hostname: string;
+  status: string;
+  verifiedAt?: string | null;
+  lastCheckedAt?: string | null;
+  records?: {
+    txt: { name: string; value: string };
+    cname: { name: string; target: string | null };
+  };
+  detail?: string;
+}
+
+function Mono({ children }: { children: string }) {
+  return (
+    <span className="rounded bg-slate-200 px-1 font-mono break-all select-all">
+      {children}
+    </span>
+  );
+}
+
 export function CustomDomainCard({ draftId }: { draftId: string }) {
   const [loading, setLoading] = useState(true);
-  const [domain, setDomain] = useState<{
-    hostname: string;
-    status: string;
-  } | null>(null);
+  const [domain, setDomain] = useState<DomainView | null>(null);
   const [input, setInput] = useState("");
   const [checkLoading, setCheckLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -18,7 +35,7 @@ export function CustomDomainCard({ draftId }: { draftId: string }) {
       try {
         const response = await fetch(`/api/studio/drafts/${draftId}/domain`);
         if (!response.ok) throw new Error("Failed to load");
-        const data = await response.json();
+        const data = (await response.json()) as DomainView | null;
         setDomain(data);
         if (data) setInput(data.hostname);
       } catch (err) {
@@ -49,7 +66,7 @@ export function CustomDomainCard({ draftId }: { draftId: string }) {
     setCheckLoading(true);
     setError(null);
     try {
-      const result = await apiMutation<{ hostname: string; status: string }>(
+      const result = await apiMutation<DomainView>(
         `/api/studio/drafts/${draftId}/domain`,
         {
           hostname: input.trim(),
@@ -73,6 +90,11 @@ export function CustomDomainCard({ draftId }: { draftId: string }) {
       />
     );
 
+  const cnameTarget =
+    domain?.records?.cname.target ??
+    process.env.NEXT_PUBLIC_STUDIO_PLATFORM_HOST ??
+    null;
+
   return (
     <section
       id="custom-domain-card"
@@ -93,27 +115,47 @@ export function CustomDomainCard({ draftId }: { draftId: string }) {
             className="flex-1 rounded-lg border border-line px-3 py-1.5 text-sm"
           />
         </div>
-        {domain && (
-          <div className="mt-2 rounded bg-slate-50 p-3 text-xs text-slate-700">
-            <p className="font-semibold">
-              Set this CNAME record at your registrar:
-            </p>
-            <p className="mt-1">
-              Host:{" "}
-              <span className="font-mono bg-slate-200 px-1 rounded">www</span>{" "}
-              (or <span className="font-mono bg-slate-200 px-1 rounded">@</span>
-              )
-            </p>
-            <p className="mt-1">
-              Target:{" "}
-              <span className="font-mono bg-slate-200 px-1 rounded">
-                {process.env.NEXT_PUBLIC_STUDIO_PLATFORM_HOST || "valmont.test"}
-              </span>
-            </p>
-            {!process.env.NEXT_PUBLIC_STUDIO_PLATFORM_HOST && (
-              <p className="mt-2 text-[10px] text-amber-600">
+        {domain && domain.records && (
+          <div className="mt-2 grid gap-3 rounded bg-slate-50 p-3 text-xs text-slate-700">
+            <div>
+              <p className="font-semibold">
+                1. Prove you own the domain — add this TXT record at your
+                registrar:
+              </p>
+              <p className="mt-1">
+                Name: <Mono>{domain.records.txt.name}</Mono>
+              </p>
+              <p className="mt-1">
+                Value: <Mono>{domain.records.txt.value}</Mono>
+              </p>
+            </div>
+            <div>
+              <p className="font-semibold">
+                2. Point the domain at Valmont — add this CNAME record:
+              </p>
+              <p className="mt-1">
+                Name: <Mono>{domain.records.cname.name}</Mono>
+              </p>
+              <p className="mt-1">
+                Target:{" "}
+                {cnameTarget ? (
+                  <Mono>{cnameTarget}</Mono>
+                ) : (
+                  <span className="text-amber-700">
+                    not configured on this server yet
+                  </span>
+                )}
+              </p>
+            </div>
+            {domain.detail && (
+              <p className="text-slate-600" data-testid="domain-detail">
+                {domain.detail}
+              </p>
+            )}
+            {!cnameTarget && (
+              <p className="text-[10px] text-amber-600">
                 Note: The public Valmont address isn&apos;t configured on this
-                machine.
+                machine, so the domain cannot be connected here yet.
               </p>
             )}
           </div>
@@ -123,16 +165,21 @@ export function CustomDomainCard({ draftId }: { draftId: string }) {
           <button
             onClick={onSave}
             disabled={checkLoading}
-            className="btn-primary text-xs py-1 px-3"
+            className="btn-primary px-3 py-1 text-xs"
           >
             {checkLoading
               ? "Checking..."
               : input.trim()
-                ? "Check my domain"
+                ? domain
+                  ? "Check again"
+                  : "Check my domain"
                 : "Remove"}
           </button>
           {domain && (
-            <span className="text-xs font-medium px-2 py-1 rounded bg-slate-100">
+            <span
+              className="rounded bg-slate-100 px-2 py-1 text-xs font-medium"
+              data-testid="domain-status"
+            >
               {domain.status === "not_set"
                 ? "Not set"
                 : domain.status === "pending"
@@ -144,8 +191,10 @@ export function CustomDomainCard({ draftId }: { draftId: string }) {
           )}
         </div>
         <p className="mt-3 text-[10px] text-slate-500">
-          The security padlock turns on automatically once your domain is
-          connected and your site is running on the public Valmont server.
+          Both records are required. Ownership is re-checked from time to time,
+          so keep the TXT record in place. The security padlock turns on
+          automatically once your domain is connected and your site is running
+          on the public Valmont server.
         </p>
       </div>
     </section>

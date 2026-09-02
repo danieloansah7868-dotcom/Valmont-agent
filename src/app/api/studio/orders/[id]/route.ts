@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { publicOrigin } from "@/lib/auth-redirect";
 import { z } from "zod";
 import { requireApiSessionUser } from "@/lib/auth";
 import { assertCsrf } from "@/lib/security";
@@ -60,7 +61,7 @@ export async function PATCH(
     if (existing.status !== status) {
       await notifyCustomerOrderStatus({
         order: updated,
-        origin: request.nextUrl.origin,
+        origin: publicOrigin(request.url),
       }).catch(() => "failed");
     }
     return NextResponse.json(updated);

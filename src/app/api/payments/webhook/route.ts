@@ -1,6 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { publicOrigin } from "@/lib/auth-redirect";
 import { z } from "zod";
 import { safeApiError } from "@/lib/api";
+import { readBoundedText } from "@/lib/bounded-json";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { verifyWebhookSignature } from "@/lib/studio/valmont-pay";
 import { notifyCustomerOrderStatus } from "@/lib/customer-order-notifications";
@@ -39,10 +41,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const raw = await request.text();
-    if (Buffer.byteLength(raw, "utf8") > WEBHOOK_BODY_LIMIT_BYTES) {
-      return NextResponse.json({ error: "Body too large" }, { status: 413 });
-    }
+    // Streamed with a byte ceiling: an oversized body is cut off as it
+    // arrives instead of being buffered whole and measured afterwards. The
+    // exact raw bytes are kept because the HMAC check below covers them.
+    const raw = await readBoundedText(
+      request as unknown as Request,
+      WEBHOOK_BODY_LIMIT_BYTES,
+    );
     if (
       !(await verifyWebhookSignature(raw, {
         valmont: request.headers.get("x-valmont-signature"),
@@ -52,7 +57,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
     }
 
-    const body = raw ? (JSON.parse(raw) as unknown) : {};
+    let body: unknown = {};
+    if (raw) {
+      try {
+        body = JSON.parse(raw) as unknown;
+      } catch {
+        return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+      }
+    }
     const parsed = webhookSchema.parse(body);
 
     const store = getOrdersStore();
@@ -73,7 +85,7 @@ export async function POST(request: NextRequest) {
     if (order && existing.status !== order.status) {
       await notifyCustomerOrderStatus({
         order,
-        origin: request.nextUrl.origin,
+        origin: publicOrigin(request.url),
       }).catch(() => "failed");
     }
 

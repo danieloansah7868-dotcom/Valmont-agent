@@ -25,7 +25,7 @@ beforeEach(() => {
     ),
   );
   vi.stubEnv("DATABASE_URL", "");
-  vi.stubEnv("SESSION_SECRET", "test-session-secret");
+  vi.stubEnv("SESSION_SECRET", "test-session-secret-that-is-long-enough");
 });
 
 afterEach(() => {

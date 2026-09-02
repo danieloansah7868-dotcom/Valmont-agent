@@ -38,7 +38,7 @@ beforeEach(() => {
     ),
   );
   vi.stubEnv("DATABASE_URL", "");
-  vi.stubEnv("SESSION_SECRET", "test-session-secret");
+  vi.stubEnv("SESSION_SECRET", "test-session-secret-that-is-long-enough");
   vi.stubEnv("VALMONT_PAY_API_URL", "");
   vi.stubEnv("VALMONT_PAY_API_KEY", "");
   vi.stubEnv("VALMONT_PAY_WEBHOOK_SECRET", "");

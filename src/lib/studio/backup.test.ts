@@ -20,6 +20,7 @@ import { createDefaultBrief } from "./site-brief/defaults";
 import { SqliteCustomerAccountStore } from "@/lib/customer-account-store";
 import { hashCustomerToken } from "@/lib/customer-password";
 import { SqliteOrdersStore, type NewOrderInput } from "./orders";
+import { SqliteDomainStore, newVerificationToken } from "./domains";
 
 const userA: SessionUser = { id: "9001", login: "ama", name: "Ama" };
 const userB: SessionUser = { id: "9002", login: "kofi", name: "Kofi" };
@@ -498,6 +499,150 @@ describe("customer accounts survive export and restore", () => {
     expect(summary.customerAccounts).toBe(0);
     expect(summary.customerSessions).toBe(0);
     expect(summary.customerTokens).toBe(0);
+  });
+});
+
+describe("custom domains survive export and restore — unverified", () => {
+  async function attachDomain(draftId: string, hostname: string) {
+    const store = new SqliteDomainStore();
+    await store.setDomain({
+      draftId,
+      ownerId: canonicalUserId(userA),
+      hostname,
+      status: "active",
+      verificationToken: newVerificationToken(),
+      verifiedAt: new Date().toISOString(),
+      lastCheckedAt: new Date().toISOString(),
+    });
+    return store;
+  }
+
+  it("exports the owner's domains without the verification token", async () => {
+    const { draft } = await seedUserA();
+    const store = await attachDomain(draft.id, "shop.adom.example");
+    const original = await store.getDomain(draft.id);
+
+    const backup = await buildBackup(userA);
+    expect(backup.domains).toEqual({
+      version: 1,
+      domains: [
+        expect.objectContaining({
+          draftId: draft.id,
+          hostname: "shop.adom.example",
+          status: "active",
+        }),
+      ],
+    });
+    const serialized = JSON.stringify(backup);
+    expect(serialized).not.toContain(original!.verification_token!);
+    expect(serialized).not.toContain("verification_token");
+    expect(serialized).not.toContain("verificationToken");
+  });
+
+  it("never exports another owner's domains", async () => {
+    const { draft } = await seedUserA();
+    await attachDomain(draft.id, "shop.adom.example");
+    const backup = await buildBackup(userB);
+    expect(backup.domains).toEqual({ version: 1, domains: [] });
+  });
+
+  it("re-attaches domains as pending with a fresh token, following remapped draft ids", async () => {
+    const { draft } = await seedUserA();
+    const store = await attachDomain(draft.id, "shop.adom.example");
+    const originalToken = (await store.getDomain(draft.id))!.verification_token;
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+
+    // Same database: the draft id collides and is remapped, and the hostname
+    // is still held by the original draft — so this copy must be skipped.
+    const collided = await importBackup(userA, parseBackup(backup));
+    expect(collided.remappedDraftIds).toBe(1);
+    expect(collided.customDomains).toBe(0);
+    expect(collided.skippedDomains).toBe(1);
+    const stillOriginal = await store.getDomainByHostname("shop.adom.example");
+    expect(stillOriginal!.draft_id).toBe(draft.id);
+    expect(stillOriginal!.status).toBe("active");
+
+    // Fresh machine: the domain follows the restored draft and starts over.
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+    expect(summary.studioDrafts).toBe(1);
+    expect(summary.customDomains).toBe(1);
+    expect(summary.skippedDomains).toBe(0);
+
+    const restored = await new SqliteDomainStore().getDomainByHostname(
+      "shop.adom.example",
+    );
+    expect(restored).not.toBeNull();
+    expect(restored!.draft_id).toBe(draft.id);
+    expect(restored!.owner_id).toBe(canonicalUserId(userA));
+    expect(restored!.status).toBe("pending");
+    expect(restored!.verified_at).toBeNull();
+    expect(restored!.verification_token).toBeTruthy();
+    expect(restored!.verification_token).not.toBe(originalToken);
+  });
+
+  it("follows a remapped draft id when the hostname is free", async () => {
+    const { draft } = await seedUserA();
+    await attachDomain(draft.id, "shop.adom.example");
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+
+    // Keep the draft (forcing a remap) but release the hostname first.
+    await new SqliteDomainStore().deleteDomain(draft.id);
+    const summary = await importBackup(userA, parseBackup(backup));
+    expect(summary.remappedDraftIds).toBe(1);
+    expect(summary.customDomains).toBe(1);
+
+    const restored = await new SqliteDomainStore().getDomainByHostname(
+      "shop.adom.example",
+    );
+    const all = await drafts.list(userA);
+    const copy = all.find((item) => item.id !== draft.id);
+    expect(copy).toBeDefined();
+    expect(restored!.draft_id).toBe(copy!.id);
+  });
+
+  it("skips a domain whose draft is not in the file and one with an invalid hostname", async () => {
+    const { draft } = await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    backup.domains = {
+      version: 1,
+      domains: [
+        {
+          draftId: "00000000-0000-4000-8000-00000000dead",
+          hostname: "orphan.example",
+          status: "pending",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        {
+          draftId: draft.id,
+          hostname: "not a hostname",
+          status: "pending",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    };
+
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+    expect(summary.customDomains).toBe(0);
+    expect(summary.skippedDomains).toBe(2);
+    expect(
+      await new SqliteDomainStore().getDomainByHostname("orphan.example"),
+    ).toBeNull();
+  });
+
+  it("a v2 file written before domains were exported still imports cleanly", async () => {
+    await seedUserA();
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    delete backup.domains;
+
+    freshDatabase();
+    const summary = await importBackup(userA, parseBackup(backup));
+    expect(summary.studioDrafts).toBe(1);
+    expect(summary.customDomains).toBe(0);
+    expect(summary.skippedDomains).toBe(0);
   });
 });
 

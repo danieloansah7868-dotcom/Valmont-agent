@@ -159,7 +159,13 @@ export default async function StudioAnalyticsPage({
         <MetricCard
           label="Paid orders"
           value={String(analytics.paidOrders)}
-          detail="Settled orders"
+          detail={
+            analytics.excludedTestOrders > 0
+              ? `Settled orders · ${analytics.excludedTestOrders} test ${
+                  analytics.excludedTestOrders === 1 ? "order" : "orders"
+                } excluded`
+              : "Settled orders"
+          }
         />
         <MetricCard
           label="Average order"

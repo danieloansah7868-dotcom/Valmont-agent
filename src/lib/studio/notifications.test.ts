@@ -20,6 +20,7 @@ const order: OrderRecord = {
   customerPhone: "+233240000000",
   customerAddress: "12 Independence Avenue Accra",
   paymentMethod: "valmont_pay",
+  paymentMode: "live",
   createdAt: "2026-08-23T18:02:09.000Z",
   updatedAt: "2026-08-23T18:02:09.000Z",
   statusHistory: [{ status: "paid", at: "2026-08-23T18:02:09.000Z" }],

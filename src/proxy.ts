@@ -1,5 +1,45 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getDomainStore } from "./lib/studio/domains";
+import { getDomainStore, type DomainRow } from "./lib/studio/domains";
+import { checkDomain, needsRecheck } from "./lib/studio/domain-verification";
+
+/**
+ * Hostnames whose re-verification is currently in flight, so a burst of
+ * requests on a stale domain triggers one DNS check rather than one per hit.
+ */
+const rechecking = new Set<string>();
+
+/**
+ * Re-verifies an active custom domain in the background once its last check
+ * is older than the re-check interval. The request being served is never
+ * delayed or affected; a domain whose ownership proof or CNAME has since been
+ * removed simply stops being served on the NEXT request after the check
+ * lands. This is what keeps a domain from remaining attached to a draft
+ * after its owner has moved it elsewhere.
+ */
+function scheduleRecheck(domain: DomainRow): void {
+  if (!needsRecheck(domain.last_checked_at)) return;
+  if (!domain.verification_token) return;
+  if (rechecking.has(domain.hostname)) return;
+  rechecking.add(domain.hostname);
+  void (async () => {
+    try {
+      const result = await checkDomain({
+        hostname: domain.hostname,
+        token: domain.verification_token!,
+        platformHost: process.env.STUDIO_PLATFORM_HOST,
+      });
+      const now = new Date().toISOString();
+      await getDomainStore().updateStatus(domain.draft_id, result.status, {
+        lastCheckedAt: now,
+        ...(result.ownershipProven ? {} : { verifiedAt: null }),
+      });
+    } catch (err) {
+      console.error("Domain re-verification error:", err);
+    } finally {
+      rechecking.delete(domain.hostname);
+    }
+  })();
+}
 
 export async function proxy(request: NextRequest) {
   const hostHeader = request.headers.get("host") || "";
@@ -36,6 +76,7 @@ export async function proxy(request: NextRequest) {
       if (domain && domain.status === "active") {
         rewriteUrl = request.nextUrl.clone();
         rewriteUrl.pathname = `/s/${domain.draft_id}`;
+        scheduleRecheck(domain);
       }
     } catch (err) {
       console.error("Proxy domain error:", err);

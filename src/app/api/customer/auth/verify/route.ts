@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { publicOrigin } from "@/lib/auth-redirect";
 import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { getCustomerAccountStore } from "@/lib/customer-account-store";
 import { normalizeCustomerEmail } from "@/lib/customer-password";
@@ -9,7 +10,7 @@ import { customerAccountsEnabled } from "@/lib/studio/site-brief/schema";
 export async function GET(request: NextRequest) {
   try {
     const token = request.nextUrl.searchParams.get("token")?.trim();
-    const loginUrl = new URL("/account/login", request.nextUrl.origin);
+    const loginUrl = new URL("/account/login", publicOrigin(request.url));
     if (!token || token.length > 200) {
       loginUrl.searchParams.set("verified", "invalid");
       return NextResponse.redirect(loginUrl);

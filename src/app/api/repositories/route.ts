@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { readBoundedJson } from "@/lib/bounded-json";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
@@ -35,7 +36,7 @@ export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
     assertApiRateLimit(request, "create-repository", 5);
-    const input = repositoryInput.parse(await request.json());
+    const input = repositoryInput.parse(await readBoundedJson(request, 8_000));
     await requireApiSessionUser();
     const provider = await getGitHubProvider();
     const repository = await provider.createRepository({

@@ -9,6 +9,14 @@ const isDev = process.env.NODE_ENV !== "production";
  * environments, and Turbopack serves HMR chunks that the browser may request
  * from 127.0.0.1 even when the server is bound to 0.0.0.0. Production keeps the
  * strict policy below with no 'unsafe-eval' and no websocket origins.
+ *
+ * 'unsafe-inline' for scripts remains in production because the App Router
+ * streams its React Server Components payload as inline <script> tags and
+ * the static headers() below cannot carry a per-request nonce; moving to a
+ * nonce-based policy needs the CSP header set from `src/proxy.ts` per
+ * request and is tracked in docs/SECURITY.md. Everything else that does not
+ * need inline execution is locked down: no plugins, no framed content, no
+ * cross-origin form posts beyond the GitHub sign-in.
  */
 const scriptSrc = isDev
   ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
@@ -46,6 +54,8 @@ const nextConfig: NextConfig = {
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data: https://avatars.githubusercontent.com",
               connectSrc,
+              "object-src 'none'",
+              "frame-src 'none'",
               "frame-ancestors 'self'",
               "base-uri 'self'",
               "form-action 'self' https://github.com",

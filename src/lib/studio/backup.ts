@@ -38,6 +38,12 @@ import {
   STUDIO_SCHEMA_VERSION,
 } from "./draft-store";
 import { ensureCustomerAccountSchema } from "@/lib/customer-account-store";
+import {
+  DOMAIN_STATUS,
+  ensureDomainsSchema,
+  newVerificationToken,
+  normalizeHostname,
+} from "./domains";
 
 export const BACKUP_VERSION = 2 as const;
 export const CHAT_SECTION_VERSION = 1 as const;
@@ -205,6 +211,26 @@ export const customerSectionSchema = z.object({
   tokens: z.array(customerTokenBackupSchema).max(500_000),
 });
 
+/**
+ * A custom domain attached to one of the exported drafts. The verification
+ * token is deliberately NOT exported: on restore the domain comes back as
+ * `pending` with a fresh token, so a file restored on another machine must
+ * prove ownership again before the hostname is served there.
+ */
+const domainBackupSchema = z.object({
+  draftId,
+  hostname: z.string().min(1).max(253),
+  status: z.enum(DOMAIN_STATUS),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+
+/** Optional backup section: custom domains. Absent in older files. */
+export const domainSectionSchema = z.object({
+  version: z.literal(1),
+  domains: z.array(domainBackupSchema).max(5_000),
+});
+
 /** A complete backup: chat, memories and website drafts together. */
 export const backupV2Schema = z.object({
   backupVersion: z.literal(2),
@@ -212,6 +238,7 @@ export const backupV2Schema = z.object({
   chat: chatSectionSchema,
   studio: studioSectionSchema,
   customers: customerSectionSchema.optional(),
+  domains: domainSectionSchema.optional(),
 });
 
 /** The older chat-only file produced by /api/memories/export. */
@@ -220,12 +247,15 @@ export const backupV1Schema = chatSectionSchema;
 export type BackupV2 = z.infer<typeof backupV2Schema>;
 export type StudioSection = z.infer<typeof studioSectionSchema>;
 export type CustomerSection = z.infer<typeof customerSectionSchema>;
+export type DomainSection = z.infer<typeof domainSectionSchema>;
 
 export interface NormalizedBackup {
   chat: z.infer<typeof chatSectionSchema>;
   studio: StudioSection;
   /** Present only in backups written after customer accounts existed. */
   customers?: CustomerSection;
+  /** Present only in backups written after custom domains were exported. */
+  domains?: DomainSection;
   sourceVersion: 1 | 2;
 }
 
@@ -248,6 +278,7 @@ export function parseBackup(input: unknown): NormalizedBackup {
       chat: parsed.data.chat,
       studio: parsed.data.studio,
       customers: parsed.data.customers,
+      domains: parsed.data.domains,
       sourceVersion: 2,
     };
   }
@@ -292,7 +323,8 @@ export async function buildBackup(
     const chat = await getSqliteChatStore().exportUser(user.id);
     const drafts = await new PostgresStudioDraftStore().list(user);
     const customers = await exportCustomersPostgres(canonicalUserId(user));
-    return assembleBackup(chat, drafts, customers);
+    const domains = await exportDomainsPostgres(canonicalUserId(user));
+    return assembleBackup(chat, drafts, customers, domains);
   }
 
   // Chat and drafts are read back to back from the one shared connection
@@ -305,6 +337,7 @@ export async function buildBackup(
   // Create the customer tables before opening the read transaction: DDL inside
   // a read snapshot would force a write upgrade and fail under concurrency.
   ensureCustomerAccountSchema(store.connection);
+  ensureDomainsSchema(store.connection);
   let chat: {
     version: number;
     sessions: ChatSession[];
@@ -315,6 +348,7 @@ export async function buildBackup(
   // Customer accounts share the same snapshot so a shopper signing up
   // mid-export cannot split the file between two points in time.
   let customers: CustomerSection | undefined;
+  let domains: DomainSection | undefined;
   store.runInReadTransaction(() => {
     chat = store.exportUserSync(user.id);
     // Test hook: proves the export cannot combine records from different
@@ -346,8 +380,9 @@ export async function buildBackup(
       })(),
     }));
     customers = exportCustomersSnapshot(store.connection, ownerId);
+    domains = exportDomainsSnapshot(store.connection, ownerId);
   });
-  return assembleBackup(chat!, drafts, customers);
+  return assembleBackup(chat!, drafts, customers, domains);
 }
 
 function assembleBackup(
@@ -359,6 +394,7 @@ function assembleBackup(
   },
   drafts: StudioDraft[],
   customers?: CustomerSection,
+  domains?: DomainSection,
 ): BackupV2 {
   return {
     backupVersion: BACKUP_VERSION,
@@ -380,6 +416,66 @@ function assembleBackup(
       sessions: [],
       tokens: [],
     },
+    domains: domains ?? { version: 1, domains: [] },
+  };
+}
+
+interface SqliteDomainBackupRow {
+  draft_id: string;
+  hostname: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * The owner's custom domains, read inside the caller's read transaction.
+ * Scoped by owner id, like every other section: a hostname belongs to one
+ * tenant's draft and never appears in another tenant's file.
+ */
+function exportDomainsSnapshot(
+  db: DatabaseSync,
+  ownerId: string,
+): DomainSection {
+  const rows = db
+    .prepare(
+      `SELECT draft_id, hostname, status, created_at, updated_at
+         FROM studio_domains WHERE owner_id = ? ORDER BY created_at`,
+    )
+    .all(ownerId) as unknown as SqliteDomainBackupRow[];
+  return {
+    version: 1,
+    domains: rows.map((row) => ({
+      draftId: row.draft_id,
+      hostname: row.hostname,
+      status: (DOMAIN_STATUS as readonly string[]).includes(row.status)
+        ? (row.status as (typeof DOMAIN_STATUS)[number])
+        : "pending",
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+  };
+}
+
+async function exportDomainsPostgres(ownerId: string): Promise<DomainSection> {
+  const { eq } = await import("drizzle-orm");
+  const { getDatabase } = await import("@/db");
+  const { studioDomains } = await import("@/db/schema");
+  const rows = await getDatabase()
+    .select()
+    .from(studioDomains)
+    .where(eq(studioDomains.ownerId, ownerId));
+  return {
+    version: 1,
+    domains: rows.map((row) => ({
+      draftId: row.draftId,
+      hostname: row.hostname,
+      status: (DOMAIN_STATUS as readonly string[]).includes(row.status)
+        ? (row.status as (typeof DOMAIN_STATUS)[number])
+        : "pending",
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    })),
   };
 }
 
@@ -634,6 +730,15 @@ export interface ImportSummary {
   customerSessions: number;
   customerTokens: number;
   /**
+   * Custom domains re-attached to restored drafts, always as `pending` with
+   * a fresh verification token: ownership must be proven again on the
+   * machine the file was restored to. A hostname already attached to
+   * another draft here, or attached to a draft that was not in the file, is
+   * left out and counted in `skippedDomains`.
+   */
+  customDomains: number;
+  skippedDomains: number;
+  /**
    * How the import was made atomic across stores.
    *
    * - `"single-transaction"` (SQLite): chat, memories and drafts share one
@@ -760,6 +865,8 @@ export async function importBackup(
     skippedCustomerAccounts: 0,
     customerSessions: 0,
     customerTokens: 0,
+    customDomains: 0,
+    skippedDomains: 0,
     atomicity: process.env.DATABASE_URL ? "coordinated" : "single-transaction",
   };
 
@@ -805,9 +912,12 @@ async function importIntoSqlite(
       summary.chatSessions = counts.chatSessions;
       summary.memories = counts.memories;
       summary.skippedMemories = counts.skippedMemories;
-      importStudioDrafts(db, ownerId, backup.studio, summary);
+      const draftIds = importStudioDrafts(db, ownerId, backup.studio, summary);
       if (backup.customers) {
         importCustomersSqlite(db, backup.customers, summary);
+      }
+      if (backup.domains) {
+        importDomainsSqlite(db, ownerId, backup.domains, draftIds, summary);
       }
       // Test hook: proves a failure after inserts rolls the whole import back.
       options.failAfterInsertForTests?.();
@@ -836,13 +946,18 @@ export function importStudioDrafts(
   ownerId: string,
   studio: StudioSection,
   summary: ImportSummary,
-): void {
+): Map<string, string> {
   ensureStudioSchema(db);
+  // File draft id → id actually written, so dependent rows (custom domains)
+  // follow a draft that was given a fresh id.
+  const written = new Map<string, string>();
   for (const incoming of studio.drafts) {
     const collides = draftIdExists(db, incoming.id);
     if (collides) summary.remappedDraftIds += 1;
+    const id = collides ? randomUUID() : incoming.id;
+    written.set(incoming.id, id);
     insertDraftRow(db, {
-      id: collides ? randomUUID() : incoming.id,
+      id,
       // The owner in the file is ignored on purpose.
       ownerId,
       schemaVersion: incoming.schemaVersion,
@@ -854,6 +969,49 @@ export function importStudioDrafts(
       brief: incoming.brief,
     });
     summary.studioDrafts += 1;
+  }
+  return written;
+}
+
+/**
+ * Re-attaches custom domains to the drafts restored in this import. Every
+ * restored domain starts `pending` with a NEW verification token — the file
+ * carries no token — so the hostname is never served from this machine until
+ * its owner publishes the new TXT record. Hostnames that fail validation,
+ * already belong to another draft here, or reference a draft that was not in
+ * this file are skipped and counted, never silently dropped.
+ */
+export function importDomainsSqlite(
+  db: DatabaseSync,
+  ownerId: string,
+  section: DomainSection,
+  draftIds: Map<string, string>,
+  summary: ImportSummary,
+): void {
+  ensureDomainsSchema(db);
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO studio_domains (
+       draft_id, owner_id, hostname, status, verification_token,
+       verified_at, last_checked_at, created_at, updated_at
+     ) VALUES (?, ?, ?, 'pending', ?, NULL, NULL, ?, ?)`,
+  );
+  for (const domain of section.domains) {
+    const draftId = draftIds.get(domain.draftId);
+    const hostname = normalizeHostname(domain.hostname);
+    if (!draftId || !hostname) {
+      summary.skippedDomains += 1;
+      continue;
+    }
+    const result = insert.run(
+      draftId,
+      ownerId,
+      hostname,
+      newVerificationToken(),
+      domain.createdAt,
+      domain.updatedAt,
+    );
+    if (Number(result.changes) > 0) summary.customDomains += 1;
+    else summary.skippedDomains += 1;
   }
 }
 
@@ -943,10 +1101,15 @@ async function importIntoPostgres(
   options: ImportOptions,
 ): Promise<void> {
   const { getDatabase } = await import("@/db");
-  const { customerAccounts, customerSessions, customerTokens, studioDrafts } =
-    await import("@/db/schema");
+  const {
+    customerAccounts,
+    customerSessions,
+    customerTokens,
+    studioDomains,
+    studioDrafts,
+  } = await import("@/db/schema");
   const { ensureStudioUser } = await import("@/lib/user-identity");
-  const { eq } = await import("drizzle-orm");
+  const { eq, inArray } = await import("drizzle-orm");
 
   const ownerId = await ensureStudioUser(user);
   // Live leases 409 before recovery. Expired leases are claimed atomically
@@ -1055,9 +1218,13 @@ async function importIntoPostgres(
     let insertedDrafts = 0;
     await getDatabase().transaction(async (tx) => {
       insertedDrafts = 0;
+      summary.customDomains = 0;
+      summary.skippedDomains = 0;
       // Early, non-locking fence verification inside this transaction. The
       // authoritative check is the conditional touch just before commit.
       await verifyStudioImportFenceInTx(tx, held);
+      // File draft id → id written, so restored domains follow remapped drafts.
+      const writtenDraftIds = new Map<string, string>();
       for (const incoming of backup.studio.drafts) {
         const [existing] = await tx
           .select({ id: studioDrafts.id })
@@ -1065,8 +1232,10 @@ async function importIntoPostgres(
           .where(eq(studioDrafts.id, incoming.id))
           .limit(1);
         if (existing) summary.remappedDraftIds += 1;
+        const writtenId = existing ? randomUUID() : incoming.id;
+        writtenDraftIds.set(incoming.id, writtenId);
         await tx.insert(studioDrafts).values({
-          id: existing ? randomUUID() : incoming.id,
+          id: writtenId,
           ownerId,
           schemaVersion: incoming.schemaVersion,
           templateVersion: incoming.templateRegistryVersion ?? 1,
@@ -1162,6 +1331,68 @@ async function importIntoPostgres(
             .onConflictDoNothing()
             .returning({ id: customerTokens.id });
           summary.customerTokens = insertedTokens.length;
+        }
+      }
+
+      // Custom domains ride in the same transaction. Each comes back
+      // `pending` with a fresh verification token (the file carries none),
+      // so a restored hostname is never served here until ownership is
+      // proven again. Hostnames already attached to another draft, invalid
+      // hostnames and domains of drafts absent from the file are skipped.
+      if (backup.domains && backup.domains.domains.length > 0) {
+        const candidates = backup.domains.domains.flatMap((domain) => {
+          const draftId = writtenDraftIds.get(domain.draftId);
+          const hostname = normalizeHostname(domain.hostname);
+          if (!draftId || !hostname) {
+            summary.skippedDomains += 1;
+            return [];
+          }
+          return [{ ...domain, draftId, hostname }];
+        });
+        const taken = new Set(
+          candidates.length === 0
+            ? []
+            : (
+                await tx
+                  .select({ hostname: studioDomains.hostname })
+                  .from(studioDomains)
+                  .where(
+                    inArray(
+                      studioDomains.hostname,
+                      candidates.map((domain) => domain.hostname),
+                    ),
+                  )
+              ).map((row) => row.hostname),
+        );
+        const seen = new Set<string>();
+        const fresh = candidates.filter((domain) => {
+          if (taken.has(domain.hostname) || seen.has(domain.hostname)) {
+            summary.skippedDomains += 1;
+            return false;
+          }
+          seen.add(domain.hostname);
+          return true;
+        });
+        if (fresh.length > 0) {
+          const inserted = await tx
+            .insert(studioDomains)
+            .values(
+              fresh.map((domain) => ({
+                draftId: domain.draftId,
+                ownerId,
+                hostname: domain.hostname,
+                status: "pending",
+                verificationToken: newVerificationToken(),
+                verifiedAt: null,
+                lastCheckedAt: null,
+                createdAt: new Date(domain.createdAt),
+                updatedAt: new Date(domain.updatedAt),
+              })),
+            )
+            .onConflictDoNothing()
+            .returning({ draftId: studioDomains.draftId });
+          summary.customDomains = inserted.length;
+          summary.skippedDomains += fresh.length - inserted.length;
         }
       }
       // A throw here rolls the PostgreSQL transaction back; the coordinator

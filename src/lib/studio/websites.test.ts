@@ -52,6 +52,9 @@ function domainRow(
     owner_id: ownerId,
     hostname: `${draftId}.example.com`,
     status,
+    verification_token: "0123456789abcdef0123456789abcdef",
+    verified_at: status === "active" ? "2026-08-01T09:00:00.000Z" : null,
+    last_checked_at: "2026-08-01T09:00:00.000Z",
     created_at: "2026-08-01T09:00:00.000Z",
     updated_at: "2026-08-02T09:00:00.000Z",
   };

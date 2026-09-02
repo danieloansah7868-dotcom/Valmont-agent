@@ -16,6 +16,7 @@ import type {
   ChatSession,
 } from "@/lib/types";
 import { redactSecrets } from "@/lib/security";
+import { ChatNotFoundError } from "@/lib/api-errors";
 import {
   assertDistinctStorePaths,
   configuredLegacyChatStorePath,
@@ -109,7 +110,7 @@ export class JsonChatStore implements ChatStore {
       const session = document.sessions.find(
         (candidate) => candidate.id === id && candidate.userId === userId,
       );
-      if (!session) throw new Error("Chat not found");
+      if (!session) throw new ChatNotFoundError();
       session.messages.push(...structuredClone(messages));
       if (session.title === "New conversation" && titleIfNew) {
         session.title = titleIfNew;
@@ -117,7 +118,7 @@ export class JsonChatStore implements ChatStore {
       session.updatedAt = new Date().toISOString();
       saved = cloneSession(session);
     });
-    if (!saved) throw new Error("Chat not found");
+    if (!saved) throw new ChatNotFoundError();
     return saved;
   }
 
@@ -551,7 +552,7 @@ export class SqliteChatStore implements ChatStore {
       const row = this.db
         .prepare("SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?")
         .get(id, userId) as SessionRow | undefined;
-      if (!row) throw new Error("Chat not found");
+      if (!row) throw new ChatNotFoundError();
       const insert = this.db.prepare(
         "INSERT INTO chat_messages(id,session_id,user_id,role,content,created_at,model,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?,?)",
       );

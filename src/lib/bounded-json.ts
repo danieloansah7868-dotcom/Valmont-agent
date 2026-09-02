@@ -27,7 +27,14 @@ export async function readBoundedJson(
   }
 }
 
-async function readBoundedText(
+/**
+ * Reads a raw text body with the same streaming byte ceiling as
+ * {@link readBoundedJson}. For callers that must keep the exact bytes — a
+ * webhook verifying an HMAC over the raw body — and therefore cannot let the
+ * JSON helper parse for them. Throws `PayloadTooLargeError` the moment the
+ * running total passes the limit, before the rest is buffered.
+ */
+export async function readBoundedText(
   request: Request,
   limitBytes: number,
 ): Promise<string> {

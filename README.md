@@ -52,7 +52,7 @@ The included local workspace adapter makes the complete flow usable on a trusted
 
 ## Quick start
 
-Requirements: Node.js 22.13+ and npm. Chat memory uses the built-in local SQLite driver; no hosted database or paid vector service is required.
+Requirements: Node.js 22.13+ (the container images pin 22.23) and npm. Chat memory uses the built-in local SQLite driver; no hosted database or paid vector service is required.
 
 ```bash
 npm install
@@ -66,21 +66,28 @@ Open [http://localhost:3000](http://localhost:3000). Configure `SESSION_SECRET`,
 
 Valmont requires `SESSION_SECRET`, the GitHub OAuth pair, and `MODEL_API_KEY`. Never prefix model or GitHub secrets with `NEXT_PUBLIC_`.
 
-| Variable                     | Purpose                                                                                       |
-| ---------------------------- | --------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`               | PostgreSQL connection URL                                                                     |
-| `CHAT_STORE_PATH`            | Legacy JSON chat-store input for migration (default `.data/chat-store.json`)                  |
-| `CHAT_SQLITE_PATH`           | SQLite chat-store destination; defaults to a sibling `.sqlite` path next to `CHAT_STORE_PATH` |
-| `SESSION_SECRET`             | 32+ random bytes for AES-GCM OAuth session encryption                                         |
-| `APP_URL`                    | Public origin, e.g. `http://localhost:3000`                                                   |
-| `GITHUB_CLIENT_ID`           | GitHub OAuth App client ID                                                                    |
-| `GITHUB_CLIENT_SECRET`       | GitHub OAuth App secret                                                                       |
-| `MODEL_BASE_URL`             | OpenAI-compatible `/v1` base URL                                                              |
-| `MODEL_API_KEY`              | Server-only model API key                                                                     |
-| `MODEL_NAME`                 | Provider model identifier                                                                     |
-| `VALMONT_COMMAND_TIMEOUT_MS` | Per-command validation timeout (default 180000)                                               |
+| Variable                     | Purpose                                                                                        |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`               | PostgreSQL connection URL                                                                      |
+| `CHAT_STORE_PATH`            | Legacy JSON chat-store input for migration (default `.data/chat-store.json`)                   |
+| `CHAT_SQLITE_PATH`           | SQLite chat-store destination; defaults to a sibling `.sqlite` path next to `CHAT_STORE_PATH`  |
+| `SESSION_SECRET`             | 32+ random characters for AES-GCM session encryption; short or placeholder values are refused  |
+| `APP_URL`                    | Public origin, e.g. `http://localhost:3000`; every emailed link and payment return URL uses it |
+| `TRUST_PROXY`                | `true` only behind a proxy that rewrites `X-Forwarded-For` (per-client rate limits)            |
+| `VALMONT_WORKSPACE_PROVIDER` | `local` (default, restricted process) or `docker` (one throwaway container per task)           |
+| `GITHUB_CLIENT_ID`           | GitHub OAuth App client ID                                                                     |
+| `GITHUB_CLIENT_SECRET`       | GitHub OAuth App secret                                                                        |
+| `MODEL_BASE_URL`             | OpenAI-compatible `/v1` base URL                                                               |
+| `MODEL_API_KEY`              | Server-only model API key                                                                      |
+| `MODEL_NAME`                 | Provider model identifier                                                                      |
+| `VALMONT_COMMAND_TIMEOUT_MS` | Per-command validation timeout (default 180000)                                                |
 
-See `.env.example` for placeholders.
+See `.env.example` for placeholders and the optional Studio, payments,
+custom-domain and notification variables.
+
+`GET /api/health` is the readiness probe (503 until the required settings and
+dependencies are usable); `GET /api/health?probe=live` is the liveness probe
+used by the container `HEALTHCHECK`.
 
 ### GitHub OAuth
 
@@ -150,7 +157,7 @@ Delivery uses `fetch` with portable `AbortController` + 10s timeout (timer clear
 
 ### Strict typed API errors
 
-`src/lib/api-errors.ts` defines explicit `ApiError` subclasses with intentional statuses: 400 `BadRequestError`, 401 `UnauthorizedError`/`NotConnectedError`, 403 `ForbiddenError`, 404 `NotFoundError`/`ChatNotFoundError`/etc, 409 `ConflictError`/`DraftConflictError`/`ImportInProgressError`, 413 `PayloadTooLargeError`, 429 `RateLimitError`, 502 `CustomerEmailDeliveryError`/`GitHubApiError`, 503 `CustomerEmailConfigurationError`.
+`src/lib/api-errors.ts` defines explicit `ApiError` subclasses with intentional statuses: 400 `BadRequestError`, 401 `UnauthorizedError`/`NotConnectedError`, 403 `ForbiddenError`, 404 `NotFoundError`/`ChatNotFoundError`/`TaskNotFoundError`/etc, 409 `ConflictError`/`DraftConflictError`/`ImportInProgressError`/`OrderTransitionError`/`OnlinePaymentUnavailableError`, 413 `PayloadTooLargeError`, 429 `RateLimitError`, 502 `CustomerEmailDeliveryError`/`GitHubApiError`, 503 `CustomerEmailConfigurationError`/`WeakSessionSecretError`.
 
 `safeApiError` in `src/lib/api.ts` trusts **only** `ApiError` instances. Zod errors → generic 400, JSON syntax → generic 400, arbitrary `Error("Task not found")`, plain objects with `status`, driver/network errors → opaque 500. No message-text heuristics. Tests preserve a single shared `ApiError` identity (no `vi.resetModules` with partial mocks).
 
@@ -270,7 +277,11 @@ whether an ID exists.
 ### Backups
 
 - `GET /api/backup/export` downloads a version 2 backup:
-  `{ backupVersion: 2, exportedAt, chat: {...}, studio: {...} }`.
+  `{ backupVersion: 2, exportedAt, chat: {...}, studio: {...}, customers: {...}, domains: {...} }`.
+  Custom domains are exported without their verification tokens; on import
+  they are re-attached as `pending` with a fresh token and must be verified
+  again, and a hostname already claimed on the target machine is skipped and
+  counted.
 - `POST /api/backup/import` accepts a version 2 backup **and** a legacy
   version 1 chat-only file. An unknown version is rejected _before anything is
   written_.
@@ -311,10 +322,14 @@ Request bodies are read as a stream and counted byte by byte, stopping as soon
 as the limit is passed and parsing only afterwards. This holds even when
 `Content-Length` is missing, wrong, or the body is chunked.
 
-| Endpoint                | Limit |
-| ----------------------- | ----- |
-| Draft create and update | 1 MB  |
-| Backup import           | 25 MB |
+| Endpoint                                    | Limit   |
+| ------------------------------------------- | ------- |
+| Draft create and update                     | 1 MB    |
+| Backup import                               | 25 MB   |
+| Payment webhook (raw body, HMAC-verified)   | 50 KB   |
+| Tasks                                       | 64 KB   |
+| Chat messages                               | 32 KB   |
+| Chats, memories, repositories, task actions | 4–16 KB |
 
 Errors never echo back what you submitted, so business details and private
 values stay out of messages and logs.

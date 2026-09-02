@@ -29,6 +29,7 @@ function order(overrides: Partial<OrderRecord> = {}): OrderRecord {
     customerPhone: "+233240000000",
     customerEmail: "ama@example.com",
     paymentMethod: "valmont_pay",
+    paymentMode: "live",
     createdAt: "2026-08-26T10:00:00.000Z",
     updatedAt: "2026-08-26T10:00:00.000Z",
     statusHistory: [],

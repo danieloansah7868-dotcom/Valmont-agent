@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ApiError, ConflictError, TaskNotFoundError } from "@/lib/api-errors";
 import type {
   CreatedPullRequest,
   GitHubProvider,
@@ -6,7 +7,14 @@ import type {
 } from "@/lib/github/types";
 import type { TaskStore } from "@/lib/task-store";
 import type { CodingTask } from "@/lib/types";
-import { TaskWorkflowService } from "@/lib/workflow";
+import { RestrictedLocalWorkspaceProvider } from "@/lib/workspace";
+import { DockerWorkspaceProvider } from "@/lib/workspace-docker";
+import {
+  createWorkspaceProvider,
+  resetWorkspaceProviderForTests,
+  resolveWorkspaceProviderKind,
+  TaskWorkflowService,
+} from "@/lib/workflow";
 
 /** A GitHub provider that fails loudly: the guards under test must run first. */
 class UnusedGitHub implements GitHubProvider {
@@ -112,5 +120,72 @@ describe("pull request workflow guard", () => {
     await expect(
       service.createPullRequestWithoutApproval(task.id),
     ).rejects.toThrow(/final approval/);
+  });
+});
+
+describe("workflow errors the API can trust", () => {
+  it("reports an unknown task as a typed 404", async () => {
+    const service = new TaskWorkflowService(
+      new MemoryStore(finalTask(true)),
+      new UnusedGitHub(),
+    );
+    const failure = await service
+      .approvePlan("no-such-task", "u")
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(TaskNotFoundError);
+    expect((failure as ApiError).status).toBe(404);
+  });
+
+  it("reports an approval in the wrong state as a typed 409", async () => {
+    const service = new TaskWorkflowService(
+      new MemoryStore(finalTask(false)),
+      new UnusedGitHub(),
+    );
+    const plan = await service
+      .approvePlan("task-test", "u")
+      .catch((error: unknown) => error);
+    expect(plan).toBeInstanceOf(ConflictError);
+    expect((plan as ApiError).status).toBe(409);
+    expect((plan as Error).message).toMatch(/awaiting_final_approval/);
+
+    const reject = await service
+      .reject("task-test", "plan", "u")
+      .catch((error: unknown) => error);
+    expect(reject).toBeInstanceOf(ConflictError);
+  });
+});
+
+describe("workspace provider selection", () => {
+  afterEach(() => {
+    resetWorkspaceProviderForTests();
+    vi.unstubAllEnvs();
+  });
+
+  it("defaults to the restricted local provider", () => {
+    expect(resolveWorkspaceProviderKind({})).toBe("local");
+    expect(createWorkspaceProvider({})).toBeInstanceOf(
+      RestrictedLocalWorkspaceProvider,
+    );
+  });
+
+  it("builds one shared Docker provider when VALMONT_WORKSPACE_PROVIDER=docker", () => {
+    const env = {
+      VALMONT_WORKSPACE_PROVIDER: "docker",
+      VALMONT_SANDBOX_IMAGE: "valmont-sandbox:test",
+      // A zero reap interval keeps the test free of background timers.
+      VALMONT_SANDBOX_REAP_INTERVAL_MS: "0",
+    };
+    const first = createWorkspaceProvider(env);
+    const second = createWorkspaceProvider(env);
+    expect(first).toBeInstanceOf(DockerWorkspaceProvider);
+    expect(second).toBe(first);
+  });
+
+  it("refuses an unknown provider name instead of silently using local", () => {
+    expect(() =>
+      resolveWorkspaceProviderKind({
+        VALMONT_WORKSPACE_PROVIDER: "firecracker",
+      }),
+    ).toThrow(/VALMONT_WORKSPACE_PROVIDER/);
   });
 });
