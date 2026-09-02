@@ -1,7 +1,7 @@
 import type { SiteBriefV1 } from "./schema";
 import { isStarterValue } from "./defaults";
 
-export const READINESS_RULES_VERSION = 1;
+export const READINESS_RULES_VERSION = 2;
 
 /** A single thing the Brief still needs, with plain-language wording. */
 export interface BriefGap {
@@ -37,6 +37,7 @@ interface Rule {
   severity: BriefGap["severity"];
   hint: string;
   satisfied(brief: Partial<SiteBriefV1>): boolean;
+  applicable?: (brief: Partial<SiteBriefV1>) => boolean;
 }
 
 function filled(value: unknown): boolean {
@@ -137,11 +138,39 @@ const RULES: Rule[] = [
     satisfied: (brief) =>
       filled(brief.serviceAreas) || filled(brief.deliveryAreas),
   },
+  {
+    field: "bundleCatalogue",
+    label: "Data bundles catalogue",
+    severity: "required",
+    hint: "Add at least one priced bundle. Use the bundle table in step 4.",
+    applicable: (brief) => brief.category === "data-bundles",
+    satisfied: (brief) => {
+      const items = brief.items ?? [];
+      if (items.length === 0) return false;
+      const priced = items.filter((i) => i.price !== undefined);
+      if (priced.length === 0) return false;
+      return priced.some((i) => i.bundle?.network && i.bundle?.dataMb);
+    },
+  },
+  {
+    field: "bundleMetadata",
+    label: "Bundle details",
+    severity: "required",
+    hint: "Every priced bundle must have a network and size. Fill in the table.",
+    applicable: (brief) => brief.category === "data-bundles",
+    satisfied: (brief) => {
+      const items = brief.items ?? [];
+      const priced = items.filter((i) => i.price !== undefined);
+      if (priced.length === 0) return false;
+      return priced.every((i) => i.bundle?.network && i.bundle?.dataMb);
+    },
+  },
 ];
 
 /**
  * Scores how complete a Site Brief is. The score is a straight weighted count
  * of satisfied rules, so it moves predictably as fields are filled in.
+ * Rules with an `applicable` predicate only count when applicable.
  */
 export function computeBriefCompleteness(
   brief: Partial<SiteBriefV1>,
@@ -151,6 +180,9 @@ export function computeBriefCompleteness(
   let totalPoints = 0;
 
   for (const rule of RULES) {
+    if (rule.applicable && !rule.applicable(brief)) {
+      continue;
+    }
     const weight =
       rule.severity === "required" ? REQUIRED_WEIGHT : RECOMMENDED_WEIGHT;
     totalPoints += weight;

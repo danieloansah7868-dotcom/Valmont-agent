@@ -1,4 +1,8 @@
-import { CATEGORY_IDS, type CategoryId } from "./categories";
+import {
+  CATEGORY_IDS,
+  type CategoryId,
+  categories as categoryManifests,
+} from "./categories";
 
 export const TEMPLATE_IDS = [
   "classic-hero",
@@ -9,6 +13,7 @@ export const TEMPLATE_IDS = [
   "tour-booking",
   "luxury-escape",
   "product-catalogue",
+  "bundle-shop",
   "service-showcase",
   "booking-journey",
   "property-collection",
@@ -131,6 +136,14 @@ export const templates: TemplateManifest[] = [
     compatibleCategories: ["online-shop", "restaurant", "clinic"],
   },
   {
+    id: "bundle-shop",
+    label: "Bundle Shop",
+    description:
+      "Network tabs for MTN, Telecel and AirtelTigo with instant bundle delivery.",
+    sections: ["hero", "bundle-grid", "how-it-works", "contact"],
+    compatibleCategories: ["data-bundles"],
+  },
+  {
     id: "service-showcase",
     label: "Service Showcase",
     description:
@@ -241,6 +254,13 @@ export function templatesForCategory(categoryId: string): TemplateManifest[] {
 
 /** The layout to fall back to when the chosen one does not suit a new type. */
 export function defaultTemplateForCategory(categoryId: string): TemplateId {
+  const manifest = categoryManifests.find((c) => c.id === categoryId);
+  if (manifest?.preferredTemplate) {
+    const pref = manifest.preferredTemplate;
+    if (isTemplateCompatible(pref, categoryId)) {
+      return pref as TemplateId;
+    }
+  }
   return templatesForCategory(categoryId)[0]!.id;
 }
 

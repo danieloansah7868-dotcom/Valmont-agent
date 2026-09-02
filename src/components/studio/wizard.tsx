@@ -25,6 +25,7 @@ import {
   type PaymentMethodId,
   type SiteBriefV1,
   type StudioDraft,
+  type CatalogItem,
 } from "@/lib/studio/site-brief/schema";
 import { formatPricedItems, parsePricedItems } from "@/lib/studio/catalog";
 import { ShareLinkButton } from "./share-link-button";
@@ -41,6 +42,14 @@ import {
 } from "@/lib/studio/site-brief/defaults";
 import { changedFields, mergeBriefs } from "@/lib/studio/merge";
 import { AssetUploader } from "./asset-uploader";
+import {
+  BUNDLE_NETWORKS,
+  type BundleNetworkId,
+  starterBundleCatalogue,
+  mergeStarterBundles,
+  formatDataMb,
+  bundleNetworkLabel,
+} from "@/lib/studio/bundles";
 
 const STEPS = [
   { number: 1, title: "Website type" },
@@ -59,7 +68,6 @@ type SaveState =
 
 const AUTOSAVE_DELAY_MS = 600;
 
-/** Comma-separated text <-> list of trimmed values. */
 function toList(text: string): string[] {
   return text
     .split(",")
@@ -76,53 +84,25 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     at: initial.updatedAt,
   });
   const [deleting, setDeleting] = useState(false);
-  // Deleting a brief is irreversible, so the button asks first. This is an
-  // in-page confirmation rather than window.confirm(): it is reachable by
-  // screen readers, testable, and cannot be suppressed by the browser.
   const [confirmingDelete, setConfirmingDelete] = useState(false);
-  /** Both versions kept side by side while the person decides. */
   const [conflictPair, setConflictPair] = useState<{
     mine: SiteBriefV1;
     theirs: SiteBriefV1;
   } | null>(null);
-  /** Number of unsaved field changes, tracked in state so render stays pure. */
   const [pendingCount, setPendingCount] = useState(0);
-  /**
-   * Current server-confirmed revision, mirrored from revisionRef so the
-   * AssetUploader (which renders during the main render) can read it without
-   * touching a ref inside render.
-   */
   const [serverRevision, setServerRevision] = useState<number>(
     initial.revision,
   );
 
-  /**
-   * Everything the save loop needs lives in refs so the loop never restarts
-   * mid-flight and never captures a stale copy of the Brief.
-   */
   const revisionRef = useRef<number>(initial.revision);
-  /** The version last confirmed by the server — the base for any merge. */
   const savedBriefRef = useRef<SiteBriefV1>(initial.brief);
-  /** Latest on-screen version waiting to be written. */
   const pendingRef = useRef<SiteBriefV1 | null>(null);
-  /** True while a request is in flight: this is what serializes saving. */
   const inFlightRef = useRef(false);
-  /**
-   * True from the moment overlapping edits are detected until the owner picks a
-   * version. While set, no save may leave this component. Without it, typing
-   * anything while the choice is on screen would autosave the whole on-screen
-   * version over the other tab's work — the exact loss the choice exists to
-   * prevent. A ref rather than state because the save loop reads it
-   * synchronously and must never act on a stale render.
-   */
   const awaitingConflictChoiceRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Lets the save loop re-enter itself without becoming its own dependency. */
   const flushRef = useRef<() => Promise<void>>(async () => {});
   const unmountedRef = useRef(false);
-  /** The confirmation panel, so focus can be moved into and kept inside it. */
   const deleteDialogRef = useRef<HTMLDivElement | null>(null);
-  /** Where focus was before the dialog opened, so it can be handed back. */
   const deleteTriggerRef = useRef<HTMLElement | null>(null);
 
   useEffect(
@@ -133,26 +113,14 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     [],
   );
 
-  /**
-   * Keyboard and screen-reader behaviour for the delete confirmation.
-   *
-   * The trigger button is removed from the page when the dialog opens, so focus
-   * would otherwise fall back to the top of a long form. Focus is moved to the
-   * safe option, held inside the dialog while it is open, and returned to where
-   * it started once the dialog closes. Escape cancels, matching what a dialog
-   * is expected to do.
-   */
   useEffect(() => {
     if (!confirmingDelete) return;
     const dialog = deleteDialogRef.current;
     if (!dialog) return;
-
-    // Land on "Keep this draft" — the non-destructive choice.
     const cancelButton = dialog.querySelector<HTMLButtonElement>(
       '[data-testid="delete-draft-cancel"]',
     );
     cancelButton?.focus();
-
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -166,7 +134,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       if (focusable.length === 0) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-      // Wrap at both ends so Tab cannot walk out into the page behind.
       if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
@@ -175,11 +142,9 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         first.focus();
       }
     };
-
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
-      // Hand focus back to whatever opened the dialog, when it still exists.
       const trigger = deleteTriggerRef.current;
       if (trigger && document.body.contains(trigger)) trigger.focus();
     };
@@ -190,7 +155,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     if (result.success) return { ok: true as const, issues: [] };
     return {
       ok: false as const,
-      // Field paths and Zod's own wording only — never the value entered.
       issues: result.error.issues.map((issue) => ({
         field: issue.path.join(".") || "form",
         message: issue.message,
@@ -200,13 +164,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
 
   const completeness = useMemo(() => computeBriefCompleteness(brief), [brief]);
 
-  /**
-   * A 409 means somebody else saved first. We fetch their version, then try to
-   * replay our pending edit on top of it. If the two edits touched different
-   * fields the replay is safe and happens automatically. If they touched the
-   * same field we stop and ask, because either answer would throw away real
-   * work. Nothing is discarded without the person choosing.
-   */
   const handleConflict = useCallback(
     async (mine: SiteBriefV1): Promise<void> => {
       let latest: StudioDraft;
@@ -225,12 +182,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         });
         return;
       }
-
       revisionRef.current = latest.revision;
-      // The freshest local state, not the snapshot that was sent: the owner
-      // may have typed while the failed save and this fetch were in flight.
-      // Rebasing from that state means the automatic replay below and the
-      // conflict choice both carry the newest typing.
       const latestLocal = pendingRef.current ?? mine;
       const outcome = mergeBriefs(
         savedBriefRef.current,
@@ -238,17 +190,11 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
         latest.brief,
       );
       savedBriefRef.current = latest.brief;
-
       if (outcome.merged) {
-        // Safe: replay our fields on their version and retry exactly once.
         setBrief(outcome.merged);
         pendingRef.current = outcome.merged;
         return;
       }
-
-      // Overlapping edits: show both options rather than pick for them.
-      // Freeze saving first, so an edit made while the choice is on screen
-      // cannot escape and overwrite the other version.
       awaitingConflictChoiceRef.current = true;
       setConflictPair({ mine: latestLocal, theirs: latest.brief });
       setSaveState({
@@ -259,30 +205,19 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     [id],
   );
 
-  /**
-   * Sends exactly one save at a time. If edits arrive while a request is in
-   * flight they queue in `pendingRef` and are written by the next pass, so
-   * requests can never overtake one another and clobber a newer value.
-   */
   const flush = useCallback(async (): Promise<void> => {
     const outgoing = pendingRef.current;
-    // The rule itself lives in save-gate.ts so it can be unit tested. An
-    // unresolved conflict freezes saving: the edit stays queued and is written
-    // only after the owner chooses which version to keep.
     const decision = evaluateSaveGate({
       inFlight: inFlightRef.current,
       awaitingConflictChoice: awaitingConflictChoiceRef.current,
       hasPendingEdit: outgoing !== null,
-      // Never send something the server would reject; wait for it to be valid.
       isValid:
         outgoing !== null && siteBriefSchemaV1.safeParse(outgoing).success,
     });
     if (!decision.send || !outgoing) return;
-
     inFlightRef.current = true;
     pendingRef.current = null;
     setSaveState({ kind: "saving" });
-
     try {
       const updated = await apiPatch<StudioDraft>(`/api/studio/drafts/${id}`, {
         ...outgoing,
@@ -298,20 +233,15 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     } catch (cause) {
       const message =
         cause instanceof Error ? cause.message : "Could not save your changes.";
-      // Branch on the HTTP status, never on the message text: rewording a
-      // server message must not turn a conflict into a retry loop, and a 500
-      // that happens to contain the word "conflict" must not trigger a merge.
       const isConflict = cause instanceof ApiError && cause.status === 409;
       if (isConflict) {
         await handleConflict(outgoing);
       } else if (!unmountedRef.current) {
-        // Keep the edit queued so it is retried on the next change or retry.
         pendingRef.current = pendingRef.current ?? outgoing;
         setSaveState({ kind: "error", message });
       }
     } finally {
       inFlightRef.current = false;
-      // A newer edit may have queued while we were saving.
       if (pendingRef.current && !unmountedRef.current) {
         void flushRef.current();
       }
@@ -322,7 +252,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     flushRef.current = flush;
   }, [flush]);
 
-  /** Queue an edit and restart the debounce window. */
   const update = useCallback(
     (patch: Partial<SiteBriefV1>) => {
       setBrief((current) => {
@@ -340,12 +269,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     [flush],
   );
 
-  /**
-   * Leaving via "Done" must not outrun the autosave debounce. The unmount
-   * cleanup only clears the pending timer, so navigating within the debounce
-   * window would silently drop the last edit. Write it first, and stay on the
-   * page if the write did not land so the error or conflict stays visible.
-   */
   const finishAndLeave = useCallback(async (): Promise<void> => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
@@ -357,10 +280,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     }
   }, [flush, router]);
 
-  /**
-   * Changing the website type may make the chosen layout unsuitable. Only the
-   * layout is adjusted — every business detail is left exactly as it was.
-   */
   const changeCategory = useCallback(
     (categoryId: string) => {
       if (!isCategoryId(categoryId)) return;
@@ -378,12 +297,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     if (!conflictPair) return;
     awaitingConflictChoiceRef.current = false;
     setConflictPair(null);
-    // “Keep what is on this screen” means exactly that: the newest on-screen
-    // state, including anything typed after the warning appeared. The conflict
-    // snapshot is only the fallback when nothing has been typed since. The
-    // save below carries the newest revision and goes through the normal
-    // conflict loop, so the latest local state is rebased onto the newest
-    // server revision before it is written.
     const latest = pendingRef.current ?? conflictPair.mine;
     pendingRef.current = latest;
     setSaveState({ kind: "unsaved" });
@@ -420,6 +333,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
   }
 
   const availableTemplates = templatesForCategory(brief.category);
+  const isBundleSite = brief.category === "data-bundles";
 
   return (
     <div className="mx-auto w-full max-w-[980px] p-4 sm:p-6">
@@ -593,10 +507,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   </span>
                 </label>
               ))}
-              <p className="text-xs text-slate-500">
-                The package is separate from the website type. Changing it does
-                not affect anything else you have filled in.
-              </p>
             </fieldset>
           )}
 
@@ -682,9 +592,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                         at: new Date().toISOString(),
                       });
                     }}
-                    onError={() => {
-                      /* error is shown inside the uploader */
-                    }}
+                    onError={() => {}}
                   />
                 </div>
               </section>
@@ -724,13 +632,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 onChange={(value) => update({ adminEmail: value })}
                 hint="Where Valmont will contact you about this website."
               />
-              {/*
-                The public contact address. It is deliberately separate from the
-                admin email: that one is how Valmont reaches the owner and must
-                never be published, so the preview and the eventual site read
-                this field instead. Without an input for it the preview could
-                only ever say "Not provided yet".
-              */}
               <TextField
                 id="email"
                 label="Email shown to customers"
@@ -849,8 +750,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 </div>
                 <p className="text-xs text-slate-500">
                   Ghana, GHS (GH₵) and Africa/Accra are the starting defaults.
-                  The alternatives are planning choices only — nothing is
-                  priced, charged or generated from them in Phase 1.
                 </p>
               </fieldset>
 
@@ -862,50 +761,59 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 hint="e.g. Mon–Sat 8am–6pm"
               />
 
-              <TextField
-                id="services"
-                label="Services you offer"
-                value={brief.services.join(", ")}
-                onChange={(value) => update({ services: toList(value) })}
-                hint="Separate each one with a comma."
-              />
+              {isBundleSite ? (
+                <BundleTable
+                  items={brief.items}
+                  onChange={(items) => update({ items })}
+                />
+              ) : (
+                <>
+                  <TextField
+                    id="services"
+                    label="Services you offer"
+                    value={brief.services.join(", ")}
+                    onChange={(value) => update({ services: toList(value) })}
+                    hint="Separate each one with a comma."
+                  />
 
-              <TextArea
-                id="products"
-                label="Products you sell"
-                value={formatPricedItems(brief.items)}
-                onChange={(value) =>
-                  update({ items: parsePricedItems(value, brief.items) })
-                }
-              />
-              <p className="text-xs text-slate-500">
-                One item per line works best, or separate with commas. Add a
-                price with a dash, e.g. Jollof Rice - 45.
-              </p>
-              {brief.items.length > 0 && (
-                <ul
-                  data-testid="parsed-items-preview"
-                  className="grid gap-1 rounded-lg border border-line bg-ivory-50 p-3 text-sm"
-                >
-                  {brief.items.map((item) => (
-                    <li
-                      key={item.id}
-                      className="flex items-center justify-between gap-3"
+                  <TextArea
+                    id="products"
+                    label="Products you sell"
+                    value={formatPricedItems(brief.items)}
+                    onChange={(value) =>
+                      update({ items: parsePricedItems(value, brief.items) })
+                    }
+                  />
+                  <p className="text-xs text-slate-500">
+                    One item per line works best, or separate with commas. Add a
+                    price with a dash, e.g. Jollof Rice - 45.
+                  </p>
+                  {brief.items.length > 0 && (
+                    <ul
+                      data-testid="parsed-items-preview"
+                      className="grid gap-1 rounded-lg border border-line bg-ivory-50 p-3 text-sm"
                     >
-                      <span>{item.name}</span>
-                      <span className="text-xs font-semibold text-copper">
-                        {item.price !== undefined
-                          ? `GH₵${item.price}`
-                          : "No price — shown as information only"}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
+                      {brief.items.map((item) => (
+                        <li
+                          key={item.id}
+                          className="flex items-center justify-between gap-3"
+                        >
+                          <span>{item.name}</span>
+                          <span className="text-xs font-semibold text-copper">
+                            {item.price !== undefined
+                              ? `GH₵${item.price}`
+                              : "No price — shown as information only"}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <ProductImagesEditor
+                    items={brief.items}
+                    onChange={(items) => update({ items })}
+                  />
+                </>
               )}
-              <ProductImagesEditor
-                items={brief.items}
-                onChange={(items) => update({ items })}
-              />
 
               <TextField
                 id="serviceAreas"
@@ -959,8 +867,9 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   </span>
                 </label>
                 <p className="text-xs text-slate-600">
-                  Add prices to your products in Step 4 so customers can add
-                  them to a basket and pay.
+                  {isBundleSite
+                    ? "Turn on checkout so customers can buy bundles with Mobile Money."
+                    : "Add prices to your products in Step 4 so customers can add them to a basket and pay."}
                 </p>
               </fieldset>
 
@@ -986,12 +895,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                     Let customers create an account to track their orders
                   </span>
                 </label>
-                <p className="text-xs text-slate-600">
-                  Customers can always order as guests. When this is on, your
-                  public website shows an Account link and customers can sign in
-                  to see their orders. Turn it off at any time — your orders
-                  stay safe in Website Studio.
-                </p>
               </fieldset>
 
               {brief.payments.enabled && (
@@ -1050,81 +953,87 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                     ))}
                   </fieldset>
 
-                  <fieldset className="grid gap-3 rounded-lg border border-line p-3">
-                    <legend className="text-sm font-semibold">Delivery</legend>
-                    <label className="flex items-center gap-2">
-                      <input
-                        type="checkbox"
-                        checked={brief.payments.delivery.enabled}
-                        onChange={(event) =>
-                          update({
-                            payments: {
-                              ...brief.payments,
-                              delivery: {
-                                ...brief.payments.delivery,
-                                enabled: event.target.checked,
+                  {!isBundleSite && (
+                    <fieldset className="grid gap-3 rounded-lg border border-line p-3">
+                      <legend className="text-sm font-semibold">
+                        Delivery
+                      </legend>
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={brief.payments.delivery.enabled}
+                          onChange={(event) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                delivery: {
+                                  ...brief.payments.delivery,
+                                  enabled: event.target.checked,
+                                },
                               },
-                            },
-                          })
-                        }
-                      />
-                      <span className="text-sm">Offer delivery</span>
-                    </label>
+                            })
+                          }
+                        />
+                        <span className="text-sm">Offer delivery</span>
+                      </label>
 
-                    {brief.payments.delivery.enabled && (
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        <NumberField
-                          id="deliveryFee"
-                          label="Delivery fee"
-                          value={brief.payments.delivery.fee}
-                          onChange={(value) =>
-                            update({
-                              payments: {
-                                ...brief.payments,
-                                delivery: {
-                                  ...brief.payments.delivery,
-                                  fee: value,
+                      {brief.payments.delivery.enabled && (
+                        <div className="grid gap-3 sm:grid-cols-3">
+                          <NumberField
+                            id="deliveryFee"
+                            label="Delivery fee"
+                            value={brief.payments.delivery.fee}
+                            onChange={(value) =>
+                              update({
+                                payments: {
+                                  ...brief.payments,
+                                  delivery: {
+                                    ...brief.payments.delivery,
+                                    fee: value,
+                                  },
                                 },
-                              },
-                            })
-                          }
-                        />
-                        <NumberField
-                          id="minimumOrder"
-                          label="Minimum order"
-                          value={brief.payments.delivery.minimumOrder}
-                          onChange={(value) =>
-                            update({
-                              payments: {
-                                ...brief.payments,
-                                delivery: {
-                                  ...brief.payments.delivery,
-                                  minimumOrder: value,
+                              })
+                            }
+                          />
+                          <NumberField
+                            id="minimumOrder"
+                            label="Minimum order"
+                            value={brief.payments.delivery.minimumOrder}
+                            onChange={(value) =>
+                              update({
+                                payments: {
+                                  ...brief.payments,
+                                  delivery: {
+                                    ...brief.payments.delivery,
+                                    minimumOrder: value,
+                                  },
                                 },
-                              },
-                            })
-                          }
-                        />
-                        <NumberField
-                          id="freeDeliveryAbove"
-                          label="Free delivery above"
-                          value={brief.payments.delivery.freeDeliveryAbove ?? 0}
-                          onChange={(value) =>
-                            update({
-                              payments: {
-                                ...brief.payments,
-                                delivery: {
-                                  ...brief.payments.delivery,
-                                  freeDeliveryAbove:
-                                    value > 0 ? value : undefined,
+                              })
+                            }
+                          />
+                          <NumberField
+                            id="freeDeliveryAbove"
+                            label="Free delivery above"
+                            value={
+                              brief.payments.delivery.freeDeliveryAbove ?? 0
+                            }
+                            onChange={(value) =>
+                              update({
+                                payments: {
+                                  ...brief.payments,
+                                  delivery: {
+                                    ...brief.payments.delivery,
+                                    freeDeliveryAbove:
+                                      value > 0 ? value : undefined,
+                                  },
                                 },
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    )}
-                  </fieldset>
+                              })
+                            }
+                          />
+                        </div>
+                      )}
+                    </fieldset>
+                  )}
 
                   <fieldset className="grid gap-3 rounded-lg border border-line p-3">
                     <legend className="text-sm font-semibold">
@@ -1206,12 +1115,6 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             </div>
           )}
 
-          {/*
-            Sequential controls. The numbered buttons above allow jumping to any
-            step, but nothing signalled how to move on, so the wizard read as a
-            dead end after each screen. Autosave already persists every change,
-            so moving between steps needs no explicit save.
-          */}
           <nav
             aria-label="Step navigation"
             className="mt-6 flex items-center justify-between gap-3 border-t border-line pt-4"
@@ -1421,6 +1324,268 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function BundleTable({
+  items,
+  onChange,
+}: {
+  items: CatalogItem[];
+  onChange: (items: CatalogItem[]) => void;
+}) {
+  const idCounterRef = useRef(items.length);
+
+  const addBundle = useCallback(() => {
+    idCounterRef.current += 1;
+    const newId = `bundle-${String(idCounterRef.current).padStart(2, "0")}-${Date.now().toString(36)}`;
+    const newItem: CatalogItem = {
+      id: newId,
+      name: "MTN 1GB",
+      price: 10,
+      category: "mtn",
+      description: "1GB - 30 days",
+      bundle: {
+        network: "mtn",
+        dataMb: 1024,
+        validity: "30 days",
+      },
+    };
+    onChange([...items, newItem]);
+  }, [items, onChange]);
+
+  const loadStarter = useCallback(() => {
+    const merged = mergeStarterBundles(items, starterBundleCatalogue());
+    onChange(merged);
+  }, [items, onChange]);
+
+  const updateItem = useCallback(
+    (
+      id: string,
+      patch: Partial<Omit<CatalogItem, "bundle">> & {
+        bundle?: Partial<NonNullable<CatalogItem["bundle"]>>;
+      },
+    ) => {
+      const next = items.map((it) => {
+        if (it.id !== id) return it;
+        const nextBundle = patch.bundle
+          ? { ...(it.bundle ?? {}), ...patch.bundle }
+          : it.bundle;
+        let name = it.name;
+        if (patch.bundle?.network || patch.bundle?.dataMb !== undefined) {
+          const network = (patch.bundle?.network ??
+            it.bundle?.network ??
+            "mtn") as BundleNetworkId;
+          const mb = patch.bundle?.dataMb ?? it.bundle?.dataMb ?? 1024;
+          name = `${bundleNetworkLabel(network)} ${formatDataMb(mb)}`;
+        }
+        if (patch.name) name = patch.name;
+        return {
+          ...it,
+          ...patch,
+          bundle: nextBundle,
+          name,
+          category:
+            (patch.bundle?.network as string) ?? patch.category ?? it.category,
+        };
+      });
+      onChange(next as CatalogItem[]);
+    },
+    [items, onChange],
+  );
+
+  const deleteItem = useCallback(
+    (id: string) => {
+      onChange(items.filter((it) => it.id !== id));
+    },
+    [items, onChange],
+  );
+
+  return (
+    <div className="grid gap-3 rounded-lg border border-line p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold">Bundles you sell</h3>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={loadStarter}
+            className="rounded-md border border-line bg-white px-2 py-1 text-xs font-semibold hover:bg-slate-50"
+            data-testid="load-starter-bundles"
+          >
+            Load starter price list
+          </button>
+          <button
+            type="button"
+            onClick={addBundle}
+            className="rounded-md bg-navy px-2 py-1 text-xs font-semibold text-white"
+            data-testid="add-bundle"
+          >
+            Add bundle
+          </button>
+        </div>
+      </div>
+      <p className="text-xs text-slate-500">
+        Each bundle needs a network, size and price. Use MB or GB — stored as
+        whole MB (1 GB = 1024 MB).
+      </p>
+
+      {items.length === 0 ? (
+        <p className="rounded bg-amber-50 p-2 text-xs text-amber-800">
+          No bundles yet. Click &quot;Load starter price list&quot; to add 18
+          Ghana bundles with placeholder prices, or Add bundle.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead>
+              <tr className="border-b text-xs text-slate-500">
+                <th className="p-1">Network</th>
+                <th className="p-1">Size</th>
+                <th className="p-1">Unit</th>
+                <th className="p-1">Price (GHS)</th>
+                <th className="p-1">Validity</th>
+                <th className="p-1"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => {
+                const network = (item.bundle?.network ??
+                  "mtn") as BundleNetworkId;
+                const dataMb = item.bundle?.dataMb ?? 1024;
+                const isGb = dataMb % 1024 === 0;
+                const displayValue = isGb ? dataMb / 1024 : dataMb;
+                const displayUnit = isGb ? "GB" : "MB";
+                return (
+                  <tr key={item.id} className="border-b last:border-0">
+                    <td className="p-1">
+                      <select
+                        value={network}
+                        onChange={(e) =>
+                          updateItem(item.id, {
+                            bundle: {
+                              network: e.target.value as BundleNetworkId,
+                            },
+                          })
+                        }
+                        className="rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-network-${item.id}`}
+                      >
+                        {BUNDLE_NETWORKS.map((n) => (
+                          <option key={n.id} value={n.id}>
+                            {n.label}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td className="p-1">
+                      <input
+                        type="number"
+                        min={0.1}
+                        step={displayUnit === "GB" ? 0.5 : 1}
+                        value={displayValue}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          if (!Number.isFinite(raw) || raw <= 0) return;
+                          const mb =
+                            displayUnit === "GB"
+                              ? Math.round(raw * 1024)
+                              : Math.round(raw);
+                          if (mb <= 0) return;
+                          updateItem(item.id, {
+                            bundle: { dataMb: mb },
+                          });
+                        }}
+                        className="w-20 rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-size-${item.id}`}
+                      />
+                    </td>
+                    <td className="p-1">
+                      <select
+                        value={displayUnit}
+                        onChange={(e) => {
+                          const newUnit = e.target.value as "MB" | "GB";
+                          // Convert current displayValue to new unit's MB
+                          const currentMb = dataMb;
+                          let newMb: number;
+                          if (newUnit === "GB") {
+                            // If switching to GB, convert MB to GB rounded to 0.5
+                            newMb =
+                              (Math.round((currentMb / 1024) * 2) / 2) * 1024;
+                            if (newMb < 1024) newMb = 1024;
+                          } else {
+                            // GB to MB: keep same MB
+                            newMb = currentMb;
+                          }
+                          updateItem(item.id, {
+                            bundle: { dataMb: Math.round(newMb) },
+                          });
+                        }}
+                        className="rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-unit-${item.id}`}
+                      >
+                        <option value="MB">MB</option>
+                        <option value="GB">GB</option>
+                      </select>
+                    </td>
+                    <td className="p-1">
+                      <input
+                        type="number"
+                        min={0}
+                        step={0.01}
+                        value={item.price ?? 0}
+                        onChange={(e) => {
+                          const price = Number(e.target.value);
+                          updateItem(item.id, {
+                            price: Number.isFinite(price) ? price : 0,
+                          });
+                        }}
+                        className="w-20 rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-price-${item.id}`}
+                      />
+                    </td>
+                    <td className="p-1">
+                      <input
+                        type="text"
+                        value={item.bundle?.validity ?? ""}
+                        onChange={(e) =>
+                          updateItem(item.id, {
+                            bundle: { validity: e.target.value || undefined },
+                          })
+                        }
+                        placeholder="30 days"
+                        className="w-24 rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-validity-${item.id}`}
+                      />
+                    </td>
+                    <td className="p-1">
+                      <button
+                        type="button"
+                        onClick={() => deleteItem(item.id)}
+                        className="rounded bg-red-50 px-2 py-1 text-xs text-red-700 hover:bg-red-100"
+                        data-testid={`delete-bundle-${item.id}`}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {items.length > 0 && (
+        <ul className="grid gap-1 text-xs text-slate-600">
+          {items.map((i) => (
+            <li key={i.id}>
+              {i.name} — {i.bundle ? formatDataMb(i.bundle.dataMb) : "no size"}{" "}
+              {i.bundle?.validity ? `• ${i.bundle.validity}` : ""} — GH₵
+              {i.price}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
