@@ -1,6 +1,7 @@
-import { mkdtempSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import {
@@ -144,10 +145,25 @@ describe("DomainStore (SQLite)", () => {
     expect(row?.last_checked_at).toBeNull();
   });
 
-  it("never writes to the repository's .data directory", () => {
-    expect(
-      existsSync(path.join(process.cwd(), ".data", "chat-store.sqlite")),
-    ).toBe(false);
+  it("writes to the injected test database, not the repository's .data file", async () => {
+    await store.setDomain(domain({ hostname: "isolated.example.com" }));
+
+    // Positive proof of isolation: the row is readable from the throwaway
+    // file this test created. (Asserting that `.data/` does not exist would
+    // be a statement about the whole test run — other suites legitimately
+    // create it — not about this store.)
+    const probe = new DatabaseSync(
+      path.join(dirs[dirs.length - 1]!, "chat-store.sqlite"),
+      { readOnly: true },
+    );
+    try {
+      const row = probe
+        .prepare("SELECT hostname FROM studio_domains WHERE draft_id = ?")
+        .get("draft-1") as { hostname: string } | undefined;
+      expect(row?.hostname).toBe("isolated.example.com");
+    } finally {
+      probe.close();
+    }
   });
 });
 
