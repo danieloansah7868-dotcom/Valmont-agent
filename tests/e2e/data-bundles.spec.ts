@@ -234,6 +234,9 @@ test.describe("data-bundles shop", () => {
     await page.getByLabel("Phone number").fill("0301234567");
     // Address should be required and visible for restaurant with delivery
     await expect(page.getByLabel("Delivery address")).toBeVisible();
+    // Try without address first — should show error
+    await page.getByTestId("place-order").click();
+    await expect(page.getByText(/delivery address/i)).toBeVisible();
     await page
       .getByLabel("Delivery address")
       .fill("12 Independence Ave, Accra");
