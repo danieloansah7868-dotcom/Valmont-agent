@@ -248,6 +248,10 @@ Phases 2–6 (uploads and object storage, repository generation, sandboxed
 builds, preview deployments, roles, e-commerce and payments) are deliberately
 **not implemented.**
 
+### Data Bundles website type
+
+A **Data Bundles & Airtime Reseller** website type sells MTN, Telecel and AirtelTigo data bundles with instant delivery. Bundles are normal catalogue products with a structured `bundle: { network, dataMb, validity }` field (1 GB = 1024 MB, stored as whole MB so 0.5 GB → 512 MB). The wizard shows a dedicated **Bundles you sell** table with network, size (MB/GB display-only switch), price and validity, plus a _Load starter price list_ that merges 18 Ghana bundles (6 per network) by stable id. Readiness v2 requires at least one priced bundle with metadata and no missing fields. The public shop at `/s/[id]` renders network tabs, size+validity, Ghana-mobile-only checkout (02x/05x, 030 landline refused, normalized to 0xxxxxxxxx, single `validateGhanaMobile` source), and shows a network-mismatch warning only. Category switching strips bundle metadata when leaving data-bundles and enriches priced items when entering, keeping the brief valid so autosave never freezes.
+
 ### Where drafts are stored
 
 - **Without `DATABASE_URL`** — SQLite, in **exactly the same file as Chat**. One

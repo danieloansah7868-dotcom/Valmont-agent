@@ -25,6 +25,7 @@ import {
   type PaymentMethodId,
   type SiteBriefV1,
   type StudioDraft,
+  type CatalogItem,
 } from "@/lib/studio/site-brief/schema";
 import { formatPricedItems, parsePricedItems } from "@/lib/studio/catalog";
 import { ShareLinkButton } from "./share-link-button";
@@ -41,6 +42,16 @@ import {
 } from "@/lib/studio/site-brief/defaults";
 import { changedFields, mergeBriefs } from "@/lib/studio/merge";
 import { AssetUploader } from "./asset-uploader";
+import {
+  BUNDLE_NETWORKS,
+  type BundleNetworkId,
+  starterBundleCatalogue,
+  mergeStarterBundles,
+  formatDataMb,
+  bundleNetworkLabel,
+  guessNetworkFromItem,
+  guessDataMbFromItem,
+} from "@/lib/studio/bundles";
 
 const STEPS = [
   { number: 1, title: "Website type" },
@@ -80,6 +91,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
   // in-page confirmation rather than window.confirm(): it is reachable by
   // screen readers, testable, and cannot be suppressed by the browser.
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [categoryNotice, setCategoryNotice] = useState<string | null>(null);
   /** Both versions kept side by side while the person decides. */
   const [conflictPair, setConflictPair] = useState<{
     mine: SiteBriefV1;
@@ -364,14 +376,99 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
   const changeCategory = useCallback(
     (categoryId: string) => {
       if (!isCategoryId(categoryId)) return;
+      const leavingBundles =
+        brief.category === "data-bundles" && categoryId !== "data-bundles";
+      const enteringBundles =
+        brief.category !== "data-bundles" && categoryId === "data-bundles";
+
+      if (leavingBundles) {
+        // Strip bundle metadata so the brief stays valid for non-bundle sites
+        const stripped = (brief.items ?? []).map((item) => {
+          const { bundle: _bundle, ...rest } = item as CatalogItem & {
+            bundle?: unknown;
+          };
+          void _bundle;
+          return rest;
+        });
+        update({
+          category: categoryId,
+          selectedTemplate: reconcileTemplate(
+            categoryId,
+            brief.selectedTemplate,
+          ),
+          ecomSubcategory:
+            (categoryId as string) === "online-shop"
+              ? brief.ecomSubcategory
+              : undefined,
+          items: stripped as CatalogItem[],
+        });
+        setCategoryNotice(null);
+        return;
+      }
+
+      if (enteringBundles) {
+        const enriched = (brief.items ?? []).map((item) => {
+          const catalogItem = item as CatalogItem;
+          const priced = catalogItem.price !== undefined;
+          if (!priced) return item;
+          // Price <=0 is invalid for bundles (superRefine) — drop it to unpriced so autosave doesn't freeze
+          if (catalogItem.price !== undefined && catalogItem.price <= 0) {
+            const {
+              price: _price,
+              bundle: _bundle,
+              ...rest
+            } = catalogItem as CatalogItem & {
+              bundle?: unknown;
+              price?: unknown;
+            };
+            void _price;
+            void _bundle;
+            return rest as CatalogItem;
+          }
+          const existing = catalogItem.bundle;
+          if (existing?.network && existing?.dataMb) return item;
+          return {
+            ...item,
+            bundle: {
+              network:
+                existing?.network ?? guessNetworkFromItem(catalogItem) ?? "mtn",
+              dataMb:
+                existing?.dataMb ?? guessDataMbFromItem(catalogItem) ?? 1024,
+              validity: existing?.validity,
+            },
+          } as CatalogItem;
+        });
+        update({
+          category: categoryId,
+          selectedTemplate: reconcileTemplate(
+            categoryId,
+            brief.selectedTemplate,
+          ),
+          ecomSubcategory:
+            (categoryId as string) === "online-shop"
+              ? brief.ecomSubcategory
+              : undefined,
+          items: enriched as CatalogItem[],
+        });
+        setCategoryNotice("Check the network and size of your existing items");
+        return;
+      }
+
       update({
         category: categoryId,
         selectedTemplate: reconcileTemplate(categoryId, brief.selectedTemplate),
         ecomSubcategory:
           categoryId === "online-shop" ? brief.ecomSubcategory : undefined,
       });
+      setCategoryNotice(null);
     },
-    [brief.ecomSubcategory, brief.selectedTemplate, update],
+    [
+      brief.category,
+      brief.ecomSubcategory,
+      brief.items,
+      brief.selectedTemplate,
+      update,
+    ],
   );
 
   const keepMine = useCallback(() => {
@@ -420,6 +517,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
   }
 
   const availableTemplates = templatesForCategory(brief.category);
+  const isBundleSite = brief.category === "data-bundles";
 
   return (
     <div className="mx-auto w-full max-w-[980px] p-4 sm:p-6">
@@ -530,6 +628,11 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   </option>
                 ))}
               </select>
+              {categoryNotice && (
+                <p className="rounded bg-amber-50 p-2 text-xs text-amber-800">
+                  {categoryNotice}
+                </p>
+              )}
 
               {brief.category === "online-shop" && (
                 <>
@@ -870,42 +973,51 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 hint="Separate each one with a comma."
               />
 
-              <TextArea
-                id="products"
-                label="Products you sell"
-                value={formatPricedItems(brief.items)}
-                onChange={(value) =>
-                  update({ items: parsePricedItems(value, brief.items) })
-                }
-              />
-              <p className="text-xs text-slate-500">
-                One item per line works best, or separate with commas. Add a
-                price with a dash, e.g. Jollof Rice - 45.
-              </p>
-              {brief.items.length > 0 && (
-                <ul
-                  data-testid="parsed-items-preview"
-                  className="grid gap-1 rounded-lg border border-line bg-ivory-50 p-3 text-sm"
-                >
-                  {brief.items.map((item) => (
-                    <li
-                      key={item.id}
-                      className="flex items-center justify-between gap-3"
+              {isBundleSite ? (
+                <BundleTable
+                  items={brief.items}
+                  onChange={(items) => update({ items })}
+                />
+              ) : (
+                <>
+                  <TextArea
+                    id="products"
+                    label="Products you sell"
+                    value={formatPricedItems(brief.items)}
+                    onChange={(value) =>
+                      update({ items: parsePricedItems(value, brief.items) })
+                    }
+                  />
+                  <p className="text-xs text-slate-500">
+                    One item per line works best, or separate with commas. Add a
+                    price with a dash, e.g. Jollof Rice - 45.
+                  </p>
+                  {brief.items.length > 0 && (
+                    <ul
+                      data-testid="parsed-items-preview"
+                      className="grid gap-1 rounded-lg border border-line bg-ivory-50 p-3 text-sm"
                     >
-                      <span>{item.name}</span>
-                      <span className="text-xs font-semibold text-copper">
-                        {item.price !== undefined
-                          ? `GH₵${item.price}`
-                          : "No price — shown as information only"}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
+                      {brief.items.map((item) => (
+                        <li
+                          key={item.id}
+                          className="flex items-center justify-between gap-3"
+                        >
+                          <span>{item.name}</span>
+                          <span className="text-xs font-semibold text-copper">
+                            {item.price !== undefined
+                              ? `GH₵${item.price}`
+                              : "No price — shown as information only"}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <ProductImagesEditor
+                    items={brief.items}
+                    onChange={(items) => update({ items })}
+                  />
+                </>
               )}
-              <ProductImagesEditor
-                items={brief.items}
-                onChange={(items) => update({ items })}
-              />
 
               <TextField
                 id="serviceAreas"
@@ -1050,81 +1162,87 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                     ))}
                   </fieldset>
 
-                  <fieldset className="grid gap-3 rounded-lg border border-line p-3">
-                    <legend className="text-sm font-semibold">Delivery</legend>
-                    <label className="flex items-center gap-2">
-                      <input
-                        type="checkbox"
-                        checked={brief.payments.delivery.enabled}
-                        onChange={(event) =>
-                          update({
-                            payments: {
-                              ...brief.payments,
-                              delivery: {
-                                ...brief.payments.delivery,
-                                enabled: event.target.checked,
+                  {!isBundleSite && (
+                    <fieldset className="grid gap-3 rounded-lg border border-line p-3">
+                      <legend className="text-sm font-semibold">
+                        Delivery
+                      </legend>
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={brief.payments.delivery.enabled}
+                          onChange={(event) =>
+                            update({
+                              payments: {
+                                ...brief.payments,
+                                delivery: {
+                                  ...brief.payments.delivery,
+                                  enabled: event.target.checked,
+                                },
                               },
-                            },
-                          })
-                        }
-                      />
-                      <span className="text-sm">Offer delivery</span>
-                    </label>
+                            })
+                          }
+                        />
+                        <span className="text-sm">Offer delivery</span>
+                      </label>
 
-                    {brief.payments.delivery.enabled && (
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        <NumberField
-                          id="deliveryFee"
-                          label="Delivery fee"
-                          value={brief.payments.delivery.fee}
-                          onChange={(value) =>
-                            update({
-                              payments: {
-                                ...brief.payments,
-                                delivery: {
-                                  ...brief.payments.delivery,
-                                  fee: value,
+                      {brief.payments.delivery.enabled && (
+                        <div className="grid gap-3 sm:grid-cols-3">
+                          <NumberField
+                            id="deliveryFee"
+                            label="Delivery fee"
+                            value={brief.payments.delivery.fee}
+                            onChange={(value) =>
+                              update({
+                                payments: {
+                                  ...brief.payments,
+                                  delivery: {
+                                    ...brief.payments.delivery,
+                                    fee: value,
+                                  },
                                 },
-                              },
-                            })
-                          }
-                        />
-                        <NumberField
-                          id="minimumOrder"
-                          label="Minimum order"
-                          value={brief.payments.delivery.minimumOrder}
-                          onChange={(value) =>
-                            update({
-                              payments: {
-                                ...brief.payments,
-                                delivery: {
-                                  ...brief.payments.delivery,
-                                  minimumOrder: value,
+                              })
+                            }
+                          />
+                          <NumberField
+                            id="minimumOrder"
+                            label="Minimum order"
+                            value={brief.payments.delivery.minimumOrder}
+                            onChange={(value) =>
+                              update({
+                                payments: {
+                                  ...brief.payments,
+                                  delivery: {
+                                    ...brief.payments.delivery,
+                                    minimumOrder: value,
+                                  },
                                 },
-                              },
-                            })
-                          }
-                        />
-                        <NumberField
-                          id="freeDeliveryAbove"
-                          label="Free delivery above"
-                          value={brief.payments.delivery.freeDeliveryAbove ?? 0}
-                          onChange={(value) =>
-                            update({
-                              payments: {
-                                ...brief.payments,
-                                delivery: {
-                                  ...brief.payments.delivery,
-                                  freeDeliveryAbove:
-                                    value > 0 ? value : undefined,
+                              })
+                            }
+                          />
+                          <NumberField
+                            id="freeDeliveryAbove"
+                            label="Free delivery above"
+                            value={
+                              brief.payments.delivery.freeDeliveryAbove ?? 0
+                            }
+                            onChange={(value) =>
+                              update({
+                                payments: {
+                                  ...brief.payments,
+                                  delivery: {
+                                    ...brief.payments.delivery,
+                                    freeDeliveryAbove:
+                                      value > 0 ? value : undefined,
+                                  },
                                 },
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    )}
-                  </fieldset>
+                              })
+                            }
+                          />
+                        </div>
+                      )}
+                    </fieldset>
+                  )}
 
                   <fieldset className="grid gap-3 rounded-lg border border-line p-3">
                     <legend className="text-sm font-semibold">
@@ -1421,6 +1539,349 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function BundleTable({
+  items,
+  onChange,
+}: {
+  items: CatalogItem[];
+  onChange: (items: CatalogItem[]) => void;
+}) {
+  const idCounterRef = useRef(items.length);
+  const [displayUnits, setDisplayUnits] = useState<Record<string, "MB" | "GB">>(
+    () => {
+      const init: Record<string, "MB" | "GB"> = {};
+      for (const item of items) {
+        const mb = item.bundle?.dataMb ?? 1024;
+        init[item.id] = mb % 1024 === 0 ? "GB" : "MB";
+      }
+      return init;
+    },
+  );
+  const [priceDrafts, setPriceDrafts] = useState<Record<string, string>>(() => {
+    const init: Record<string, string> = {};
+    for (const item of items) {
+      init[item.id] = item.price !== undefined ? String(item.price) : "";
+    }
+    return init;
+  });
+
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    setDisplayUnits((prev) => {
+      const next = { ...prev };
+      for (const item of items) {
+        if (!(item.id in next)) {
+          const mb = item.bundle?.dataMb ?? 1024;
+          next[item.id] = mb % 1024 === 0 ? "GB" : "MB";
+        }
+      }
+      for (const key of Object.keys(next)) {
+        if (!items.some((i) => i.id === key)) delete next[key];
+      }
+      return next;
+    });
+    setPriceDrafts((prev) => {
+      const next = { ...prev };
+      for (const item of items) {
+        if (!(item.id in next)) {
+          next[item.id] = item.price !== undefined ? String(item.price) : "";
+        }
+      }
+      for (const key of Object.keys(next)) {
+        if (!items.some((i) => i.id === key)) delete next[key];
+      }
+      return next;
+    });
+  }, [items]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  const addBundle = useCallback(() => {
+    idCounterRef.current += 1;
+    const newId = `bundle-${String(idCounterRef.current).padStart(2, "0")}-${Date.now().toString(36)}`;
+    const newItem: CatalogItem = {
+      id: newId,
+      name: "MTN 1GB",
+      price: 10,
+      category: "mtn",
+      description: "1GB - 30 days",
+      bundle: {
+        network: "mtn",
+        dataMb: 1024,
+        validity: "30 days",
+      },
+    };
+    onChange([...items, newItem]);
+  }, [items, onChange]);
+
+  const loadStarter = useCallback(() => {
+    const merged = mergeStarterBundles(items, starterBundleCatalogue());
+    onChange(merged);
+  }, [items, onChange]);
+
+  const updateItem = useCallback(
+    (
+      id: string,
+      patch: Partial<Omit<CatalogItem, "bundle">> & {
+        bundle?: Partial<NonNullable<CatalogItem["bundle"]>>;
+      },
+    ) => {
+      const next = items.map((it) => {
+        if (it.id !== id) return it;
+        // Ensure we never produce { network } without dataMb — fill from existing or defaults
+        const existingBundle = it.bundle ?? {
+          network: "mtn" as BundleNetworkId,
+          dataMb: 1024,
+        };
+        const nextBundle = patch.bundle
+          ? {
+              network: (patch.bundle.network ??
+                existingBundle.network ??
+                "mtn") as BundleNetworkId,
+              dataMb: patch.bundle.dataMb ?? existingBundle.dataMb ?? 1024,
+              validity: patch.bundle.validity ?? existingBundle.validity,
+            }
+          : existingBundle;
+        let name = it.name;
+        if (patch.bundle?.network || patch.bundle?.dataMb !== undefined) {
+          const network = (nextBundle.network ?? "mtn") as BundleNetworkId;
+          const mb = nextBundle.dataMb ?? 1024;
+          name = `${bundleNetworkLabel(network)} ${formatDataMb(mb)}`;
+        }
+        if (patch.name) name = patch.name;
+        return {
+          ...it,
+          ...patch,
+          bundle: nextBundle,
+          name,
+          category:
+            (patch.bundle?.network as string) ?? patch.category ?? it.category,
+        };
+      });
+      onChange(next as CatalogItem[]);
+    },
+    [items, onChange],
+  );
+
+  const deleteItem = useCallback(
+    (id: string) => {
+      onChange(items.filter((it) => it.id !== id));
+    },
+    [items, onChange],
+  );
+
+  return (
+    <div className="grid gap-3 rounded-lg border border-line p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold">Bundles you sell</h3>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={loadStarter}
+            className="rounded-md border border-line bg-white px-2 py-1 text-xs font-semibold hover:bg-slate-50"
+            data-testid="load-starter-bundles"
+          >
+            Load starter price list
+          </button>
+          <button
+            type="button"
+            onClick={addBundle}
+            className="rounded-md bg-navy px-2 py-1 text-xs font-semibold text-white"
+            data-testid="add-bundle"
+          >
+            Add bundle
+          </button>
+        </div>
+      </div>
+      <p className="text-xs text-slate-500">
+        Each bundle needs a network, size and price. Use MB or GB — stored as
+        whole MB (1 GB = 1024 MB).
+      </p>
+
+      {items.length === 0 ? (
+        <p className="rounded bg-amber-50 p-2 text-xs text-amber-800">
+          No bundles yet. Click &quot;Load starter price list&quot; to add 18
+          Ghana bundles with placeholder prices, or Add bundle.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead>
+              <tr className="border-b text-xs text-slate-500">
+                <th className="p-1">Network</th>
+                <th className="p-1">Size</th>
+                <th className="p-1">Unit</th>
+                <th className="p-1">Price (GHS)</th>
+                <th className="p-1">Validity</th>
+                <th className="p-1"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => {
+                const network = (item.bundle?.network ??
+                  "mtn") as BundleNetworkId;
+                const dataMb = item.bundle?.dataMb ?? 1024;
+                const displayUnit =
+                  displayUnits[item.id] ?? (dataMb % 1024 === 0 ? "GB" : "MB");
+                const displayValue =
+                  displayUnit === "GB" ? dataMb / 1024 : dataMb;
+                return (
+                  <tr key={item.id} className="border-b last:border-0">
+                    <td className="p-1">
+                      <select
+                        value={network}
+                        onChange={(e) =>
+                          updateItem(item.id, {
+                            bundle: {
+                              network: e.target.value as BundleNetworkId,
+                            },
+                          })
+                        }
+                        className="rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-network-${item.id}`}
+                      >
+                        {BUNDLE_NETWORKS.map((n) => (
+                          <option key={n.id} value={n.id}>
+                            {n.label}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td className="p-1">
+                      <input
+                        type="number"
+                        min={0.1}
+                        step={displayUnit === "GB" ? 0.5 : 1}
+                        value={displayValue}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          if (!Number.isFinite(raw) || raw <= 0) return;
+                          const mb =
+                            displayUnit === "GB"
+                              ? Math.round(raw * 1024)
+                              : Math.round(raw);
+                          if (mb <= 0) return;
+                          updateItem(item.id, {
+                            bundle: { dataMb: mb },
+                          });
+                        }}
+                        className="w-20 rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-size-${item.id}`}
+                      />
+                    </td>
+                    <td className="p-1">
+                      <select
+                        value={displayUnit}
+                        onChange={(e) => {
+                          const newUnit = e.target.value as "MB" | "GB";
+                          // Unit switch must only change display, never dataMb
+                          setDisplayUnits((prev) => ({
+                            ...prev,
+                            [item.id]: newUnit,
+                          }));
+                        }}
+                        className="rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-unit-${item.id}`}
+                      >
+                        <option value="MB">MB</option>
+                        <option value="GB">GB</option>
+                      </select>
+                    </td>
+                    <td className="p-1">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={
+                          priceDrafts[item.id] ??
+                          (item.price !== undefined ? String(item.price) : "")
+                        }
+                        placeholder="10"
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setPriceDrafts((prev) => ({
+                            ...prev,
+                            [item.id]: val,
+                          }));
+                          if (val.trim() === "") return;
+                          const price = Number(val);
+                          if (!Number.isFinite(price) || price <= 0) return;
+                          updateItem(item.id, { price });
+                        }}
+                        onBlur={() => {
+                          const draft = priceDrafts[item.id];
+                          if (draft === undefined) return;
+                          if (draft.trim() === "") {
+                            // Restore previous price on empty
+                            setPriceDrafts((prev) => ({
+                              ...prev,
+                              [item.id]:
+                                item.price !== undefined
+                                  ? String(item.price)
+                                  : "",
+                            }));
+                            return;
+                          }
+                          const price = Number(draft);
+                          if (!Number.isFinite(price) || price <= 0) {
+                            // Invalid — restore previous
+                            setPriceDrafts((prev) => ({
+                              ...prev,
+                              [item.id]:
+                                item.price !== undefined
+                                  ? String(item.price)
+                                  : "",
+                            }));
+                          }
+                        }}
+                        className="w-20 rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-price-${item.id}`}
+                      />
+                    </td>
+                    <td className="p-1">
+                      <input
+                        type="text"
+                        value={item.bundle?.validity ?? ""}
+                        onChange={(e) =>
+                          updateItem(item.id, {
+                            bundle: { validity: e.target.value || undefined },
+                          })
+                        }
+                        placeholder="30 days"
+                        className="w-24 rounded border border-line px-1 py-1 text-xs"
+                        data-testid={`bundle-validity-${item.id}`}
+                      />
+                    </td>
+                    <td className="p-1">
+                      <button
+                        type="button"
+                        onClick={() => deleteItem(item.id)}
+                        className="rounded bg-red-50 px-2 py-1 text-xs text-red-700 hover:bg-red-100"
+                        data-testid={`delete-bundle-${item.id}`}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {items.length > 0 && (
+        <ul className="grid gap-1 text-xs text-slate-600">
+          {items.map((i) => (
+            <li key={i.id}>
+              {i.name} — {i.bundle ? formatDataMb(i.bundle.dataMb) : "no size"}{" "}
+              {i.bundle?.validity ? `• ${i.bundle.validity}` : ""} — GH₵
+              {i.price}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

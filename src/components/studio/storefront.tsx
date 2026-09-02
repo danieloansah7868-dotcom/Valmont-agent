@@ -11,6 +11,7 @@ import {
 } from "@/lib/studio/site-brief/schema";
 import { getTheme } from "@/lib/studio/themes";
 import { computeTotals, formatMoney } from "@/lib/studio/money";
+import { BundleShop } from "./bundle-shop";
 
 interface CheckoutResponse {
   orderId: string;
@@ -50,6 +51,7 @@ export function Storefront({
   const mapsLink =
     brief.mapsLink && isHttpsSafeUrl(brief.mapsLink) ? brief.mapsLink : null;
   const cta = brief.primaryCallToAction?.trim() || "Order now";
+  const isBundleSite = brief.category === "data-bundles";
 
   return (
     <div
@@ -114,7 +116,11 @@ export function Storefront({
         <div className="mx-auto grid max-w-3xl gap-6">
           <div>
             <p className="text-[11px] font-bold tracking-[0.16em] uppercase opacity-70">
-              {brief.category === "restaurant" ? "Restaurant" : "Welcome"}
+              {brief.category === "restaurant"
+                ? "Restaurant"
+                : brief.category === "data-bundles"
+                  ? "Data Bundles"
+                  : "Welcome"}
             </p>
             <h1 className="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">
               {name}
@@ -164,16 +170,29 @@ export function Storefront({
       </section>
 
       {shopOpen && pricedItems.length > 0 ? (
-        <Shop
-          items={items}
-          currency={currency}
-          payments={payments!}
-          draftId={draftId}
-          canCheckout={canCheckout}
-          accent={accent}
-          primary={primary}
-          checkoutNote={payments?.checkoutNote}
-        />
+        isBundleSite ? (
+          <BundleShop
+            items={items}
+            currency={currency}
+            payments={payments!}
+            draftId={draftId}
+            canCheckout={canCheckout}
+            accent={accent}
+            primary={primary}
+            checkoutNote={payments?.checkoutNote}
+          />
+        ) : (
+          <Shop
+            items={items}
+            currency={currency}
+            payments={payments!}
+            draftId={draftId}
+            canCheckout={canCheckout}
+            accent={accent}
+            primary={primary}
+            checkoutNote={payments?.checkoutNote}
+          />
+        )
       ) : items.length > 0 ? (
         <section className="mx-auto max-w-3xl px-4 pb-10 sm:px-6">
           <h2 className="text-lg font-bold">Menu</h2>

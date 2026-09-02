@@ -21,6 +21,10 @@ import {
   isPaymentMethodId,
 } from "@/lib/studio/site-brief/schema";
 import { notifyMerchantNewOrder } from "@/lib/studio/notifications";
+import {
+  validateGhanaMobile,
+  normalizeGhanaMobile,
+} from "@/lib/studio/bundles";
 
 const CHECKOUT_BODY_LIMIT_BYTES = 100_000;
 
@@ -101,6 +105,19 @@ export async function POST(
       );
     }
 
+    // Ghana mobile validation for data-bundles sites: 02x/05x only, saved as 0240000001, landline 030 refused
+    // Uses single explainer from bundles.ts — no duplicated regexes.
+    const isBundleSite = draft.brief.category === "data-bundles";
+    let normalizedPhone = payload.customerPhone.trim();
+    if (isBundleSite) {
+      const validationError = validateGhanaMobile(payload.customerPhone);
+      if (validationError) {
+        return NextResponse.json({ error: validationError }, { status: 400 });
+      }
+      const norm = normalizeGhanaMobile(payload.customerPhone);
+      if (norm) normalizedPhone = norm;
+    }
+
     // Re-price every line from the server-side catalogue. A line whose item is
     // unknown or has no price is rejected — never silently priced at zero.
     const catalogue = new Map(draft.brief.items.map((item) => [item.id, item]));
@@ -125,7 +142,7 @@ export async function POST(
     }
 
     const totals = computeTotals(pricedLines, {
-      enabled: payments.delivery.enabled,
+      enabled: isBundleSite ? false : payments.delivery.enabled,
       fee: payments.delivery.fee,
       minimumOrder: payments.delivery.minimumOrder,
       freeDeliveryAbove: payments.delivery.freeDeliveryAbove,
@@ -133,6 +150,7 @@ export async function POST(
 
     // Enforce the minimum order on the goods subtotal, before delivery.
     if (
+      !isBundleSite &&
       payments.delivery.minimumOrder > 0 &&
       totals.subtotal < payments.delivery.minimumOrder
     ) {
@@ -146,6 +164,7 @@ export async function POST(
 
     // A delivery order needs somewhere to deliver to.
     if (
+      !isBundleSite &&
       payments.delivery.enabled &&
       (!payload.customerAddress || payload.customerAddress.trim() === "")
     ) {
@@ -209,7 +228,7 @@ export async function POST(
       total: totals.total,
       lines,
       customerName: payload.customerName,
-      customerPhone: payload.customerPhone,
+      customerPhone: normalizedPhone,
       customerEmail: orderCustomerEmail,
       customerAddress: payload.customerAddress || undefined,
       customerAccountId,
@@ -247,7 +266,7 @@ export async function POST(
       description: `${draft.brief.businessName} order`,
       customerName: payload.customerName,
       customerEmail: orderCustomerEmail,
-      customerPhone: payload.customerPhone,
+      customerPhone: normalizedPhone,
       callbackUrl: `${origin}/api/payments/webhook?access_code=${code}`,
     });
 

@@ -6,6 +6,15 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
+## Data Bundles — Stage 2 implemented, Stage 3–6 pending
+
+Stage 2 (catalogue field `bundle: { network, dataMb, validity }`, superRefine, starter merge, wizard table, readiness v2, storefront tabs, Ghana mobile single-source validation, network-mismatch warning only) is on this branch `arena/01a062e7-valmont-agent`.
+
+Stage 3: recipient phone column + validation in orders table and checkout API (no new DB migration in Stage 2).
+Stage 4: delivery integration (provider API, status callbacks).
+Stage 5: TechChief key provisioning — awaiting TechChief integration doc (API spec, auth, pricing, callback format).
+Stage 6: analytics, rate-limits, fraud checks, documentation polish.
+
 ---
 
 ## Deep-scan remediation — branch `arena/01a06135-valmont-agent`

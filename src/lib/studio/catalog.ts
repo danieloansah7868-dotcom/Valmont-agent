@@ -33,6 +33,7 @@ export function parsePricedItems(
       if (prior?.category) item.category = prior.category;
       if (prior?.description) item.description = prior.description;
       if (prior?.image) item.image = prior.image;
+      if (prior?.bundle) item.bundle = prior.bundle;
       return item;
     });
 }

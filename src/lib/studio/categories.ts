@@ -1,5 +1,6 @@
 export const CATEGORY_IDS = [
   "online-shop",
+  "data-bundles",
   "business-profile",
   "school",
   "church",
@@ -39,9 +40,10 @@ export interface CategoryManifest {
   description: string;
   ecomSubcategories?: EcomSubcategoryId[];
   requiredPagesHint: string[];
+  preferredTemplate?: string;
 }
 
-export const CATEGORY_REGISTRY_VERSION = 1;
+export const CATEGORY_REGISTRY_VERSION = 2;
 
 export const categories: CategoryManifest[] = [
   {
@@ -56,6 +58,14 @@ export const categories: CategoryManifest[] = [
       "checkout",
       "contact",
     ],
+  },
+  {
+    id: "data-bundles",
+    label: "Data Bundles & Airtime Reseller",
+    description:
+      "Sell MTN, Telecel and AirtelTigo data bundles with instant delivery.",
+    requiredPagesHint: ["home", "bundles", "how-it-works", "contact"],
+    preferredTemplate: "bundle-shop",
   },
   {
     id: "business-profile",

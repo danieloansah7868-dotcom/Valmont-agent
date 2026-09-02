@@ -403,8 +403,21 @@ const priceAmount = z
 export { priceAmount };
 
 /**
+ * Ghana telecom bundle metadata — structured so delivery can never send the wrong thing.
+ * Old sites without it still load (optional), Stage 1 guessed from name/category.
+ */
+export const bundleMetaSchema = z.object({
+  network: z.enum(["mtn", "telecel", "airteltigo"]),
+  dataMb: z.number().int().min(1).max(1_000_000),
+  validity: freeText(40).optional(),
+});
+
+export type BundleMeta = z.infer<typeof bundleMetaSchema>;
+
+/**
  * A single item in a shop's catalogue. A priced item can be added to a basket
  * and paid for; an unpriced item is shown for information only.
+ * For data-bundles sites, priced items must carry `bundle`.
  */
 export const catalogItemSchema = z.object({
   id: z.string().max(64),
@@ -417,6 +430,7 @@ export const catalogItemSchema = z.object({
     .max(1_600_000)
     .regex(/^data:image\//, "Image must be a data URL")
     .optional(),
+  bundle: bundleMetaSchema.optional(),
 });
 
 export type CatalogItem = z.infer<typeof catalogItemSchema>;
@@ -584,6 +598,56 @@ export const siteBriefSchemaV1 = baseSiteBriefV1.superRefine((brief, ctx) => {
       path: ["ecomSubcategory"],
       message: "A shop subtype only applies to the Online Shop website type",
     });
+  }
+
+  // Stage 2 rule: data-bundles sites must have structured bundle metadata on every priced item;
+  // other sites must not carry it.
+  const isBundleSite = brief.category === "data-bundles";
+  if (isBundleSite) {
+    for (let i = 0; i < brief.items.length; i += 1) {
+      const item = brief.items[i];
+      if (item.price === undefined) continue;
+      if (item.price <= 0) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["items", i, "price"],
+          message: "Bundle price must be greater than 0",
+        });
+      }
+      if (!item.bundle) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["items", i, "bundle"],
+          message: "Every priced bundle must have network and size",
+        });
+      } else {
+        if (!item.bundle.network) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["items", i, "bundle", "network"],
+            message: "Bundle network is required",
+          });
+        }
+        if (!item.bundle.dataMb) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["items", i, "bundle", "dataMb"],
+            message: "Bundle size is required",
+          });
+        }
+      }
+    }
+  } else {
+    for (let i = 0; i < brief.items.length; i += 1) {
+      const item = brief.items[i];
+      if (item.bundle) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["items", i, "bundle"],
+          message: "Bundle metadata only applies to Data Bundles sites",
+        });
+      }
+    }
   }
 });
 
