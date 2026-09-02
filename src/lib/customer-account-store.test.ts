@@ -110,12 +110,17 @@ describe("SqliteCustomerAccountStore", () => {
       CUSTOMER_RESET_TTL_MS,
     );
 
-    // Age one session past its expiry without touching the other.
+    // Age one session past its expiry without touching the other. Selected by token hash: both
+    // sessions are created within the same millisecond, so "newest by created_at" is a coin toss.
+    const { hashCustomerToken } = await import("@/lib/customer-password");
     const db = (store as unknown as { db: import("node:sqlite").DatabaseSync })
       .db;
     db.prepare(
-      "UPDATE customer_sessions SET expires_at = ? WHERE id = (SELECT id FROM customer_sessions ORDER BY created_at DESC LIMIT 1)",
-    ).run(new Date(Date.now() - 1000).toISOString());
+      "UPDATE customer_sessions SET expires_at = ? WHERE token_hash = ?",
+    ).run(
+      new Date(Date.now() - 1000).toISOString(),
+      hashCustomerToken(stale.token),
+    );
 
     const purged = await store.purgeExpired();
 

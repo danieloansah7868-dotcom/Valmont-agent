@@ -65,12 +65,13 @@ export function BundleShop({
   const [activeNetwork, setActiveNetwork] = useState<BundleNetworkId>("mtn");
 
   useEffect(() => {
+    if (grouped[activeNetwork]?.length > 0) return;
     const firstWith = (Object.keys(grouped) as BundleNetworkId[]).find(
       (k) => grouped[k].length > 0,
     );
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (firstWith) setActiveNetwork(firstWith);
-  }, [grouped]);
+  }, [grouped, activeNetwork]);
 
   const priced = useMemo(
     () => items.filter((item) => item.price !== undefined),

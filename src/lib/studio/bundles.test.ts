@@ -216,10 +216,14 @@ describe("groupBundlesByNetwork field-first fallback", () => {
 });
 
 describe("readiness for bundle shop", () => {
-  it("requires at least one priced bundle per present network", () => {
+  it("requires at least one priced bundle with bundle meta", () => {
     const emptyBundleBrief = baseBrief({ items: [] });
     const c1 = computeBriefCompleteness(emptyBundleBrief);
     expect(c1.missingRequired.map((g) => g.field)).toContain("bundleCatalogue");
+    // bundleMetadata is vacuously true when empty, so only catalogue fires
+    expect(c1.missingRequired.map((g) => g.field)).not.toContain(
+      "bundleMetadata",
+    );
 
     const withBundles = baseBrief({
       items: starterBundleCatalogue().slice(0, 2),
@@ -422,6 +426,46 @@ describe("category switch trap", () => {
       })),
     };
     expect(siteBriefSchemaV1.safeParse(enriched).success).toBe(true);
+  });
+
+  it("entering data-bundles drops price <=0 to unpriced and stays valid", () => {
+    const businessBrief = {
+      schemaVersion: 1,
+      businessName: "Adom Fabrics",
+      category: "business-profile",
+      selectedPackage: "starter",
+      selectedTheme: "clean-corporate",
+      selectedTemplate: "classic-hero",
+      adminEmail: "ama@adomfabrics.com",
+      phone: "+233201234567",
+      items: [
+        { id: "item-1", name: "MTN 5GB", price: 0 },
+        { id: "item-2", name: "Free sample", price: -5 },
+        { id: "item-3", name: "Valid", price: 10 },
+      ],
+    };
+    // Simulate enrich that drops price <=0
+    const enrichedItems = businessBrief.items.map((item: any) => {
+      if (item.price !== undefined && item.price <= 0) {
+        const { price: _p, ...rest } = item;
+        void _p;
+        return rest;
+      }
+      return item;
+    });
+    const brief = {
+      ...businessBrief,
+      category: "data-bundles",
+      selectedTemplate: "bundle-shop",
+      items: enrichedItems.map((item: any) => {
+        if (item.price === undefined) return item;
+        return {
+          ...item,
+          bundle: { network: "mtn", dataMb: 1024 },
+        };
+      }),
+    };
+    expect(siteBriefSchemaV1.safeParse(brief).success).toBe(true);
   });
 
   it("price 0 is invalid for bundle", () => {

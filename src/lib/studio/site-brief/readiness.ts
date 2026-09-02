@@ -161,7 +161,7 @@ const RULES: Rule[] = [
     satisfied: (brief) => {
       const items = brief.items ?? [];
       const priced = items.filter((i) => i.price !== undefined);
-      if (priced.length === 0) return false;
+      // Vacuously true when no priced items — only bundleCatalogue should fire for empty shop
       return priced.every((i) => i.bundle?.network && i.bundle?.dataMb);
     },
   },

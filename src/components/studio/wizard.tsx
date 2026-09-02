@@ -408,21 +408,32 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
 
       if (enteringBundles) {
         const enriched = (brief.items ?? []).map((item) => {
-          const priced = (item as CatalogItem).price !== undefined;
+          const catalogItem = item as CatalogItem;
+          const priced = catalogItem.price !== undefined;
           if (!priced) return item;
-          const existing = (item as CatalogItem).bundle;
+          // Price <=0 is invalid for bundles (superRefine) — drop it to unpriced so autosave doesn't freeze
+          if (catalogItem.price !== undefined && catalogItem.price <= 0) {
+            const {
+              price: _price,
+              bundle: _bundle,
+              ...rest
+            } = catalogItem as CatalogItem & {
+              bundle?: unknown;
+              price?: unknown;
+            };
+            void _price;
+            void _bundle;
+            return rest as CatalogItem;
+          }
+          const existing = catalogItem.bundle;
           if (existing?.network && existing?.dataMb) return item;
           return {
             ...item,
             bundle: {
               network:
-                existing?.network ??
-                guessNetworkFromItem(item as CatalogItem) ??
-                "mtn",
+                existing?.network ?? guessNetworkFromItem(catalogItem) ?? "mtn",
               dataMb:
-                existing?.dataMb ??
-                guessDataMbFromItem(item as CatalogItem) ??
-                1024,
+                existing?.dataMb ?? guessDataMbFromItem(catalogItem) ?? 1024,
               validity: existing?.validity,
             },
           } as CatalogItem;
@@ -1550,9 +1561,16 @@ function BundleTable({
       return init;
     },
   );
+  const [priceDrafts, setPriceDrafts] = useState<Record<string, string>>(() => {
+    const init: Record<string, string> = {};
+    for (const item of items) {
+      init[item.id] = item.price !== undefined ? String(item.price) : "";
+    }
+    return init;
+  });
 
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setDisplayUnits((prev) => {
       const next = { ...prev };
       for (const item of items) {
@@ -1561,13 +1579,25 @@ function BundleTable({
           next[item.id] = mb % 1024 === 0 ? "GB" : "MB";
         }
       }
-      // Remove stale ids
+      for (const key of Object.keys(next)) {
+        if (!items.some((i) => i.id === key)) delete next[key];
+      }
+      return next;
+    });
+    setPriceDrafts((prev) => {
+      const next = { ...prev };
+      for (const item of items) {
+        if (!(item.id in next)) {
+          next[item.id] = item.price !== undefined ? String(item.price) : "";
+        }
+      }
       for (const key of Object.keys(next)) {
         if (!items.some((i) => i.id === key)) delete next[key];
       }
       return next;
     });
   }, [items]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const addBundle = useCallback(() => {
     idCounterRef.current += 1;
@@ -1762,28 +1792,48 @@ function BundleTable({
                     </td>
                     <td className="p-1">
                       <input
-                        type="number"
-                        min={0.01}
-                        step={0.01}
-                        value={item.price ?? ""}
+                        type="text"
+                        inputMode="decimal"
+                        value={
+                          priceDrafts[item.id] ??
+                          (item.price !== undefined ? String(item.price) : "")
+                        }
                         placeholder="10"
                         onChange={(e) => {
                           const val = e.target.value;
-                          if (val === "") return;
+                          setPriceDrafts((prev) => ({
+                            ...prev,
+                            [item.id]: val,
+                          }));
+                          if (val.trim() === "") return;
                           const price = Number(val);
                           if (!Number.isFinite(price) || price <= 0) return;
-                          updateItem(item.id, {
-                            price,
-                          });
+                          updateItem(item.id, { price });
                         }}
-                        onBlur={(e) => {
-                          // If left empty, keep previous price
-                          if (
-                            e.target.value === "" &&
-                            item.price !== undefined
-                          ) {
-                            // force re-render by keeping value
-                            e.target.value = String(item.price);
+                        onBlur={() => {
+                          const draft = priceDrafts[item.id];
+                          if (draft === undefined) return;
+                          if (draft.trim() === "") {
+                            // Restore previous price on empty
+                            setPriceDrafts((prev) => ({
+                              ...prev,
+                              [item.id]:
+                                item.price !== undefined
+                                  ? String(item.price)
+                                  : "",
+                            }));
+                            return;
+                          }
+                          const price = Number(draft);
+                          if (!Number.isFinite(price) || price <= 0) {
+                            // Invalid — restore previous
+                            setPriceDrafts((prev) => ({
+                              ...prev,
+                              [item.id]:
+                                item.price !== undefined
+                                  ? String(item.price)
+                                  : "",
+                            }));
                           }
                         }}
                         className="w-20 rounded border border-line px-1 py-1 text-xs"
