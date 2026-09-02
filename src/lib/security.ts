@@ -6,6 +6,10 @@ import {
 } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { ForbiddenError } from "@/lib/api-errors";
+import {
+  describeSessionSecretProblem,
+  sessionSecretProblem,
+} from "@/lib/session-secret";
 
 export { redactSecrets, redactPaymentData } from "./redact";
 
@@ -20,9 +24,25 @@ export function containsLikelySecret(value: string): boolean {
   ].some((pattern) => pattern.test(value));
 }
 
+export class WeakSessionSecretError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WeakSessionSecretError";
+  }
+}
+
+/**
+ * Derives the AES key. A missing, short or placeholder secret is refused here
+ * — at the primitive — so no code path can encrypt a session, an OAuth state
+ * or a payment credential under a guessable key, whatever the caller did or
+ * did not check first.
+ */
 function sessionKey(secret = process.env.SESSION_SECRET): Buffer {
-  if (!secret) throw new Error("SESSION_SECRET is required");
-  return createHash("sha256").update(secret).digest();
+  const problem = sessionSecretProblem(secret);
+  if (problem) {
+    throw new WeakSessionSecretError(describeSessionSecretProblem(problem));
+  }
+  return createHash("sha256").update(secret!).digest();
 }
 
 /** AES-256-GCM envelope for short-lived OAuth session values. */

@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import {
   CUSTOMER_RESET_TTL_MS,
+  CUSTOMER_SESSION_TTL_MS,
+  resetCustomerPurgeClockForTests,
   SqliteCustomerAccountStore,
 } from "@/lib/customer-account-store";
 
@@ -21,6 +23,7 @@ beforeEach(() => {
     ),
   );
   store = new SqliteCustomerAccountStore();
+  resetCustomerPurgeClockForTests();
 });
 
 afterEach(() => {
@@ -85,5 +88,70 @@ describe("SqliteCustomerAccountStore", () => {
       context: "guest-order-access-code",
     });
     expect(await store.consumeToken(replacement, "reset_password")).toBeNull();
+  });
+
+  it("purges expired sessions and spent or expired tokens, keeping live ones", async () => {
+    const account = await store.createAccount({
+      name: "Efua Mensah",
+      email: "efua@example.com",
+      password: "a sufficiently long password",
+    });
+    const live = await store.createSession(account.id);
+    const stale = await store.createSession(account.id);
+    const spent = await store.createToken(
+      account.id,
+      "verify_email",
+      CUSTOMER_RESET_TTL_MS,
+    );
+    await store.consumeToken(spent, "verify_email");
+    const pendingReset = await store.createToken(
+      account.id,
+      "reset_password",
+      CUSTOMER_RESET_TTL_MS,
+    );
+
+    // Age one session past its expiry without touching the other.
+    const db = (store as unknown as { db: import("node:sqlite").DatabaseSync })
+      .db;
+    db.prepare(
+      "UPDATE customer_sessions SET expires_at = ? WHERE id = (SELECT id FROM customer_sessions ORDER BY created_at DESC LIMIT 1)",
+    ).run(new Date(Date.now() - 1000).toISOString());
+
+    const purged = await store.purgeExpired();
+
+    expect(purged).toEqual({ sessions: 1, tokens: 1 });
+    expect(await store.getSession(live.token)).not.toBeNull();
+    expect(await store.getSession(stale.token)).toBeNull();
+    expect(await store.consumeToken(pendingReset, "reset_password")).toEqual({
+      accountId: account.id,
+      context: undefined,
+    });
+    expect(CUSTOMER_SESSION_TTL_MS).toBeGreaterThan(0);
+  });
+
+  it("runs the purge opportunistically from session creation, at most hourly", async () => {
+    const account = await store.createAccount({
+      name: "Yaw Mensah",
+      email: "yaw@example.com",
+      password: "a sufficiently long password",
+    });
+    const db = (store as unknown as { db: import("node:sqlite").DatabaseSync })
+      .db;
+    db.prepare(
+      `INSERT INTO customer_sessions(id, account_id, token_hash, expires_at, created_at)
+       VALUES ('old-session', ?, 'old-hash', ?, ?)`,
+    ).run(
+      account.id,
+      new Date(Date.now() - 60_000).toISOString(),
+      new Date(Date.now() - 120_000).toISOString(),
+    );
+
+    await store.createSession(account.id);
+    const remaining = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM customer_sessions WHERE id = 'old-session'",
+      )
+      .get() as { n: number };
+    expect(Number(remaining.n)).toBe(0);
   });
 });

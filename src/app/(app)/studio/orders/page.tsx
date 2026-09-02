@@ -10,6 +10,7 @@ import {
 } from "@/lib/studio/order-status";
 import { formatMoney } from "@/lib/studio/valmont-pay";
 import { formatAccra } from "@/lib/studio/format";
+import { PaymentModeBadge } from "@/components/studio/payment-mode-badge";
 
 export const dynamic = "force-dynamic";
 
@@ -120,6 +121,7 @@ export default async function OrdersPage({
                   </p>
                 </div>
                 <div className="flex items-center gap-3">
+                  <PaymentModeBadge mode={order.paymentMode} />
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
                       STATUS_BADGE_CLASS[order.status] ??

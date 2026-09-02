@@ -33,6 +33,7 @@ function makeOrder(
     customerName: "Ama",
     customerPhone: "+233240000000",
     paymentMethod: "valmont_pay",
+    paymentMode: "live",
     createdAt: "2026-08-25T12:00:00.000Z",
     updatedAt: "2026-08-25T12:00:00.000Z",
     statusHistory: [],
@@ -160,6 +161,39 @@ describe("summariseOrders", () => {
     ]);
   });
 
+  it("leaves simulator (test-mode) orders out of every figure", () => {
+    const result = summariseOrders([
+      makeOrder({ id: "real", status: "paid", total: 40 }),
+      makeOrder({
+        id: "practice",
+        status: "paid",
+        total: 999,
+        paymentMode: "test",
+        paymentMethod: "card",
+        createdAt: "2026-08-25T04:15:00.000Z",
+        lines: [{ itemId: "x", name: "Pretend", price: 999, quantity: 1 }],
+      }),
+      makeOrder({
+        id: "practice-refund",
+        status: "refunded",
+        total: 500,
+        paymentMode: "test",
+      }),
+    ]);
+
+    expect(result.excludedTestOrders).toBe(2);
+    expect(result.paidOrders).toBe(1);
+    expect(result.grossRevenue).toBe(40);
+    expect(result.paidRevenue).toBe(40);
+    expect(result.refundedOrders).toBe(0);
+    expect(result.refundedRevenue).toBe(0);
+    expect(result.topItems.map((item) => item.name)).toEqual(["Jollof Rice"]);
+    expect(result.paymentMethods.map((row) => row.method)).toEqual([
+      "valmont_pay",
+    ]);
+    expect(result.busiestHours).toEqual([{ hour: 12, orders: 1 }]);
+  });
+
   it("groups busiest order hours in Accra time", () => {
     const result = summariseOrders([
       makeOrder({ id: "early", createdAt: "2026-08-25T04:15:00.000Z" }),
@@ -176,6 +210,7 @@ describe("summariseOrders", () => {
   it("returns an empty, safe summary when there are no orders", () => {
     expect(summariseOrders([])).toEqual({
       paidOrders: 0,
+      excludedTestOrders: 0,
       paidRevenue: 0,
       grossRevenue: 0,
       refundedRevenue: 0,

@@ -12,6 +12,7 @@ import {
   users,
 } from "@/db/schema";
 import type { SessionUser } from "@/lib/auth";
+import { ForbiddenError } from "@/lib/api-errors";
 import type {
   Approval,
   CodingTask,
@@ -204,7 +205,7 @@ export class PostgresTaskStore implements TaskStore {
     if (!isUuid(task.id))
       throw new Error("PostgreSQL tasks require UUID identifiers");
     if (task.userId && task.userId !== this.user.id) {
-      throw new Error("Task ownership check failed");
+      throw new ForbiddenError("Task ownership check failed");
     }
     const db = getDatabase();
     await db

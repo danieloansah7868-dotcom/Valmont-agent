@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { publicOrigin } from "@/lib/auth-redirect";
 import { z } from "zod";
 import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
@@ -7,7 +8,10 @@ import {
   CUSTOMER_VERIFICATION_TTL_MS,
   getCustomerAccountStore,
 } from "@/lib/customer-account-store";
-import { normalizeCustomerEmail } from "@/lib/customer-password";
+import {
+  hashCustomerPassword,
+  normalizeCustomerEmail,
+} from "@/lib/customer-password";
 import {
   assertCustomerEmailDeliveryReady,
   customerEmailHtml,
@@ -18,6 +22,7 @@ import { getOrdersStore } from "@/lib/studio/orders";
 import { customerAccountsEnabled } from "@/lib/studio/site-brief/schema";
 import {
   CustomerAccountExistsError,
+  CustomerEmailDeliveryError,
   InvalidOrderClaimError,
 } from "@/lib/api-errors";
 
@@ -74,15 +79,37 @@ export async function POST(request: NextRequest) {
     }
 
     const store = getCustomerAccountStore();
-    if (await store.getByEmail(email)) {
-      throw new CustomerAccountExistsError();
-    }
+    const origin = publicOrigin(request.url);
 
-    const account = await store.createAccount({
-      email,
-      name: parsed.name,
-      password: parsed.password,
-    });
+    // Registration must not reveal whether an address already has an account.
+    // An existing address gets the SAME response as a new one; the difference
+    // happens only in the inbox, which only the address owner can read: an
+    // unverified account receives a fresh verification link, a verified one a
+    // note that someone tried to sign up with it. A creation race (two
+    // registrations at once) lands in the same branch via the unique index.
+    let account = null;
+    const existing = await store.getByEmail(email);
+    if (!existing) {
+      try {
+        account = await store.createAccount({
+          email,
+          name: parsed.name,
+          password: parsed.password,
+        });
+      } catch (error) {
+        if (!(error instanceof CustomerAccountExistsError)) throw error;
+      }
+    }
+    if (!account) {
+      // Creating an account costs one scrypt hash; spend the same work here so
+      // the response time cannot distinguish the two branches either.
+      await hashCustomerPassword(parsed.password);
+      await notifyExistingAccount(store, email, origin);
+      return NextResponse.json(
+        { ok: true, message: REGISTRATION_MESSAGE },
+        { status: 201 },
+      );
+    }
 
     const token = await store.createToken(
       account.id,
@@ -90,10 +117,7 @@ export async function POST(request: NextRequest) {
       CUSTOMER_VERIFICATION_TTL_MS,
       claimAccessCode,
     );
-    const verificationLink = new URL(
-      "/api/customer/auth/verify",
-      request.nextUrl.origin,
-    );
+    const verificationLink = new URL("/api/customer/auth/verify", origin);
     verificationLink.searchParams.set("token", token);
     const delivery = await sendCustomerEmail({
       to: account.email,
@@ -113,8 +137,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       {
         ok: true,
-        message:
-          "Your account is ready. Check your email to verify the address before signing in.",
+        message: REGISTRATION_MESSAGE,
         ...(delivery.developmentLink
           ? { verificationLink: delivery.developmentLink }
           : {}),
@@ -123,5 +146,73 @@ export async function POST(request: NextRequest) {
     );
   } catch (error) {
     return safeApiError(error);
+  }
+}
+
+/** One message for every outcome, so the response cannot be used to enumerate. */
+const REGISTRATION_MESSAGE =
+  "Check your email to finish setting up your account. If you already had one, we have sent instructions for signing in instead.";
+
+/**
+ * Tells the real owner of an already-registered address what happened. Only
+ * transport failures are swallowed — a broken sender must still stay neutral
+ * — while configuration errors (503) propagate exactly as they would for a
+ * brand-new address, so the two branches remain indistinguishable.
+ */
+async function notifyExistingAccount(
+  store: ReturnType<typeof getCustomerAccountStore>,
+  email: string,
+  origin: string,
+): Promise<void> {
+  const account = await store.getByEmail(email);
+  if (!account) return;
+  try {
+    if (!account.emailVerifiedAt) {
+      const token = await store.createToken(
+        account.id,
+        "verify_email",
+        CUSTOMER_VERIFICATION_TTL_MS,
+      );
+      const link = new URL("/api/customer/auth/verify", origin);
+      link.searchParams.set("token", token);
+      await sendCustomerEmail({
+        to: account.email,
+        name: account.name,
+        subject: "Verify your Valmont customer account",
+        text: `Verify your Valmont customer account: ${link.toString()}`,
+        html: customerEmailHtml(
+          "Verify your Valmont account",
+          account.name,
+          "Someone — probably you — tried to create an account with this address. It already exists but has not been verified yet, so here is a fresh verification link.",
+          "Verify email address",
+          link.toString(),
+        ),
+        developmentLink: link.toString(),
+      });
+      return;
+    }
+    const login = new URL("/account/login", origin);
+    const reset = new URL("/account/forgot-password", origin);
+    await sendCustomerEmail({
+      to: account.email,
+      name: account.name,
+      subject: "You already have a Valmont customer account",
+      text: [
+        "Someone tried to create a Valmont customer account with this email address, but you already have one.",
+        `Sign in: ${login.toString()}`,
+        `Forgot your password? ${reset.toString()}`,
+        "If this was not you, no action is needed — nothing about your account has changed.",
+      ].join("\n"),
+      html: customerEmailHtml(
+        "You already have an account",
+        account.name,
+        "Someone tried to create a Valmont customer account with this email address, but you already have one. If it was you, simply sign in; if you have forgotten your password, use the reset link on the sign-in page. If this was not you, nothing about your account has changed.",
+        "Sign in",
+        login.toString(),
+      ),
+      developmentLink: login.toString(),
+    });
+  } catch (error) {
+    if (!(error instanceof CustomerEmailDeliveryError)) throw error;
   }
 }

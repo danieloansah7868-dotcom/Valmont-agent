@@ -403,6 +403,8 @@ export const studioOrders = pgTable(
       { onDelete: "set null" },
     ),
     paymentMethod: text("payment_method").notNull(),
+    /** "test" (local simulator, no real money) or "live". */
+    paymentMode: text("payment_mode").notNull().default("live"),
     paymentRef: text("payment_ref"),
     paidAt: timestamp("paid_at", { withTimezone: true }),
     fulfilledAt: timestamp("fulfilled_at", { withTimezone: true }),
@@ -448,6 +450,16 @@ export const studioDomains = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     hostname: text("hostname").notNull().unique(),
     status: text("status").notNull().default("not_set"),
+    /**
+     * Per-draft ownership proof. The owner publishes it as a DNS TXT record
+     * (`_valmont-verify.<hostname>` = `valmont-verify=<token>`); the domain
+     * is served only once that record AND the CNAME both resolve correctly.
+     */
+    verificationToken: text("verification_token"),
+    /** When ownership was last proven; null until the TXT record is seen. */
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    /** When DNS was last checked, so re-verification can be throttled. */
+    lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

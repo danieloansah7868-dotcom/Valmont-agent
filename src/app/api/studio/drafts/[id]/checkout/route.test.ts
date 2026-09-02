@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   getOrdersStore: vi.fn(),
   computeTotals: vi.fn(),
   createPaymentLink: vi.fn(),
+  onlinePaymentAvailability: vi.fn(),
   notifyMerchantNewOrder: vi.fn(),
 }));
 
@@ -40,6 +41,9 @@ vi.mock("@/lib/studio/orders", () => ({
 vi.mock("@/lib/studio/valmont-pay", () => ({
   computeTotals: mocks.computeTotals,
   createPaymentLink: mocks.createPaymentLink,
+  onlinePaymentAvailability: mocks.onlinePaymentAvailability,
+  ONLINE_PAYMENT_UNAVAILABLE_MESSAGE:
+    "Online payment is temporarily unavailable for this shop. Please choose another payment method or try again later.",
 }));
 
 vi.mock("@/lib/studio/notifications", () => ({
@@ -81,23 +85,38 @@ const createdOrder = {
   status: "cod_pending",
 };
 
-function request(customerEmail?: string) {
+function request(
+  customerEmail?: string,
+  options: { paymentMethod?: string; url?: string; host?: string } = {},
+) {
   return new NextRequest(
-    `http://localhost/api/studio/drafts/${draftId}/checkout`,
+    options.url ?? `http://localhost/api/studio/drafts/${draftId}/checkout`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(options.host ? { host: options.host } : {}),
+      },
       body: JSON.stringify({
         lines: [{ itemId: "item-1", quantity: 1 }],
         customerName: "Ama Mensah",
         customerPhone: "+233240000000",
         customerEmail,
-        paymentMethod: "cod",
+        paymentMethod: options.paymentMethod ?? "cod",
         customerAddress: "12 Independence Avenue",
       }),
     },
   );
 }
+
+/** The same shop with Valmont Pay switched on beside cash on delivery. */
+const onlineDraft = {
+  ...draft,
+  brief: {
+    ...draft.brief,
+    payments: { ...draft.brief.payments, methods: ["cod", "valmont_pay"] },
+  },
+};
 
 function params() {
   return { params: Promise.resolve({ id: draftId }) };
@@ -106,6 +125,16 @@ function params() {
 describe("checkout customer account linking", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "/pay/simulated",
+      live: false,
+    });
     mocks.internalGetDraftForCheckout.mockResolvedValue(draft);
     mocks.getCustomerSession.mockResolvedValue({
       account,
@@ -170,6 +199,148 @@ describe("checkout customer account linking", () => {
     expect(mocks.getCustomerSession).not.toHaveBeenCalled();
     expect(mocks.create).toHaveBeenCalledWith(
       expect.objectContaining({ customerAccountId: undefined }),
+    );
+  });
+});
+
+describe("checkout payment rail", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
+    mocks.internalGetDraftForCheckout.mockResolvedValue(onlineDraft);
+    mocks.getCustomerSession.mockResolvedValue(null);
+    mocks.getOrdersStore.mockReturnValue({ create: mocks.create });
+    mocks.computeTotals.mockReturnValue({
+      subtotal: 25,
+      deliveryFee: 0,
+      total: 25,
+    });
+    mocks.create.mockResolvedValue({ ...createdOrder, status: "pending" });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "/pay/simulated",
+      live: false,
+    });
+    mocks.notifyMerchantNewOrder.mockResolvedValue({
+      email: "skipped",
+      whatsapp: "skipped",
+    });
+  });
+
+  it("stamps an online order with the test rail while the simulator is active", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+
+    const response = await POST(
+      request("", { paymentMethod: "valmont_pay" }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMode: "test" }),
+    );
+  });
+
+  it("stamps an online order as live once Valmont Pay is fully configured", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "live",
+    });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "https://pay.example/l/abc",
+      live: true,
+    });
+
+    const response = await POST(
+      request("", { paymentMethod: "valmont_pay" }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMode: "live" }),
+    );
+  });
+
+  it("keeps cash-on-delivery orders live even while online payment is in test mode", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+
+    const response = await POST(request(""), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMethod: "cod", paymentMode: "live" }),
+    );
+    expect(mocks.createPaymentLink).not.toHaveBeenCalled();
+  });
+
+  it("refuses online payment — before creating an order — when Live is selected but incomplete", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: false,
+      mode: "live",
+      reason: "webhook secret missing",
+    });
+
+    const response = await POST(
+      request("", { paymentMethod: "valmont_pay" }),
+      params(),
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: expect.stringContaining(
+        "Online payment is temporarily unavailable",
+      ),
+    });
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.createPaymentLink).not.toHaveBeenCalled();
+    expect(mocks.notifyMerchantNewOrder).not.toHaveBeenCalled();
+  });
+
+  it("still accepts cash on delivery while Live is selected but incomplete", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: false,
+      mode: "live",
+    });
+
+    const response = await POST(request(""), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMethod: "cod", paymentMode: "live" }),
+    );
+  });
+
+  it("builds the merchant link and Valmont Pay callback from APP_URL, not the request host", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "live",
+    });
+
+    const response = await POST(
+      request("", {
+        paymentMethod: "valmont_pay",
+        url: `http://0.0.0.0:3000/api/studio/drafts/${draftId}/checkout`,
+        host: "attacker.example",
+      }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.notifyMerchantNewOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ origin: "https://shop.example" }),
+    );
+    const call = mocks.createPaymentLink.mock.calls[0]?.[0] as {
+      callbackUrl: string;
+    };
+    expect(call.callbackUrl).toMatch(
+      /^https:\/\/shop\.example\/api\/payments\/webhook\?access_code=[0-9a-f]{32}$/,
     );
   });
 });

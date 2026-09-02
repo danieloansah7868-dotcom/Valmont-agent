@@ -8,6 +8,7 @@ import { formatMoney } from "@/lib/studio/valmont-pay";
 import { formatAccra } from "@/lib/studio/format";
 import { PAYMENT_METHODS } from "@/lib/studio/site-brief/schema";
 import { OrderActions } from "@/components/studio/order-actions";
+import { PaymentModeBadge } from "@/components/studio/payment-mode-badge";
 
 export const dynamic = "force-dynamic";
 
@@ -39,14 +40,27 @@ export default async function OrderDetailPage({
             Placed {formatAccra(order.createdAt)}
           </p>
         </div>
-        <span
-          className={`rounded-full px-3 py-1 text-sm font-semibold ${
-            STATUS_BADGE_CLASS[order.status] ?? "bg-slate-200 text-slate-700"
-          }`}
-        >
-          {STATUS_LABELS[order.status]}
-        </span>
+        <div className="flex items-center gap-2">
+          <PaymentModeBadge mode={order.paymentMode} />
+          <span
+            className={`rounded-full px-3 py-1 text-sm font-semibold ${
+              STATUS_BADGE_CLASS[order.status] ?? "bg-slate-200 text-slate-700"
+            }`}
+          >
+            {STATUS_LABELS[order.status]}
+          </span>
+        </div>
       </div>
+      {order.paymentMode === "test" && (
+        <p
+          className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900"
+          data-testid="order-test-mode-notice"
+        >
+          This order was placed while payments were in test mode. The payment
+          went through the local simulator, so no real money was received. It is
+          excluded from sales analytics.
+        </p>
+      )}
 
       <section className="mt-6 rounded-xl border border-line bg-white p-4">
         <h2 className="text-sm font-semibold text-navy">Customer</h2>

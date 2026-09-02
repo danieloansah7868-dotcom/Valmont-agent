@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { readBoundedJson } from "@/lib/bounded-json";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
 import { getChatStore } from "@/lib/chat-store";
@@ -44,7 +45,9 @@ export async function PATCH(
   try {
     assertCsrf(request);
     assertApiRateLimit(request, "archive-chat", 20);
-    const { action } = (await request.json()) as { action?: string };
+    const { action } = (await readBoundedJson(request, 4_000)) as {
+      action?: string;
+    };
     if (action !== "archive")
       throw new BadRequestError("Unsupported chat action");
     const { id } = await context.params;

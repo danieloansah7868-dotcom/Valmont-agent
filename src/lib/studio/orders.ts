@@ -4,6 +4,7 @@ import { and, desc, eq, gte, inArray, isNull, lt, or } from "drizzle-orm";
 import { getDatabase } from "@/db";
 import { studioOrders } from "@/db/schema";
 import { getSqliteChatStore } from "@/lib/chat-store";
+import { ConflictError } from "@/lib/api-errors";
 import {
   canTransition,
   matchesFilter,
@@ -12,6 +13,21 @@ import {
 } from "./order-status";
 
 export type { OrderStatus } from "./order-status";
+
+/**
+ * Which payment rail an order was created under. `test` orders were paid (or
+ * not) through the local simulator and represent no real money; `live` orders
+ * went through the hosted Valmont Pay page. Cash-on-delivery and manual
+ * methods take no online payment, so they are recorded as `live` — the goods
+ * and the cash are real either way. The marker is stamped at checkout and
+ * never changes, so a merchant can always tell a practice order from a sale.
+ */
+export const PAYMENT_MODES = ["test", "live"] as const;
+export type OrderPaymentMode = (typeof PAYMENT_MODES)[number];
+
+export function isOrderPaymentMode(value: unknown): value is OrderPaymentMode {
+  return value === "test" || value === "live";
+}
 
 export interface StatusEvent {
   status: OrderStatus;
@@ -59,6 +75,8 @@ export interface OrderRecord {
   /** Set after an optional customer account claims the order. */
   customerAccountId?: string;
   paymentMethod: string;
+  /** Test (simulator) or live rail; see {@link OrderPaymentMode}. */
+  paymentMode: OrderPaymentMode;
   paymentRef?: string;
   paidAt?: string;
   fulfilledAt?: string;
@@ -89,6 +107,8 @@ export interface NewOrderInput {
   customerAddress?: string;
   customerAccountId?: string;
   paymentMethod: string;
+  /** Defaults to `live` when omitted so cash/manual orders are never hidden. */
+  paymentMode?: OrderPaymentMode;
   merchantNote?: string;
 }
 
@@ -157,6 +177,18 @@ function timestampPatch(
       return { refundedAt: at };
     default:
       return {};
+  }
+}
+
+/**
+ * Raised when a merchant asks for a status the order cannot move to. A typed
+ * 409 so the route returns the explanation instead of an opaque 500 (the
+ * strict `safeApiError` trusts only `ApiError` instances).
+ */
+export class OrderTransitionError extends ConflictError {
+  constructor(from: OrderStatus, to: OrderStatus) {
+    super(`This order cannot move from ${from} to ${to}.`);
+    this.name = "OrderTransitionError";
   }
 }
 
@@ -249,6 +281,7 @@ interface OrderRow {
   customer_address: string | null;
   customer_account_id: string | null;
   payment_method: string;
+  payment_mode: string | null;
   payment_ref: string | null;
   paid_at: string | null;
   fulfilled_at: string | null;
@@ -280,6 +313,12 @@ function rowToOrder(row: OrderRow): OrderRecord {
     customerAddress: row.customer_address ?? undefined,
     customerAccountId: row.customer_account_id ?? undefined,
     paymentMethod: row.payment_method,
+    // Rows written before the column existed were all created by the
+    // simulator-era code path; anything unmarked is treated as a real order
+    // so no sale can ever be hidden from the merchant.
+    paymentMode: isOrderPaymentMode(row.payment_mode)
+      ? row.payment_mode
+      : "live",
     paymentRef: row.payment_ref ?? undefined,
     paidAt: row.paid_at ?? undefined,
     fulfilledAt: row.fulfilled_at ?? undefined,
@@ -327,6 +366,7 @@ export function ensureOrdersSchema(db: DatabaseSync): void {
       customer_address TEXT,
       customer_account_id TEXT,
       payment_method TEXT NOT NULL,
+      payment_mode TEXT NOT NULL DEFAULT 'live',
       payment_ref TEXT,
       paid_at TEXT,
       fulfilled_at TEXT,
@@ -355,6 +395,7 @@ export function ensureOrdersSchema(db: DatabaseSync): void {
   ensureColumn(db, "refunded_at", "TEXT", existing);
   ensureColumn(db, "status_history_json", "TEXT", existing);
   ensureColumn(db, "customer_account_id", "TEXT", existing);
+  ensureColumn(db, "payment_mode", "TEXT NOT NULL DEFAULT 'live'", existing);
   db.exec(
     "CREATE INDEX IF NOT EXISTS studio_orders_customer_account ON studio_orders(customer_account_id)",
   );
@@ -377,9 +418,9 @@ export class SqliteOrdersStore implements OrdersStore {
           id, owner_id, draft_id, access_code, status, currency,
           subtotal, delivery_fee, total, lines_json,
           customer_name, customer_phone, customer_email, customer_address,
-          customer_account_id, payment_method, merchant_note, created_at, updated_at,
-          status_history_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          customer_account_id, payment_method, payment_mode, merchant_note,
+          created_at, updated_at, status_history_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -398,6 +439,7 @@ export class SqliteOrdersStore implements OrdersStore {
         input.customerAddress ?? null,
         input.customerAccountId ?? null,
         input.paymentMethod,
+        input.paymentMode ?? "live",
         input.merchantNote ?? null,
         now,
         now,
@@ -563,11 +605,7 @@ export class SqliteOrdersStore implements OrdersStore {
     if (!existing) return null;
     if (existing.status === status) return existing;
     if (!canTransition(existing.status, status)) {
-      const error = new Error(
-        `This order cannot move from ${existing.status} to ${status}.`,
-      );
-      (error as Error & { status: number }).status = 409;
-      throw error;
+      throw new OrderTransitionError(existing.status, status);
     }
     const now = new Date().toISOString();
     const history = appendHistory(existing.statusHistory, status, now);
@@ -621,6 +659,7 @@ function pgRowToOrder(row: typeof studioOrders.$inferSelect): OrderRecord {
     customerAddress: row.customerAddress ?? undefined,
     customerAccountId: row.customerAccountId ?? undefined,
     paymentMethod: row.paymentMethod,
+    paymentMode: isOrderPaymentMode(row.paymentMode) ? row.paymentMode : "live",
     paymentRef: row.paymentRef ?? undefined,
     paidAt: row.paidAt?.toISOString(),
     fulfilledAt: row.fulfilledAt?.toISOString(),
@@ -656,6 +695,7 @@ export class PostgresOrdersStore implements OrdersStore {
         customerAddress: input.customerAddress ?? null,
         customerAccountId: input.customerAccountId ?? null,
         paymentMethod: input.paymentMethod,
+        paymentMode: input.paymentMode ?? "live",
         merchantNote: input.merchantNote ?? null,
         statusHistory: appendHistory([], input.status, now.toISOString()),
       })
@@ -835,11 +875,7 @@ export class PostgresOrdersStore implements OrdersStore {
     if (!existing) return null;
     if (existing.status === status) return existing;
     if (!canTransition(existing.status, status)) {
-      const error = new Error(
-        `This order cannot move from ${existing.status} to ${status}.`,
-      );
-      (error as Error & { status: number }).status = 409;
-      throw error;
+      throw new OrderTransitionError(existing.status, status);
     }
     const now = new Date();
     const stamps = timestampPatch(status, now.toISOString());

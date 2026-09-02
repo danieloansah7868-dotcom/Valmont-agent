@@ -9,14 +9,29 @@
  */
 
 import { getResendConfigState } from "@/lib/resend-config";
+import { isStrongSessionSecret } from "@/lib/session-secret";
 
 export type RuntimeEnv = Record<string, string | undefined>;
+
+/**
+ * True only for a usable SESSION_SECRET: present, at least 32 characters and
+ * not one of the placeholder values that ship in example files. A weak secret
+ * is reported exactly like a missing one so nothing — OAuth, health, the
+ * dashboard — treats the deployment as configured while sessions are forgeable.
+ */
+export function sessionSecretConfigured(
+  env: RuntimeEnv = process.env,
+): boolean {
+  return isStrongSessionSecret(env.SESSION_SECRET);
+}
 
 export function githubCredentialsConfigured(
   env: RuntimeEnv = process.env,
 ): boolean {
   return Boolean(
-    env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET && env.SESSION_SECRET,
+    env.GITHUB_CLIENT_ID &&
+    env.GITHUB_CLIENT_SECRET &&
+    sessionSecretConfigured(env),
   );
 }
 
@@ -58,7 +73,7 @@ export function missingLiveRequirements(
   env: RuntimeEnv = process.env,
 ): string[] {
   const missing: string[] = [];
-  if (!env.SESSION_SECRET) missing.push("SESSION_SECRET");
+  if (!sessionSecretConfigured(env)) missing.push("SESSION_SECRET");
   if (!env.GITHUB_CLIENT_ID) missing.push("GITHUB_CLIENT_ID");
   if (!env.GITHUB_CLIENT_SECRET) missing.push("GITHUB_CLIENT_SECRET");
   if (!env.MODEL_API_KEY) missing.push("MODEL_API_KEY");

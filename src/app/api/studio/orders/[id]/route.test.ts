@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PATCH } from "@/app/api/studio/orders/[id]/route";
 import { resetRateLimitForTests } from "@/lib/security";
+import { ConflictError } from "@/lib/api-errors";
 
 const mocks = vi.hoisted(() => ({
   getForOwner: vi.fn(),
@@ -60,6 +61,8 @@ describe("Studio order status HTTP route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetRateLimitForTests();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
     mocks.requireApiSessionUser.mockResolvedValue({
       id: "user-1",
       login: "merchant",
@@ -81,8 +84,44 @@ describe("Studio order status HTTP route", () => {
     );
     expect(mocks.notifyCustomerOrderStatus).toHaveBeenCalledWith({
       order: updated,
-      origin: "http://localhost",
+      origin: "https://shop.example",
     });
+  });
+
+  it("builds customer links from APP_URL, never from the request host", async () => {
+    const response = await PATCH(
+      new NextRequest(`http://0.0.0.0:3000/api/studio/orders/${orderId}`, {
+        method: "PATCH",
+        headers: {
+          cookie: `valmont_csrf=${csrf}`,
+          "content-type": "application/json",
+          "x-valmont-csrf": csrf,
+          host: "attacker.example",
+        },
+        body: JSON.stringify({ status: "preparing" }),
+      }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.notifyCustomerOrderStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ origin: "https://shop.example" }),
+    );
+  });
+
+  it("returns the store's typed 409 when the transition is not allowed", async () => {
+    class OrderTransitionError extends ConflictError {}
+    mocks.updateStatus.mockRejectedValueOnce(
+      new OrderTransitionError("This order cannot move from paid to refunded."),
+    );
+
+    const response = await PATCH(request("refunded"), params());
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: "This order cannot move from paid to refunded.",
+    });
+    expect(mocks.notifyCustomerOrderStatus).not.toHaveBeenCalled();
   });
 
   it("does not send a duplicate notification for a same-status retry", async () => {

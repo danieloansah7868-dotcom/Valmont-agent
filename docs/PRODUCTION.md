@@ -8,10 +8,26 @@ The included `Dockerfile` and `compose.yaml` provide a repeatable single-tenant 
 
 ```bash
 cp .env.example .env
-# Set APP_URL, POSTGRES_PASSWORD, SESSION_SECRET, GitHub, and model values.
+# Set APP_URL (the public https origin), POSTGRES_PASSWORD, SESSION_SECRET
+# (32+ random characters — `openssl rand -base64 48`), GitHub, and model values.
 docker compose up --build -d
-curl https://your-domain.example/api/health
+curl https://your-domain.example/api/health            # readiness (503 until configured)
+curl https://your-domain.example/api/health?probe=live # liveness (200 once the process answers)
 ```
+
+`APP_URL` is not cosmetic: every link the server writes into an email
+(customer verification, password reset, merchant order alerts) and the return
+URL handed to Valmont Pay are built from it. The server never derives them
+from the socket it listens on, which inside the container is `0.0.0.0:3000`.
+
+`compose.yaml` passes every runtime setting the app reads through to the
+container — `TRUST_PROXY` (defaults to `true` because the compose port is
+reachable only through the reverse proxy), the Valmont Pay fallback
+connection, `STUDIO_PAYMENT_ADMINS`, `STUDIO_PLATFORM_HOST`, the SMS/WhatsApp
+providers and `VALMONT_WORKSPACE_PROVIDER`. `NEXT_PUBLIC_STUDIO_PLATFORM_HOST`
+is inlined into the browser bundle at **build** time, so it is a `build.args`
+entry in `compose.yaml` and an `ARG` in the Dockerfile; rebuild the image when
+it changes.
 
 ### Database migrations — controlled, verified, never automatic
 
@@ -41,22 +57,36 @@ npm run db:verify         # read-only — validates ledger membership against jo
 - `db:migrate` — controlled runner: requires `DATABASE_URL` with a generic safe error if missing (no leak), takes an advisory transaction lock (`72707369`), ensures `drizzle` schema and `__drizzle_migrations` table exist, loads manifest, validates journal, fetches ledger, **fails closed** on `unexpected` ledger rows (unknown hash), `altered` hashes/timestamps, or duplicate hashes/timestamps, applies **only missing** migrations in journal order splitting on `-->` statement-breakpoint, inserts ledger rows with hash and journal `when`, then re-verifies ledger.
 - `db:verify` — read-only: attempts advisory lock (fails open for read), loads manifest, fetches ledger, verifies exact membership by hash+`created_at`, reports missing/unexpected/altered/duplicate.
 
+**Migration `0010_order_payment_mode_domain_verification`** (this release) adds
+`studio_orders.payment_mode` (`test` | `live`, default `live` for rows that
+predate it — they were only ever created by real checkouts) and the
+`verification_token` / `verified_at` / `last_checked_at` columns on
+`studio_domains`. Until it is applied, `/api/health` reports
+`migrations.status: incomplete` and the app answers 503; every existing custom
+domain becomes `pending` after the deploy and must be re-verified once with the
+new TXT record (see [Custom domains](#custom-domains-ownership-proof)).
+
 **Why not timestamp ordering:**
 
 - Drizzle's journal carries both `idx` and `when`. `when` is wall-clock and can regress (see `0007` earlier than `0006`). The system **never** uses timestamp ordering; journal `idx` order is authoritative. The regression test `src/lib/db/migration-bootstrap.test.ts` asserts this invariant and that the bootstrap ledger SQL contains the expected hash/timestamp derived from source.
 
 **Health probe:**
 
-- `GET /api/health` uses `checkMigrationReadiness()` which probes without leaking driver details:
+- `GET /api/health?probe=live` is the **liveness** probe: `200 {"status":"live"}`
+  whenever the process can answer, regardless of configuration. The Docker
+  `HEALTHCHECK` uses it so a missing optional integration (email, payments)
+  never restart-loops the container.
+- `GET /api/health` (no parameter) is the **readiness** probe. Point the load
+  balancer and uptime monitoring at this one. It uses `checkMigrationReadiness()` which probes without leaking driver details:
   - `not_configured` → `DATABASE_URL` unset → degraded 503 (or healthy in SQLite mode if applicable)
   - `unavailable` → cannot connect → degraded 503
   - `incomplete` → ledger missing/altered/unexpected → degraded 503
   - `complete` → ledger exactly matches journal → healthy 200
-- Response includes `dependencies.migrations: { status, expected, applied }` and `missingConfiguration` when relevant. No internal error messages or connection strings are returned.
+- Response includes `dependencies.migrations: { status, expected, applied }`, `dependencies.email` and `dependencies.payments` (`test`, `live`, or `live_misconfigured` — Live was selected on the Payments page but the connection is incomplete, which also degrades the probe to 503 because online checkout is refusing orders), plus `missingConfiguration` when relevant. A `SESSION_SECRET` that is shorter than 32 characters or a known placeholder is reported as missing. No internal error messages or connection strings are returned. Responses carry `cache-control: no-store`.
 
 **CI verification:**
 
-- `.github/workflows/ci.yml` provides a throwaway PostgreSQL 16 service. It runs `db:migrate` → `db:verify` → `npm test` → `npm run build`. This proves the controlled runner works against a real engine and that the test suite runs only after migrations are verified.
+- `.github/workflows/ci.yml` provides a throwaway PostgreSQL 16 service (`compose.yaml` ships 17; aligning CI to `postgres:17` is a one-line workflow edit that needs the `workflows` permission, see NEXT-STEPS.md). It runs `db:migrate` → `db:verify` → `npm test` → `npm run build`. This proves the controlled runner works against a real engine and that the test suite runs only after migrations are verified.
 
 The default persistent `/app/.data` volume also retains chat SQLite data. If `CHAT_STORE_PATH` or `CHAT_SQLITE_PATH` points outside that directory, mount the custom parent directory into the app container; leaving `CHAT_SQLITE_PATH` unset derives a sibling SQLite file next to the legacy JSON input.
 
@@ -73,8 +103,9 @@ After the DNS record points to the server, Caddy obtains and renews HTTPS automa
 
 ## Required configuration
 
-- A public HTTPS `APP_URL`
-- 32+ random bytes in `SESSION_SECRET`
+- A public HTTPS `APP_URL` — the origin of every emailed link and payment return URL
+- 32+ random characters in `SESSION_SECRET`. The app enforces this: a shorter value or a recognisable placeholder (the `.env.example` text, `changeme`, a repeated character, …) makes sign-in answer 503 and `/api/health` list `SESSION_SECRET` under `missingConfiguration`
+- `TRUST_PROXY=true` only when clients can reach the app exclusively through a proxy that overwrites `X-Forwarded-For`; with it unset every client shares one rate-limit bucket behind a proxy, which turns the limiter into a denial-of-service lever
 - GitHub OAuth App callback `${APP_URL}/api/auth/github/callback`
 - OpenAI-compatible model endpoint/key/name with structured JSON output support
 - PostgreSQL with TLS and backups
@@ -103,9 +134,22 @@ Delivery:
 
 ## Critical sandbox boundary
 
-Dockerizing the Valmont web process is not the same as isolating each repository task. The bundled `RestrictedLocalWorkspaceProvider` is appropriate only for a private, single-tenant installation where every connected repository and user is trusted.
+Dockerizing the Valmont web process is not the same as isolating each repository task. The default `RestrictedLocalWorkspaceProvider` (`VALMONT_WORKSPACE_PROVIDER=local`) is appropriate only for a private, single-tenant installation where every connected repository and user is trusted.
 
-Before exposing Valmont to customers, organizations you do not control, or public sign-up, implement `WorkspaceProvider` using one ephemeral container or microVM per task. The task sandbox must have:
+### Switching to the Docker workspace provider
+
+`VALMONT_WORKSPACE_PROVIDER=docker` selects the bundled `DockerWorkspaceProvider`: one throwaway container per task built from `sandbox/Dockerfile`, no network, all capabilities dropped, an unprivileged uid, and CPU / memory / pid / storage / wall-clock quotas. Any other value fails at startup rather than silently falling back to the local provider.
+
+```bash
+docker build -t valmont-sandbox:local sandbox/     # the inert task image
+VALMONT_WORKSPACE_PROVIDER=docker \
+VALMONT_SANDBOX_IMAGE=valmont-sandbox:local \
+npm run start
+```
+
+The app process needs the `docker` CLI and a reachable daemon (`DOCKER_HOST` is honoured). In `compose.yaml` that means either running the app outside compose with the provider pointed at the host daemon, or mounting a socket proxy into the app container — **never the raw `/var/run/docker.sock`**, which is root on the host. Tuning variables (`VALMONT_SANDBOX_CPUS`, `_MEMORY_BYTES`, `_PIDS_LIMIT`, `_STORAGE_BYTES`, `_TTL_MS`, `_UID`/`_GID`) are listed in `.env.example`; multi-process deployments sharing one daemon must also set `VALMONT_SANDBOX_LEASE_DIR` (shared POSIX volume) and a stable `VALMONT_SANDBOX_INSTANCE_ID` — see [docs/SANDBOX-SMOKE.md](SANDBOX-SMOKE.md) and run `npm run smoke:sandbox` against the real daemon before going live.
+
+Whichever provider you pick, before exposing Valmont to customers, organizations you do not control, or public sign-up, the task sandbox must have:
 
 - no mount of the application container, Docker socket, host source, or cloud credentials;
 - an unprivileged user, read-only base image, seccomp/AppArmor, and no added capabilities;
@@ -122,7 +166,7 @@ Before exposing Valmont to customers, organizations you do not control, or publi
 3. Use managed session storage/KMS token encryption and distributed rate limiting.
 4. Ship audit events to append-only centralized storage.
 5. Add workspace TTL cleanup, storage quotas, alerts, and backup restoration tests.
-6. Keep `/api/health` on an internal monitoring check — it now reports `degraded` 503 when migrations are incomplete/unavailable.
+6. Keep `/api/health` (readiness) on an internal monitoring check — it reports `degraded` 503 when migrations are incomplete/unavailable, email is half-configured, Live payments are selected without a complete connection, or `SESSION_SECRET` is weak. Container orchestration should use `/api/health?probe=live`.
 7. Review failed validations and diffs; never bypass final approval.
 8. Keep branch protection and mandatory GitHub reviews enabled.
 9. For every release with new migrations: run `db:migrate` and `db:verify` from a controlled job, not from the app.
@@ -204,10 +248,43 @@ rejected before they reach the application.
 
 ### Browsers are not installed in production
 
-The production image (`node:22.13-bookworm-slim`, Next.js standalone output,
+The production image (`node:22.23-bookworm-slim`, Next.js standalone output,
 running as `USER node`) installs **no Playwright browser binaries**. Browser
 tests belong in CI, where `npx playwright install --with-deps chromium` runs as
 an explicit step. Do not add that step to the Dockerfile.
+
+### Custom domains: ownership proof
+
+A merchant attaches a hostname on the website's **Domain** card. Studio issues
+a per-website verification token and shows two DNS records:
+
+| Type  | Name                         | Value                    |
+| ----- | ---------------------------- | ------------------------ |
+| TXT   | `_valmont-verify.<hostname>` | `valmont-verify=<token>` |
+| CNAME | `<hostname>`                 | `STUDIO_PLATFORM_HOST`   |
+
+The hostname is served only while **both** resolve: the TXT record proves
+control of the zone (a dangling CNAME left behind by a previous owner is not
+enough), and the CNAME must point exactly at the platform host — there is no
+A-record / IP fallback. The proxy re-checks every active domain in the
+background at most once per 24 hours and flips it back to `pending` when
+either record disappears. Hostnames are validated against the DNS label
+grammar and are unique across all tenants; a hostname already attached to
+another website answers 409. Backups export domains **without** their tokens,
+so a restore on another machine re-issues a token and starts the domain at
+`pending` again.
+
+### Payments: test and live orders
+
+Every order is stamped with the payment mode it was created under
+(`payment_mode`: `test` or `live`). Test-mode orders — placed through the
+built-in simulator — carry a **Test** badge in Studio, are excluded from the
+revenue analytics (the page shows how many were excluded) and are never
+something to fulfil. If the Payments page has Live selected but the API URL,
+key or webhook secret is missing, online checkout methods answer 409 with a
+customer-facing message (no order row is created) rather than falling
+back to the simulator; cash-on-delivery and other offline methods keep
+working, and readiness reports `dependencies.payments = live_misconfigured`.
 
 ### What Phase 1 does not do in production
 

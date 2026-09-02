@@ -90,6 +90,9 @@ export default defineConfig({
     env: {
       NODE_ENV: "production",
       SESSION_SECRET: sessionSecret,
+      // The server builds every emailed link and payment return URL from
+      // APP_URL, never from the socket it happens to listen on.
+      APP_URL: baseURL,
       NEXT_TELEMETRY_DISABLED: "1",
       // Placeholder OAuth credentials so the session cookie is honoured. These
       // are NOT an auth bypass: the tests still present a real encrypted

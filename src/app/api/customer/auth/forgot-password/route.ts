@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { publicOrigin } from "@/lib/auth-redirect";
 import { z } from "zod";
 import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
@@ -49,7 +50,7 @@ export async function POST(request: NextRequest) {
       );
       const resetLink = new URL(
         "/account/reset-password",
-        request.nextUrl.origin,
+        publicOrigin(request.url),
       );
       resetLink.searchParams.set("token", token);
       try {

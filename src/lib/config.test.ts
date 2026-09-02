@@ -43,7 +43,7 @@ describe("runtime configuration", () => {
       githubCredentialsConfigured({
         GITHUB_CLIENT_ID: "id",
         GITHUB_CLIENT_SECRET: "secret",
-        SESSION_SECRET: "a".repeat(32),
+        SESSION_SECRET: "c0nf1g-t3st-s3cr3t-9f2c1e0b7a6d4c3b",
       }),
     ).toBe(true);
   });
@@ -53,7 +53,7 @@ describe("runtime configuration", () => {
       runtimeReadiness({
         GITHUB_CLIENT_ID: "id",
         GITHUB_CLIENT_SECRET: "secret",
-        SESSION_SECRET: "a".repeat(32),
+        SESSION_SECRET: "c0nf1g-t3st-s3cr3t-9f2c1e0b7a6d4c3b",
         MODEL_API_KEY: "key",
         DATABASE_URL: "postgres://localhost/valmont",
       }),
@@ -74,7 +74,7 @@ describe("runtime configuration", () => {
     ]);
     expect(
       missingLiveRequirements({
-        SESSION_SECRET: "a".repeat(32),
+        SESSION_SECRET: "c0nf1g-t3st-s3cr3t-9f2c1e0b7a6d4c3b",
         GITHUB_CLIENT_ID: "id",
         GITHUB_CLIENT_SECRET: "secret",
         MODEL_API_KEY: "key",
@@ -85,7 +85,7 @@ describe("runtime configuration", () => {
   it("reports missing customer email delivery configuration in production", () => {
     const env = {
       NODE_ENV: "production",
-      SESSION_SECRET: "a".repeat(32),
+      SESSION_SECRET: "c0nf1g-t3st-s3cr3t-9f2c1e0b7a6d4c3b",
       GITHUB_CLIENT_ID: "id",
       GITHUB_CLIENT_SECRET: "secret",
       MODEL_API_KEY: "key",
@@ -106,7 +106,7 @@ describe("runtime configuration", () => {
   it("ignores a legacy ENABLE_DEMO_MODE variable entirely", () => {
     const env = {
       ENABLE_DEMO_MODE: "true",
-      SESSION_SECRET: "a".repeat(32),
+      SESSION_SECRET: "c0nf1g-t3st-s3cr3t-9f2c1e0b7a6d4c3b",
       GITHUB_CLIENT_ID: "id",
       GITHUB_CLIENT_SECRET: "secret",
     };

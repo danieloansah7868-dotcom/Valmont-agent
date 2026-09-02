@@ -8,6 +8,39 @@ independent review).
 
 ---
 
+## Deep-scan remediation — branch `arena/01a06135-valmont-agent`
+
+Every finding from the deep scan of `dc0bd0a` is addressed on this branch.
+Nothing here touches `main`; merge only after an independent review.
+
+| Id  | Finding                                                                    | Fix                                                                                                                                                                                                                                                                       |
+| --- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H1  | Emailed links / Valmont Pay return URL built from `request.nextUrl.origin` | `publicOrigin()` in `src/lib/auth-redirect.ts` (APP_URL first) at all eight call sites; Playwright starts the server with `APP_URL`; route tests assert the emitted origin.                                                                                               |
+| H2  | `SESSION_SECRET` never strength-checked                                    | `src/lib/session-secret.ts` policy (≥ 32 chars, placeholder list/patterns) enforced by `sessionKey()` (typed 503) and `config.ts` (health lists it as missing). `.env.example` ships it empty.                                                                            |
+| H3  | Domain store keyed on `USE_POSTGRES_FOR_CHAT`; test wrote real `.data/`    | `getDomainStore()` keys on `DATABASE_URL`; `domains.test.ts` uses a temp SQLite store.                                                                                                                                                                                    |
+| M1  | Custom-domain claim had no ownership proof                                 | Per-website TXT token + exact CNAME (`src/lib/studio/domain-verification.ts`), hostname grammar (400), cross-tenant uniqueness (409), no IP fallback, 24 h background re-check from `src/proxy.ts`, migration 0010 columns.                                               |
+| M2  | Test-mode orders indistinguishable from live                               | `studio_orders.payment_mode` (SQLite `ensureColumn`, PG migration 0010), stamped by checkout, `PaymentModeBadge` on order views, excluded from analytics with an explicit count.                                                                                          |
+| M3  | Live selected + incomplete keys → simulator + refused webhook              | `onlinePaymentAvailability()`; checkout answers 409 for online methods before any order exists; readiness reports `dependencies.payments = live_misconfigured`.                                                                                                           |
+| M4  | Compose missing runtime vars; `NEXT_PUBLIC_*` not a build arg              | `compose.yaml` passes `TRUST_PROXY` (default true), Valmont Pay, payment admins, platform host, SMS/WhatsApp, workspace provider; `NEXT_PUBLIC_STUDIO_PLATFORM_HOST` via `build.args` + Dockerfile `ARG`.                                                                 |
+| M5  | Plain `Error` + `.status` became opaque 500                                | `OrderTransitionError`, `ConflictError`/`TaskNotFoundError` in workflow, `ForbiddenError` in task store, `ChatNotFoundError` in chat store; route tests cover the statuses.                                                                                               |
+| M6  | `DockerWorkspaceProvider` unreachable                                      | `VALMONT_WORKSPACE_PROVIDER=local\|docker` in `createWorkspaceProvider()`; unknown values fail at startup; documented in `docs/PRODUCTION.md`.                                                                                                                            |
+| L1  | Dead `payment-admin.ts`                                                    | Deleted with its test and the `PAYMENT_SETTINGS_ADMIN_LOGINS` example.                                                                                                                                                                                                    |
+| L2  | Eight legacy routes used `request.json()`                                  | All use `readBoundedJson`; the webhook streams through `readBoundedText`.                                                                                                                                                                                                 |
+| L3  | Docker `HEALTHCHECK` hit readiness                                         | `/api/health?probe=live` liveness; HEALTHCHECK uses it; readiness adds the payments dependency and `cache-control: no-store`.                                                                                                                                             |
+| L4  | Custom domains absent from backups                                         | v2 backup `domains` section (no tokens); import re-attaches as `pending` following remapped draft ids, skips taken hostnames, reports `customDomains`/`skippedDomains`; PostgreSQL restore no longer deletes-and-reinserts drafts (which cascaded to orders and domains). |
+| L5  | Registration leaked account existence; expired rows never purged           | Neutral response + "already registered" / re-verify email; hourly opportunistic purge of expired sessions and tokens.                                                                                                                                                     |
+| L6  | CSP / image pins                                                           | `object-src 'none'`, `frame-src 'none'` added; nonce-based `script-src` documented as the open follow-up (needs the header minted in `src/proxy.ts`). Node images pinned to 22.23; the CI Postgres bump is listed below.                                                  |
+| L7  | `.env.example` shipped a live `STUDIO_PLATFORM_HOST` placeholder           | Commented out and documented together with the new variables.                                                                                                                                                                                                             |
+
+Open follow-ups from this pass:
+
+- `.github/workflows/ci.yml`: change `image: postgres:16` to `image: postgres:17` so CI runs the same major as `compose.yaml`. Not included here because the Arena GitHub connection lacks the `workflows` permission needed to push workflow edits; it is a one-line change for a maintainer.
+- Nonce-based `script-src` (drop `'unsafe-inline'`) by emitting the CSP header per request from `src/proxy.ts`.
+- `npm audit` still reports the dev-only `drizzle-kit → @esbuild-kit → esbuild ≤ 0.24.2` advisory (GHSA-67mh-4wv8-2f99); it does not ship in the production image. Clears when drizzle-kit drops `@esbuild-kit`.
+- Existing custom domains become `pending` after migration 0010 and need one TXT verification each; tell merchants before the deploy.
+
+---
+
 ## Production hardening — Resend + Migrations + Strict ApiError + CI (this branch)
 
 This branch implements the production-hardening follow-up described in the Arena task:

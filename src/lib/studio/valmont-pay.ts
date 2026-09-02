@@ -20,7 +20,8 @@
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { resolvePaymentConfig } from "./payment-settings";
+import { ConflictError } from "@/lib/api-errors";
+import { resolvePaymentConfig, type PaymentMode } from "./payment-settings";
 import { buildPublicUrl } from "./money";
 
 // The pure money helpers live in ./money so client components (the public
@@ -46,6 +47,50 @@ export { STATUS_LABELS } from "./order-status";
  */
 export async function isLiveConfigured(): Promise<boolean> {
   return (await resolvePaymentConfig()).liveActive;
+}
+
+/**
+ * Whether online (Valmont Pay / card) checkout can currently be offered, and
+ * which mode an order created now would be stamped with.
+ *
+ * - `test`: the local simulator handles payment; no real money moves.
+ * - `live`: the hosted Valmont Pay page handles payment.
+ * - unavailable: Live is SELECTED but a required piece (API URL, key, or the
+ *   webhook signing secret) is missing. The simulator must not silently step
+ *   in here — the webhook would refuse the unsigned confirmation and the order
+ *   would be stuck as "pending" — so checkout refuses online methods until the
+ *   merchant finishes the Live setup or switches back to Test.
+ */
+export interface OnlinePaymentAvailability {
+  available: boolean;
+  mode: PaymentMode;
+  reason?: string;
+}
+
+export const ONLINE_PAYMENT_UNAVAILABLE_MESSAGE =
+  "Online payment is temporarily unavailable for this shop. Please choose another payment method or try again later.";
+
+export async function onlinePaymentAvailability(): Promise<OnlinePaymentAvailability> {
+  const config = await resolvePaymentConfig();
+  if (config.mode === "test") return { available: true, mode: "test" };
+  if (config.liveActive && config.webhookSecret) {
+    return { available: true, mode: "live" };
+  }
+  return {
+    available: false,
+    mode: "live",
+    reason: config.liveActive
+      ? "Live mode is selected but the webhook signing secret is missing, so payment confirmations would be refused."
+      : "Live mode is selected but the Valmont Pay API URL or secret key is missing.",
+  };
+}
+
+/** Thrown when online payment is requested while Live is selected but incomplete. */
+export class OnlinePaymentUnavailableError extends ConflictError {
+  constructor() {
+    super(ONLINE_PAYMENT_UNAVAILABLE_MESSAGE);
+    this.name = "OnlinePaymentUnavailableError";
+  }
 }
 
 /**
@@ -90,6 +135,11 @@ export async function createPaymentLink(
   req: CreatePaymentLinkRequest,
 ): Promise<CreatePaymentLinkResult> {
   const config = await resolvePaymentConfig();
+  if (config.mode === "live" && (!config.liveActive || !config.webhookSecret)) {
+    // Never fall back to the simulator while the merchant has chosen Live:
+    // the resulting order could not be confirmed by the fail-closed webhook.
+    throw new OnlinePaymentUnavailableError();
+  }
   if (!config.liveActive) {
     return {
       paymentLink: await paymentUrlFor(req.accessCode),

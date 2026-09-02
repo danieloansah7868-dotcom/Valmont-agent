@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { readBoundedJson } from "@/lib/bounded-json";
 import { z } from "zod";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { getGitHubProvider, requireApiSessionUser } from "@/lib/auth";
@@ -28,7 +29,7 @@ export async function POST(request: NextRequest) {
   try {
     assertCsrf(request);
     assertApiRateLimit(request, "create-task", 10);
-    const input = taskInput.parse(await request.json());
+    const input = taskInput.parse(await readBoundedJson(request, 64_000));
     const user = await requireApiSessionUser();
     const github = await getGitHubProvider();
     const repositories = await github.listRepositories();

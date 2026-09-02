@@ -13,7 +13,7 @@
 # Everything else the provider needs is a standard toolchain:
 # bash, git, tar, and coreutils. No agent runtimes are installed.
 
-FROM node:22.13-bookworm-slim
+FROM node:22.23-bookworm-slim
 
 # Non-root user the container runs as (uid/gid 1000 in the base image).
 # git is required by the provider's baseline/diff operations; ca-certs is

@@ -86,15 +86,33 @@ The schema contains `encrypted_access_token`, never raw token. Production should
 
 Use TLS, backups, point-in-time recovery, row ownership checks, and migration review. Valmont never runs production database migrations automatically — they are a controlled `db:migrate` + `db:verify` operator step with full journal verification, advisory locking, and fail-closed on altered/unexpected/duplicate ledger entries.
 
+## Session secret policy
+
+`SESSION_SECRET` protects the OAuth session cookie, the customer sign-in
+cookie, the CSRF token and the encrypted payment settings. It is therefore
+validated, not merely required (`src/lib/session-secret.ts`):
+
+- at least 32 characters;
+- not a known placeholder (`replace-with-a-long-random-value`, `changeme`,
+  `secret`, `password`, …) and not a trivially repeated character;
+- the check runs wherever the key is derived (`sessionKey()` throws
+  `WeakSessionSecretError`, a typed 503) and in `config.ts`, so `/api/health`
+  lists a weak secret under `missingConfiguration` and GitHub sign-in refuses
+  to start rather than issuing forgeable cookies.
+
+`.env.example` deliberately ships `SESSION_SECRET=` empty. Generate a value with
+`openssl rand -base64 48`.
+
 ## Operational checklist
 
 - [ ] GitHub App with minimum selected-repository permissions
-- [ ] external sandbox implementation and egress policy
+- [ ] external sandbox implementation and egress policy (`VALMONT_WORKSPACE_PROVIDER=docker` with the sandbox image, or an equivalent per-task isolation)
 - [ ] managed PostgreSQL and migrations applied via controlled `db:migrate` + `db:verify` (never automatic)
-- [ ] KMS-backed token encryption and 32+ byte session secret
+- [ ] KMS-backed token encryption and a `SESSION_SECRET` that passes the policy above
+- [ ] `APP_URL` set to the public origin (emailed links and the payment return URL are built from it, never from the listening socket) and `TRUST_PROXY=true` only behind a header-rewriting proxy
 - [ ] distributed CSRF-aware sessions and rate limiting
 - [ ] secret scanning in CI and log sink redaction (Resend keys/bodies never leak)
-- [ ] CSP reviewed for deployed provider/observability endpoints
+- [ ] CSP reviewed for deployed provider/observability endpoints. The production policy allows no `unsafe-eval`, no plugins (`object-src 'none'`), no framed content (`frame-src 'none'`) and posts forms only to itself and GitHub. `script-src` still carries `'unsafe-inline'` because the App Router streams its RSC payload as inline scripts and `next.config.ts` `headers()` cannot mint a per-request nonce; moving that header into `src/proxy.ts` with a nonce is the open follow-up.
 - [ ] immutable audit export and alerts for failed gates and `migrations.status: incomplete` health
 - [ ] dependency/image scanning and regular rotation
 - [ ] penetration test focused on repo prompt injection and sandbox escape
@@ -134,6 +152,12 @@ closing if these endpoints are ever exposed beyond a signed-in session.
 This removes the old message-text heuristics (`Task not found` → 404, `CSRF` → 403, `Rate limit` → 429, arbitrary `status` property). Intentional statuses are now typed: `BadRequestError` 400, `UnauthorizedError`/`NotConnectedError`/`CustomerNotConnectedError` 401, `ForbiddenError` 403, `NotFoundError`/`ChatNotFoundError`/`TaskNotFoundError`/etc 404, `ConflictError`/`DraftConflictError`/`ImportInProgressError`/`ImportLostLeaseError` 409, `PayloadTooLargeError` 413, `RateLimitError` 429, `CustomerEmailDeliveryError`/`EmailDeliveryError`/`GitHubApiError` 502, `CustomerEmailConfigurationError`/`ConfigurationError` 503.
 
 Tests in `src/lib/api.test.ts` assert that arbitrary message-bearing errors, plain objects with status, driver errors, and network errors remain opaque 500, while typed `ApiError` instances preserve their intentional statuses. Tests never use `vi.resetModules` with partial mocks of `security`/`api` modules, preserving a single shared `ApiError` class identity.
+
+Because the fallback is opaque, every intentional non-500 raised from a store or workflow must be a typed subclass. The remaining plain `Error` + `.status` sites were converted: `OrderTransitionError` (409, illegal order-status transition), `OnlinePaymentUnavailableError` (409, Live selected but incomplete), `ConflictError` for workflow stage/approval conflicts, `TaskNotFoundError` in the workflow, `ForbiddenError` for a task owned by someone else, and `ChatNotFoundError` in the chat store. Route tests assert the status the client actually receives.
+
+### Request bodies
+
+Every JSON route reads its body through `readBoundedJson` (`src/lib/bounded-json.ts`), which counts real bytes while streaming and answers 413 before parsing; the Valmont Pay webhook reads its raw body through `readBoundedText` (50 KB) so the HMAC is computed over exactly the bytes that were bounded. No route calls `request.json()` directly.
 
 ### Owner isolation
 
@@ -291,6 +315,50 @@ number is replaced with `[REDACTED_CARD_NUMBER]` before the value is stored.
 
 Nobody should be encouraged to paste payment details on the strength of this.
 The correct control remains not collecting them, and Phase 1 asks for none.
+
+### Custom domains — ownership proof, not just a CNAME
+
+A hostname is served for a website only after **two** DNS records resolve
+(`src/lib/studio/domain-verification.ts`):
+
+- `TXT _valmont-verify.<hostname>` = `valmont-verify=<token>` — the token is
+  issued per website (`newVerificationToken()`, 16 random bytes as hex) and only ever
+  shown to the website's owner. It proves control of the zone, which a CNAME
+  alone does not: a dangling CNAME left behind after a previous tenant
+  released the hostname would otherwise let anyone claim it.
+- `CNAME <hostname>` → `STUDIO_PLATFORM_HOST`, compared exactly. There is no
+  A-record / IP fallback, so a hostname that merely resolves to the same
+  address as the platform is not accepted.
+
+Hostnames are normalised and validated against the DNS label grammar before
+any lookup (400 otherwise) and are unique across tenants (409 when another
+website already holds one). Active domains are re-checked by the proxy in the
+background, at most every 24 hours, and drop back to `pending` when either
+record disappears. Backups never carry the token: a restored domain is
+re-issued a token and starts `pending`, so a file copied to another machine
+cannot serve a hostname it has not proved.
+
+### Test vs live orders
+
+Every order carries `payment_mode` (`test` | `live`), stamped by the checkout
+route from the payment configuration in force at that moment — never from the
+client. Test orders are badged in every merchant view and excluded from
+revenue analytics, so a simulator payment can never be presented as money
+received. When Live is selected but the connection is incomplete, online
+methods are refused with 409 **before** an order row exists; the fail-closed
+webhook therefore never has an orphaned pending order to ignore.
+
+### Customer registration — no account enumeration
+
+`POST /api/customer/auth/register` answers with the same neutral message
+whether or not the address already has an account. When it does, the owner of
+that address receives an email instead (a fresh verification link if the
+account is still unverified, otherwise an "you already have an account" note
+with the sign-in link) — an attacker probing addresses learns nothing from the
+response, while a legitimate user who forgot they had signed up is still told
+what to do. A concurrent duplicate insert (`CustomerAccountExistsError`) takes
+the same neutral path. Expired sessions and one-time tokens are purged
+opportunistically (at most hourly) so they never accumulate.
 
 ### Customer email delivery hardening
 

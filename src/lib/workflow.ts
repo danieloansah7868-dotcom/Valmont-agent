@@ -13,6 +13,7 @@ import { createModelProvider, type ModelProvider } from "@/lib/models";
 import { prepareRepositorySource } from "@/lib/repository-source";
 import { isSensitivePath, LocalRepositoryRetriever } from "@/lib/retrieval";
 import { redactSecrets } from "@/lib/security";
+import { ConflictError, TaskNotFoundError } from "@/lib/api-errors";
 import {
   assertCanCreatePullRequest,
   assertCanExecute,
@@ -34,6 +35,7 @@ import {
   type WorkspaceHandle,
   type WorkspaceProvider,
 } from "@/lib/workspace";
+import { DockerWorkspaceProvider } from "@/lib/workspace-docker";
 
 const APPROVED_COMMANDS = new Set([
   "npm ci",
@@ -286,7 +288,7 @@ export class TaskWorkflowService {
   async approvePlan(taskId: string, actorId: string): Promise<CodingTask> {
     const task = await this.required(taskId);
     if (task.state !== "awaiting_plan_approval") {
-      throw new Error(
+      throw new ConflictError(
         `Plan approval is not available while task is ${task.state}`,
       );
     }
@@ -333,7 +335,9 @@ export class TaskWorkflowService {
     const expected =
       stage === "plan" ? "awaiting_plan_approval" : "awaiting_final_approval";
     if (task.state !== expected)
-      throw new Error(`Cannot reject ${stage} while task is ${task.state}`);
+      throw new ConflictError(
+        `Cannot reject ${stage} while task is ${task.state}`,
+      );
     this.approval(task, stage, "rejected", actorId);
     this.event(
       task,
@@ -354,7 +358,7 @@ export class TaskWorkflowService {
   async approveFinal(taskId: string, actorId: string): Promise<CodingTask> {
     const task = await this.required(taskId);
     if (task.state !== "awaiting_final_approval") {
-      throw new Error(
+      throw new ConflictError(
         `Final approval is not available while task is ${task.state}`,
       );
     }
@@ -397,7 +401,7 @@ export class TaskWorkflowService {
       const handle = await this.workspace.open(task.id);
       const changed = await this.workspace.listChangedFiles(handle);
       if (changed.length === 0)
-        throw new Error("Workspace has no approved changes to commit");
+        throw new ConflictError("Workspace has no approved changes to commit");
       const files: FileChange[] = await Promise.all(
         changed.map(async (file) => ({
           path: file.path,
@@ -861,7 +865,7 @@ export class TaskWorkflowService {
 
   private async required(id: string): Promise<CodingTask> {
     const task = await this.store.get(id);
-    if (!task) throw new Error("Task not found");
+    if (!task) throw new TaskNotFoundError();
     return task;
   }
 }
@@ -886,10 +890,52 @@ async function readWorkspaceContext(
   return files;
 }
 
-function createWorkspaceProvider(): WorkspaceProvider {
-  const configuredTimeout = Number(
-    process.env.VALMONT_COMMAND_TIMEOUT_MS ?? 180_000,
+/**
+ * The workspace providers this deployment may run task validation in.
+ *
+ * - `local` (default): `RestrictedLocalWorkspaceProvider` — validation runs
+ *   as the web process on the app host. Appropriate ONLY for a private,
+ *   single-tenant installation where every repository and user is trusted.
+ * - `docker`: `DockerWorkspaceProvider` — one ephemeral, unprivileged,
+ *   network-less container per task, built from `sandbox/Dockerfile`. See
+ *   `docs/SANDBOX-SMOKE.md` and the `VALMONT_SANDBOX_*` variables.
+ *
+ * Any other value is a configuration error and is refused at startup of the
+ * workflow rather than quietly falling back to the weaker local provider.
+ */
+export const WORKSPACE_PROVIDERS = ["local", "docker"] as const;
+export type WorkspaceProviderKind = (typeof WORKSPACE_PROVIDERS)[number];
+
+export type WorkspaceEnv = Record<string, string | undefined>;
+
+export function resolveWorkspaceProviderKind(
+  env: WorkspaceEnv = process.env,
+): WorkspaceProviderKind {
+  const raw = env.VALMONT_WORKSPACE_PROVIDER?.trim().toLowerCase();
+  if (!raw) return "local";
+  if (raw === "local" || raw === "docker") return raw;
+  throw new Error(
+    `VALMONT_WORKSPACE_PROVIDER must be one of ${WORKSPACE_PROVIDERS.join(", ")}`,
   );
+}
+
+/**
+ * One provider per process. The Docker provider owns a reaper timer and a
+ * per-process instance identity, so constructing it per request would leak
+ * timers and split container ownership across identities.
+ */
+let sharedDockerProvider: DockerWorkspaceProvider | undefined;
+
+export function createWorkspaceProvider(
+  env: WorkspaceEnv = process.env,
+): WorkspaceProvider {
+  if (resolveWorkspaceProviderKind(env) === "docker") {
+    sharedDockerProvider ??= DockerWorkspaceProvider.fromEnv(
+      env as NodeJS.ProcessEnv,
+    );
+    return sharedDockerProvider;
+  }
+  const configuredTimeout = Number(env.VALMONT_COMMAND_TIMEOUT_MS ?? 180_000);
   return new RestrictedLocalWorkspaceProvider({
     baseDirectory: path.join(process.cwd(), ".data", "workspaces"),
     timeoutMs: Number.isFinite(configuredTimeout)
@@ -897,6 +943,12 @@ function createWorkspaceProvider(): WorkspaceProvider {
       : 180_000,
     outputLimitBytes: 256_000,
   });
+}
+
+/** Test seam: drop the cached Docker provider so a fresh one is built. */
+export function resetWorkspaceProviderForTests(): void {
+  sharedDockerProvider?.stopReaper();
+  sharedDockerProvider = undefined;
 }
 
 function repositoryParts(fullName: string): [string, string] {

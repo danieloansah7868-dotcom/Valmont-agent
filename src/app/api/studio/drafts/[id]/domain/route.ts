@@ -1,13 +1,47 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import dns from "node:dns/promises";
 import { requireApiSessionUser } from "@/lib/auth";
 import { assertCsrf } from "@/lib/security";
 import { assertOwnerRateLimit, safeApiError } from "@/lib/api";
-import { getDomainStore, DomainStatus } from "@/lib/studio/domains";
+import {
+  getDomainStore,
+  newVerificationToken,
+  normalizeHostname,
+  verificationRecordName,
+  verificationRecordValue,
+  type DomainRow,
+} from "@/lib/studio/domains";
+import { checkDomain } from "@/lib/studio/domain-verification";
 import { getStudioDraftStore } from "@/lib/studio/draft-store";
 import { canonicalUserId } from "@/lib/user-identity";
 import { readBoundedJson, DRAFT_BODY_LIMIT_BYTES } from "@/lib/bounded-json";
+import { BadRequestError, ConflictError } from "@/lib/api-errors";
+
+/**
+ * What the owner sees: the hostname, its status and the two DNS records to
+ * publish. The verification token is shown only to the draft's owner (this
+ * route is owner-scoped) and is useless to anyone else — it proves control
+ * of the zone, not identity.
+ */
+function present(domain: DomainRow, detail?: string) {
+  return {
+    hostname: domain.hostname,
+    status: domain.status,
+    verifiedAt: domain.verified_at,
+    lastCheckedAt: domain.last_checked_at,
+    records: {
+      txt: {
+        name: verificationRecordName(domain.hostname),
+        value: verificationRecordValue(domain.verification_token ?? ""),
+      },
+      cname: {
+        name: domain.hostname,
+        target: process.env.STUDIO_PLATFORM_HOST?.trim() || null,
+      },
+    },
+    ...(detail ? { detail } : {}),
+  };
+}
 
 export async function GET(
   request: NextRequest,
@@ -26,10 +60,7 @@ export async function GET(
     const domain = await domainStore.getDomain(id);
 
     if (!domain) return NextResponse.json(null);
-    return NextResponse.json({
-      hostname: domain.hostname,
-      status: domain.status,
-    });
+    return NextResponse.json(present(domain));
   } catch (err) {
     return safeApiError(err);
   }
@@ -55,61 +86,51 @@ export async function POST(
       return NextResponse.json({ error: "Not found" }, { status: 404 });
 
     const body = await readBoundedJson(request, DRAFT_BODY_LIMIT_BYTES);
-    const { hostname } = postSchema.parse(body);
+    const { hostname: rawHostname } = postSchema.parse(body);
 
-    // Normalize hostname
-    const normalizedHostname = hostname.trim().toLowerCase();
-
-    // Ensure unique hostname
-    const domainStore = getDomainStore();
-    const existing = await domainStore.getDomainByHostname(normalizedHostname);
-    if (existing && existing.draft_id !== id) {
-      return NextResponse.json(
-        { error: "Domain is already in use by another draft" },
-        { status: 400 },
+    const hostname = normalizeHostname(rawHostname);
+    if (!hostname) {
+      throw new BadRequestError(
+        "Enter a domain name such as example.com or shop.example.com.",
       );
     }
 
-    // Verify DNS
-    let status: DomainStatus = "pending";
-    const targetHost = process.env.STUDIO_PLATFORM_HOST;
-    if (targetHost) {
-      try {
-        let isConnected = false;
-        try {
-          const cnames = await dns.resolveCname(normalizedHostname);
-          if (
-            cnames.some((c) => c.toLowerCase() === targetHost.toLowerCase())
-          ) {
-            isConnected = true;
-          }
-        } catch {
-          // fallback to lookup if resolveCname fails (e.g., hosts file)
-          const domainIp = await dns.lookup(normalizedHostname);
-          const targetIp = await dns.lookup(targetHost);
-          if (domainIp.address === targetIp.address) {
-            isConnected = true;
-          }
-        }
-
-        if (isConnected) {
-          status = "active";
-        } else {
-          status = "error";
-        }
-      } catch {
-        status = "error";
-      }
+    // One hostname belongs to at most one draft.
+    const domainStore = getDomainStore();
+    const existingByHostname = await domainStore.getDomainByHostname(hostname);
+    if (existingByHostname && existingByHostname.draft_id !== id) {
+      throw new ConflictError("Domain is already in use by another website.");
     }
 
-    await domainStore.setDomain(
-      id,
-      canonicalUserId(user),
-      normalizedHostname,
-      status,
-    );
+    // Keep the existing token when the owner re-checks the same hostname so a
+    // TXT record already published keeps working; mint a fresh one when the
+    // hostname changes so a proof for the old name cannot carry over.
+    const current = await domainStore.getDomain(id);
+    const token =
+      current && current.hostname === hostname && current.verification_token
+        ? current.verification_token
+        : newVerificationToken();
 
-    return NextResponse.json({ hostname: normalizedHostname, status });
+    const check = await checkDomain({
+      hostname,
+      token,
+      platformHost: process.env.STUDIO_PLATFORM_HOST,
+    });
+    const now = new Date().toISOString();
+
+    await domainStore.setDomain({
+      draftId: id,
+      ownerId: canonicalUserId(user),
+      hostname,
+      status: check.status,
+      verificationToken: token,
+      verifiedAt: check.ownershipProven ? (current?.verified_at ?? now) : null,
+      lastCheckedAt: now,
+    });
+
+    const saved = await domainStore.getDomain(id);
+    if (!saved) throw new Error("Domain row vanished after save");
+    return NextResponse.json(present(saved, check.detail));
   } catch (err) {
     return safeApiError(err);
   }

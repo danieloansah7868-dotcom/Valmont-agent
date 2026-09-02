@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { publicOrigin } from "@/lib/auth-redirect";
 import { z } from "zod";
 import { assertCustomerRateLimit, safeApiError } from "@/lib/api";
 import { readBoundedJson } from "@/lib/bounded-json";
@@ -41,7 +42,10 @@ export async function POST(request: NextRequest) {
         "verify_email",
         CUSTOMER_VERIFICATION_TTL_MS,
       );
-      const link = new URL("/api/customer/auth/verify", request.nextUrl.origin);
+      const link = new URL(
+        "/api/customer/auth/verify",
+        publicOrigin(request.url),
+      );
       link.searchParams.set("token", token);
       try {
         const delivery = await sendCustomerEmail({

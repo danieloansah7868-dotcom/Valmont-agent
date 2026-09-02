@@ -17,7 +17,13 @@ services:
       retries: 10
 
   app:
-    build: .
+    build:
+      context: .
+      args:
+        # Baked into the browser bundle at build time; must match the runtime
+        # STUDIO_PLATFORM_HOST below. Leave unset until custom domains are
+        # offered.
+        NEXT_PUBLIC_STUDIO_PLATFORM_HOST: ${NEXT_PUBLIC_STUDIO_PLATFORM_HOST:-}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -27,20 +33,49 @@ services:
       - "127.0.0.1:3000:3000"
     environment:
       DATABASE_URL: postgresql://valmont:${POSTGRES_PASSWORD:-change-this-before-production}@postgres:5432/valmont
+      # The public https origin. Every emailed link and the Valmont Pay return
+      # URL is built from it — never leave the localhost default in production.
       APP_URL: ${APP_URL:-http://localhost:3000}
+      # >= 32 random characters; placeholders are refused at runtime.
       SESSION_SECRET: ${SESSION_SECRET:-}
+      # The app is only reachable through the reverse proxy in front of this
+      # compose file, so trust its X-Forwarded-For for per-client rate limits.
+      # Set false if clients can ever reach port 3000 directly.
+      TRUST_PROXY: ${TRUST_PROXY:-true}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
       MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.openai.com/v1}
       MODEL_API_KEY: ${MODEL_API_KEY:-}
       MODEL_NAME: ${MODEL_NAME:-gpt-4.1-mini}
+      # Merchant + customer email (order alerts, verification, password reset).
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       NOTIFY_EMAIL_FROM: ${NOTIFY_EMAIL_FROM:-}
+      # Optional SMS / WhatsApp order alerts.
+      ARKESEL_API_KEY: ${ARKESEL_API_KEY:-}
+      ARKESEL_SENDER: ${ARKESEL_SENDER:-}
+      TERMII_API_KEY: ${TERMII_API_KEY:-}
+      TERMII_SENDER: ${TERMII_SENDER:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
+      # Valmont Pay connection fallback. Live mode is still only selected on
+      # Studio → Settings → Payments; values saved there win over these.
+      VALMONT_PAY_API_URL: ${VALMONT_PAY_API_URL:-}
+      VALMONT_PAY_API_KEY: ${VALMONT_PAY_API_KEY:-}
+      VALMONT_PAY_WEBHOOK_SECRET: ${VALMONT_PAY_WEBHOOK_SECRET:-}
+      # GitHub logins allowed to change payment settings (comma-separated).
+      STUDIO_PAYMENT_ADMINS: ${STUDIO_PAYMENT_ADMINS:-}
+      # Custom-domain CNAME target; same value as the build arg above.
+      STUDIO_PLATFORM_HOST: ${STUDIO_PLATFORM_HOST:-}
       # CHAT_STORE_PATH remains a legacy JSON input; CHAT_SQLITE_PATH can select
       # a distinct destination. Mount any custom parent directory as well.
       CHAT_STORE_PATH: ${CHAT_STORE_PATH:-}
       CHAT_SQLITE_PATH: ${CHAT_SQLITE_PATH:-}
       VALMONT_COMMAND_TIMEOUT_MS: ${VALMONT_COMMAND_TIMEOUT_MS:-180000}
+      # local (default) runs validation commands in a restricted process on
+      # this container; docker gives each task a throwaway container and needs
+      # a Docker socket mounted plus the docker CLI — see docs/PRODUCTION.md.
+      VALMONT_WORKSPACE_PROVIDER: ${VALMONT_WORKSPACE_PROVIDER:-local}
     volumes:
       - valmont-workspaces:/app/.data
     security_opt:

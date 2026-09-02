@@ -21,6 +21,8 @@ interface ImportSummary {
   skippedCustomerAccounts: number;
   customerSessions: number;
   customerTokens: number;
+  customDomains: number;
+  skippedDomains: number;
   atomicity: "single-transaction" | "coordinated";
   notice?: string;
 }
@@ -178,6 +180,36 @@ export function BackupControls() {
           {status.summary.skippedCustomerAccounts} customer account
           {status.summary.skippedCustomerAccounts === 1 ? "" : "s"} already
           existed here and were left unchanged.
+        </p>
+      )}
+
+      {/* Restored custom domains always come back unverified: the file never
+          carries the verification token, so the owner must publish a fresh TXT
+          record before the hostname is served from this machine. */}
+      {status.kind === "done" && status.summary.customDomains > 0 && (
+        <p
+          role="status"
+          data-testid="import-domains"
+          className="text-sm text-amber-800"
+        >
+          {status.summary.customDomains} custom domain
+          {status.summary.customDomains === 1 ? " was" : "s were"} re-attached
+          and must be verified again from each website&apos;s Domain card.
+        </p>
+      )}
+
+      {/* A hostname already claimed here, or attached to a draft that was not
+          in the file, is skipped rather than moved. */}
+      {status.kind === "done" && status.summary.skippedDomains > 0 && (
+        <p
+          role="status"
+          data-testid="import-skipped-domains"
+          className="text-sm text-amber-800"
+        >
+          {status.summary.skippedDomains} custom domain
+          {status.summary.skippedDomains === 1 ? " was" : "s were"} not restored
+          because the hostname is already in use here or its website was not in
+          the file.
         </p>
       )}
 

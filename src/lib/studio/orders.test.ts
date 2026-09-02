@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
-import { SqliteOrdersStore, type NewOrderInput } from "./orders";
+import {
+  OrderTransitionError,
+  SqliteOrdersStore,
+  type NewOrderInput,
+} from "./orders";
+import { ApiError } from "@/lib/api-errors";
 
 const dirs: string[] = [];
 let store: SqliteOrdersStore;
@@ -210,6 +215,44 @@ describe("SqliteOrdersStore", () => {
     await expect(
       store.updateStatus("owner-1", created.id, "preparing"),
     ).rejects.toThrow(/cannot move/);
+  });
+
+  it("reports an impossible transition as a typed 409 the route can trust", async () => {
+    const created = await store.create(newOrder());
+    const failure = await store
+      .updateStatus("owner-1", created.id, "preparing")
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(OrderTransitionError);
+    expect(failure).toBeInstanceOf(ApiError);
+    expect((failure as ApiError).status).toBe(409);
+  });
+
+  it("stamps the payment rail at checkout and defaults it to live", async () => {
+    const practice = await store.create(
+      newOrder({ accessCode: "code-test", paymentMode: "test" }),
+    );
+    const real = await store.create(
+      newOrder({ accessCode: "code-live", paymentMethod: "cod" }),
+    );
+    expect(practice.paymentMode).toBe("test");
+    expect(real.paymentMode).toBe("live");
+    expect((await store.getByAccessCode("code-test"))?.paymentMode).toBe(
+      "test",
+    );
+  });
+
+  it("treats orders written before the payment_mode column existed as live", async () => {
+    // Simulate a pre-upgrade row: strip the column's value the way an old
+    // database would have it (NULL after ALTER TABLE ... ADD COLUMN on a
+    // table whose rows pre-date the default).
+    const created = await store.create(newOrder({ paymentMode: "test" }));
+    const db = (store as unknown as { db: import("node:sqlite").DatabaseSync })
+      .db;
+    db.prepare("UPDATE studio_orders SET payment_mode = ? WHERE id = ?").run(
+      "garbage",
+      created.id,
+    );
+    expect((await store.getById(created.id))?.paymentMode).toBe("live");
   });
 
   it("keeps a customer note on the order", async () => {

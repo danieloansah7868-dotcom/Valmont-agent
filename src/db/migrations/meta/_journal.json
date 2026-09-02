@@ -71,6 +71,13 @@
       "when": 1787738197336,
       "tag": "0009_uneven_orphan",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1787900000000,
+      "tag": "0010_order_payment_mode_domain_verification",
+      "breakpoints": true
     }
   ]
 }

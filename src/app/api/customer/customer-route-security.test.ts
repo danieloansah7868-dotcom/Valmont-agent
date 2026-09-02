@@ -74,9 +74,20 @@ describe("customer account HTTP routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetRateLimitForTests();
+    vi.unstubAllEnvs();
     vi.stubEnv("NODE_ENV", "test");
     vi.stubEnv("TRUST_PROXY", "false");
+    vi.stubEnv("APP_URL", "https://shop.example");
     mocks.accountStore.getByEmail.mockResolvedValue(null);
+    mocks.accountStore.createAccount.mockResolvedValue({
+      id: "account-1",
+      email: "ama@example.com",
+      name: "Ama Mensah",
+    });
+    mocks.accountStore.createToken.mockResolvedValue(
+      "verification-token-1234567890",
+    );
+    mocks.sendCustomerEmail.mockResolvedValue({ delivered: true });
     mocks.accountStore.getById.mockResolvedValue({
       id: "account-1",
       email: "ama@example.com",
@@ -121,6 +132,134 @@ describe("customer account HTTP routes", () => {
     expect(response.status).toBe(403);
     expect(mocks.ordersStore.getByAccessCode).not.toHaveBeenCalled();
     expect(mocks.accountStore.createAccount).not.toHaveBeenCalled();
+  });
+
+  it("builds the verification link from APP_URL, never the request host", async () => {
+    const response = await register(
+      new NextRequest("http://0.0.0.0:3000/api/customer/auth/register", {
+        method: "POST",
+        headers: {
+          cookie: `valmont_csrf=${csrf}`,
+          "content-type": "application/json",
+          "x-valmont-csrf": csrf,
+          host: "attacker.example",
+        },
+        body: JSON.stringify(registrationBody("")),
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    const email = mocks.sendCustomerEmail.mock.calls[0]?.[0] as {
+      text: string;
+      html: string;
+    };
+    expect(email.text).toContain(
+      "https://shop.example/api/customer/auth/verify?token=",
+    );
+    expect(email.text).not.toContain("0.0.0.0");
+    expect(email.text).not.toContain("attacker.example");
+  });
+
+  it("redirects a verification click to the APP_URL login page", async () => {
+    const response = await verify(
+      new NextRequest(
+        "http://0.0.0.0:3000/api/customer/auth/verify?token=verification-token-1234567890",
+        { headers: { host: "attacker.example" } },
+      ),
+    );
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe(
+      "https://shop.example/account/login?verified=success",
+    );
+  });
+
+  describe("registration does not reveal whether an address is taken", () => {
+    const verifiedOwner = {
+      id: "account-1",
+      email: "ama@example.com",
+      name: "Ama Mensah",
+      emailVerifiedAt: "2026-08-01T00:00:00.000Z",
+    };
+
+    it("answers a brand-new address and an existing one identically", async () => {
+      const fresh = await register(
+        mutation("/api/customer/auth/register", registrationBody("")),
+      );
+      const freshBody = await fresh.json();
+
+      mocks.accountStore.getByEmail.mockResolvedValue(verifiedOwner);
+      const taken = await register(
+        mutation("/api/customer/auth/register", registrationBody("")),
+      );
+      const takenBody = await taken.json();
+
+      expect(fresh.status).toBe(201);
+      expect(taken.status).toBe(201);
+      expect(takenBody).toEqual(freshBody);
+      expect(mocks.accountStore.createAccount).toHaveBeenCalledTimes(1);
+    });
+
+    it("tells the real owner of a verified address instead of the requester", async () => {
+      mocks.accountStore.getByEmail.mockResolvedValue(verifiedOwner);
+
+      const response = await register(
+        mutation("/api/customer/auth/register", registrationBody("")),
+      );
+
+      expect(response.status).toBe(201);
+      expect(mocks.accountStore.createAccount).not.toHaveBeenCalled();
+      expect(mocks.accountStore.createToken).not.toHaveBeenCalled();
+      const email = mocks.sendCustomerEmail.mock.calls[0]?.[0] as {
+        to: string;
+        subject: string;
+        text: string;
+      };
+      expect(email.to).toBe("ama@example.com");
+      expect(email.subject).toMatch(/already have/i);
+      expect(email.text).toContain("https://shop.example/account/login");
+    });
+
+    it("re-sends a verification link when the existing account is unverified", async () => {
+      mocks.accountStore.getByEmail.mockResolvedValue({
+        ...verifiedOwner,
+        emailVerifiedAt: undefined,
+      });
+
+      const response = await register(
+        mutation("/api/customer/auth/register", registrationBody("")),
+      );
+
+      expect(response.status).toBe(201);
+      expect(mocks.accountStore.createAccount).not.toHaveBeenCalled();
+      expect(mocks.accountStore.createToken).toHaveBeenCalledWith(
+        "account-1",
+        "verify_email",
+        expect.any(Number),
+      );
+      const email = mocks.sendCustomerEmail.mock.calls[0]?.[0] as {
+        subject: string;
+        text: string;
+      };
+      expect(email.subject).toMatch(/verify/i);
+      expect(email.text).toContain(
+        "https://shop.example/api/customer/auth/verify?token=",
+      );
+    });
+
+    it("stays neutral when the existing-owner email cannot be delivered", async () => {
+      mocks.accountStore.getByEmail.mockResolvedValue(verifiedOwner);
+      const { CustomerEmailDeliveryError } = await import("@/lib/api-errors");
+      mocks.sendCustomerEmail.mockRejectedValueOnce(
+        new CustomerEmailDeliveryError(),
+      );
+
+      const response = await register(
+        mutation("/api/customer/auth/register", registrationBody("")),
+      );
+
+      expect(response.status).toBe(201);
+    });
   });
 
   it("refuses to claim a guest order that has no checkout email", async () => {
