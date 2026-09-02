@@ -6,6 +6,7 @@ import { isTemplateId, isTemplateCompatible } from "../templates";
 import { isThemeId, HEX_COLOR_RE } from "../themes";
 import { isGhanaRegion } from "./defaults";
 import { ACCEPTED_MIME_TYPES } from "../assets";
+import { dataBundleSchema } from "../data-bundles";
 
 export const SITE_BRIEF_VERSION = 1 as const;
 
@@ -530,6 +531,11 @@ const baseSiteBriefV1 = z.object({
    * the draft store). A priced item can be added to a basket and paid for.
    */
   items: z.array(catalogItemSchema).max(200).default([]),
+  /**
+   * Data bundles (Ghana telecom) — MTN, Telecel, AirtelTigo, Up2U.
+   * Separate from `items` so checkout can require recipient phone.
+   */
+  dataBundles: z.array(dataBundleSchema).max(200).default([]),
   /** Phase 3 payments and delivery configuration. */
   payments: paymentsConfigSchema,
   /**
@@ -544,8 +550,14 @@ const baseSiteBriefV1 = z.object({
        * attaches a customer account, and orders cannot be claimed.
        */
       customerAccounts: z.boolean().default(false),
+      /**
+       * Lets the shop sell Ghana telecom data bundles (MTN, Telecel, etc.).
+       * When off, the storefront shows no bundles section and checkout does
+       * not require a recipient phone for bundles.
+       */
+      dataBundles: z.boolean().default(false),
     })
-    .default({ customerAccounts: false }),
+    .default({ customerAccounts: false, dataBundles: false }),
   country: z.string().max(60).default("Ghana"),
   currency: z.string().max(10).default("GHS"),
   timezone: z.string().max(40).default("Africa/Accra"),
@@ -598,6 +610,12 @@ export function customerAccountsEnabled(
   brief: Partial<SiteBriefV1> | null | undefined,
 ): boolean {
   return brief?.features?.customerAccounts === true;
+}
+
+export function dataBundlesEnabled(
+  brief: Partial<SiteBriefV1> | null | undefined,
+): boolean {
+  return brief?.features?.dataBundles === true;
 }
 
 export interface StudioDraft {

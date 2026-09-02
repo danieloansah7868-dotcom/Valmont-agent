@@ -175,6 +175,7 @@ export function createDefaultBrief(
     adminEmail: "owner@example.com",
     assets: { logo: null, photos: [] },
     items: [],
+    dataBundles: [],
     payments: {
       enabled: false,
       methods: [],
@@ -183,7 +184,7 @@ export function createDefaultBrief(
       notifications: {},
       staged: { enabled: false, stages: [] },
     },
-    features: { customerAccounts: false },
+    features: { customerAccounts: false, dataBundles: false },
     plannedPaymentMethods: [],
     country: GHANA_DEFAULTS.country,
     currency: GHANA_DEFAULTS.currency,

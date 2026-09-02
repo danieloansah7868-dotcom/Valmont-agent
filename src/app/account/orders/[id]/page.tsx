@@ -14,6 +14,7 @@ import {
 } from "@/lib/studio/site-brief/schema";
 import { formatMoney } from "@/lib/studio/valmont-pay";
 import { formatAccra } from "@/lib/studio/format";
+import { dataNetworkLabel } from "@/lib/studio/data-bundles";
 
 export const dynamic = "force-dynamic";
 
@@ -144,6 +145,15 @@ export default async function CustomerOrderPage({
               <span className="min-w-0 flex-1 text-navy">
                 {line.name}{" "}
                 <span className="text-slate">× {line.quantity}</span>
+                {line.bundleMeta ? (
+                  <span className="block text-xs text-slate-600">
+                    {dataNetworkLabel(line.bundleMeta.network)} •{" "}
+                    {line.bundleMeta.volume} • {line.bundleMeta.validityDays}d
+                    {line.bundleMeta.recipientPhone
+                      ? ` • to ${line.bundleMeta.recipientPhone}`
+                      : ""}
+                  </span>
+                ) : null}
               </span>
               <span className="font-semibold text-navy">
                 {formatMoney(line.price * line.quantity, order.currency)}

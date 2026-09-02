@@ -9,6 +9,7 @@ import { formatAccra } from "@/lib/studio/format";
 import { PAYMENT_METHODS } from "@/lib/studio/site-brief/schema";
 import { OrderActions } from "@/components/studio/order-actions";
 import { PaymentModeBadge } from "@/components/studio/payment-mode-badge";
+import { dataNetworkLabel } from "@/lib/studio/data-bundles";
 
 export const dynamic = "force-dynamic";
 
@@ -121,6 +122,15 @@ export default async function OrderDetailPage({
               ) : null}
               <span className="min-w-0 flex-1">
                 {line.name} × {line.quantity}
+                {line.bundleMeta ? (
+                  <span className="ml-2 block text-xs text-slate-600">
+                    {dataNetworkLabel(line.bundleMeta.network)} •{" "}
+                    {line.bundleMeta.volume} • {line.bundleMeta.validityDays}d
+                    {line.bundleMeta.recipientPhone
+                      ? ` • to ${line.bundleMeta.recipientPhone}`
+                      : ""}
+                  </span>
+                ) : null}
               </span>
               <span className="font-semibold">
                 {formatMoney(line.price * line.quantity, order.currency)}

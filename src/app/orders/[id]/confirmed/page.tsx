@@ -7,6 +7,7 @@ import { publicGetDraft } from "@/lib/studio/draft-public";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { customerAccountsEnabled } from "@/lib/studio/site-brief/schema";
 import { formatMoney, STATUS_LABELS } from "@/lib/studio/valmont-pay";
+import { dataNetworkLabel } from "@/lib/studio/data-bundles";
 
 export const dynamic = "force-dynamic";
 
@@ -69,6 +70,15 @@ export default async function OrderConfirmedPage({
             <li key={line.itemId} className="flex justify-between gap-4">
               <span>
                 {line.name} × {line.quantity}
+                {line.bundleMeta ? (
+                  <span className="block text-xs text-slate-600">
+                    {dataNetworkLabel(line.bundleMeta.network)} •{" "}
+                    {line.bundleMeta.volume} • {line.bundleMeta.validityDays}d
+                    {line.bundleMeta.recipientPhone
+                      ? ` • to ${line.bundleMeta.recipientPhone}`
+                      : ""}
+                  </span>
+                ) : null}
               </span>
               <span>
                 {formatMoney(line.price * line.quantity, order.currency)}

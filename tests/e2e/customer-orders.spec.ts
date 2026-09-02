@@ -147,7 +147,7 @@ async function seedShop(owner: StudioOwner) {
         staged: { enabled: false, stages: [] },
       },
       // Opt-in is explicit per website; these scenarios exercise the feature.
-      features: { customerAccounts: true },
+      features: { customerAccounts: true, dataBundles: false },
     }),
   );
 }

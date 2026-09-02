@@ -41,6 +41,7 @@ import {
 } from "@/lib/studio/site-brief/defaults";
 import { changedFields, mergeBriefs } from "@/lib/studio/merge";
 import { AssetUploader } from "./asset-uploader";
+import { DataBundleEditor } from "./data-bundle-editor";
 
 const STEPS = [
   { number: 1, title: "Website type" },
@@ -907,6 +908,21 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 onChange={(items) => update({ items })}
               />
 
+              <fieldset className="grid gap-3 rounded-lg border border-line p-3">
+                <legend className="text-sm font-semibold">
+                  Data bundles (Ghana telecom)
+                </legend>
+                <p className="text-xs text-slate-600">
+                  Sell MTN, Telecel, AirtelTigo and MTN Up2U bundles. Customers
+                  enter the recipient phone at checkout. Turn on the feature in
+                  Step 5 to show bundles on your website.
+                </p>
+                <DataBundleEditor
+                  bundles={brief.dataBundles ?? []}
+                  onChange={(dataBundles) => update({ dataBundles })}
+                />
+              </fieldset>
+
               <TextField
                 id="serviceAreas"
                 label="Areas you serve"
@@ -991,6 +1007,35 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                   public website shows an Account link and customers can sign in
                   to see their orders. Turn it off at any time — your orders
                   stay safe in Website Studio.
+                </p>
+              </fieldset>
+
+              <fieldset className="grid gap-2 rounded-lg border border-line p-3">
+                <legend className="text-sm font-semibold">
+                  Data bundles (optional)
+                </legend>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={brief.features.dataBundles}
+                    onChange={(event) =>
+                      update({
+                        features: {
+                          ...brief.features,
+                          dataBundles: event.target.checked,
+                        },
+                      })
+                    }
+                    data-testid="data-bundles-enabled"
+                  />
+                  <span className="text-sm">
+                    Sell MTN, Telecel, AirtelTigo and Up2U data bundles
+                  </span>
+                </label>
+                <p className="text-xs text-slate-600">
+                  When on, your shop shows a Data Bundles section grouped by
+                  network. Checkout collects the recipient phone number. Turn it
+                  off anytime — your bundles stay saved.
                 </p>
               </fieldset>
 

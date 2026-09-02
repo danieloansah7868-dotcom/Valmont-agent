@@ -18,9 +18,14 @@ import {
 } from "@/lib/studio/valmont-pay";
 import {
   customerAccountsEnabled,
+  dataBundlesEnabled,
   isPaymentMethodId,
 } from "@/lib/studio/site-brief/schema";
 import { notifyMerchantNewOrder } from "@/lib/studio/notifications";
+import {
+  isValidBundleRecipientPhone,
+  normalizeVolume,
+} from "@/lib/studio/data-bundles";
 
 const CHECKOUT_BODY_LIMIT_BYTES = 100_000;
 
@@ -46,6 +51,16 @@ const checkoutSchema = z.object({
   customerAddress: z.string().trim().max(500).optional().or(z.literal("")),
   paymentMethod: z.string().max(30),
   note: z.string().max(500).optional().or(z.literal("")),
+  bundleRecipientPhone: z.string().trim().max(30).optional().or(z.literal("")),
+  bundleRecipients: z
+    .array(
+      z.object({
+        itemId: z.string().max(64),
+        phone: z.string().trim().min(6).max(30),
+      }),
+    )
+    .max(100)
+    .optional(),
 });
 
 function accessCode(): string {
@@ -101,27 +116,124 @@ export async function POST(
       );
     }
 
-    // Re-price every line from the server-side catalogue. A line whose item is
-    // unknown or has no price is rejected — never silently priced at zero.
+    // Re-price every line from the server-side catalogue + data bundles.
+    // A line whose item is unknown or has no price is rejected — never silently
+    // priced at zero.
     const catalogue = new Map(draft.brief.items.map((item) => [item.id, item]));
+    const bundleCatalogue = new Map(
+      (draft.brief.dataBundles ?? []).map((bundle) => [bundle.id, bundle]),
+    );
+    const perLineRecipient = new Map(
+      (payload.bundleRecipients ?? []).map((entry) => [
+        entry.itemId,
+        entry.phone,
+      ]),
+    );
+
     const lines: OrderLine[] = [];
     const pricedLines: PricedLine[] = [];
+    let hasBundle = false;
+
     for (const line of payload.lines) {
       const item = catalogue.get(line.itemId);
-      if (!item || item.price === undefined) {
+      const bundle = bundleCatalogue.get(line.itemId);
+
+      if (item && item.price !== undefined) {
+        lines.push({
+          itemId: item.id,
+          name: item.name,
+          price: item.price,
+          quantity: line.quantity,
+          image: item.image,
+        });
+        pricedLines.push({ price: item.price, quantity: line.quantity });
+        continue;
+      }
+
+      if (bundle) {
+        if (!dataBundlesEnabled(draft.brief)) {
+          return NextResponse.json(
+            { error: "Data bundles are not available for this shop." },
+            { status: 409 },
+          );
+        }
+        if (bundle.active === false) {
+          return NextResponse.json(
+            {
+              error:
+                "One of the data bundles in your basket is no longer available.",
+            },
+            { status: 409 },
+          );
+        }
+        const recipientFromLine = perLineRecipient.get(bundle.id);
+        const recipient = recipientFromLine || payload.bundleRecipientPhone;
+        hasBundle = true;
+        lines.push({
+          itemId: bundle.id,
+          name: bundle.name,
+          price: bundle.price,
+          quantity: line.quantity,
+          bundleMeta: {
+            network: bundle.network,
+            volume: normalizeVolume(bundle.volume) ?? bundle.volume,
+            validityDays: bundle.validityDays,
+            recipientPhone: recipient || undefined,
+          },
+        });
+        pricedLines.push({ price: bundle.price, quantity: line.quantity });
+        continue;
+      }
+
+      return NextResponse.json(
+        { error: "One of the items in your basket is no longer available." },
+        { status: 409 },
+      );
+    }
+
+    if (hasBundle) {
+      const globalRecipient = payload.bundleRecipientPhone?.trim();
+      // If any bundle line lacks a per-line recipient and no global recipient,
+      // require it.
+      const missingRecipient = lines.some(
+        (line) =>
+          line.bundleMeta &&
+          !line.bundleMeta.recipientPhone &&
+          !globalRecipient,
+      );
+      if (missingRecipient && !globalRecipient) {
         return NextResponse.json(
-          { error: "One of the items in your basket is no longer available." },
-          { status: 409 },
+          {
+            error:
+              "Please add the phone number that should receive the data bundle.",
+          },
+          { status: 400 },
         );
       }
-      lines.push({
-        itemId: item.id,
-        name: item.name,
-        price: item.price,
-        quantity: line.quantity,
-        image: item.image,
-      });
-      pricedLines.push({ price: item.price, quantity: line.quantity });
+      // Validate all recipient phones
+      const allRecipients = [
+        ...(globalRecipient ? [globalRecipient] : []),
+        ...(payload.bundleRecipients ?? []).map((r) => r.phone),
+        ...lines
+          .filter((l) => l.bundleMeta?.recipientPhone)
+          .map((l) => l.bundleMeta!.recipientPhone!),
+      ];
+      for (const phone of allRecipients) {
+        if (!isValidBundleRecipientPhone(phone)) {
+          return NextResponse.json(
+            { error: "The data bundle recipient phone number is not valid." },
+            { status: 400 },
+          );
+        }
+      }
+      // Fill global recipient into any bundle line that still lacks one
+      if (globalRecipient) {
+        for (const line of lines) {
+          if (line.bundleMeta && !line.bundleMeta.recipientPhone) {
+            line.bundleMeta.recipientPhone = globalRecipient;
+          }
+        }
+      }
     }
 
     const totals = computeTotals(pricedLines, {

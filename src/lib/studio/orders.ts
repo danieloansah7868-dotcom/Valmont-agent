@@ -43,6 +43,13 @@ export interface OrderLine {
   quantity: number;
   /** Optional product photo snapshotted at checkout. */
   image?: string;
+  /** When the line is a data bundle, its telecom metadata. */
+  bundleMeta?: {
+    network: string;
+    volume: string;
+    validityDays: number;
+    recipientPhone?: string;
+  };
 }
 
 /** What the checkout endpoint receives from the browser. */

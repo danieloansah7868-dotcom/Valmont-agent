@@ -127,7 +127,10 @@ const RULES: Rule[] = [
     severity: "recommended",
     hint: "List a few services you provide, or the kinds of products you sell.",
     satisfied: (brief) =>
-      filled(brief.services) || filled(brief.products) || filled(brief.items),
+      filled(brief.services) ||
+      filled(brief.products) ||
+      filled(brief.items) ||
+      filled(brief.dataBundles),
   },
   {
     field: "coverage",
