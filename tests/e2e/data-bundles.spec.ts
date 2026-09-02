@@ -60,6 +60,7 @@ async function signInStudio(
   user: StudioOwner,
   baseURL: string,
 ): Promise<void> {
+  await context.clearCookies();
   const host = new URL(baseURL).hostname;
   await context.addCookies([
     {
@@ -151,9 +152,13 @@ test.describe("data-bundles shop", () => {
       (b) => b.bundle?.network === "mtn",
     )!;
     await page.getByTestId(`add-${firstBundle.id}`).click();
+    await expect(page.getByTestId("cart-bar")).toBeVisible();
     await page.getByTestId("start-checkout").click();
     await page.getByLabel("Your name").fill("Kwame Buyer");
     await page.getByTestId("checkout-phone").fill("024 000 0001");
+    // blur to trigger validation (should be valid, no error)
+    await page.getByTestId("checkout-phone").blur();
+    await expect(page.getByText(/Ghana mobiles only/)).toBeVisible();
     await page.getByTestId("place-order").click();
     await expect(page.getByTestId("order-success")).toBeVisible();
     const payLink = page.getByTestId("order-pay-link");
@@ -185,9 +190,11 @@ test.describe("data-bundles shop", () => {
       (b) => b.bundle?.network === "mtn",
     )!;
     await page.getByTestId(`add-${firstBundle2.id}`).click();
+    await expect(page.getByTestId("cart-bar")).toBeVisible();
     await page.getByTestId("start-checkout").click();
     await page.getByLabel("Your name").fill("Kwame Buyer");
     await page.getByTestId("checkout-phone").fill("030 123 4567");
+    await page.getByTestId("checkout-phone").blur();
     await expect(
       page.getByText(/Landline numbers.*not supported/i),
     ).toBeVisible();
@@ -221,6 +228,7 @@ test.describe("data-bundles shop", () => {
     await page.goto(`/s/${draft.id}`);
     await expect(page.getByTestId("public-storefront")).toBeVisible();
     await page.getByTestId("add-jollof-rice").click();
+    await expect(page.getByTestId("cart-bar")).toBeVisible();
     await page.getByTestId("start-checkout").click();
     await page.getByLabel("Your name").fill("Ama Customer");
     await page.getByLabel("Phone number").fill("0301234567");
