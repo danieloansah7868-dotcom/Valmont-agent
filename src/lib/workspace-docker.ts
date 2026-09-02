@@ -2609,6 +2609,15 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
         ...(opts.legacyAdopted ? { legacyAdopted: true } : {}),
       });
       await this.fs.writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
+      // Re-verify the fence IMMEDIATELY BEFORE publication: the entry check
+      // above is not enough — a fence lost after writeFile but before link
+      // must refuse publication rather than leave a canonical mapping with
+      // no lease and a live, restart-openable container (Phase 2 item 2).
+      // Mirrors writeLease/writeQuarantineRecord.
+      if (!(await this.checkFenceLive(fence))) {
+        await this.fs.rm(tmp, { force: true }).catch(() => {});
+        return false;
+      }
       try {
         await this.fs.link(tmp, final);
       } catch (error) {
@@ -2619,6 +2628,10 @@ export class DockerWorkspaceProvider implements WorkspaceProvider {
       } finally {
         await this.fs.rm(tmp, { force: true }).catch(() => {});
       }
+      // Readback with a live fence (mirrors writeLease/writeQuarantineRecord):
+      // a fence lost at the link instant makes the return dishonest otherwise.
+      // The caller then quarantines/fails closed on false.
+      if (!(await this.checkFenceLive(fence))) return false;
       const back = await this.readAuthoritativeMapping(taskId);
       return (
         back.kind === "mapping" &&

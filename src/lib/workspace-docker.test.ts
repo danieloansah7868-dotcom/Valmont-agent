@@ -5227,6 +5227,54 @@ describe("DockerWorkspaceProvider", () => {
     expect(containerForTask(state, "taskMapPub")).toBeDefined();
   });
 
+  it("a fence lost before the mapping-final .json link refuses publication (the F1 fence re-check)", async () => {
+    const state = makeState();
+    const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
+    leaseDirs.push(leaseDir);
+    let broke = false;
+    const provider = makeProvider(state, {
+      leaseDir,
+      fsOverride: {
+        writeFile: async (p, data, options) => {
+          if (
+            !broke &&
+            p.includes(`${path.sep}mappings${path.sep}`) &&
+            p.endsWith(".json.tmp")
+          ) {
+            // The fence is broken away the moment the mapping publication
+            // temp lands — i.e. at the mapping-final `.json` instant, but
+            // BEFORE the re-check that now precedes link(). The link itself
+            // is left to succeed, isolating the fence re-check (F1) from the
+            // link-failure path already covered above.
+            broke = true;
+            const lockDir = path.join(
+              leaseDir,
+              ".locks",
+              "taskMapRecheck.lock",
+            );
+            for (const entry of readdirSync(lockDir)) {
+              rmSync(path.join(lockDir, entry), { force: true });
+            }
+            rmSync(lockDir, { recursive: true, force: true });
+          }
+          return fsWriteFile(p, data, options);
+        },
+      },
+    });
+    const src = await makeSource({ "a.txt": "x" });
+    await expect(provider.create("taskMapRecheck", src)).rejects.toThrow(
+      /could not be determined/,
+    );
+    expect(broke).toBe(true);
+    // No canonical mapping was ever published (the re-check refused it even
+    // though the link would have succeeded); the half-initialized container
+    // survives only as a reaper-discoverable orphan, never as openable
+    // canonical state, and never with a canonical mapping but no lease.
+    expect(readRecords(leaseDir, "mappings", "taskMapRecheck")).toHaveLength(0);
+    expect(readRecords(leaseDir, "leases", "taskMapRecheck")).toHaveLength(0);
+    expect(containerForTask(state, "taskMapRecheck")).toBeDefined();
+  });
+
   it("a stale publisher refuses to publish over a higher-epoch mapping (publication conflict fails closed)", async () => {
     const state = makeState();
     const leaseDir = mkdtempSync(path.join(tmpdir(), "valmont-test-leases-"));
