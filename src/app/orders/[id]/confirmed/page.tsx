@@ -63,6 +63,18 @@ export default async function OrderConfirmedPage({
           <span className="font-semibold">Status: </span>
           {STATUS_LABELS[order.status]}
         </p>
+        {order.recipientPhone && (
+          <p className="mt-2 text-sm">
+            <span className="font-semibold">Send to: </span>
+            {order.recipientPhone}
+          </p>
+        )}
+        {order.customerPhone && (
+          <p className="mt-1 text-sm">
+            <span className="font-semibold">Contact: </span>
+            {order.customerPhone}
+          </p>
+        )}
 
         <ul className="mt-3 grid gap-1 text-sm">
           {order.lines.map((line) => (

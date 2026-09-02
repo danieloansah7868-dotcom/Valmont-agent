@@ -155,10 +155,13 @@ test.describe("data-bundles shop", () => {
     await expect(page.getByTestId("cart-bar")).toBeVisible();
     await page.getByTestId("start-checkout").click();
     await page.getByLabel("Your name").fill("Kwame Buyer");
+    // Stage 3: recipient required, buyer optional
     await page.getByTestId("checkout-phone").fill("024 000 0001");
-    // blur to trigger validation (should be valid, no error)
     await page.getByTestId("checkout-phone").blur();
     await expect(page.getByText(/Ghana mobiles only/)).toBeVisible();
+    // Fill buyer number as different
+    await page.getByTestId("checkout-buyer-phone").fill("020 000 0002");
+    await page.getByTestId("checkout-buyer-phone").blur();
     await page.getByTestId("place-order").click();
     await expect(page.getByTestId("order-success")).toBeVisible();
     const payLink = page.getByTestId("order-pay-link");
@@ -178,7 +181,10 @@ test.describe("data-bundles shop", () => {
       }),
     ).toBeVisible();
     await expect(page.getByText(firstBundle.name)).toBeVisible();
+    // Recipient shown as Send to, buyer as Phone
     await expect(page.getByText("0240000001")).toBeVisible();
+    await expect(page.getByText(/Send to/)).toBeVisible();
+    await expect(page.getByText("0200000002")).toBeVisible();
 
     // Landline refusal — client shows error
     const owner2 = nextOwner();
@@ -199,14 +205,15 @@ test.describe("data-bundles shop", () => {
       page.getByText(/Landline numbers.*not supported/i),
     ).toBeVisible();
 
-    // Server also refuses — direct POST bypassing client validation
+    // Server also refuses — direct POST bypassing client validation (recipientPhone required)
     const serverResp = await request.post(
       `/api/studio/drafts/${draft2.id}/checkout`,
       {
         data: {
           lines: [{ itemId: firstBundle2.id, quantity: 1 }],
           customerName: "Kwame Buyer",
-          customerPhone: "030 123 4567",
+          recipientPhone: "030 123 4567",
+          customerPhone: "0200000002",
           paymentMethod: "valmont_pay",
         },
       },

@@ -77,6 +77,16 @@ export default async function OrderDetailPage({
               </a>
             </dd>
           </div>
+          {order.recipientPhone && (
+            <div>
+              <dt className="inline font-semibold">Send to: </dt>
+              <dd className="inline">
+                <a href={`tel:${order.recipientPhone}`} className="underline">
+                  {order.recipientPhone}
+                </a>
+              </dd>
+            </div>
+          )}
           {order.customerEmail && (
             <div>
               <dt className="inline font-semibold">Email: </dt>

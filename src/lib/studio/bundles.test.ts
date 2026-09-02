@@ -369,6 +369,146 @@ describe("Ghana mobile validation", () => {
   });
 });
 
+describe("bundle shop payment rules (stage 3)", () => {
+  it("rejects cod for data-bundles", () => {
+    const brief = baseBrief({
+      items: [
+        {
+          id: "bundle-01",
+          name: "MTN 1GB",
+          price: 10,
+          bundle: { network: "mtn", dataMb: 1024 },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["cod"],
+        delivery: { enabled: false, fee: 0, minimumOrder: 0 },
+        valmontPay: { provisioned: false },
+        notifications: {},
+        staged: { enabled: false, stages: [] },
+      },
+    });
+    const result = siteBriefSchemaV1.safeParse(brief);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const paths = result.error.issues.map((i) => i.path.join("."));
+      expect(paths.some((p) => p.includes("payments"))).toBe(true);
+    }
+  });
+
+  it("rejects delivery enabled for data-bundles", () => {
+    const brief = baseBrief({
+      items: [
+        {
+          id: "bundle-01",
+          name: "MTN 1GB",
+          price: 10,
+          bundle: { network: "mtn", dataMb: 1024 },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: { enabled: true, fee: 5, minimumOrder: 0 },
+        valmontPay: { provisioned: false },
+        notifications: {},
+        staged: { enabled: false, stages: [] },
+      },
+    });
+    const result = siteBriefSchemaV1.safeParse(brief);
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts valmont_pay only with no delivery for data-bundles", () => {
+    const brief = baseBrief({
+      items: [
+        {
+          id: "bundle-01",
+          name: "MTN 1GB",
+          price: 10,
+          bundle: { network: "mtn", dataMb: 1024 },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: { enabled: false, fee: 0, minimumOrder: 0 },
+        valmontPay: { provisioned: false },
+        notifications: {},
+        staged: { enabled: false, stages: [] },
+      },
+    });
+    expect(siteBriefSchemaV1.safeParse(brief).success).toBe(true);
+  });
+
+  it("accepts cod and delivery for online-shop", () => {
+    const brief = {
+      schemaVersion: 1,
+      businessName: "Test Shop",
+      category: "online-shop",
+      selectedPackage: "starter",
+      selectedTheme: "clean-corporate",
+      selectedTemplate: "classic-hero",
+      adminEmail: "owner@example.com",
+      phone: "+233201234567",
+      items: [{ id: "item-1", name: "Shirt", price: 50 }],
+      payments: {
+        enabled: true,
+        methods: ["cod", "momo"],
+        delivery: { enabled: true, fee: 5, minimumOrder: 0 },
+        valmontPay: { provisioned: false },
+        notifications: {},
+        staged: { enabled: false, stages: [] },
+      },
+    };
+    expect(siteBriefSchemaV1.safeParse(brief).success).toBe(true);
+  });
+
+  it("switch into data-bundles with cod/momo sanitizes to valmont_pay only and no delivery", async () => {
+    const { guessNetworkFromItem, guessDataMbFromItem } =
+      await import("./bundles");
+    const businessBrief = {
+      schemaVersion: 1,
+      businessName: "Adom Fabrics",
+      category: "business-profile",
+      selectedPackage: "starter",
+      selectedTheme: "clean-corporate",
+      selectedTemplate: "classic-hero",
+      adminEmail: "ama@adomfabrics.com",
+      phone: "+233201234567",
+      items: [{ id: "item-1", name: "MTN 5GB", price: 30 }],
+      payments: {
+        enabled: true,
+        methods: ["cod", "momo"],
+        delivery: { enabled: true, fee: 5, minimumOrder: 0 },
+        valmontPay: { provisioned: false },
+        notifications: {},
+        staged: { enabled: false, stages: [] },
+      },
+    };
+    const enrichedItems = businessBrief.items.map((item: any) => ({
+      ...item,
+      bundle: {
+        network: guessNetworkFromItem(item) ?? "mtn",
+        dataMb: guessDataMbFromItem(item) ?? 1024,
+      },
+    }));
+    const sanitized = {
+      ...businessBrief,
+      category: "data-bundles",
+      selectedTemplate: "bundle-shop",
+      items: enrichedItems,
+      payments: {
+        ...businessBrief.payments,
+        methods: ["valmont_pay"],
+        delivery: { ...businessBrief.payments.delivery, enabled: false },
+      },
+    };
+    expect(siteBriefSchemaV1.safeParse(sanitized).success).toBe(true);
+  });
+});
+
 describe("category switch trap", () => {
   it("leaving data-bundles strips bundle and stays valid", () => {
     const bundleBrief = baseBrief({

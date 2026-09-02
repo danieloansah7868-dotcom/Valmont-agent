@@ -374,7 +374,11 @@ describe("checkout data-bundles Ghana mobile validation", () => {
     },
   };
 
-  function bundleRequest(phone: string) {
+  function bundleRequest(
+    recipientPhone: string,
+    customerPhone?: string,
+    paymentMethod = "valmont_pay",
+  ) {
     return new NextRequest(
       `http://localhost/api/studio/drafts/${draftId}/checkout`,
       {
@@ -383,8 +387,9 @@ describe("checkout data-bundles Ghana mobile validation", () => {
         body: JSON.stringify({
           lines: [{ itemId: "bundle-00", quantity: 1 }],
           customerName: "Kwame Buyer",
-          customerPhone: phone,
-          paymentMethod: "valmont_pay",
+          recipientPhone,
+          customerPhone: customerPhone ?? "",
+          paymentMethod,
         }),
       },
     );
@@ -422,10 +427,40 @@ describe("checkout data-bundles Ghana mobile validation", () => {
 
     expect(response.status).toBe(200);
     expect(mocks.create).toHaveBeenCalledWith(
-      expect.objectContaining({ customerPhone: "0240000001" }),
+      expect.objectContaining({
+        recipientPhone: "0240000001",
+        customerPhone: "0240000001",
+      }),
     );
     expect(mocks.createPaymentLink).toHaveBeenCalledWith(
       expect.objectContaining({ customerPhone: "0240000001" }),
+    );
+  });
+
+  it("stores buyer number separately when given", async () => {
+    const response = await POST(
+      bundleRequest("0240000001", "0200000002"),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientPhone: "0240000001",
+        customerPhone: "0200000002",
+      }),
+    );
+  });
+
+  it("falls back customerPhone to recipient when buyer blank", async () => {
+    const response = await POST(bundleRequest("0240000001", ""), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientPhone: "0240000001",
+        customerPhone: "0240000001",
+      }),
     );
   });
 
@@ -439,6 +474,23 @@ describe("checkout data-bundles Ghana mobile validation", () => {
       expect(mocks.createPaymentLink).not.toHaveBeenCalled();
     },
   );
+
+  it("rejects missing recipient phone with 400", async () => {
+    const response = await POST(bundleRequest(""), params());
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects cod on bundle shop with 400", async () => {
+    const response = await POST(
+      bundleRequest("0240000001", "", "cod"),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
 
   it("accepts landline 0301234567 for non-bundle shop (unchanged)", async () => {
     mocks.internalGetDraftForCheckout.mockResolvedValue(draft);

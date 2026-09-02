@@ -174,6 +174,12 @@ export default async function CustomerOrderPage({
             <dt className="inline font-semibold text-navy">Phone: </dt>
             <dd className="inline">{order.customerPhone}</dd>
           </div>
+          {order.recipientPhone ? (
+            <div>
+              <dt className="inline font-semibold text-navy">Send to: </dt>
+              <dd className="inline">{order.recipientPhone}</dd>
+            </div>
+          ) : null}
           {order.customerAddress ? (
             <div>
               <dt className="inline font-semibold text-navy">Address: </dt>

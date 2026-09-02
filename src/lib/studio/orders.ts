@@ -50,6 +50,7 @@ export interface CheckoutPayload {
   lines: Array<{ itemId: string; quantity: number }>;
   customerName: string;
   customerPhone: string;
+  recipientPhone?: string;
   customerEmail?: string;
   customerAddress?: string;
   paymentMethod: string;
@@ -70,6 +71,8 @@ export interface OrderRecord {
   lines: OrderLine[];
   customerName: string;
   customerPhone: string;
+  /** For bundle shops: the number that should receive the bundle. Null for older orders. */
+  recipientPhone?: string;
   customerEmail?: string;
   customerAddress?: string;
   /** Set after an optional customer account claims the order. */
@@ -103,6 +106,7 @@ export interface NewOrderInput {
   lines: OrderLine[];
   customerName: string;
   customerPhone: string;
+  recipientPhone?: string;
   customerEmail?: string;
   customerAddress?: string;
   customerAccountId?: string;
@@ -277,6 +281,7 @@ interface OrderRow {
   lines_json: string;
   customer_name: string;
   customer_phone: string;
+  recipient_phone: string | null;
   customer_email: string | null;
   customer_address: string | null;
   customer_account_id: string | null;
@@ -309,6 +314,7 @@ function rowToOrder(row: OrderRow): OrderRecord {
     lines: JSON.parse(row.lines_json) as OrderLine[],
     customerName: row.customer_name,
     customerPhone: row.customer_phone,
+    recipientPhone: row.recipient_phone ?? undefined,
     customerEmail: row.customer_email ?? undefined,
     customerAddress: row.customer_address ?? undefined,
     customerAccountId: row.customer_account_id ?? undefined,
@@ -396,6 +402,7 @@ export function ensureOrdersSchema(db: DatabaseSync): void {
   ensureColumn(db, "status_history_json", "TEXT", existing);
   ensureColumn(db, "customer_account_id", "TEXT", existing);
   ensureColumn(db, "payment_mode", "TEXT NOT NULL DEFAULT 'live'", existing);
+  ensureColumn(db, "recipient_phone", "TEXT", existing);
   db.exec(
     "CREATE INDEX IF NOT EXISTS studio_orders_customer_account ON studio_orders(customer_account_id)",
   );
@@ -417,10 +424,10 @@ export class SqliteOrdersStore implements OrdersStore {
         `INSERT INTO studio_orders(
           id, owner_id, draft_id, access_code, status, currency,
           subtotal, delivery_fee, total, lines_json,
-          customer_name, customer_phone, customer_email, customer_address,
+          customer_name, customer_phone, recipient_phone, customer_email, customer_address,
           customer_account_id, payment_method, payment_mode, merchant_note,
           created_at, updated_at, status_history_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -435,6 +442,7 @@ export class SqliteOrdersStore implements OrdersStore {
         JSON.stringify(input.lines),
         input.customerName,
         input.customerPhone,
+        input.recipientPhone ?? null,
         input.customerEmail ?? null,
         input.customerAddress ?? null,
         input.customerAccountId ?? null,
@@ -655,6 +663,7 @@ function pgRowToOrder(row: typeof studioOrders.$inferSelect): OrderRecord {
     lines: row.linesJson as OrderLine[],
     customerName: row.customerName,
     customerPhone: row.customerPhone,
+    recipientPhone: row.recipientPhone ?? undefined,
     customerEmail: row.customerEmail ?? undefined,
     customerAddress: row.customerAddress ?? undefined,
     customerAccountId: row.customerAccountId ?? undefined,
@@ -691,6 +700,7 @@ export class PostgresOrdersStore implements OrdersStore {
         linesJson: input.lines,
         customerName: input.customerName,
         customerPhone: input.customerPhone,
+        recipientPhone: input.recipientPhone ?? null,
         customerEmail: input.customerEmail ?? null,
         customerAddress: input.customerAddress ?? null,
         customerAccountId: input.customerAccountId ?? null,

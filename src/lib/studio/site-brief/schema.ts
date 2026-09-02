@@ -637,6 +637,27 @@ export const siteBriefSchemaV1 = baseSiteBriefV1.superRefine((brief, ctx) => {
         }
       }
     }
+    // Stage 3 rule: bundle shops are online-only, Valmont Pay only, no delivery
+    if (brief.payments.enabled) {
+      const nonValmont = brief.payments.methods.filter(
+        (m) => m !== "valmont_pay",
+      );
+      if (nonValmont.length > 0) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["payments", "methods"],
+          message:
+            "Data bundle shops accept only online payments via Valmont Pay.",
+        });
+      }
+      if (brief.payments.delivery.enabled) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["payments", "delivery", "enabled"],
+          message: "Delivery is not available for data bundle shops.",
+        });
+      }
+    }
   } else {
     for (let i = 0; i < brief.items.length; i += 1) {
       const item = brief.items[i];

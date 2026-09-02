@@ -51,8 +51,10 @@ export function BundleShop({
   const [cartOpen, setCartOpen] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
   const [name, setName] = useState("");
-  const [phone, setPhone] = useState("");
-  const [phoneError, setPhoneError] = useState<string | null>(null);
+  const [recipientPhone, setRecipientPhone] = useState("");
+  const [recipientError, setRecipientError] = useState<string | null>(null);
+  const [buyerPhone, setBuyerPhone] = useState("");
+  const [buyerError, setBuyerError] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   const methods = customerFacingPaymentMethods(payments.methods);
   const [method, setMethod] = useState<string>(methods[0] ?? "");
@@ -119,14 +121,28 @@ export function BundleShop({
 
   async function placeOrder() {
     if (!draftId) return;
-    const phoneErr = validateGhanaMobile(phone);
-    if (phoneErr) {
-      setPhoneError(phoneErr);
-      setError(phoneErr);
+    const recipientErr = validateGhanaMobile(recipientPhone);
+    if (recipientErr) {
+      setRecipientError(recipientErr);
+      setError(recipientErr);
       return;
     }
-    setPhoneError(null);
-    const normalizedPhone = normalizeGhanaMobile(phone) ?? phone;
+    setRecipientError(null);
+    let buyerErr: string | null = null;
+    if (buyerPhone.trim()) {
+      buyerErr = validateGhanaMobile(buyerPhone);
+      if (buyerErr) {
+        setBuyerError(buyerErr);
+        setError(buyerErr);
+        return;
+      }
+    }
+    setBuyerError(null);
+    const normalizedRecipient =
+      normalizeGhanaMobile(recipientPhone) ?? recipientPhone.trim();
+    const normalizedBuyer = buyerPhone.trim()
+      ? (normalizeGhanaMobile(buyerPhone) ?? buyerPhone.trim())
+      : normalizedRecipient;
 
     setBusy(true);
     setError(null);
@@ -140,7 +156,8 @@ export function BundleShop({
             quantity: line.quantity,
           })),
           customerName: name,
-          customerPhone: normalizedPhone,
+          recipientPhone: normalizedRecipient,
+          customerPhone: normalizedBuyer,
           customerEmail: email || undefined,
           paymentMethod: method,
           note: note || undefined,
@@ -163,19 +180,19 @@ export function BundleShop({
   }
 
   const networkWarnings = useMemo(() => {
-    if (!phone.trim()) return [];
-    if (validateGhanaMobile(phone)) return [];
+    if (!recipientPhone.trim()) return [];
+    if (validateGhanaMobile(recipientPhone)) return [];
     const warnings: string[] = [];
     for (const line of lines) {
       const net = getBundleNetwork(line.item);
       if (!net) continue;
-      const check = checkRecipientNetworkMatch(phone, net);
+      const check = checkRecipientNetworkMatch(recipientPhone, net);
       if (!check.matches && check.warning) {
         warnings.push(check.warning);
       }
     }
     return [...new Set(warnings)];
-  }, [phone, lines]);
+  }, [recipientPhone, lines]);
 
   const activeBundles = grouped[activeNetwork] ?? [];
 
@@ -422,34 +439,74 @@ export function BundleShop({
                       <div className="grid gap-1">
                         <label className="grid gap-1">
                           <span className="text-sm font-semibold">
-                            Phone number (Ghana mobile)
+                            Number to receive the bundle
                           </span>
                           <input
                             type="tel"
-                            value={phone}
+                            value={recipientPhone}
                             placeholder="0240000001"
                             required
                             onChange={(e) => {
-                              setPhone(e.target.value);
-                              if (phoneError) setPhoneError(null);
+                              setRecipientPhone(e.target.value);
+                              if (recipientError) setRecipientError(null);
                             }}
                             onBlur={() => {
-                              const err = validateGhanaMobile(phone);
-                              setPhoneError(err);
+                              const err = validateGhanaMobile(recipientPhone);
+                              setRecipientError(err);
                             }}
                             className={`w-full rounded-lg border px-3 py-2 text-base ${
-                              phoneError ? "border-red-500" : "border-line"
+                              recipientError ? "border-red-500" : "border-line"
                             }`}
                             data-testid="checkout-phone"
+                            id="checkout-recipient-phone"
                           />
                         </label>
-                        {phoneError ? (
+                        {recipientError ? (
                           <p className="text-xs text-red-700" role="alert">
-                            {phoneError}
+                            {recipientError}
                           </p>
                         ) : (
                           <p className="text-xs text-slate-500">
-                            Ghana mobiles only: 02x or 05x, saved as 0240000001
+                            Ghana mobiles only: 02x or 05x, saved as 0240000001.
+                            Every bundle in the basket goes to this number.
+                          </p>
+                        )}
+                      </div>
+                      <div className="grid gap-1">
+                        <label className="grid gap-1">
+                          <span className="text-sm font-semibold">
+                            Your WhatsApp number (optional, if different)
+                          </span>
+                          <input
+                            type="tel"
+                            value={buyerPhone}
+                            placeholder="Optional"
+                            onChange={(e) => {
+                              setBuyerPhone(e.target.value);
+                              if (buyerError) setBuyerError(null);
+                            }}
+                            onBlur={() => {
+                              if (!buyerPhone.trim()) {
+                                setBuyerError(null);
+                                return;
+                              }
+                              const err = validateGhanaMobile(buyerPhone);
+                              setBuyerError(err);
+                            }}
+                            className={`w-full rounded-lg border px-3 py-2 text-base ${
+                              buyerError ? "border-red-500" : "border-line"
+                            }`}
+                            data-testid="checkout-buyer-phone"
+                          />
+                        </label>
+                        {buyerError ? (
+                          <p className="text-xs text-red-700" role="alert">
+                            {buyerError}
+                          </p>
+                        ) : (
+                          <p className="text-xs text-slate-500">
+                            If blank, we will use the recipient number to
+                            contact you.
                           </p>
                         )}
                       </div>

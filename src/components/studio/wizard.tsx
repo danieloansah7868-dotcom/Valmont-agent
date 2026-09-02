@@ -438,6 +438,17 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             },
           } as CatalogItem;
         });
+        // Stage 3: entering data-bundles must set Valmont Pay only and disable delivery, otherwise new superRefine freezes autosave
+        const sanitizedPayments = {
+          ...brief.payments,
+          methods: brief.payments.enabled
+            ? (["valmont_pay"] as PaymentMethodId[])
+            : brief.payments.methods,
+          delivery: {
+            ...brief.payments.delivery,
+            enabled: false,
+          },
+        };
         update({
           category: categoryId,
           selectedTemplate: reconcileTemplate(
@@ -449,6 +460,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               ? brief.ecomSubcategory
               : undefined,
           items: enriched as CatalogItem[],
+          payments: sanitizedPayments,
         });
         setCategoryNotice("Check the network and size of your existing items");
         return;
@@ -466,6 +478,7 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
       brief.category,
       brief.ecomSubcategory,
       brief.items,
+      brief.payments,
       brief.selectedTemplate,
       update,
     ],
@@ -1112,7 +1125,16 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                     <legend className="text-sm font-semibold">
                       How can customers pay?
                     </legend>
+                    {isBundleSite && (
+                      <p className="text-xs text-slate-600">
+                        Data bundle shops accept only online payments via
+                        Valmont Pay (Mobile Money, card and bank inside it).
+                      </p>
+                    )}
                     {PAYMENT_METHODS.filter((method) => {
+                      if (isBundleSite) {
+                        return method.id === "valmont_pay";
+                      }
                       if (
                         brief.payments.methods.includes("valmont_pay") &&
                         REDUNDANT_WHEN_VALMONT_PAY.includes(method.id)
