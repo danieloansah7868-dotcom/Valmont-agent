@@ -1,3 +1,15 @@
+# Data-Bundle Plan — Stage 2 (current branch `arena/01a06135-valmont-agent`)
+
+**Status: Stage 2 implemented and pushed (7e461ea).**
+
+- **Stage 1 foundation** — `src/lib/studio/data-bundles.ts` (networks MTN/Telecel/AirtelTigo/Up2U, volume grammar, Zod schema, parsing, grouping, Ghana phone validation), `SiteBriefV1.dataBundles` + `features.dataBundles` flag (off by default), `OrderLine.bundleMeta`, backward-compatible `normalizeBrief`, backup v2 carries bundles automatically. Tests: `data-bundles.test.ts`.
+- **Stage 2 merchant UX + storefront** — `DataBundleEditor` component (network/volume/validity/price/name/active, grouped by network, edit/hide/delete) in Step 4, feature toggle `data-bundles-enabled` in Step 5, storefront Data Bundles section grouped by network with colored badges (MTN yellow, Telecel red, AirtelTigo navy, Up2U orange), cart merges items + bundles, checkout collects `bundleRecipientPhone` when bundles in basket, validates Ghana E.164, re-prices server-side from draft's `dataBundles`, snapshots `bundleMeta`, respects feature flag + active flag. Order views (Studio, customer, public confirmed) show bundle meta. Checkout tests: `route.bundles.test.ts` (6 cases). Typecheck, build, 767 tests green.
+- **Next (Stage 3)** — provider API integration (BundlesGhana/DataPlug), wallet, auto-delivery on paid webhook, fulfillment ref, SMS to recipient. See `docs/DATA-BUNDLE-PLAN.md` for full roadmap.
+
+Branch `arena/01a06135-valmont-agent` is now at `7e461ea` and pushed. Ready for review; merge only after independent review.
+
+---
+
 # Follow-up items — status updated by production-hardening session (arena/01a05a32-valmont-agent)
 
 Owner note: PR #10 was merged intentionally by the owner. It was not a mistake and
