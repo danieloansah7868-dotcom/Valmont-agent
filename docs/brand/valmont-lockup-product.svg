@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 618 64" role="img" aria-label="Valmont Agent">
+  <!--
+    Product lockup — VALMONT carries the house navy; AGENT carries copper,
+    the color of action and approval. Use when the product, not the house,
+    must be named. Minimum width: 140px.
+  -->
+  <g>
+    <rect width="64" height="64" rx="14" fill="#0A1F44"/>
+    <path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/>
+    <path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/>
+  </g>
+  <g fill="none" stroke="#0A1F44" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)">
+    <path d="M2.5 3 14 37 25.5 3"/>
+    <path d="M46 37 58 3 70 37M50.8 25.5h14.4"/>
+    <path d="M91.5 3V37h21.5"/>
+    <path d="M134.5 37V3l13.5 21L161.5 3v34"/>
+    <ellipse cx="220" cy="20" rx="17.5" ry="17"/>
+    <path d="M239 37V3l23 34V3"/>
+    <path d="M283.5 3h23M295 3v34"/>
+  </g>
+  <g fill="none" stroke="#E8822B" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(412 12)">
+    <path d="M2 37 14 3 26 37M6.8 25.5h14.4"/>
+    <path d="M77.4 12A17.5 17 0 1 0 78.8 24.9h-15.9"/>
+    <path d="M118 3H97.5v34H118M97.5 20H114"/>
+    <path d="M135 37V3l23 34V3"/>
+    <path d="M176.5 3h23M188 3v34"/>
+  </g>
+</svg>

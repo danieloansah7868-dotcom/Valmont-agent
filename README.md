@@ -23,6 +23,8 @@ Valmont Agent is a private, web-based software assistant with reopenable convers
 
 ## Brand
 
+The full identity system — logo assets, clear space, voice, typography, imagery, and governance — lives in [`docs/BRAND.md`](docs/BRAND.md) with vector assets in [`docs/brand/`](docs/brand/) and a visual brand book at [`docs/brand/index.html`](docs/brand/index.html).
+
 The interface uses the Valmont Web visual identity from [valmontweb.com](https://valmontweb.com):
 
 | Token        | Hex       | Usage                                     |

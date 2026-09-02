@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Valmont Agent — Brand Identity</title>
+<meta name="description" content="The Valmont Agent brand system: identity, color, typography, voice, and imagery." />
+<link rel="icon" href="valmont-tile.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;650&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --navy: #0A1F44;
+    --navy-900: #06152F;
+    --navy-800: #0D2953;
+    --navy-700: #143467;
+    --navy-600: #1D447F;
+    --copper: #E8822B;
+    --copper-700: #9E4E11;
+    --copper-600: #D26E1C;
+    --copper-300: #F3B77C;
+    --copper-100: #FBE6D1;
+    --copper-50: #FEF6EE;
+    --ivory: #ECE9DE;
+    --ivory-200: #E3DFD1;
+    --ivory-100: #F2EFE6;
+    --ivory-50: #F8F6F0;
+    --brandblue: #14446C;
+    --brandblue-700: #0F3455;
+    --brandblue-200: #BCD2E3;
+    --brandblue-50: #EEF4F9;
+    --slate: #606678;
+    --slate-700: #464B5B;
+    --slate-400: #8B90A0;
+    --slate-200: #C9CCD5;
+    --slate-100: #E5E7EC;
+    --line: #DCD8CB;
+    --line-strong: #C5BFAE;
+    --paper: #FFFFFF;
+    --fail: #B3392F;
+    --shadow-brand: 0 18px 48px rgb(9 21 52 / 0.12);
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--ivory-50);
+    color: var(--navy);
+    font-family: "Inter", "Avenir Next", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
+
+  /* ---------- top bar ---------- */
+  header.top {
+    position: sticky; top: 0; z-index: 40;
+    background: var(--navy);
+    color: var(--ivory);
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; padding: 14px clamp(20px, 5vw, 56px);
+    border-bottom: 3px solid var(--copper);
+  }
+  header.top .brand { display: flex; align-items: center; gap: 14px; color: var(--ivory); text-decoration: none; }
+  header.top .brand svg { width: 120px; height: auto; display: block; }
+  header.top .tag { font-size: 13px; font-weight: 500; letter-spacing: 0.02em; color: var(--copper-300); white-space: nowrap; }
+  nav.toc { display: flex; flex-wrap: wrap; gap: 4px 18px; padding: 10px clamp(20px, 5vw, 56px); background: var(--ivory-100); border-bottom: 1px solid var(--line); position: sticky; top: 65px; z-index: 30; }
+  nav.toc a { font-size: 13px; font-weight: 650; color: var(--navy); text-decoration: none; padding: 4px 2px; border-bottom: 2px solid transparent; }
+  nav.toc a:hover { color: var(--copper-700); }
+  nav.toc a:focus-visible { outline: 2px solid var(--copper); outline-offset: 2px; }
+
+  /* ---------- layout ---------- */
+  main { max-width: 1080px; margin: 0 auto; padding: 0 clamp(20px, 5vw, 48px) 96px; }
+  section { padding-top: 72px; }
+  .eyebrow { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .eyebrow .no { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; font-size: 13px; font-weight: 500; color: var(--copper-700); letter-spacing: 0.08em; }
+  .eyebrow .rule { height: 1px; width: 56px; background: var(--copper); }
+  h1 { font-size: clamp(34px, 5vw, 56px); line-height: 1.08; font-weight: 650; letter-spacing: -0.01em; margin: 0 0 18px; }
+  h2 { font-size: clamp(26px, 3.4vw, 34px); line-height: 1.18; font-weight: 650; margin: 0 0 14px; }
+  h3 { font-size: 19px; font-weight: 650; margin: 28px 0 10px; }
+  p.lead { font-size: 18px; max-width: 62ch; color: var(--slate-700); }
+  p { max-width: 72ch; }
+  .card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 24px; box-shadow: var(--shadow-brand); }
+
+  /* ---------- hero ---------- */
+  .hero { padding: 84px 0 8px; }
+  .hero .tagline {
+    display: inline-block; margin: 26px 0 8px; padding: 10px 18px;
+    border-left: 4px solid var(--copper);
+    background: var(--paper); border-radius: 0 10px 10px 0;
+    font-size: clamp(19px, 2.6vw, 26px); font-weight: 650; box-shadow: var(--shadow-brand);
+  }
+  .hero .meta { margin-top: 22px; font-size: 13px; color: var(--slate); display: flex; flex-wrap: wrap; gap: 8px 26px; }
+  .hero .meta b { color: var(--navy); font-weight: 650; }
+
+  /* ---------- grids ---------- */
+  .grid { display: grid; gap: 16px; }
+  .g2 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .g3 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .g5 { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+
+  /* ---------- personality ---------- */
+  .trait { border-top: 3px solid var(--navy); }
+  .trait:nth-child(2) { border-top-color: var(--copper); }
+  .trait:nth-child(3) { border-top-color: var(--brandblue); }
+  .trait:nth-child(4) { border-top-color: var(--slate); }
+  .trait:nth-child(5) { border-top-color: var(--copper-300); }
+  .trait h4 { margin: 14px 0 6px; font-size: 16px; font-weight: 650; }
+  .trait p { margin: 0; font-size: 14px; color: var(--slate-700); }
+  .values { counter-reset: v; }
+  .values li { list-style: none; position: relative; padding-left: 44px; margin: 14px 0; }
+  .values li::before {
+    counter-increment: v; content: counter(v, decimal-leading-zero);
+    position: absolute; left: 0; top: 1px;
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px; font-weight: 500; color: var(--paper); background: var(--navy);
+    border-radius: 8px; padding: 3px 7px;
+  }
+  .values li:nth-child(2)::before { background: var(--copper); color: var(--navy); }
+  ol.values { padding: 0; }
+
+  /* ---------- logo swatches ---------- */
+  .logo-well { display: flex; align-items: center; justify-content: center; min-height: 170px; padding: 24px; border-radius: 10px; }
+  .logo-well svg { max-width: 100%; height: auto; }
+  .logo-well.light { background: var(--ivory); }
+  .logo-well.dark { background: var(--navy); }
+  .logo-well.paper-well { background: var(--paper); border: 1px dashed var(--line-strong); }
+  .logo-well.blue { background: var(--brandblue); }
+  .asset-label { font-size: 12.5px; font-weight: 650; margin: 10px 0 2px; }
+  .asset-note { font-size: 12.5px; color: var(--slate); margin: 0; }
+
+  /* clear space diagram */
+  .clearspace { --h: 64px; display: inline-block; position: relative; padding: calc(var(--h) / 2); border: 1px dashed var(--copper-700); border-radius: 4px; background: var(--paper); }
+  .clearspace svg { display: block; height: var(--h); width: auto; }
+  .clearspace .tag-h { position: absolute; top: -22px; left: 50%; transform: translateX(-50%); font-size: 11px; font-weight: 650; color: var(--copper-700); letter-spacing: 0.06em; }
+
+  /* misuse */
+  .misuse { position: relative; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); overflow: hidden; }
+  .misuse .demo { display: flex; align-items: center; justify-content: center; min-height: 120px; background: var(--ivory-50); }
+  .misuse .demo.busy { background: repeating-linear-gradient(45deg, var(--brandblue-200) 0 10px, var(--ivory) 10px 20px); }
+  .misuse .demo svg { width: 88px; height: auto; }
+  .misuse .x {
+    position: absolute; top: 8px; right: 8px; width: 22px; height: 22px; border-radius: 50%;
+    background: var(--fail); color: var(--paper); display: flex; align-items: center; justify-content: center;
+    font-size: 13px; line-height: 1;
+  }
+  .misuse figcaption { font-size: 12.5px; color: var(--slate-700); padding: 10px 12px; border-top: 1px solid var(--line); }
+
+  /* ---------- color ---------- */
+  .chip { border-radius: 10px; overflow: hidden; border: 1px solid var(--line); background: var(--paper); box-shadow: var(--shadow-brand); }
+  .chip .swatch { height: 86px; position: relative; }
+  .chip .swatch .copy {
+    position: absolute; right: 8px; bottom: 8px; font-size: 11px; font-weight: 650;
+    background: rgb(255 255 255 / 0.85); color: var(--navy); border: none; border-radius: 6px;
+    padding: 3px 8px; cursor: pointer; opacity: 0; transition: opacity 120ms ease-out;
+  }
+  .chip:hover .copy, .chip:focus-within .copy { opacity: 1; }
+  .chip .info { padding: 10px 12px 12px; }
+  .chip .name { font-size: 13.5px; font-weight: 650; }
+  .chip .role { font-size: 12px; color: var(--slate); display: block; margin-bottom: 2px; }
+  .chip .hex { font-size: 12px; color: var(--slate-700); }
+  .ramp { display: flex; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); }
+  .ramp div { flex: 1; height: 54px; display: flex; align-items: flex-end; justify-content: center; padding-bottom: 5px; font-size: 10.5px; font-weight: 650; }
+  .ramp-row { display: grid; grid-template-columns: 110px 1fr; gap: 12px; align-items: center; margin: 10px 0; }
+  .ramp-row .ramp-name { font-size: 13px; font-weight: 650; }
+  .dist { display: flex; height: 46px; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); font-size: 12px; font-weight: 650; }
+  .dist div { display: flex; align-items: center; justify-content: center; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; background: var(--paper); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--ivory-100); font-weight: 650; font-size: 12.5px; letter-spacing: 0.02em; }
+  tr:last-child td { border-bottom: none; }
+  td.code, .code { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
+  .ok { color: #17603F; font-weight: 650; }
+  .bad { color: var(--fail); font-weight: 650; }
+
+  /* ---------- voice ---------- */
+  .voice-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); }
+  @media (max-width: 640px) { .voice-pair { grid-template-columns: 1fr; } }
+  .voice-pair blockquote { margin: 0; padding: 18px 20px; font-size: 14.5px; }
+  .voice-pair .say { background: var(--paper); }
+  .voice-pair .dont { background: var(--ivory-100); color: var(--slate-700); text-decoration: line-through; text-decoration-color: rgb(179 57 47 / 0.55); text-decoration-thickness: 1.5px; }
+  .voice-pair .label { display: block; font-size: 11px; font-weight: 650; letter-spacing: 0.1em; margin-bottom: 8px; }
+  .voice-pair .say .label { color: #17603F; }
+  .voice-pair .dont .label { color: var(--fail); }
+
+  /* ---------- type specimens ---------- */
+  .specimen { border-bottom: 1px solid var(--line); padding: 16px 0; display: flex; align-items: baseline; gap: 22px; flex-wrap: wrap; }
+  .specimen:last-child { border-bottom: none; }
+  .specimen .tag { font-size: 11.5px; font-weight: 650; color: var(--slate); min-width: 150px; letter-spacing: 0.04em; }
+  .specimen .sample { flex: 1; min-width: 240px; }
+
+  /* ---------- imagery ---------- */
+  .imgcard { border-radius: 12px; overflow: hidden; border: 1px solid var(--line); background: var(--paper); box-shadow: var(--shadow-brand); }
+  .imgcard img { display: block; width: 100%; height: auto; }
+  .imgcard figcaption { padding: 12px 14px; font-size: 13px; color: var(--slate-700); }
+  .imgcard figcaption b { color: var(--navy); font-weight: 650; }
+
+  footer { margin-top: 90px; padding-top: 28px; border-top: 2px solid var(--navy); display: flex; justify-content: space-between; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: var(--slate); }
+  #toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(8px);
+    background: var(--navy); color: var(--ivory); font-size: 13px; font-weight: 650;
+    border-radius: 10px; padding: 10px 18px; border-bottom: 3px solid var(--copper);
+    opacity: 0; pointer-events: none; transition: opacity 160ms ease-out, transform 160ms ease-out; z-index: 90;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  a { color: var(--navy); }
+  :focus-visible { outline: 2px solid var(--copper); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="#top" aria-label="Valmont Agent — brand identity">
+    <svg viewBox="0 0 398 64" role="img" aria-label="Valmont">
+      <g>
+        <rect width="64" height="64" rx="14" fill="#0D2953"/>
+        <path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/>
+        <path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/>
+      </g>
+      <g fill="none" stroke="#ECE9DE" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)">
+        <path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/>
+        <path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/>
+        <ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/>
+        <path d="M283.5 3h23M295 3v34"/>
+      </g>
+    </svg>
+    <span class="tag">Brand identity · v1.0</span>
+  </a>
+  <span class="tag" style="color:#F3B77C">Nothing ships without you.</span>
+</header>
+
+<nav class="toc" aria-label="Sections">
+  <a href="#core">Core</a>
+  <a href="#logo">Logo</a>
+  <a href="#color">Color</a>
+  <a href="#type">Type</a>
+  <a href="#voice">Voice</a>
+  <a href="#imagery">Imagery</a>
+  <a href="#apply">Applications</a>
+</nav>
+
+<main id="top">
+
+  <!-- ================= HERO ================= -->
+  <div class="hero">
+    <p style="font-size:13px;font-weight:650;letter-spacing:0.12em;color:var(--copper-700);margin:0 0 14px">BRAND IDENTITY · SEPTEMBER 2026</p>
+    <h1>The agent that asks first.</h1>
+    <p class="lead">Valmont Agent is a private, approval-first software assistant. It plans, writes, and validates code against real repositories — and does none of it without explicit human approval. This page is the identity system: mark, palette, type, voice, and imagery.</p>
+    <div class="tagline">Nothing ships without you.</div>
+    <div class="meta">
+      <span><b>Token source</b> <span class="code">src/app/globals.css</span></span>
+      <span><b>Asset source</b> <span class="code">docs/brand/</span></span>
+      <span><b>Guidelines</b> <span class="code">docs/BRAND.md</span></span>
+    </div>
+  </div>
+
+  <!-- ================= CORE ================= -->
+  <section id="core">
+    <div class="eyebrow"><span class="no">01</span><span class="rule"></span></div>
+    <h2>Brand core</h2>
+    <p class="lead">Calm engineering discipline, made visible. Valmont Agent sells <b>verified leverage</b>, not autonomy: every plan grounded in the real repository, every change contained, every pull request gated by a person. There is no demo mode anywhere in the product — what you see is what ran.</p>
+
+    <div class="grid g5" style="margin-top:26px">
+      <div class="card trait"><h4>Deliberate</h4><p>Moves at the speed of proof, not the speed of hype.</p></div>
+      <div class="card trait"><h4>Exact</h4><p>Names the branch, the file, the command, the variable.</p></div>
+      <div class="card trait"><h4>Transparent</h4><p>Plans, diffs, logs, timelines — always the real ones.</p></div>
+      <div class="card trait"><h4>Calm</h4><p>No urgency theater, no exclamation marks, no dark patterns.</p></div>
+      <div class="card trait"><h4>Stewardly</h4><p>Treats the repository as someone else's property, because it is.</p></div>
+    </div>
+
+    <h3>Values</h3>
+    <ol class="values">
+      <li><b>Consent before change.</b> Two explicit approvals — before code is written and before a pull request is created — are the product, not friction to remove.</li>
+      <li><b>Truth over theater.</b> Live only. Missing configuration fails loudly; nothing is fabricated to fill a gap.</li>
+      <li><b>Precision as care.</b> Bounded retrieval, redacted secrets, restricted workspaces, exact command allowlists.</li>
+      <li><b>The human signs.</b> Never merges, never deploys, never force-pushes, never touches protected branches.</li>
+    </ol>
+
+    <h3>The mark tells one story</h3>
+    <p>The <b>checkpoint V</b>: an ivory letterform — the work — resting on a copper band — the approval threshold — inside a navy field — the house. Every asset repeats this single idea: <b>work stops at the copper line until a human moves it.</b></p>
+  </section>
+
+  <!-- ================= LOGO ================= -->
+  <section id="logo">
+    <div class="eyebrow"><span class="no">02</span><span class="rule"></span></div>
+    <h2>Logo system</h2>
+    <p class="lead">The wordmark is drawn geometry — monoline, 5-unit stroke, 40-unit cap height, rounded terminals — not a font. Never retype it; always place the SVG from <span class="code">docs/brand/</span>.</p>
+
+    <div class="grid g2" style="margin-top:24px">
+      <figure style="margin:0">
+        <div class="logo-well paper-well">
+          <svg viewBox="0 0 618 64" role="img" aria-label="Valmont Agent product lockup">
+            <g><rect width="64" height="64" rx="14" fill="#0A1F44"/><path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/><path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/></g>
+            <g fill="none" stroke="#0A1F44" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)"><path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/><path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/><ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/><path d="M283.5 3h23M295 3v34"/></g>
+            <g fill="none" stroke="#E8822B" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(412 12)"><path d="M2 37 14 3 26 37M6.8 25.5h14.4"/><path d="M77.4 12A17.5 17 0 1 0 78.8 24.9h-15.9"/><path d="M118 3H97.5v34H118M97.5 20H114"/><path d="M135 37V3l23 34V3"/><path d="M176.5 3h23M188 3v34"/></g>
+          </svg>
+        </div>
+        <figcaption><p class="asset-label">Product lockup — <span class="code">valmont-lockup-product.svg</span></p><p class="asset-note">VALMONT carries the house navy; AGENT carries copper, the color of action and approval. Use when the product must be named. Min width 140 px.</p></figcaption>
+      </figure>
+      <figure style="margin:0">
+        <div class="logo-well dark">
+          <svg viewBox="0 0 398 64" role="img" aria-label="Valmont reverse lockup">
+            <g><rect width="64" height="64" rx="14" fill="#0D2953"/><path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/><path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/></g>
+            <g fill="none" stroke="#ECE9DE" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)"><path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/><path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/><ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/><path d="M283.5 3h23M295 3v34"/></g>
+          </svg>
+        </div>
+        <figcaption><p class="asset-label">House lockup, reverse — <span class="code">valmont-lockup-reverse.svg</span></p><p class="asset-note">Tile lifts to navy-800 on navy surfaces. Ivory wordmark. For navy headers, email bands, dark chrome.</p></figcaption>
+      </figure>
+      <figure style="margin:0">
+        <div class="logo-well light">
+          <svg viewBox="0 0 398 64" role="img" aria-label="Valmont primary lockup">
+            <g><rect width="64" height="64" rx="14" fill="#0A1F44"/><path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/><path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/></g>
+            <g fill="none" stroke="#0A1F44" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)"><path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/><path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/><ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/><path d="M283.5 3h23M295 3v34"/></g>
+          </svg>
+        </div>
+        <figcaption><p class="asset-label">House lockup — <span class="code">valmont-lockup.svg</span></p><p class="asset-note">Names the Valmont portfolio. Ivory or paper ground only. Min width 96 px.</p></figcaption>
+      </figure>
+      <figure style="margin:0">
+        <div class="logo-well blue">
+          <svg viewBox="0 0 64 56" style="width:76px" role="img" aria-label="Valmont glyph reverse">
+            <path d="M8 3h11l13 37 13-37h11L41 53H23L8 3Z" fill="#ECE9DE"/>
+            <path d="M22 41h20l-1 12H23l-1-12Z" fill="#E8822B"/>
+          </svg>
+        </div>
+        <figcaption><p class="asset-label">Bare glyph — <span class="code">valmont-glyph-reverse.svg</span> / <span class="code">valmont-glyph.svg</span></p><p class="asset-note">Navy version on light surfaces; ivory on navy and blue. The contained tile (<span class="code">valmont-tile.svg</span>) is the app icon and avatar.</p></figcaption>
+      </figure>
+    </div>
+
+    <h3>Clear space &amp; minimum sizes</h3>
+    <div class="card" style="display:flex;gap:32px;align-items:center;flex-wrap:wrap">
+      <div class="clearspace">
+        <span class="tag-h">H/2 — CLEAR SPACE</span>
+        <svg viewBox="0 0 398 64" role="img" aria-label="clear space diagram">
+          <g><rect width="64" height="64" rx="14" fill="#0A1F44"/><path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/><path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/></g>
+          <g fill="none" stroke="#0A1F44" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)"><path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/><path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/><ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/><path d="M283.5 3h23M295 3v34"/></g>
+        </svg>
+      </div>
+      <ul style="margin:0;padding-left:20px;font-size:14px;color:var(--slate-700)">
+        <li>Clear space on all sides: <b>half the tile height (H/2)</b>. Nothing enters it.</li>
+        <li>Minimum widths — house lockup <b>96 px</b> · product lockup <b>140 px</b> · tile/glyph <b>16 px</b>.</li>
+        <li>Below 24 px, use the tile only — never the lockup.</li>
+        <li>The threshold stays copper in every variant, except single-ink print.</li>
+      </ul>
+    </div>
+
+    <h3>Never</h3>
+    <div class="grid g5">
+      <figure class="misuse" style="margin:0"><div class="demo"><svg viewBox="0 0 398 64" style="width:150px" aria-hidden="true"><g><rect width="64" height="64" rx="14" fill="#0A1F44"/><path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/><path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/></g><g fill="none" stroke="#0A1F44" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)"><path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/><path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/><ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/><path d="M283.5 3h23M295 3v34"/></g></svg></div><span class="x" aria-hidden="true">✕</span><figcaption>Stretch or condense</figcaption></figure>
+      <figure class="misuse" style="margin:0"><div class="demo"><svg viewBox="0 0 398 64" aria-hidden="true"><g><rect width="64" height="64" rx="14" fill="#606678"/><path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/><path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#14446C"/></g><g fill="none" stroke="#8B90A0" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)"><path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/><path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/><ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/><path d="M283.5 3h23M295 3v34"/></g></svg></div><span class="x" aria-hidden="true">✕</span><figcaption>Recolor the tile, letterform, or threshold</figcaption></figure>
+      <figure class="misuse" style="margin:0"><div class="demo"><svg viewBox="0 0 398 64" aria-hidden="true"><g><rect width="64" height="64" rx="0" fill="#0A1F44"/><path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/><path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/></g><g fill="none" stroke="#0A1F44" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)"><path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/><path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/><ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/><path d="M283.5 3h23M295 3v34"/></g></svg></div><span class="x" aria-hidden="true">✕</span><figcaption>Change the radius or redraw the V</figcaption></figure>
+      <figure class="misuse" style="margin:0"><div class="demo busy"><svg viewBox="0 0 398 64" aria-hidden="true"><g><rect width="64" height="64" rx="14" fill="#0A1F44"/><path d="M14 15h10.5l7.5 26.5L39.5 15H50L37 49H27L14 15Z" fill="#ECE9DE"/><path d="M24.5 41.5h15L37 49H27l-2.5-7.5Z" fill="#E8822B"/></g><g fill="none" stroke="#0A1F44" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" transform="translate(84 12)"><path d="M2.5 3 14 37 25.5 3"/><path d="M46 37 58 3 70 37M50.8 25.5h14.4"/><path d="M91.5 3V37h21.5"/><path d="M134.5 37V3l13.5 21L161.5 3v34"/><ellipse cx="220" cy="20" rx="17.5" ry="17"/><path d="M239 37V3l23 34V3"/><path d="M283.5 3h23M295 3v34"/></g></svg></div><span class="x" aria-hidden="true">✕</span><figcaption>Place on photography or pattern</figcaption></figure>
+      <figure class="misuse" style="margin:0"><div class="demo"><span style="font-weight:650;font-size:30px;letter-spacing:0.02em;color:var(--navy)">VALMONT</span></div><span class="x" aria-hidden="true">✕</span><figcaption>Retype the wordmark in a font</figcaption></figure>
+    </div>
+  </section>
+
+  <!-- ================= COLOR ================= -->
+  <section id="color">
+    <div class="eyebrow"><span class="no">03</span><span class="rule"></span></div>
+    <h2>Color</h2>
+    <p class="lead">Five core colors with strict jobs. Copper is scarce on purpose — scarcity is what makes the approval moment visible. Green and red are reserved exclusively for passed/failed validations; never decorative, never marketing.</p>
+
+    <div class="grid g5" style="margin-top:24px">
+      <div class="chip"><div class="swatch" style="background:#0A1F44"><button class="copy" data-hex="#0A1F44">Copy</button></div><div class="info"><span class="role">Foundation</span><span class="name">Navy</span><div class="hex code">#0A1F44 · 10 31 68</div></div></div>
+      <div class="chip"><div class="swatch" style="background:#E8822B"><button class="copy" data-hex="#E8822B">Copy</button></div><div class="info"><span class="role">Action</span><span class="name">Copper</span><div class="hex code">#E8822B · 232 130 43</div></div></div>
+      <div class="chip"><div class="swatch" style="background:#ECE9DE"><button class="copy" data-hex="#ECE9DE">Copy</button></div><div class="info"><span class="role">Warm ground</span><span class="name">Ivory</span><div class="hex code">#ECE9DE · 236 233 222</div></div></div>
+      <div class="chip"><div class="swatch" style="background:#14446C"><button class="copy" data-hex="#14446C">Copy</button></div><div class="info"><span class="role">Support</span><span class="name">Valmont blue</span><div class="hex code">#14446C · 20 68 108</div></div></div>
+      <div class="chip"><div class="swatch" style="background:#606678"><button class="copy" data-hex="#606678">Copy</button></div><div class="info"><span class="role">Body text</span><span class="name">Slate</span><div class="hex code">#606678 · 96 102 120</div></div></div>
+    </div>
+
+    <h3>Distribution</h3>
+    <div class="dist" role="img" aria-label="color distribution: 60 percent ground, 25 percent structure, 10 percent support, 5 percent action">
+      <div style="flex:60;background:var(--ivory);color:var(--navy)">60% ground</div>
+      <div style="flex:25;background:var(--navy);color:var(--ivory)">25% structure</div>
+      <div style="flex:10;background:var(--brandblue);color:var(--ivory)">10%</div>
+      <div style="flex:5;background:var(--copper);color:var(--navy)">5%</div>
+    </div>
+    <p style="font-size:13px;color:var(--slate-700);margin-top:8px">Roughly: ivory/paper ground · navy structure · slate/blue support · copper action.</p>
+
+    <h3>Ramps</h3>
+    <div class="ramp-row"><span class="ramp-name">Navy</span><div class="ramp"><div style="background:#06152F;color:#ECE9DE">900</div><div style="background:#0D2953;color:#ECE9DE">800</div><div style="background:#143467;color:#ECE9DE">700</div><div style="background:#1D447F;color:#ECE9DE">600</div><div style="background:#0A1F44;color:#ECE9DE">base</div></div></div>
+    <div class="ramp-row"><span class="ramp-name">Copper</span><div class="ramp"><div style="background:#9E4E11;color:#FBE6D1">700</div><div style="background:#D26E1C;color:#FBE6D1">600</div><div style="background:#E8822B;color:#0A1F44">base</div><div style="background:#F3B77C;color:#0A1F44">300</div><div style="background:#FBE6D1;color:#9E4E11">100</div><div style="background:#FEF6EE;color:#9E4E11">50</div></div></div>
+    <div class="ramp-row"><span class="ramp-name">Ivory</span><div class="ramp"><div style="background:#E3DFD1;color:#464B5B">200</div><div style="background:#ECE9DE;color:#464B5B">base</div><div style="background:#F2EFE6;color:#464B5B">100</div><div style="background:#F8F6F0;color:#464B5B">50</div></div></div>
+    <div class="ramp-row"><span class="ramp-name">Blue</span><div class="ramp"><div style="background:#0F3455;color:#ECE9DE">700</div><div style="background:#14446C;color:#ECE9DE">base</div><div style="background:#1B5688;color:#ECE9DE">600</div><div style="background:#BCD2E3;color:#0F3455">200</div><div style="background:#DBE7F0;color:#0F3455">100</div><div style="background:#EEF4F9;color:#0F3455">50</div></div></div>
+    <div class="ramp-row"><span class="ramp-name">Slate</span><div class="ramp"><div style="background:#464B5B;color:#ECE9DE">700</div><div style="background:#606678;color:#ECE9DE">base</div><div style="background:#767C8D;color:#0A1F44">500</div><div style="background:#8B90A0;color:#0A1F44">400</div><div style="background:#C9CCD5;color:#464B5B">200</div><div style="background:#E5E7EC;color:#464B5B">100</div></div></div>
+    <div class="ramp-row"><span class="ramp-name">Status</span><div class="ramp"><div style="background:#1F7A54;color:#ECE9DE">pass</div><div style="background:#E6F2EC;color:#17603F">pass-soft</div><div style="background:#B3392F;color:#ECE9DE">fail</div><div style="background:#FBECEB;color:#8F2B23">fail-soft</div><div style="background:#A2661A;color:#ECE9DE">attention</div></div></div>
+
+    <h3>Measured contrast</h3>
+    <table>
+      <thead><tr><th>Pair</th><th>Ratio</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>Navy on ivory</td><td class="code">13.37 : 1</td><td class="ok">AAA</td></tr>
+        <tr><td>Ivory on Valmont blue</td><td class="code">8.33 : 1</td><td class="ok">AAA</td></tr>
+        <tr><td>Slate-700 on ivory-50</td><td class="code">8.04 : 1</td><td class="ok">AAA</td></tr>
+        <tr><td>Copper on navy</td><td class="code">5.93 : 1</td><td class="ok">AA</td></tr>
+        <tr><td><b>Navy on copper</b> — primary buttons</td><td class="code">5.93 : 1</td><td class="ok">AA — required</td></tr>
+        <tr><td>Slate on ivory-50 — body text</td><td class="code">5.30 : 1</td><td class="ok">AA</td></tr>
+        <tr><td>White on copper</td><td class="code">&lt; 4.5 : 1</td><td class="bad">Fails — banned</td></tr>
+        <tr><td>Copper on white / ivory</td><td class="code">&lt; 3 : 1</td><td class="bad">Fails — banned</td></tr>
+      </tbody>
+    </table>
+    <ul style="font-size:14px;color:var(--slate-700)">
+      <li>Primary buttons are <b>navy text on copper</b> — never white on copper.</li>
+      <li>Copper text only on navy / navy-900 (6.63 : 1).</li>
+      <li>Focus rings are copper, on every interactive element — try tabbing through this page.</li>
+    </ul>
+  </section>
+
+  <!-- ================= TYPE ================= -->
+  <section id="type">
+    <div class="eyebrow"><span class="no">04</span><span class="rule"></span></div>
+    <h2>Typography</h2>
+    <p class="lead">Inter is the product voice; the drawn wordmark is the logo — they are not interchangeable. Weight 650 is the Valmont emphasis weight. Code, diffs, and telemetry are always monospace — always the real strings.</p>
+
+    <div class="card" style="margin-top:24px">
+      <div class="specimen"><span class="tag">Display · 56–72 · 650 · −1%</span><div class="sample" style="font-size:clamp(38px,6vw,64px);line-height:1.05;font-weight:650;letter-spacing:-0.01em">Nothing ships without you.</div></div>
+      <div class="specimen"><span class="tag">H1 · 40 · 650</span><div class="sample" style="font-size:34px;line-height:1.15;font-weight:650">Approval-first by design</div></div>
+      <div class="specimen"><span class="tag">H2 · 28 · 650</span><div class="sample" style="font-size:26px;line-height:1.25;font-weight:650">Plans grounded in your repository</div></div>
+      <div class="specimen"><span class="tag">Body · 16 · 400</span><div class="sample" style="font-size:16px;color:var(--slate-700)">Valmont reads your repository like an engineer, proposes a plan, waits for approval, and applies changes inside a restricted workspace.</div></div>
+      <div class="specimen"><span class="tag">Label · 14 · 650</span><div class="sample" style="font-size:14px;font-weight:650">Create pull request</div></div>
+      <div class="specimen"><span class="tag">Mono · 13 · 400</span><div class="sample mono" style="font-size:13px;color:var(--slate-700)">$ npm test → exit 1 · 3 failures in src/pay/ · branch <b style="color:var(--navy)">valmont/task-17</b></div></div>
+    </div>
+
+    <h3>Rules</h3>
+    <ul style="font-size:14px;color:var(--slate-700)">
+      <li>Sentence case everywhere — buttons and headings included.</li>
+      <li>Tabular numerals for IDs, counts, timings.</li>
+      <li>No italics in UI; never fake weights with transforms.</li>
+      <li>Fallback stack: <span class="code">Avenir Next, Segoe UI, Roboto, Helvetica, Arial</span>.</li>
+    </ul>
+  </section>
+
+  <!-- ================= VOICE ================= -->
+  <section id="voice">
+    <div class="eyebrow"><span class="no">05</span><span class="rule"></span></div>
+    <h2>Voice</h2>
+    <p class="lead">A senior engineer briefing a trusted colleague: precise, unhurried, honest about uncertainty. Say the true thing. Name the exact thing. Calm, not clever. Approval is a feature. No theater.</p>
+
+    <div class="grid g2" style="margin-top:24px">
+      <div class="voice-pair"><blockquote class="say"><span class="label">SAY</span>Plan ready for your review — 4 files, 2 commands.</blockquote><blockquote class="dont"><span class="label">DON'T</span>🎉 Your amazing plan is ready!!!</blockquote></div>
+      <div class="voice-pair"><blockquote class="say"><span class="label">SAY</span>Paused for your approval before writing code.</blockquote><blockquote class="dont"><span class="label">DON'T</span>Waiting on user input…</blockquote></div>
+      <div class="voice-pair"><blockquote class="say"><span class="label">SAY</span><span class="mono" style="font-size:13px">MODEL_API_KEY</span> is not set. Set it and retry.</blockquote><blockquote class="dont"><span class="label">DON'T</span>Something went wrong. Please try later.</blockquote></div>
+      <div class="voice-pair"><blockquote class="say"><span class="label">SAY</span>Pull request #42 created from <span class="mono" style="font-size:13px">valmont/task-17</span>.</blockquote><blockquote class="dont"><span class="label">DON'T</span>All done! You're welcome!</blockquote></div>
+      <div class="voice-pair"><blockquote class="say"><span class="label">SAY</span>I can't merge — merging is outside my boundaries.</blockquote><blockquote class="dont"><span class="label">DON'T</span>Sorry, I'm not allowed to do that :(</blockquote></div>
+      <div class="voice-pair"><blockquote class="say"><span class="label">SAY</span><span class="mono" style="font-size:13px">npm test</span> exited 1 — 3 failures in <span class="mono" style="font-size:13px">src/pay/</span>.</blockquote><blockquote class="dont"><span class="label">DON'T</span>Some tests failed.</blockquote></div>
+    </div>
+
+    <h3>Mechanics</h3>
+    <ul style="font-size:14px;color:var(--slate-700)">
+      <li>Errors follow the pattern: <b>what failed → why → the exact next step.</b></li>
+      <li>Present tense, active voice. Never blame the user; never apologize twice.</li>
+      <li>Banned words: <i>revolutionize, supercharge, unlock, seamlessly, game-changing</i>.</li>
+    </ul>
+  </section>
+
+  <!-- ================= IMAGERY ================= -->
+  <section id="imagery">
+    <div class="eyebrow"><span class="no">06</span><span class="rule"></span></div>
+    <h2>Imagery</h2>
+    <p class="lead"><b>Engineered calm.</b> Flat, editorial, matte. Geometry carries the meaning; negative space carries the confidence. The palette is locked — navy, ivory, copper, slate, and nothing else. No hoodies-and-holograms stock, no glowing brains, no circuit-board clichés.</p>
+
+    <div class="grid g2" style="margin-top:24px">
+      <figure class="imgcard" style="margin:0"><img src="poster.png" alt="Valmont brand poster: ivory V monogram with copper threshold on a navy field, Swiss grid layout" loading="lazy" /><figcaption><b>Campaign poster</b> — the V at architectural scale, Swiss grid, copper threshold. <span class="code">poster.png</span></figcaption></figure>
+      <figure class="imgcard" style="margin:0"><img src="approval-moment.png" alt="Flat illustration of a document panel with a copper approval button ringed by an ivory focus circle" loading="lazy" /><figcaption><b>The approval moment</b> — illustration style for product storytelling. <span class="code">approval-moment.png</span></figcaption></figure>
+      <figure class="imgcard" style="margin:0"><img src="application.png" alt="Overhead studio photograph of navy and ivory stationery with copper seal" loading="lazy" /><figcaption><b>Stationery direction</b> — overhead studio light, linen, real objects. <span class="code">application.png</span></figcaption></figure>
+      <figure class="imgcard" style="margin:0"><img src="pattern.png" alt="Repeating chevron and threshold-line pattern in navy, ivory, copper, and slate" loading="lazy" /><figcaption><b>Chevron repeat</b> — wraps, endpapers, reverse-side texture. <span class="code">pattern.png</span></figcaption></figure>
+    </div>
+  </section>
+
+  <!-- ================= APPLICATIONS ================= -->
+  <section id="apply">
+    <div class="eyebrow"><span class="no">07</span><span class="rule"></span></div>
+    <h2>Applications &amp; governance</h2>
+    <div class="grid g2" style="margin-top:20px">
+      <div class="card"><h4 style="margin:0 0 8px;font-weight:650">Product UI</h4><p style="margin:0;font-size:14px;color:var(--slate-700)">Tokens come from <span class="code">@theme</span> in <span class="code">globals.css</span>. Copper marks every approval gate — scan for copper to find every decision point.</p></div>
+      <div class="card"><h4 style="margin:0 0 8px;font-weight:650">Pull requests</h4><p style="margin:0;font-size:14px;color:var(--slate-700)">Always from <span class="code">valmont/*</span> branches. Copy states what changed, what ran, and what needs approval.</p></div>
+      <div class="card"><h4 style="margin:0 0 8px;font-weight:650">Docs &amp; README</h4><p style="margin:0;font-size:14px;color:var(--slate-700)">Ivory ground, navy headings, copper reserved for warnings that gate action.</p></div>
+      <div class="card"><h4 style="margin:0 0 8px;font-weight:650">Social &amp; email</h4><p style="margin:0;font-size:14px;color:var(--slate-700)">Avatar: the tile, never the lockup. Email: navy band with reverse lockup, one copper action per email.</p></div>
+    </div>
+
+    <h3>Governance</h3>
+    <ul style="font-size:14px;color:var(--slate-700)">
+      <li>Exact values live in code: <span class="code">src/app/globals.css</span>. Logo geometry lives in <span class="code">docs/brand/*.svg</span> and nowhere else.</li>
+      <li>Changes to palette, mark, or voice require brand-owner review and a version bump in <span class="code">docs/BRAND.md</span>.</li>
+      <li>If a situation isn't covered, apply the test at the top of this page: <b>does it ship without you?</b> If yes, it isn't Valmont.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span><b style="color:var(--navy)">Valmont Agent</b> · Brand identity v1.0 · September 2026</span>
+    <span>Guidelines: <span class="code">docs/BRAND.md</span> · Assets: <span class="code">docs/brand/</span></span>
+  </footer>
+</main>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+  const toast = document.getElementById('toast');
+  let toastTimer;
+  function showToast(msg) {
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove('show'), 1400);
+  }
+  document.querySelectorAll('.copy').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const hex = btn.dataset.hex;
+      const done = () => showToast(hex + ' copied');
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(hex).then(done).catch(done);
+      } else { done(); }
+    });
+  });
+</script>
+</body>
+</html>
