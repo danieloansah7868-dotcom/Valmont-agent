@@ -261,4 +261,22 @@ describe("SqliteOrdersStore", () => {
     );
     expect(created.merchantNote).toBe("No onions please");
   });
+
+  it("stores recipientPhone for bundle orders and reads it back", async () => {
+    const created = await store.create(
+      newOrder({ recipientPhone: "0240000001", customerPhone: "0200000002" }),
+    );
+    expect(created.recipientPhone).toBe("0240000001");
+    expect(created.customerPhone).toBe("0200000002");
+    const fetched = await store.getByAccessCode(created.accessCode);
+    expect(fetched?.recipientPhone).toBe("0240000001");
+    expect(fetched?.customerPhone).toBe("0200000002");
+  });
+
+  it("allows old orders without recipientPhone (NULL)", async () => {
+    const created = await store.create(newOrder());
+    expect(created.recipientPhone).toBeUndefined();
+    const fetched = await store.getByAccessCode(created.accessCode);
+    expect(fetched?.recipientPhone).toBeUndefined();
+  });
 });

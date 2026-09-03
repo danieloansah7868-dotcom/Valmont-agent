@@ -57,14 +57,21 @@ npm run db:verify         # read-only — validates ledger membership against jo
 - `db:migrate` — controlled runner: requires `DATABASE_URL` with a generic safe error if missing (no leak), takes an advisory transaction lock (`72707369`), ensures `drizzle` schema and `__drizzle_migrations` table exist, loads manifest, validates journal, fetches ledger, **fails closed** on `unexpected` ledger rows (unknown hash), `altered` hashes/timestamps, or duplicate hashes/timestamps, applies **only missing** migrations in journal order splitting on `-->` statement-breakpoint, inserts ledger rows with hash and journal `when`, then re-verifies ledger.
 - `db:verify` — read-only: attempts advisory lock (fails open for read), loads manifest, fetches ledger, verifies exact membership by hash+`created_at`, reports missing/unexpected/altered/duplicate.
 
-**Migration `0010_order_payment_mode_domain_verification`** (this release) adds
+**Migration `0010_order_payment_mode_domain_verification`** adds
 `studio_orders.payment_mode` (`test` | `live`, default `live` for rows that
 predate it — they were only ever created by real checkouts) and the
 `verification_token` / `verified_at` / `last_checked_at` columns on
-`studio_domains`. Until it is applied, `/api/health` reports
-`migrations.status: incomplete` and the app answers 503; every existing custom
-domain becomes `pending` after the deploy and must be re-verified once with the
-new TXT record (see [Custom domains](#custom-domains-ownership-proof)).
+`studio_domains`.
+
+**Migration `0011_order_recipient_phone`** (this release) adds
+`studio_orders.recipient_phone` (`text`, nullable — old orders keep NULL).
+It stores the Ghana-mobile number that should receive the data bundle, while
+`customer_phone` remains the buyer's contact (or the recipient again when the
+buyer field is blank). SQLite upgrades via `ensureColumn(..., "recipient_phone", "TEXT")`
+so existing `.data/*.sqlite` files gain the column on next access. Until the
+migration is applied, `/api/health` reports `migrations.status: incomplete`
+and the app answers 503. Run `npm run db:verify:local && npm run db:migrate && npm run db:verify`
+from a controlled job as described above.
 
 **Why not timestamp ordering:**
 

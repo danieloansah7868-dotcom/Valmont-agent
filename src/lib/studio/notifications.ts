@@ -23,6 +23,7 @@ export function orderAlertText(
     `New order at ${brief.businessName}`,
     `Ref ${order.id.slice(0, 8)} · ${total}`,
     `${order.customerName} · ${order.customerPhone}`,
+    order.recipientPhone ? `Send to: ${order.recipientPhone}` : null,
     linesSummary(order),
     order.customerAddress ? `Deliver to: ${order.customerAddress}` : null,
     order.merchantNote ? `Note: ${order.merchantNote}` : null,
@@ -51,6 +52,11 @@ export function orderAlertHtml(
   <p>${escapeHtml(order.customerName)} · ${escapeHtml(order.customerPhone)}${
     order.customerEmail ? ` · ${escapeHtml(order.customerEmail)}` : ""
   }</p>
+  ${
+    order.recipientPhone
+      ? `<p>Send to: ${escapeHtml(order.recipientPhone)}</p>`
+      : ""
+  }
   ${
     order.customerAddress
       ? `<p>Deliver to: ${escapeHtml(order.customerAddress)}</p>`

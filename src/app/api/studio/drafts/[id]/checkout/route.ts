@@ -45,7 +45,8 @@ const checkoutSchema = z.object({
     .min(1, "Your basket is empty.")
     .max(100),
   customerName: z.string().trim().min(1).max(120),
-  customerPhone: z.string().trim().min(6).max(30),
+  customerPhone: z.string().trim().max(30).optional().or(z.literal("")),
+  recipientPhone: z.string().trim().max(30).optional().or(z.literal("")),
   customerEmail: z.string().email().max(254).optional().or(z.literal("")),
   customerAddress: z.string().trim().max(500).optional().or(z.literal("")),
   paymentMethod: z.string().max(30),
@@ -108,14 +109,58 @@ export async function POST(
     // Ghana mobile validation for data-bundles sites: 02x/05x only, saved as 0240000001, landline 030 refused
     // Uses single explainer from bundles.ts — no duplicated regexes.
     const isBundleSite = draft.brief.category === "data-bundles";
-    let normalizedPhone = payload.customerPhone.trim();
+    let normalizedPhone = (payload.customerPhone ?? "").trim();
+    let normalizedRecipient: string | undefined;
+
+    // Bundle shops are online-only: only valmont_pay, no delivery
     if (isBundleSite) {
-      const validationError = validateGhanaMobile(payload.customerPhone);
-      if (validationError) {
-        return NextResponse.json({ error: validationError }, { status: 400 });
+      if (payload.paymentMethod !== "valmont_pay") {
+        return NextResponse.json(
+          { error: "This shop accepts only online payments." },
+          { status: 400 },
+        );
       }
-      const norm = normalizeGhanaMobile(payload.customerPhone);
-      if (norm) normalizedPhone = norm;
+      if (draft.brief.payments.delivery.enabled) {
+        return NextResponse.json(
+          { error: "Delivery is not available for data bundle shops." },
+          { status: 400 },
+        );
+      }
+      const recipientRaw = (payload.recipientPhone ?? "").trim();
+      if (!recipientRaw) {
+        return NextResponse.json(
+          { error: "Recipient phone number is required." },
+          { status: 400 },
+        );
+      }
+      const recipientError = validateGhanaMobile(recipientRaw);
+      if (recipientError) {
+        return NextResponse.json({ error: recipientError }, { status: 400 });
+      }
+      const normRecipient = normalizeGhanaMobile(recipientRaw);
+      normalizedRecipient = normRecipient ?? recipientRaw;
+      // customerPhone is the buyer's contact, optional — fallback to recipient
+      if (!normalizedPhone) {
+        normalizedPhone = normalizedRecipient;
+      } else {
+        // If buyer provided a phone, validate it too (but allow any format? keep Ghana check)
+        const buyerErr = validateGhanaMobile(normalizedPhone);
+        if (buyerErr) {
+          // For bundle shops, buyer contact should also be Ghana mobile if provided, but we allow fallback
+          // To keep UX simple, still enforce Ghana mobile for buyer when given
+          return NextResponse.json({ error: buyerErr }, { status: 400 });
+        }
+        const normBuyer = normalizeGhanaMobile(normalizedPhone);
+        if (normBuyer) normalizedPhone = normBuyer;
+      }
+    } else {
+      // Non-bundle shops: customerPhone required
+      if (!normalizedPhone) {
+        return NextResponse.json(
+          { error: "Phone number is required." },
+          { status: 400 },
+        );
+      }
     }
 
     // Re-price every line from the server-side catalogue. A line whose item is
@@ -229,6 +274,7 @@ export async function POST(
       lines,
       customerName: payload.customerName,
       customerPhone: normalizedPhone,
+      recipientPhone: normalizedRecipient,
       customerEmail: orderCustomerEmail,
       customerAddress: payload.customerAddress || undefined,
       customerAccountId,

@@ -396,6 +396,7 @@ export const studioOrders = pgTable(
     linesJson: jsonb("lines_json").notNull(),
     customerName: text("customer_name").notNull(),
     customerPhone: text("customer_phone").notNull(),
+    recipientPhone: text("recipient_phone"),
     customerEmail: text("customer_email"),
     customerAddress: text("customer_address"),
     customerAccountId: uuid("customer_account_id").references(
