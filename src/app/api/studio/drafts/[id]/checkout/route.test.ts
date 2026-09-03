@@ -1,129 +1,786 @@
-/**
- * Checkout HTTP route — Stage 4 live-money guard for bundle shops.
- *
- * A data-bundles order paid with REAL money must be deliverable
- * automatically; until a live delivery provider is connected (Stage 5) such
- * a checkout is refused with 409 before any order row exists. Test-mode
- * checkout is unaffected.
- */
 import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { POST } from "@/app/api/studio/drafts/[id]/checkout/route";
-import { resetRateLimitForTests } from "@/lib/security";
 
 const mocks = vi.hoisted(() => ({
+  assertApiRateLimit: vi.fn(),
+  assertSameOrigin: vi.fn(),
   internalGetDraftForCheckout: vi.fn(),
-  create: vi.fn(),
-  onlinePaymentAvailability: vi.fn(),
-  createPaymentLink: vi.fn(),
-  bundleDeliveryAvailability: vi.fn(),
-  notifyMerchantNewOrder: vi.fn(),
   getCustomerSession: vi.fn(),
+  create: vi.fn(),
+  getOrdersStore: vi.fn(),
+  computeTotals: vi.fn(),
+  createPaymentLink: vi.fn(),
+  onlinePaymentAvailability: vi.fn(),
+  notifyMerchantNewOrder: vi.fn(),
+  bundleDeliveryAvailability: vi.fn(),
+}));
+
+vi.mock("@/lib/api", () => ({
+  assertApiRateLimit: mocks.assertApiRateLimit,
+  safeApiError: (error: unknown) => {
+    throw error;
+  },
+}));
+
+vi.mock("@/lib/security", () => ({
+  assertSameOrigin: mocks.assertSameOrigin,
 }));
 
 vi.mock("@/lib/studio/draft-public", () => ({
   internalGetDraftForCheckout: mocks.internalGetDraftForCheckout,
 }));
 
-vi.mock("@/lib/studio/orders", () => ({
-  getOrdersStore: () => ({ create: mocks.create }),
+vi.mock("@/lib/customer-auth", () => ({
+  getCustomerSession: mocks.getCustomerSession,
 }));
 
-vi.mock("@/lib/studio/valmont-pay", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("@/lib/studio/valmont-pay")>();
-  return {
-    ...actual,
-    onlinePaymentAvailability: mocks.onlinePaymentAvailability,
-    createPaymentLink: mocks.createPaymentLink,
-  };
-});
+vi.mock("@/lib/studio/orders", () => ({
+  getOrdersStore: mocks.getOrdersStore,
+}));
 
-vi.mock("@/lib/studio/bundle-delivery", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("@/lib/studio/bundle-delivery")>();
-  return {
-    ...actual,
-    bundleDeliveryAvailability: mocks.bundleDeliveryAvailability,
-  };
-});
+vi.mock("@/lib/studio/valmont-pay", () => ({
+  computeTotals: mocks.computeTotals,
+  createPaymentLink: mocks.createPaymentLink,
+  onlinePaymentAvailability: mocks.onlinePaymentAvailability,
+  ONLINE_PAYMENT_UNAVAILABLE_MESSAGE:
+    "Online payment is temporarily unavailable for this shop. Please choose another payment method or try again later.",
+}));
+
+vi.mock("@/lib/studio/bundle-delivery", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/studio/bundle-delivery")>()),
+  bundleDeliveryAvailability: mocks.bundleDeliveryAvailability,
+}));
 
 vi.mock("@/lib/studio/notifications", () => ({
   notifyMerchantNewOrder: mocks.notifyMerchantNewOrder,
 }));
 
-vi.mock("@/lib/customer-auth", () => ({
-  getCustomerSession: mocks.getCustomerSession,
-}));
-
-const draftId = "draft-checkout-guard";
-const bundleDraft = {
+const draftId = "11111111-2222-4333-8444-555555555555";
+const account = {
+  id: "account-1",
+  email: "Ama@Example.com",
+};
+const draft = {
   id: draftId,
   ownerId: "owner-1",
   brief: {
-    businessName: "Guard Bundles",
-    category: "data-bundles",
+    businessName: "Akwaaba Bites",
     currency: "GHS",
-    items: [
-      {
-        id: "b1",
-        name: "MTN 1GB",
-        price: 10,
-        bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
-      },
-    ],
+    items: [{ id: "item-1", name: "Jollof Rice", price: 25 }],
     payments: {
       enabled: true,
-      methods: ["valmont_pay"],
-      valmontPay: { provisioned: false },
-      delivery: { enabled: false, fee: 0, minimumOrder: 0 },
-      notifications: {},
-      staged: { enabled: false, stages: [] },
+      methods: ["cod"],
+      delivery: {
+        enabled: false,
+        fee: 0,
+        minimumOrder: 0,
+        freeDeliveryAbove: 0,
+      },
     },
-    features: { customerAccounts: false },
+    features: { customerAccounts: true },
   },
 };
+/** Identical website, but with the customer-accounts feature left off. */
+const guestOnlyDraft = {
+  ...draft,
+  brief: { ...draft.brief, features: { customerAccounts: false } },
+};
+const createdOrder = {
+  id: "22222222-3333-4444-8555-666666666666",
+  status: "cod_pending",
+};
 
-function request() {
+function request(
+  customerEmail?: string,
+  options: { paymentMethod?: string; url?: string; host?: string } = {},
+) {
   return new NextRequest(
-    `http://localhost/api/studio/drafts/${draftId}/checkout`,
+    options.url ?? `http://localhost/api/studio/drafts/${draftId}/checkout`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(options.host ? { host: options.host } : {}),
+      },
       body: JSON.stringify({
-        lines: [{ itemId: "b1", quantity: 1 }],
-        customerName: "Kwame Buyer",
-        recipientPhone: "0240000001",
-        customerPhone: "0200000002",
-        paymentMethod: "valmont_pay",
+        lines: [{ itemId: "item-1", quantity: 1 }],
+        customerName: "Ama Mensah",
+        customerPhone: "+233240000000",
+        customerEmail,
+        paymentMethod: options.paymentMethod ?? "cod",
+        customerAddress: "12 Independence Avenue",
       }),
     },
   );
 }
 
+/** The same shop with Valmont Pay switched on beside cash on delivery. */
+const onlineDraft = {
+  ...draft,
+  brief: {
+    ...draft.brief,
+    payments: { ...draft.brief.payments, methods: ["cod", "valmont_pay"] },
+  },
+};
+
 function params() {
   return { params: Promise.resolve({ id: draftId }) };
 }
 
-describe("bundle checkout live-money guard", () => {
+describe("checkout customer account linking", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    resetRateLimitForTests();
+    vi.unstubAllEnvs();
     vi.stubEnv("APP_URL", "https://shop.example");
-    mocks.internalGetDraftForCheckout.mockResolvedValue(bundleDraft);
-    mocks.getCustomerSession.mockResolvedValue(null);
-    mocks.bundleDeliveryAvailability.mockReturnValue({
-      provider: "simulator",
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "/pay/simulated",
       live: false,
     });
-    mocks.create.mockResolvedValue({ id: "order-1", status: "pending" });
+    mocks.internalGetDraftForCheckout.mockResolvedValue(draft);
+    mocks.getCustomerSession.mockResolvedValue({
+      account,
+      token: "session-token",
+      expiresAt: "2026-09-25T00:00:00.000Z",
+    });
+    mocks.getOrdersStore.mockReturnValue({ create: mocks.create });
+    mocks.computeTotals.mockReturnValue({
+      subtotal: 25,
+      deliveryFee: 0,
+      total: 25,
+    });
+    mocks.create.mockResolvedValue(createdOrder);
+    mocks.notifyMerchantNewOrder.mockResolvedValue({
+      email: "skipped",
+      whatsapp: "skipped",
+    });
+  });
+
+  it("stores the signed-in account email and links a blank-email checkout", async () => {
+    const response = await POST(request(""), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customerEmail: account.email,
+        customerAccountId: account.id,
+      }),
+    );
+  });
+
+  it("links checkout when the submitted email matches the account", async () => {
+    const response = await POST(request("AMA@EXAMPLE.COM"), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customerEmail: account.email,
+        customerAccountId: account.id,
+      }),
+    );
+  });
+
+  it("keeps a mismatched submitted email as a guest order", async () => {
+    const response = await POST(request("different@example.com"), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customerEmail: "different@example.com",
+        customerAccountId: undefined,
+      }),
+    );
+  });
+
+  it("never reads a customer session on a website with accounts off", async () => {
+    mocks.internalGetDraftForCheckout.mockResolvedValue(guestOnlyDraft);
+
+    const response = await POST(request(""), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.getCustomerSession).not.toHaveBeenCalled();
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ customerAccountId: undefined }),
+    );
+  });
+});
+
+describe("checkout payment rail", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
+    mocks.internalGetDraftForCheckout.mockResolvedValue(onlineDraft);
+    mocks.getCustomerSession.mockResolvedValue(null);
+    mocks.getOrdersStore.mockReturnValue({ create: mocks.create });
+    mocks.computeTotals.mockReturnValue({
+      subtotal: 25,
+      deliveryFee: 0,
+      total: 25,
+    });
+    mocks.create.mockResolvedValue({ ...createdOrder, status: "pending" });
     mocks.createPaymentLink.mockResolvedValue({
-      paymentLink: "/pay/code-1",
+      paymentLink: "/pay/simulated",
       live: false,
     });
     mocks.notifyMerchantNewOrder.mockResolvedValue({
       email: "skipped",
       whatsapp: "skipped",
+    });
+  });
+
+  it("stamps an online order with the test rail while the simulator is active", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+
+    const response = await POST(
+      request("", { paymentMethod: "valmont_pay" }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMode: "test" }),
+    );
+  });
+
+  it("stamps an online order as live once Valmont Pay is fully configured", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "live",
+    });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "https://pay.example/l/abc",
+      live: true,
+    });
+
+    const response = await POST(
+      request("", { paymentMethod: "valmont_pay" }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMode: "live" }),
+    );
+  });
+
+  it("keeps cash-on-delivery orders live even while online payment is in test mode", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+
+    const response = await POST(request(""), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMethod: "cod", paymentMode: "live" }),
+    );
+    expect(mocks.createPaymentLink).not.toHaveBeenCalled();
+  });
+
+  it("refuses online payment — before creating an order — when Live is selected but incomplete", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: false,
+      mode: "live",
+      reason: "webhook secret missing",
+    });
+
+    const response = await POST(
+      request("", { paymentMethod: "valmont_pay" }),
+      params(),
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: expect.stringContaining(
+        "Online payment is temporarily unavailable",
+      ),
+    });
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.createPaymentLink).not.toHaveBeenCalled();
+    expect(mocks.notifyMerchantNewOrder).not.toHaveBeenCalled();
+  });
+
+  it("still accepts cash on delivery while Live is selected but incomplete", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: false,
+      mode: "live",
+    });
+
+    const response = await POST(request(""), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMethod: "cod", paymentMode: "live" }),
+    );
+  });
+
+  it("builds the merchant link and Valmont Pay callback from APP_URL, not the request host", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "live",
+    });
+
+    const response = await POST(
+      request("", {
+        paymentMethod: "valmont_pay",
+        url: `http://0.0.0.0:3000/api/studio/drafts/${draftId}/checkout`,
+        host: "attacker.example",
+      }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.notifyMerchantNewOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ origin: "https://shop.example" }),
+    );
+    const call = mocks.createPaymentLink.mock.calls[0]?.[0] as {
+      callbackUrl: string;
+    };
+    expect(call.callbackUrl).toMatch(
+      /^https:\/\/shop\.example\/api\/payments\/webhook\?access_code=[0-9a-f]{32}$/,
+    );
+  });
+});
+
+describe("checkout data-bundles Ghana mobile validation", () => {
+  const bundleDraft = {
+    ...draft,
+    brief: {
+      ...draft.brief,
+      category: "data-bundles",
+      businessName: "Ghana Bundles Shop",
+      items: [
+        {
+          id: "bundle-00",
+          name: "MTN 1GB",
+          price: 10,
+          category: "mtn",
+          bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: {
+          enabled: false,
+          fee: 0,
+          minimumOrder: 0,
+          freeDeliveryAbove: 0,
+        },
+      },
+    },
+  };
+
+  function bundleRequest(
+    recipientPhone: string,
+    customerPhone?: string,
+    paymentMethod = "valmont_pay",
+  ) {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "bundle-00", quantity: 1 }],
+          customerName: "Kwame Buyer",
+          recipientPhone,
+          customerPhone: customerPhone ?? "",
+          paymentMethod,
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+    mocks.bundleDeliveryAvailability.mockReturnValue({
+      provider: "simulator",
+      live: false,
+    });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "/pay/simulated",
+      live: false,
+    });
+    mocks.internalGetDraftForCheckout.mockResolvedValue(bundleDraft);
+    mocks.getCustomerSession.mockResolvedValue(null);
+    mocks.getOrdersStore.mockReturnValue({ create: mocks.create });
+    mocks.computeTotals.mockReturnValue({
+      subtotal: 10,
+      deliveryFee: 0,
+      total: 10,
+    });
+    mocks.create.mockResolvedValue({ ...createdOrder, status: "pending" });
+    mocks.notifyMerchantNewOrder.mockResolvedValue({
+      email: "skipped",
+      whatsapp: "skipped",
+    });
+  });
+
+  it("accepts +233 24 000 0001 and normalizes to 0240000001 with payment link", async () => {
+    const response = await POST(bundleRequest("+233 24 000 0001"), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientPhone: "0240000001",
+        customerPhone: "0240000001",
+      }),
+    );
+    expect(mocks.createPaymentLink).toHaveBeenCalledWith(
+      expect.objectContaining({ customerPhone: "0240000001" }),
+    );
+  });
+
+  it("stores buyer number separately when given", async () => {
+    const response = await POST(
+      bundleRequest("0240000001", "0200000002"),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientPhone: "0240000001",
+        customerPhone: "0200000002",
+      }),
+    );
+  });
+
+  it("falls back customerPhone to recipient when buyer blank", async () => {
+    const response = await POST(bundleRequest("0240000001", ""), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientPhone: "0240000001",
+        customerPhone: "0240000001",
+      }),
+    );
+  });
+
+  it.each(["030 123 4567", "+44 7700 900123", "02412345"])(
+    "rejects %s with 400 and never creates order",
+    async (badPhone) => {
+      const response = await POST(bundleRequest(badPhone), params());
+
+      expect(response.status).toBe(400);
+      expect(mocks.create).not.toHaveBeenCalled();
+      expect(mocks.createPaymentLink).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects missing recipient phone with 400", async () => {
+    const response = await POST(bundleRequest(""), params());
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects cod on bundle shop with 400", async () => {
+    const response = await POST(
+      bundleRequest("0240000001", "", "cod"),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("accepts landline 0301234567 for non-bundle shop (unchanged)", async () => {
+    mocks.internalGetDraftForCheckout.mockResolvedValue(draft);
+    const req = new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "item-1", quantity: 1 }],
+          customerName: "Ama Mensah",
+          customerPhone: "0301234567",
+          paymentMethod: "cod",
+          customerAddress: "12 Independence Avenue",
+        }),
+      },
+    );
+    const response = await POST(req, params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalled();
+  });
+});
+
+/**
+ * The customerPhone field went optional so a bundle shop can leave the buyer
+ * contact blank. Every other shop type must keep the rule it always had: a
+ * phone number is required and at least 6 characters.
+ */
+describe("checkout non-bundle phone floor", () => {
+  function shopRequest(customerPhone: string) {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "item-1", quantity: 1 }],
+          customerName: "Ama Mensah",
+          customerPhone,
+          paymentMethod: "cod",
+          customerAddress: "12 Independence Avenue",
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.internalGetDraftForCheckout.mockResolvedValue(draft);
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: false,
+      mode: "live",
+    });
+  });
+
+  it("rejects a too-short number with 400 and never creates an order", async () => {
+    const response = await POST(shopRequest("12345"), params());
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("still rejects a blank number with 400", async () => {
+    const response = await POST(shopRequest(""), params());
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it.each(["0301234567", "+233240000000", "123456"])(
+    "accepts %s with 200",
+    async (phone) => {
+      const response = await POST(shopRequest(phone), params());
+
+      expect(response.status).toBe(200);
+      expect(mocks.create).toHaveBeenCalledWith(
+        expect.objectContaining({ customerPhone: phone }),
+      );
+    },
+  );
+});
+
+/**
+ * Bundle buyers are often in the diaspora paying for family in Ghana, so the
+ * buyer's own contact number may be from any country. The recipient — the
+ * number the bundle is actually delivered to — stays Ghana-mobile-only.
+ */
+describe("checkout bundle buyer contact accepts any country", () => {
+  const bundleDraft = {
+    ...draft,
+    brief: {
+      ...draft.brief,
+      category: "data-bundles",
+      businessName: "Ghana Bundles Shop",
+      items: [
+        {
+          id: "bundle-00",
+          name: "MTN 1GB",
+          price: 10,
+          category: "mtn",
+          bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: {
+          enabled: false,
+          fee: 0,
+          minimumOrder: 0,
+          freeDeliveryAbove: 0,
+        },
+      },
+    },
+  };
+
+  function bundleRequest(body: Record<string, unknown>) {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "bundle-00", quantity: 1 }],
+          customerName: "Ama Diaspora",
+          paymentMethod: "valmont_pay",
+          ...body,
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.internalGetDraftForCheckout.mockResolvedValue(bundleDraft);
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+    // These run in payment mode "test", so the Stage 4 live-money guard is
+    // never reached; the default keeps any future mode change honest.
+    mocks.bundleDeliveryAvailability.mockReturnValue({
+      provider: "simulator",
+      live: false,
+    });
+  });
+
+  it("accepts a UK number as the BUYER contact with 200", async () => {
+    const response = await POST(
+      bundleRequest({
+        recipientPhone: "0240000001",
+        customerPhone: "+44 7700 900123",
+      }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientPhone: "0240000001",
+        customerPhone: "+44 7700 900123",
+      }),
+    );
+  });
+
+  it("rejects the same UK number as the RECIPIENT with 400", async () => {
+    const response = await POST(
+      bundleRequest({ recipientPhone: "+44 7700 900123" }),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("normalises a Ghana mobile buyer to 0240000001", async () => {
+    const response = await POST(
+      bundleRequest({
+        recipientPhone: "0240000001",
+        customerPhone: "+233240000001",
+      }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ customerPhone: "0240000001" }),
+    );
+  });
+
+  it("rejects a too-short buyer contact with 400", async () => {
+    const response = await POST(
+      bundleRequest({ recipientPhone: "0240000001", customerPhone: "12345" }),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Stage 4 live-money guard: a data-bundles order paid with REAL money must
+ * be deliverable automatically; until a live delivery provider is connected
+ * (Stage 5) such a checkout is refused with 409 before any order row exists.
+ * Test-mode checkout is unaffected: the simulated payment pairs with the
+ * simulated delivery engine.
+ */
+describe("bundle checkout live-money guard", () => {
+  const bundleDraft = {
+    ...draft,
+    brief: {
+      ...draft.brief,
+      category: "data-bundles",
+      businessName: "Guard Bundles Shop",
+      items: [
+        {
+          id: "bundle-00",
+          name: "MTN 1GB",
+          price: 10,
+          category: "mtn",
+          bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: {
+          enabled: false,
+          fee: 0,
+          minimumOrder: 0,
+          freeDeliveryAbove: 0,
+        },
+      },
+    },
+  };
+
+  function guardRequest() {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "bundle-00", quantity: 1 }],
+          customerName: "Kwame Buyer",
+          recipientPhone: "0240000001",
+          customerPhone: "0200000002",
+          paymentMethod: "valmont_pay",
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
+    mocks.internalGetDraftForCheckout.mockResolvedValue(bundleDraft);
+    mocks.getCustomerSession.mockResolvedValue(null);
+    mocks.getOrdersStore.mockReturnValue({ create: mocks.create });
+    mocks.computeTotals.mockReturnValue({
+      subtotal: 10,
+      deliveryFee: 0,
+      total: 10,
+    });
+    mocks.create.mockResolvedValue({ ...createdOrder, status: "pending" });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "/pay/simulated",
+      live: false,
+    });
+    mocks.notifyMerchantNewOrder.mockResolvedValue({
+      email: "skipped",
+      whatsapp: "skipped",
+    });
+    // Nothing connected today can deliver for real (Stage 5 stub pending).
+    mocks.bundleDeliveryAvailability.mockReturnValue({
+      provider: "simulator",
+      live: false,
     });
   });
 
@@ -133,7 +790,7 @@ describe("bundle checkout live-money guard", () => {
       mode: "live",
     });
 
-    const response = await POST(request(), params());
+    const response = await POST(guardRequest(), params());
 
     expect(response.status).toBe(409);
     await expect(response.json()).resolves.toEqual({
@@ -151,7 +808,7 @@ describe("bundle checkout live-money guard", () => {
       mode: "test",
     });
 
-    const response = await POST(request(), params());
+    const response = await POST(guardRequest(), params());
 
     expect(response.status).toBe(200);
     expect(mocks.create).toHaveBeenCalledWith(
@@ -161,7 +818,7 @@ describe("bundle checkout live-money guard", () => {
       }),
     );
     const body = await response.json();
-    expect(body).toMatchObject({ orderId: "order-1", status: "pending" });
+    expect(body).toMatchObject({ orderId: createdOrder.id, status: "pending" });
   });
 
   it("still refuses online checkout when the payment rail itself is misconfigured", async () => {
@@ -171,7 +828,7 @@ describe("bundle checkout live-money guard", () => {
       reason: "Live mode is selected but keys are missing.",
     });
 
-    const response = await POST(request(), params());
+    const response = await POST(guardRequest(), params());
 
     expect(response.status).toBe(409);
     expect(mocks.create).not.toHaveBeenCalled();

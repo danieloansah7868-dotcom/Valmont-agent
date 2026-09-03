@@ -90,8 +90,21 @@ live):**
   Stage 5 "provisioned" flag on TechChief flipped only when a live key is
   confirmed by a probe call — that is the moment
   `bundleDeliveryAvailability().live` may return true.
+- Cap units per bundle order at checkout (e.g. max 10 per line, 20 per
+  order) and cap the rows processed per recheck pass — per-unit rows ×
+  quantity 999 × 100 lines would otherwise mean ~100k provider calls on a
+  single guest page load.
+- Show the same masked aggregate line on the customer-account order page
+  (it currently gets the full owner-style view or nothing — the guest
+  summary is the nice middle ground).
 
 Stage 6: analytics, rate-limits, fraud checks, documentation polish.
+
+**Review rules (from the Stage 4 review):**
+
+- Never delete or rewrite existing tests to make room for new ones; if a
+  mock setup conflicts, add a new describe block or a new `*.test.ts` file
+  beside it.
 
 ---
 
