@@ -174,6 +174,15 @@ test.describe("data-bundles shop", () => {
     if (!match?.[1]) throw new Error("Checkout did not return an order link");
     const orderId = decodeURIComponent(match[1]);
 
+    // The guest confirmation page needs no login, so it must never print a
+    // full number: the recipient is masked and the buyer's contact is absent.
+    await page.goto(`/orders/${orderId}/confirmed`);
+    await expect(page.getByText(/Send to/)).toBeVisible();
+    await expect(page.getByText("024 ••• 0001")).toBeVisible();
+    await expect(page.getByText("0240000001")).toHaveCount(0);
+    await expect(page.getByText("0200000002")).toHaveCount(0);
+    await expect(page.getByText(/Contact:/)).toHaveCount(0);
+
     await page.goto(`/studio/orders/${orderId}`);
     await expect(
       page.getByRole("heading", {
@@ -181,7 +190,8 @@ test.describe("data-bundles shop", () => {
       }),
     ).toBeVisible();
     await expect(page.getByText(firstBundle.name)).toBeVisible();
-    // Recipient shown as Send to, buyer as Phone
+    // The owner's own page keeps the full numbers: recipient as Send to, buyer
+    // as Phone.
     await expect(page.getByText("0240000001")).toBeVisible();
     await expect(page.getByText(/Send to/)).toBeVisible();
     await expect(page.getByText("0200000002")).toBeVisible();

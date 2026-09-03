@@ -514,3 +514,175 @@ describe("checkout data-bundles Ghana mobile validation", () => {
     expect(mocks.create).toHaveBeenCalled();
   });
 });
+
+/**
+ * The customerPhone field went optional so a bundle shop can leave the buyer
+ * contact blank. Every other shop type must keep the rule it always had: a
+ * phone number is required and at least 6 characters.
+ */
+describe("checkout non-bundle phone floor", () => {
+  function shopRequest(customerPhone: string) {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "item-1", quantity: 1 }],
+          customerName: "Ama Mensah",
+          customerPhone,
+          paymentMethod: "cod",
+          customerAddress: "12 Independence Avenue",
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.internalGetDraftForCheckout.mockResolvedValue(draft);
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: false,
+      mode: "live",
+    });
+  });
+
+  it("rejects a too-short number with 400 and never creates an order", async () => {
+    const response = await POST(shopRequest("12345"), params());
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("still rejects a blank number with 400", async () => {
+    const response = await POST(shopRequest(""), params());
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it.each(["0301234567", "+233240000000", "123456"])(
+    "accepts %s with 200",
+    async (phone) => {
+      const response = await POST(shopRequest(phone), params());
+
+      expect(response.status).toBe(200);
+      expect(mocks.create).toHaveBeenCalledWith(
+        expect.objectContaining({ customerPhone: phone }),
+      );
+    },
+  );
+});
+
+/**
+ * Bundle buyers are often in the diaspora paying for family in Ghana, so the
+ * buyer's own contact number may be from any country. The recipient — the
+ * number the bundle is actually delivered to — stays Ghana-mobile-only.
+ */
+describe("checkout bundle buyer contact accepts any country", () => {
+  const bundleDraft = {
+    ...draft,
+    brief: {
+      ...draft.brief,
+      category: "data-bundles",
+      businessName: "Ghana Bundles Shop",
+      items: [
+        {
+          id: "bundle-00",
+          name: "MTN 1GB",
+          price: 10,
+          category: "mtn",
+          bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: {
+          enabled: false,
+          fee: 0,
+          minimumOrder: 0,
+          freeDeliveryAbove: 0,
+        },
+      },
+    },
+  };
+
+  function bundleRequest(body: Record<string, unknown>) {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "bundle-00", quantity: 1 }],
+          customerName: "Ama Diaspora",
+          paymentMethod: "valmont_pay",
+          ...body,
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.internalGetDraftForCheckout.mockResolvedValue(bundleDraft);
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+  });
+
+  it("accepts a UK number as the BUYER contact with 200", async () => {
+    const response = await POST(
+      bundleRequest({
+        recipientPhone: "0240000001",
+        customerPhone: "+44 7700 900123",
+      }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientPhone: "0240000001",
+        customerPhone: "+44 7700 900123",
+      }),
+    );
+  });
+
+  it("rejects the same UK number as the RECIPIENT with 400", async () => {
+    const response = await POST(
+      bundleRequest({ recipientPhone: "+44 7700 900123" }),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("normalises a Ghana mobile buyer to 0240000001", async () => {
+    const response = await POST(
+      bundleRequest({
+        recipientPhone: "0240000001",
+        customerPhone: "+233240000001",
+      }),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ customerPhone: "0240000001" }),
+    );
+  });
+
+  it("rejects a too-short buyer contact with 400", async () => {
+    const response = await POST(
+      bundleRequest({ recipientPhone: "0240000001", customerPhone: "12345" }),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+});

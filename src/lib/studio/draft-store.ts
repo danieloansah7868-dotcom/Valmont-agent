@@ -509,6 +509,26 @@ export function normalizeBrief(brief: SiteBriefV1): SiteBriefV1 {
     next.features = { ...next.features, customerAccounts: false };
   }
 
+  // Stage 3 made bundle shops online-only (Valmont Pay, no delivery). A bundle
+  // site saved before that rule can still carry "cod" or an enabled delivery
+  // option, which siteBriefSchemaV1 now rejects. Left alone, that brief would
+  // fail validation on the owner's very next edit and autosave would freeze
+  // with no visible toggle to fix it — the wizard hides both controls for
+  // bundle shops. So a stale config is repaired here on read, exactly as the
+  // legacy items/features handling above repairs older drafts. This only ever
+  // removes something the rule already forbids, never adds a feature.
+  if (next.category === "data-bundles" && next.payments) {
+    const methods = next.payments.methods.filter((m) => m === "valmont_pay");
+    const deliveryEnabled = next.payments.delivery?.enabled;
+    if (methods.length !== next.payments.methods.length || deliveryEnabled) {
+      next.payments = {
+        ...next.payments,
+        methods,
+        delivery: { ...next.payments.delivery, enabled: false },
+      };
+    }
+  }
+
   return next;
 }
 
