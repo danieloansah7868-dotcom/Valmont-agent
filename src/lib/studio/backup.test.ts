@@ -21,6 +21,7 @@ import { SqliteCustomerAccountStore } from "@/lib/customer-account-store";
 import { hashCustomerToken } from "@/lib/customer-password";
 import { SqliteOrdersStore, type NewOrderInput } from "./orders";
 import { SqliteDomainStore, newVerificationToken } from "./domains";
+import { setIdeaStoreForTests } from "@/lib/idea-store";
 
 const userA: SessionUser = { id: "9001", login: "ama", name: "Ama" };
 const userB: SessionUser = { id: "9002", login: "kofi", name: "Kofi" };
@@ -36,6 +37,9 @@ function freshDatabase() {
   dbPath = path.join(dir, "chat-store.sqlite");
   chatStore = new SqliteChatStore(dbPath, path.join(dir, "chat-store.json"));
   setSqliteChatStoreForTests(chatStore);
+  // The idea store caches a SqliteIdeaStore bound to the previous chat
+  // connection; clear it so getIdeaStore() binds to the fresh database.
+  setIdeaStoreForTests(null);
   drafts = new SqliteStudioDraftStore();
 }
 
@@ -43,6 +47,7 @@ beforeEach(freshDatabase);
 
 afterEach(() => {
   setSqliteChatStoreForTests(null);
+  setIdeaStoreForTests(null);
   delete process.env.DATABASE_URL;
   for (const dir of dirs.splice(0))
     rmSync(dir, { recursive: true, force: true });
@@ -983,5 +988,129 @@ describe("import atomicity is reported, not assumed", () => {
     expect(error.message).toMatch(/recovery/i);
     // It must not leak the underlying driver text to the user.
     expect(error.message).not.toContain("connection reset");
+  });
+});
+
+describe("ideas section in backups", () => {
+  function ideaBackup(overrides: Record<string, unknown> = {}) {
+    return {
+      backupVersion: 2,
+      exportedAt: new Date().toISOString(),
+      chat: { version: 1, sessions: [], memories: [] },
+      studio: { version: 1, schemaVersion: 1, drafts: [] },
+      ideas: {
+        version: 1,
+        ideas: [
+          {
+            id: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+            userId: "someone-else",
+            title: "Per-client API key",
+            details: "Blocked on the TechChief API document.",
+            status: "planned",
+            priority: 1,
+            createdAt: "2026-09-01T00:00:00.000Z",
+            updatedAt: "2026-09-02T00:00:00.000Z",
+          },
+        ],
+      },
+      ...overrides,
+    };
+  }
+
+  it("validates a v2 file that carries an ideas section", () => {
+    const parsed = parseBackup(ideaBackup());
+    expect(parsed.ideas?.version).toBe(1);
+    expect(parsed.ideas?.ideas).toHaveLength(1);
+    expect(parsed.ideas?.ideas[0]!.title).toBe("Per-client API key");
+  });
+
+  it("still validates an older v2 file that has no ideas section", () => {
+    const parsed = parseBackup(ideaBackup({ ideas: undefined }));
+    expect(parsed.ideas).toBeUndefined();
+  });
+
+  it("rejects an ideas section with the wrong version", () => {
+    expect(() =>
+      parseBackup(ideaBackup({ ideas: { version: 2, ideas: [] } })),
+    ).toThrow(BackupValidationError);
+  });
+
+  it("rejects an idea with a bad status", () => {
+    const bad = ideaBackup();
+    bad.ideas!.ideas[0]!.status = "someday";
+    expect(() => parseBackup(bad)).toThrow(BackupValidationError);
+  });
+
+  it("rejects an idea with a bad priority", () => {
+    const bad = ideaBackup();
+    bad.ideas!.ideas[0]!.priority = 9;
+    expect(() => parseBackup(bad)).toThrow(BackupValidationError);
+  });
+
+  it("rejects more than 10,000 ideas", () => {
+    const oversized = ideaBackup({
+      ideas: {
+        version: 1,
+        ideas: new Array(10_001).fill(undefined).map((_, i) => ({
+          id: `aaaaaaaa-1111-4111-8111-aaaa${String(i).padStart(7, "0")}`.slice(
+            0,
+            36,
+          ),
+          title: "x",
+          details: "",
+          status: "idea",
+          priority: 2,
+          createdAt: "2026-09-01T00:00:00.000Z",
+          updatedAt: "2026-09-01T00:00:00.000Z",
+        })),
+      },
+    });
+    expect(() => parseBackup(oversized)).toThrow(BackupValidationError);
+  });
+
+  it("exports the owner's ideas and restores them to the importing user", async () => {
+    const { getIdeaStore } = await import("@/lib/idea-store");
+    const store = getIdeaStore();
+    await store.create(userA.id, {
+      title: "Stage 5 — per-client TechChief API key",
+      details: "Live only after a probe passes.",
+      status: "idea",
+      priority: 1,
+    });
+
+    const backup = JSON.parse(JSON.stringify(await buildBackup(userA)));
+    expect(backup.ideas.version).toBe(1);
+    expect(backup.ideas.ideas).toHaveLength(1);
+    expect(backup.ideas.ideas[0]).toMatchObject({
+      title: "Stage 5 — per-client TechChief API key",
+      status: "idea",
+      priority: 1,
+    });
+    // The exported row carries the owner; it must be ignored on import.
+    expect(backup.ideas.ideas[0].userId ?? userA.id).toBeTruthy();
+
+    // Wipe into a fresh database and import as user B.
+    freshDatabase();
+    const summary = await importBackup(userB, parseBackup(backup));
+    expect(summary.ideas).toBe(1);
+
+    const storeB = getIdeaStore();
+    const forB = await storeB.list(userB.id);
+    expect(forB).toHaveLength(1);
+    expect(forB[0]!.title).toBe("Stage 5 — per-client TechChief API key");
+    expect(forB[0]!.userId).toBe(userB.id);
+    // The original owner gets nothing on this machine.
+    expect(await storeB.list(userA.id)).toHaveLength(0);
+  });
+
+  it("importing a file without an ideas section leaves ideas untouched", async () => {
+    const { getIdeaStore } = await import("@/lib/idea-store");
+    await getIdeaStore().create(userA.id, { title: "Existing idea" });
+    const backup = ideaBackup({ ideas: undefined });
+    const summary = await importBackup(userA, parseBackup(backup));
+    expect(summary.ideas).toBe(0);
+    const mine = await getIdeaStore().list(userA.id);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.title).toBe("Existing idea");
   });
 });

@@ -73,6 +73,20 @@ migration is applied, `/api/health` reports `migrations.status: incomplete`
 and the app answers 503. Run `npm run db:verify:local && npm run db:migrate && npm run db:verify`
 from a controlled job as described above.
 
+**Migration `0013_ideas`** (this release) creates the `ideas` table backing the
+owner's private Ideas page (`/ideas`): uuid primary key, `user_id text not
+null` (the signed-in GitHub user id, matching the chat store's text user id),
+`title text not null`, `details text not null default ''`, `status text not
+null default 'idea'`, `priority integer not null default 2`, timestamps, and
+`ideas_user_status_updated_idx` on `(user_id, status, updated_at DESC)`.
+Ideas are per-user scratch space and are never fed to model prompts. SQLite
+installations need no migration: the table is created with
+`CREATE TABLE IF NOT EXISTS` on the shared chat-store connection on first
+access (same pattern as the Studio stores). Until the PostgreSQL migration is
+applied, `/api/health` reports `migrations.status: incomplete` and the app
+answers 503. Run `npm run db:verify:local && npm run db:migrate && npm run db:verify`
+from a controlled job as described above.
+
 **Why not timestamp ordering:**
 
 - Drizzle's journal carries both `idx` and `when`. `when` is wall-clock and can regress (see `0007` earlier than `0006`). The system **never** uses timestamp ordering; journal `idx` order is authoritative. The regression test `src/lib/db/migration-bootstrap.test.ts` asserts this invariant and that the bootstrap ledger SQL contains the expected hash/timestamp derived from source.

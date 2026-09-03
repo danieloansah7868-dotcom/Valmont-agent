@@ -1,5 +1,18 @@
 # Follow-up items — status updated by production-hardening session (arena/01a05a32-valmont-agent)
 
+## Owner's idea backlog (2026-09-03)
+
+1. Stage 5 — per-client TechChief API key: each client website stores its own encrypted key; the engine picks the provider per website (today it is one server setting); Test-connection + balance; live only after a probe passes. Blocked on the TechChief API document.
+2. Client manages own float: show the TechChief wallet balance for that website in Studio; low-balance warning when paid orders are waiting.
+3. Client admin page (Stage 6): a login for the shop owner (not the agency team) with orders, delivery status, Retry, API key + balance. Changes the earlier "agency team only" decision — owner to confirm login method (phone OTP or email).
+4. Sub-agents (Stage 7, DataMartGH style): shop owner creates agents with their own prices and wallets; agent orders tracked separately; commission report.
+5. Checkout caps: max 10 units per line / 20 per order; cap rows per recheck pass.
+6. Masked delivery line on the customer-account order page.
+7. Connectors (roadmap priority 2).
+8. Lovable-style chat features (roadmap priority 3).
+9. Real deployment of main (migrations 0011 + 0012) so there is a preview link that does not die with a sandbox.
+10. Valmont-Web (valmontweb.com) static demos stay in their own repo; drag-and-drop upload is fine there only.
+
 Owner note: PR #10 was merged intentionally by the owner. It was not a mistake and
 nothing about it needs to be reverted. The items below were follow-up housekeeping
 caused by that merge; several have since been resolved by the Website Studio
