@@ -34,6 +34,19 @@ export interface StatusEvent {
   at: string;
 }
 
+/**
+ * Bundle metadata snapshotted onto an order line at checkout time (Stage 4).
+ * Present only on data-bundles shop lines — the site-brief schema forbids it
+ * on every other website type, so its presence is what marks a line as
+ * deliverable. Kept as plain data (not the zod type) so the order record
+ * never imports catalogue validation into the persistence layer.
+ */
+export interface OrderLineBundle {
+  network?: string;
+  dataMb?: number;
+  validity?: string;
+}
+
 /** A single purchased line, snapshotted at checkout time. */
 export interface OrderLine {
   itemId: string;
@@ -43,6 +56,8 @@ export interface OrderLine {
   quantity: number;
   /** Optional product photo snapshotted at checkout. */
   image?: string;
+  /** Data-bundles lines only: what the delivery engine must top up. */
+  bundle?: OrderLineBundle;
 }
 
 /** What the checkout endpoint receives from the browser. */

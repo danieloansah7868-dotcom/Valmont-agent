@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { orderAlertText } from "./notifications";
+import {
+  deliveryFailureAlertText,
+  notifyMerchantDeliveryFailed,
+  orderAlertText,
+} from "./notifications";
 import type { OrderRecord } from "./orders";
 
 const order: OrderRecord = {
@@ -38,5 +42,42 @@ describe("orderAlertText", () => {
     expect(text).toContain("GH₵85.00");
     expect(text).toContain("Jollof Rice × 1");
     expect(text).toContain("View: https://example.com/studio/orders/1");
+  });
+});
+
+describe("deliveryFailureAlertText", () => {
+  const bundleOrder: OrderRecord = {
+    ...order,
+    recipientPhone: "0240000001",
+  };
+
+  it("aggregates one message per engine pass with counts and a sample bundle", () => {
+    const text = deliveryFailureAlertText({
+      order: bundleOrder,
+      brief: { businessName: "Akwaaba Bundles", payments: {} as never },
+      deliveries: [
+        { network: "mtn", dataMb: 1024 },
+        { network: "telecel", dataMb: 2048 },
+      ],
+      total: 2,
+    });
+    expect(text).toBe(
+      "2 of 2 bundle top-ups failed for order 83b1bfd7 (MTN 1GB to 0240000001). Retry from Studio → Orders.",
+    );
+  });
+
+  it("skips channels with no configured contact and never throws", async () => {
+    // No RESEND/Twilio keys in the test environment and no contacts in the
+    // brief: every channel reports "skipped" instead of failing the engine.
+    const result = await notifyMerchantDeliveryFailed({
+      order: bundleOrder,
+      brief: {
+        businessName: "Akwaaba Bundles",
+        payments: { notifications: {} } as never,
+      },
+      deliveries: [{ network: "mtn", dataMb: 1024 }],
+      total: 1,
+    });
+    expect(result).toEqual({ email: "skipped", whatsapp: "skipped" });
   });
 });

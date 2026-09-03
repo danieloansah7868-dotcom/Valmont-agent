@@ -25,6 +25,10 @@ import {
   validateGhanaMobile,
   normalizeGhanaMobile,
 } from "@/lib/studio/bundles";
+import {
+  bundleDeliveryAvailability,
+  LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE,
+} from "@/lib/studio/bundle-delivery";
 
 const CHECKOUT_BODY_LIMIT_BYTES = 100_000;
 
@@ -197,6 +201,11 @@ export async function POST(
         price: item.price,
         quantity: line.quantity,
         image: item.image,
+        // Stage 4: data-bundles lines snapshot their delivery metadata into
+        // the order so a later catalogue edit can never change what a paid
+        // order must deliver. Undefined for every other website type, so
+        // nothing about non-bundle orders changes (JSON drops the key).
+        bundle: item.bundle,
       });
       pricedLines.push({ price: item.price, quantity: line.quantity });
     }
@@ -256,6 +265,23 @@ export async function POST(
     // Manual and cash orders are real goods for real money regardless of the
     // simulator, so only online orders inherit the test marker.
     const paymentMode = needsOnlinePayment ? availability.mode : "live";
+
+    // Stage 4 live-money guard: a bundle shop charging REAL money must be
+    // able to deliver automatically. Until a live delivery provider is
+    // connected (Stage 5), a live bundle checkout is refused BEFORE any order
+    // row exists — otherwise a paid order would owe data the simulator would
+    // only pretend to send. Test-mode checkout is unaffected: simulator
+    // payments pair with the simulated delivery engine.
+    if (
+      isBundleSite &&
+      paymentMode === "live" &&
+      !bundleDeliveryAvailability().live
+    ) {
+      return NextResponse.json(
+        { error: LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE },
+        { status: 409 },
+      );
+    }
 
     const code = accessCode();
     const isCod = payload.paymentMethod === "cod";

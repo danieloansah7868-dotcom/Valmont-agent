@@ -85,6 +85,13 @@
       "when": 1788000000000,
       "tag": "0011_order_recipient_phone",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1788100000000,
+      "tag": "0012_studio_deliveries",
+      "breakpoints": true
     }
   ]
 }

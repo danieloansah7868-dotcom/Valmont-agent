@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   getOrdersStore: vi.fn(),
   verifyWebhookSignature: vi.fn(),
   notifyCustomerOrderStatus: vi.fn(),
+  dispatchBundleDeliveriesForOrder: vi.fn(),
 }));
 
 vi.mock("@/lib/studio/orders", () => ({
@@ -17,6 +18,10 @@ vi.mock("@/lib/studio/orders", () => ({
 
 vi.mock("@/lib/studio/valmont-pay", () => ({
   verifyWebhookSignature: mocks.verifyWebhookSignature,
+}));
+
+vi.mock("@/lib/studio/bundle-delivery", () => ({
+  dispatchBundleDeliveriesForOrder: mocks.dispatchBundleDeliveriesForOrder,
 }));
 
 vi.mock("@/lib/customer-order-notifications", () => ({
@@ -58,6 +63,46 @@ describe("payment webhook customer notifications", () => {
       status: "payment_failed",
     });
     mocks.notifyCustomerOrderStatus.mockResolvedValue("sent");
+    mocks.dispatchBundleDeliveriesForOrder.mockResolvedValue([]);
+  });
+
+  it("fires the bundle delivery engine after a successful payment, fire-and-forget", async () => {
+    const response = await POST(request({ event: "payment.success" }));
+
+    expect(response.status).toBe(200);
+    expect(mocks.markPaid).toHaveBeenCalledWith(accessCode, undefined);
+    expect(mocks.dispatchBundleDeliveriesForOrder).toHaveBeenCalledWith(
+      pendingOrder.id,
+    );
+  });
+
+  it("keeps the webhook at 200 when the delivery dispatch rejects", async () => {
+    mocks.dispatchBundleDeliveriesForOrder.mockRejectedValueOnce(
+      new Error("delivery provider is down"),
+    );
+
+    const response = await POST(request({ status: "success" }));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      ok: true,
+      status: "paid",
+    });
+  });
+
+  it("does not fire delivery for a failed payment or a duplicate success webhook", async () => {
+    const failed = await POST(request({ status: "failed" }));
+    expect(failed.status).toBe(200);
+    expect(mocks.dispatchBundleDeliveriesForOrder).not.toHaveBeenCalled();
+
+    mocks.getByAccessCode.mockResolvedValueOnce({
+      ...pendingOrder,
+      status: "paid",
+    });
+    mocks.markPaid.mockResolvedValueOnce({ ...pendingOrder, status: "paid" });
+    const duplicate = await POST(request({ status: "paid" }));
+    expect(duplicate.status).toBe(200);
+    expect(mocks.dispatchBundleDeliveriesForOrder).not.toHaveBeenCalled();
   });
 
   it("notifies after a payment success changes the order status", async () => {

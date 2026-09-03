@@ -357,9 +357,15 @@ recipient of a data-bundle order, masked by `maskGhanaMobile` as
 `024 ••• 0001`, because the customer needs to confirm the number they are
 sending data to. Masking keeps the first three and last four characters only;
 input shorter than 8 characters is masked in full rather than echoed back, so
-an unexpected value cannot leak. The buyer's own contact number is never
-printed on a guest page, and full numbers appear only behind authentication:
-the owner's Studio order page and the customer-account order page.
+an unexpected value cannot leak. The Stage 4 delivery line
+(`bundle-delivery-line`) follows the same rule: it is a single aggregate
+("3GB of data to 024 ••• 0001 — delivered") built server-side by
+`guestBundleDeliverySummary` from narrowed inputs, so it never shows provider
+references, attempt counts or provider error text — only the masked recipient
+and counts. The buyer's own contact number is never printed on a guest page,
+and full numbers appear only behind authentication: the owner's Studio order
+page and the customer-account order page (and the merchant's own delivery
+alerts).
 
 ### Customer registration — no account enumeration
 

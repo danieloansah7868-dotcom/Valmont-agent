@@ -6,7 +6,7 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
-## Data Bundles — Stages 1–3 merged, Stage 4–6 pending
+## Data Bundles — Stages 1–3 merged, Stage 4 on branch, Stage 5–6 pending
 
 Stages 1–2 (catalogue field `bundle: { network, dataMb, validity }`, superRefine,
 starter merge, wizard table, readiness v2, storefront tabs, Ghana mobile
@@ -31,13 +31,80 @@ Carried by the #45 review fixes:
 - **Decision:** the buyer's own contact accepts any country (diaspora buyers),
   while the recipient stays Ghana-mobile-only.
 
-Stage 4: delivery integration (provider API, status callbacks) — the simulator
-can be built now; the real provider is blocked on the API doc below.
-Stage 5: TechChief key provisioning — **blocked awaiting the TechChief
-integration doc** (API spec, auth, pricing, callback format). Nothing in the
-codebase can substitute for it; until it arrives, bundle delivery can only run
-in test mode against the simulator.
+**Stage 4 — implemented on this branch** (PR #47 "feat(studio): bundle
+delivery engine with simulator (stage 4)", not yet merged):
+
+- Migration `0012_studio_deliveries` adds `studio_deliveries`: one row per
+  purchased bundle **unit** (`unique(order_id, line_index, unit_index)`), a
+  snapshot of what was sold (network/size/validity, full recipient — server
+  side only) plus engine state (`provider`, `status`, `attempts`,
+  `provider_ref`, `last_error`, `delivered_at`). Per-unit rows keep partial
+  delivery trackable and never let a Retry resend units that went through.
+- `src/lib/studio/bundle-delivery.ts` holds the `BundleDeliveryProvider`
+  contract, the default **SimulatedProvider** (accepts as `processing`,
+  reports `delivered` on the next status check; rehearsal hooks: recipient
+  ending `0000` always fails, `9999` stays processing for 60 s via a
+  timestamped `sim-slow-` reference), the **TechChief stub** (fails every
+  send loudly until the Stage 5 doc lands), a fail-closed answer to unknown
+  `BUNDLE_DELIVERY_PROVIDER` values, the dual SQLite/PostgreSQL stores, and
+  the engine. Invariants I1–I6 are documented in the module header and each
+  has a dedicated test (`bundle-delivery.test.ts`):
+  I1 paid-first **and live-money safety** (a live-money bundle checkout is
+  refused with 409 before any order row while no live provider exists, and
+  the engine backstop never dispatches a live order through a non-live
+  provider — `bundleDeliveryAvailability().live` is false for everything
+  connected today), I2 idempotent **also under concurrency** (unique unit
+  index + atomic `claimForDispatch`, so a webhook and a simultaneous page
+  load can never send the same unit twice), I3 delivered-is-terminal, I4
+  failure isolation (owner-retryable failures, never thrown into the payment
+  path, one aggregated merchant alert per engine pass), I5 bundle-only
+  (other website types untouched), I6 guest privacy.
+- Checkout snapshots `bundle` metadata into the order lines (data-bundles
+  sites only; legacy orders resolve from the live catalogue).
+- The payments webhook fires `dispatchBundleDeliveriesForOrder` immediately
+  after `markPaid`, **fire-and-forget** — the webhook still answers 200 even
+  when the provider is down.
+- `recheckBundleDeliveriesForOrder` runs on order-page loads (owner page and
+  guest confirmation page), recovering rows an outage prevented the webhook
+  from creating and polling in-flight rows; it never throws.
+- The owner order page shows a **Bundle delivery** panel (per-unit statuses,
+  attempts, provider reference, last error) with a Retry button routed to
+  `POST /api/studio/orders/[id]/bundle-deliveries/retry`; the guest
+  confirmation page shows one masked aggregate line (no full numbers, no
+  provider references, no error internals). `notifyMerchantDeliveryFailed`
+  sends the merchant one aggregated alert per failing engine pass.
+
+Stage 5: TechChief key provisioning — **still blocked awaiting the TechChief
+integration doc** (API spec, auth, pricing, callback format). The Stage 4
+stub is the only code that needs replacing once it arrives; until then bundle
+delivery runs against the simulator only.
+**Stage 5 notes (from the Stage 4 review — do before a real provider goes
+live):**
+
+- Throttle per-row status polls to once per 30–60 s (compare `updated_at`
+  before calling `checkStatus`): the unauthenticated guest confirmation page
+  runs `recheckPending` on every load, and a real provider would rate-limit
+  or bill each poll. The simulator makes this unnecessary today.
+- Add a readiness v2 rule `dependencies.bundleDelivery` (simulator /
+  stub / misconfigured) next to `dependencies.payments`, and think about a
+  Stage 5 "provisioned" flag on TechChief flipped only when a live key is
+  confirmed by a probe call — that is the moment
+  `bundleDeliveryAvailability().live` may return true.
+- Cap units per bundle order at checkout (e.g. max 10 per line, 20 per
+  order) and cap the rows processed per recheck pass — per-unit rows ×
+  quantity 999 × 100 lines would otherwise mean ~100k provider calls on a
+  single guest page load.
+- Show the same masked aggregate line on the customer-account order page
+  (it currently gets the full owner-style view or nothing — the guest
+  summary is the nice middle ground).
+
 Stage 6: analytics, rate-limits, fraud checks, documentation polish.
+
+**Review rules (from the Stage 4 review):**
+
+- Never delete or rewrite existing tests to make room for new ones; if a
+  mock setup conflicts, add a new describe block or a new `*.test.ts` file
+  beside it.
 
 ---
 

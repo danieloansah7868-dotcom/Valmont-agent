@@ -5,6 +5,7 @@ import { safeApiError } from "@/lib/api";
 import { readBoundedText } from "@/lib/bounded-json";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { verifyWebhookSignature } from "@/lib/studio/valmont-pay";
+import { dispatchBundleDeliveriesForOrder } from "@/lib/studio/bundle-delivery";
 import { notifyCustomerOrderStatus } from "@/lib/customer-order-notifications";
 
 const WEBHOOK_BODY_LIMIT_BYTES = 50_000;
@@ -81,6 +82,17 @@ export async function POST(request: NextRequest) {
     const order = succeeded
       ? await store.markPaid(accessCode, parsed.reference)
       : await store.markFailed(accessCode);
+
+    // Bundle delivery fires exactly when this webhook moves the order to
+    // "paid" (Stage 4). It is deliberately fire-and-forget: the payment
+    // answer is already committed, so a slow or broken delivery provider must
+    // not delay the 200 or turn it into an error — every delivery failure
+    // lands on the delivery row instead, where the owner can retry it. The
+    // pre-check keeps duplicate success webhooks from re-entering the engine
+    // (row idempotency is the backstop inside it).
+    if (order && succeeded && existing.status !== "paid") {
+      void dispatchBundleDeliveriesForOrder(order.id).catch(() => "failed");
+    }
 
     if (order && existing.status !== order.status) {
       await notifyCustomerOrderStatus({

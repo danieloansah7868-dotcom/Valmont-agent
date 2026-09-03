@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   createPaymentLink: vi.fn(),
   onlinePaymentAvailability: vi.fn(),
   notifyMerchantNewOrder: vi.fn(),
+  bundleDeliveryAvailability: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => ({
@@ -44,6 +45,11 @@ vi.mock("@/lib/studio/valmont-pay", () => ({
   onlinePaymentAvailability: mocks.onlinePaymentAvailability,
   ONLINE_PAYMENT_UNAVAILABLE_MESSAGE:
     "Online payment is temporarily unavailable for this shop. Please choose another payment method or try again later.",
+}));
+
+vi.mock("@/lib/studio/bundle-delivery", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/studio/bundle-delivery")>()),
+  bundleDeliveryAvailability: mocks.bundleDeliveryAvailability,
 }));
 
 vi.mock("@/lib/studio/notifications", () => ({
@@ -403,6 +409,10 @@ describe("checkout data-bundles Ghana mobile validation", () => {
       available: true,
       mode: "test",
     });
+    mocks.bundleDeliveryAvailability.mockReturnValue({
+      provider: "simulator",
+      live: false,
+    });
     mocks.createPaymentLink.mockResolvedValue({
       paymentLink: "/pay/simulated",
       live: false,
@@ -631,6 +641,12 @@ describe("checkout bundle buyer contact accepts any country", () => {
       available: true,
       mode: "test",
     });
+    // These run in payment mode "test", so the Stage 4 live-money guard is
+    // never reached; the default keeps any future mode change honest.
+    mocks.bundleDeliveryAvailability.mockReturnValue({
+      provider: "simulator",
+      live: false,
+    });
   });
 
   it("accepts a UK number as the BUYER contact with 200", async () => {
@@ -683,6 +699,138 @@ describe("checkout bundle buyer contact accepts any country", () => {
     );
 
     expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Stage 4 live-money guard: a data-bundles order paid with REAL money must
+ * be deliverable automatically; until a live delivery provider is connected
+ * (Stage 5) such a checkout is refused with 409 before any order row exists.
+ * Test-mode checkout is unaffected: the simulated payment pairs with the
+ * simulated delivery engine.
+ */
+describe("bundle checkout live-money guard", () => {
+  const bundleDraft = {
+    ...draft,
+    brief: {
+      ...draft.brief,
+      category: "data-bundles",
+      businessName: "Guard Bundles Shop",
+      items: [
+        {
+          id: "bundle-00",
+          name: "MTN 1GB",
+          price: 10,
+          category: "mtn",
+          bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: {
+          enabled: false,
+          fee: 0,
+          minimumOrder: 0,
+          freeDeliveryAbove: 0,
+        },
+      },
+    },
+  };
+
+  function guardRequest() {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines: [{ itemId: "bundle-00", quantity: 1 }],
+          customerName: "Kwame Buyer",
+          recipientPhone: "0240000001",
+          customerPhone: "0200000002",
+          paymentMethod: "valmont_pay",
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
+    mocks.internalGetDraftForCheckout.mockResolvedValue(bundleDraft);
+    mocks.getCustomerSession.mockResolvedValue(null);
+    mocks.getOrdersStore.mockReturnValue({ create: mocks.create });
+    mocks.computeTotals.mockReturnValue({
+      subtotal: 10,
+      deliveryFee: 0,
+      total: 10,
+    });
+    mocks.create.mockResolvedValue({ ...createdOrder, status: "pending" });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "/pay/simulated",
+      live: false,
+    });
+    mocks.notifyMerchantNewOrder.mockResolvedValue({
+      email: "skipped",
+      whatsapp: "skipped",
+    });
+    // Nothing connected today can deliver for real (Stage 5 stub pending).
+    mocks.bundleDeliveryAvailability.mockReturnValue({
+      provider: "simulator",
+      live: false,
+    });
+  });
+
+  it("refuses a live-money bundle checkout with 409 before any order row exists", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "live",
+    });
+
+    const response = await POST(guardRequest(), params());
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error:
+        "This shop cannot send bundles automatically yet. Please contact the shop.",
+    });
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.createPaymentLink).not.toHaveBeenCalled();
+    expect(mocks.notifyMerchantNewOrder).not.toHaveBeenCalled();
+  });
+
+  it("accepts the same checkout in test mode and creates the order", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+
+    const response = await POST(guardRequest(), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentMode: "test",
+        recipientPhone: "0240000001",
+      }),
+    );
+    const body = await response.json();
+    expect(body).toMatchObject({ orderId: createdOrder.id, status: "pending" });
+  });
+
+  it("still refuses online checkout when the payment rail itself is misconfigured", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: false,
+      mode: "live",
+      reason: "Live mode is selected but keys are missing.",
+    });
+
+    const response = await POST(guardRequest(), params());
+
+    expect(response.status).toBe(409);
     expect(mocks.create).not.toHaveBeenCalled();
   });
 });

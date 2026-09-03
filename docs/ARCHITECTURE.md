@@ -343,3 +343,107 @@ weakened for tests. The production Dockerfile installs no browser binaries.
 Uploads and object storage, repository generation, sandboxed builds, preview
 deployments, admin roles, e-commerce, payments, and template versioning all
 remain unimplemented.
+
+## Data Bundles — Stage 4: bundle delivery engine
+
+Stage 3 made a paid bundle order possible; Stage 4 delivers it. The engine
+(`src/lib/studio/bundle-delivery.ts`) turns every purchased bundle UNIT of a
+**paid** order into one delivery row and asks a provider to top up the
+recipient. Only `data-bundles` websites are involved; every other website
+type is untouched.
+
+### Flow
+
+1. Checkout snapshots the line's bundle metadata (`network`, `dataMb`,
+   `validity`) into `studio_orders.lines_json`, so a later catalogue edit can
+   never change what a paid order owes the customer. Orders paid before
+   Stage 4 have no snapshot and resolve against the live catalogue instead.
+2. **Live-money guard.** Checkout refuses a data-bundles order stamped `live`
+   with 409 (`"This shop cannot send bundles automatically yet…"`) _before any
+   order row exists_ while no live delivery provider is connected — a customer
+   who paid real money must never be owed data the simulator only pretended
+   to send. The engine keeps the same rule as a backstop: a live order with a
+   non-live provider produces failed rows reading "No real delivery provider
+   is connected; nothing was sent", with zero provider calls.
+3. The payments webhook calls `dispatchBundleDeliveriesForOrder(orderId)`
+   **fire-and-forget** right after it moves an order to `paid`: the payment
+   answer is already committed, so a slow or broken provider can never delay
+   or break the webhook's 200. Duplicate webhooks re-enter safely.
+4. `recheckBundleDeliveriesForOrder(orderId)` runs on order-page loads
+   (owner order page and guest confirmation page). It creates rows the
+   webhook could not create (recovery after an outage), flushes rows stuck at
+   `pending`, and polls the provider for rows at `processing`. It never
+   throws, so a page renders with or without the engine.
+5. The owner's `/studio/orders/[id]` page shows a **Bundle delivery** panel
+   (full recipient, per-row status, unit numbers, attempts, provider
+   reference, last error) with a **Retry** action for failed top-ups, routed
+   to `POST /api/studio/orders/[id]/bundle-deliveries/retry`.
+6. The unauthenticated confirmation page shows one **masked aggregate line**
+   ("3GB of data to 024 ••• 0001 — …") — never a full number, provider
+   reference, attempt count or error detail.
+7. When at least one row **enters `failed` during an engine pass** (dispatch
+   failure, provider-reported failure on recheck, or a failed retry), the
+   merchant gets ONE aggregated alert
+   (`notifyMerchantDeliveryFailed`, same discipline as the new-order alert):
+   "n of total bundle top-ups failed for order <ref> (<network> <size> to
+   <full recipient>). Retry from Studio → Orders." Rows that were already
+   failed are never re-alerted.
+
+### Invariants (each has a dedicated test)
+
+- **I1 paid-first + live-money safety** — no delivery row exists and the
+  provider is never called before the order is paid; a live-money order is
+  only ever dispatched through a live provider (checkout 409, engine
+  backstop).
+- **I2 idempotent, also under concurrency** — exactly one row per purchased
+  bundle unit via the unique `(order_id, line_index, unit_index)` index, and
+  **claim-before-send**: `claimForDispatch` moves `pending|failed →
+processing` atomically, so a webhook dispatch and a simultaneous page-load
+  recheck (or two retries) can never send the same unit twice. Per-unit rows
+  also mean partial delivery inside a line is trackable and a Retry never
+  resends units that already went through.
+- **I3 terminal success** — `delivered` is final; rechecks, retries, claims
+  and provider callbacks never move or double-send a delivered row.
+- **I4 isolated failure** — provider failures land on the row (`failed` +
+  owner-readable error + one aggregated merchant alert) and are never thrown
+  into the caller; only `failed` rows can be retried, and only by the owner.
+- **I5 bundle-only** — deliveries exist only for data-bundles orders; other
+  website types get no rows, no provider calls, no UI changes, no alerts.
+- **I6 guest privacy** — unauthenticated surfaces see only the masked
+  aggregate line.
+
+### Providers
+
+`BundleDeliveryProvider` (`sendBundle` + `checkStatus`) is selected by
+`BUNDLE_DELIVERY_PROVIDER`:
+
+- `simulator` (default): accepts every top-up as `processing` and reports it
+  `delivered` on the next status check — the offline rehearsal of the whole
+  lifecycle, mirroring the payment simulator. Rehearsal hooks: a recipient
+  ending `0000` always fails (`"Simulated failure (test number ending
+0000)"`), one ending `9999` stays `processing` for 60 s (the acceptance
+  time travels inside the `sim-slow-<epochMs>-<uuid>` reference, so no
+  in-memory state survives a restart).
+- `techchief`: a stub. The Stage 5 integration document (API spec, auth,
+  pricing, callback format) has not landed, so every send fails fast with an
+  owner-visible, retryable error instead of fabricating deliveries.
+- any other value fails closed (`MisconfiguredDeliveryProvider`), so a typo
+  can never silently activate the simulator in production.
+
+`bundleDeliveryAvailability()` reports `{ provider, live }`; every provider
+listed above is `live: false` today — Stage 5 makes TechChief the first
+`live: true` once a real key is provisioned.
+
+### Persistence
+
+`studio_deliveries` (migration `0012_studio_deliveries`, SQLite
+`ensureBundleDeliveriesSchema` beside the orders schema) stores the snapshot
+(`line_index`, `unit_index`, item id/name, network, size, validity, full
+recipient — server side only) plus engine state (`provider`, `status`,
+`attempts`, `provider_ref`, `last_error`, `delivered_at`). Every state change
+is a guarded single statement: `claimForDispatch` (`pending|failed →
+processing`, `attempts + 1`, atomic — returns true only for the one caller
+that moved the row), `setProviderRef` (`processing` only), `markFailed`
+(pending/processing/failed, error refreshed in place), `markDelivered`
+(`pending|processing` only), so an ill-timed callback, recheck or retry can
+never resurrect or double-send a row.
