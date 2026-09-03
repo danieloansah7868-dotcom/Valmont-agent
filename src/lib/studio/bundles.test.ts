@@ -7,6 +7,7 @@ import {
   groupBundlesByNetwork,
   isValidGhanaMobile,
   normalizeGhanaMobile,
+  maskGhanaMobile,
   checkRecipientNetworkMatch,
   formatDataMb,
   parseDataSizeToMb,
@@ -366,6 +367,31 @@ describe("Ghana mobile validation", () => {
     expect(validateGhanaMobile("030 123 4567")).toMatch(/Landline/);
     expect(validateGhanaMobile("0240000001")).toBeNull();
     expect(validateGhanaMobile("+44 7700 900123")).toMatch(/Ghana mobile/);
+  });
+});
+
+describe("maskGhanaMobile for pages anyone can open", () => {
+  it("masks the middle digits and keeps prefix and last four", () => {
+    expect(maskGhanaMobile("0240000001")).toBe("024 ••• 0001");
+  });
+
+  it("never reveals the full number", () => {
+    const masked = maskGhanaMobile("0541234567");
+    expect(masked).not.toContain("0541234567");
+    expect(masked).toBe("054 ••• 4567");
+  });
+
+  it("masks whatever shape it is given, so an unexpected value cannot leak", () => {
+    expect(maskGhanaMobile("+233240000001")).toBe("+23 ••• 0001");
+    expect(maskGhanaMobile("024 000 0001")).toBe("024 ••• 0001");
+    expect(maskGhanaMobile("+447700900123")).toBe("+44 ••• 0123");
+  });
+
+  it("masks short or empty input entirely instead of echoing it", () => {
+    expect(maskGhanaMobile("")).toBe("••• ••• ••••");
+    expect(maskGhanaMobile("12345")).toBe("••• ••• ••••");
+    expect(maskGhanaMobile(null)).toBe("••• ••• ••••");
+    expect(maskGhanaMobile(undefined)).toBe("••• ••• ••••");
   });
 });
 

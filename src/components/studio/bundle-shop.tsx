@@ -128,18 +128,23 @@ export function BundleShop({
       return;
     }
     setRecipientError(null);
+    // The buyer's own contact may be in any country (diaspora buyers paying
+    // for family in Ghana), so it is not held to the Ghana-mobile rule — only
+    // to the same 6-character floor the checkout route enforces.
     let buyerErr: string | null = null;
-    if (buyerPhone.trim()) {
-      buyerErr = validateGhanaMobile(buyerPhone);
-      if (buyerErr) {
-        setBuyerError(buyerErr);
-        setError(buyerErr);
-        return;
-      }
+    if (buyerPhone.trim() && buyerPhone.trim().length < 6) {
+      buyerErr = "Please enter a phone number with at least 6 digits";
+    }
+    if (buyerErr) {
+      setBuyerError(buyerErr);
+      setError(buyerErr);
+      return;
     }
     setBuyerError(null);
     const normalizedRecipient =
       normalizeGhanaMobile(recipientPhone) ?? recipientPhone.trim();
+    // A Ghana mobile is normalised to 0240000001; any other country's number is
+    // sent as typed so the shop can reach the buyer.
     const normalizedBuyer = buyerPhone.trim()
       ? (normalizeGhanaMobile(buyerPhone) ?? buyerPhone.trim())
       : normalizedRecipient;
@@ -475,7 +480,7 @@ export function BundleShop({
                       <div className="grid gap-1">
                         <label className="grid gap-1">
                           <span className="text-sm font-semibold">
-                            Your WhatsApp number (optional, if different)
+                            Your contact number (optional, any country)
                           </span>
                           <input
                             type="tel"
@@ -490,8 +495,11 @@ export function BundleShop({
                                 setBuyerError(null);
                                 return;
                               }
-                              const err = validateGhanaMobile(buyerPhone);
-                              setBuyerError(err);
+                              setBuyerError(
+                                buyerPhone.trim().length < 6
+                                  ? "Please enter a phone number with at least 6 digits"
+                                  : null,
+                              );
                             }}
                             className={`w-full rounded-lg border px-3 py-2 text-base ${
                               buyerError ? "border-red-500" : "border-line"
@@ -505,8 +513,9 @@ export function BundleShop({
                           </p>
                         ) : (
                           <p className="text-xs text-slate-500">
-                            If blank, we will use the recipient number to
-                            contact you.
+                            Any country — this is only how we contact you, not
+                            where the bundle goes. If blank we use the recipient
+                            number.
                           </p>
                         )}
                       </div>

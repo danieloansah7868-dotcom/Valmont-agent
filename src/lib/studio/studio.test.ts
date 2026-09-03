@@ -11,9 +11,10 @@ import {
   SqliteStudioDraftStore,
   getStudioSqliteDb,
   getStudioSqliteStore,
+  normalizeBrief,
 } from "./draft-store";
 import { createDefaultBrief } from "./site-brief/defaults";
-import type { SiteBriefV1 } from "./site-brief/schema";
+import { siteBriefSchemaV1, type SiteBriefV1 } from "./site-brief/schema";
 
 const userA: SessionUser = { id: "9001", login: "ama", name: "Ama" };
 const userB: SessionUser = { id: "9002", login: "kofi", name: "Kofi" };
@@ -275,5 +276,125 @@ describe("changing choices does not lose business information", () => {
     expect(final.brief.category).toBe("online-shop");
     expect(final.brief.phone).toBe("+233201234567");
     expect(final.brief.tagline).toBe("Fits you");
+  });
+});
+
+/**
+ * Stage 3 made bundle shops online-only. A bundle site saved before that rule
+ * still carries "cod" and/or an enabled delivery option, and
+ * siteBriefSchemaV1 now rejects both. normalizeBrief repairs that on read so
+ * the owner's next autosave cannot freeze silently.
+ */
+describe("normalizeBrief self-heals stale bundle-shop payment config", () => {
+  function bundleBrief(
+    methods: Array<"cod" | "valmont_pay" | "momo"> = ["cod", "valmont_pay"],
+    deliveryEnabled = true,
+    paymentsEnabled = true,
+  ): SiteBriefV1 {
+    const base = brief({ category: "data-bundles" });
+    return {
+      ...base,
+      items: [
+        {
+          id: "bundle-00",
+          name: "MTN 1GB",
+          price: 10,
+          bundle: { network: "mtn", dataMb: 1024 },
+        },
+      ],
+      payments: {
+        ...base.payments,
+        enabled: paymentsEnabled,
+        methods,
+        delivery: { ...base.payments.delivery, enabled: deliveryEnabled },
+      },
+    };
+  }
+
+  it("stale bundle config fails the schema before the fix-up", () => {
+    // Proves the trap is real: without normalizeBrief the brief is invalid.
+    expect(siteBriefSchemaV1.safeParse(bundleBrief()).success).toBe(false);
+  });
+
+  it("keeps only valmont_pay and switches delivery off", () => {
+    const normalized = normalizeBrief(bundleBrief());
+
+    expect(normalized.payments.methods).toEqual(["valmont_pay"]);
+    expect(normalized.payments.delivery.enabled).toBe(false);
+    expect(siteBriefSchemaV1.safeParse(normalized).success).toBe(true);
+  });
+
+  it("sanitises methods even when payments are switched off", () => {
+    // The wizard hides the method toggles for bundle shops, so an owner who
+    // enables payments later must not land on a stale ["cod"].
+    const normalized = normalizeBrief(bundleBrief(["cod"], false, false));
+
+    expect(normalized.payments.methods).toEqual([]);
+    expect(normalized.payments.enabled).toBe(false);
+    expect(siteBriefSchemaV1.safeParse(normalized).success).toBe(true);
+  });
+
+  it("keeps valmont_pay and the delivery fee settings intact", () => {
+    const stale = bundleBrief();
+    const normalized = normalizeBrief(stale);
+
+    expect(normalized.payments.enabled).toBe(true);
+    expect(normalized.payments.delivery.fee).toBe(stale.payments.delivery.fee);
+    expect(normalized.payments.notifications).toEqual(
+      stale.payments.notifications,
+    );
+  });
+
+  it("leaves a non-bundle brief untouched", () => {
+    const nonBundle: SiteBriefV1 = {
+      ...brief({ category: "online-shop" }),
+      payments: {
+        ...brief().payments,
+        enabled: true,
+        methods: ["cod", "momo"],
+        delivery: {
+          ...brief().payments.delivery,
+          enabled: true,
+          fee: 15,
+        },
+      },
+    };
+    const normalized = normalizeBrief(nonBundle);
+
+    expect(normalized.payments.methods).toEqual(["cod", "momo"]);
+    expect(normalized.payments.delivery.enabled).toBe(true);
+    expect(normalized.payments.delivery.fee).toBe(15);
+    expect(normalized).toEqual(nonBundle);
+  });
+
+  it("heals a stale bundle draft when it is read back from the store", async () => {
+    const draft = await store.create(
+      userA,
+      bundleBrief(["cod", "valmont_pay"], true, false),
+    );
+    // Write the stale config straight to the row, bypassing validation, the way
+    // a draft saved by the previous build would look on disk.
+    const db = getStudioSqliteDb();
+    const row = db
+      .prepare("SELECT brief_json FROM studio_drafts WHERE id = ?")
+      .get(draft.id) as { brief_json: string };
+    db.prepare("UPDATE studio_drafts SET brief_json = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...JSON.parse(row.brief_json),
+        payments: {
+          ...JSON.parse(row.brief_json).payments,
+          enabled: true,
+          methods: ["cod", "valmont_pay"],
+          delivery: { enabled: true, fee: 10, minimumOrder: 0 },
+        },
+      }),
+      draft.id,
+    );
+
+    const loaded = await store.get(userA, draft.id);
+
+    expect(loaded?.brief.payments.methods).toEqual(["valmont_pay"]);
+    expect(loaded?.brief.payments.delivery.enabled).toBe(false);
+    expect(siteBriefSchemaV1.safeParse(loaded?.brief).success).toBe(true);
   });
 });

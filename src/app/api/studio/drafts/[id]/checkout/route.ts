@@ -139,25 +139,40 @@ export async function POST(
       }
       const normRecipient = normalizeGhanaMobile(recipientRaw);
       normalizedRecipient = normRecipient ?? recipientRaw;
-      // customerPhone is the buyer's contact, optional — fallback to recipient
+      // customerPhone is the buyer's own contact, optional — falls back to the
+      // recipient number. It accepts a number from any country: plenty of
+      // bundle buyers are in the diaspora paying for family in Ghana, and they
+      // need to be reachable on the number they actually use. Only the
+      // recipient is held to the Ghana-mobile rule, because that is the number
+      // the bundle is delivered to. A Ghana mobile is still normalised to
+      // 0240000001; anything else is stored as typed.
       if (!normalizedPhone) {
         normalizedPhone = normalizedRecipient;
       } else {
-        // If buyer provided a phone, validate it too (but allow any format? keep Ghana check)
-        const buyerErr = validateGhanaMobile(normalizedPhone);
-        if (buyerErr) {
-          // For bundle shops, buyer contact should also be Ghana mobile if provided, but we allow fallback
-          // To keep UX simple, still enforce Ghana mobile for buyer when given
-          return NextResponse.json({ error: buyerErr }, { status: 400 });
+        if (normalizedPhone.length < 6) {
+          return NextResponse.json(
+            { error: "Please enter a phone number with at least 6 digits." },
+            { status: 400 },
+          );
         }
         const normBuyer = normalizeGhanaMobile(normalizedPhone);
         if (normBuyer) normalizedPhone = normBuyer;
       }
     } else {
-      // Non-bundle shops: customerPhone required
+      // Non-bundle shops: customerPhone required, and at least 6 characters —
+      // the same floor the field has always had. The route schema went
+      // optional for bundle shops (where the buyer contact may be blank), so
+      // the length floor has to be enforced here or a one-digit number would
+      // be accepted for every other shop type.
       if (!normalizedPhone) {
         return NextResponse.json(
           { error: "Phone number is required." },
+          { status: 400 },
+        );
+      }
+      if (normalizedPhone.length < 6) {
+        return NextResponse.json(
+          { error: "Please enter a phone number with at least 6 digits." },
           { status: 400 },
         );
       }

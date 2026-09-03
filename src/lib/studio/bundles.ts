@@ -241,6 +241,25 @@ export function normalizeGhanaMobile(input: string): string | null {
   return cleaned;
 }
 
+/**
+ * Masks a phone number for display on pages a stranger can open.
+ *
+ * The guest order-confirmation page (`/orders/<id>/confirmed`) needs no login,
+ * so a full number printed there is public the moment the order exists.
+ * "0240000001" becomes "024 ••• 0001": the prefix is enough for a customer to
+ * recognise which number they entered, while the middle digits stay hidden.
+ *
+ * Short or empty input is masked entirely rather than echoed back, so an
+ * unexpected value can never leak a number that does not fit the expected
+ * shape. Only ever used for display — storage and delivery keep the full
+ * number.
+ */
+export function maskGhanaMobile(input: string | null | undefined): string {
+  const cleaned = (input ?? "").trim().replace(/[\s\-()]/g, "");
+  if (cleaned.length < 8) return "••• ••• ••••";
+  return `${cleaned.slice(0, 3)} ••• ${cleaned.slice(-4)}`;
+}
+
 export function checkRecipientNetworkMatch(
   recipientPhone: string,
   bundleNetwork: BundleNetworkId,

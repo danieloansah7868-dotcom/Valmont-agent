@@ -6,6 +6,7 @@ import { orderConfirmationDestination } from "@/lib/studio/order-confirmation";
 import { publicGetDraft } from "@/lib/studio/draft-public";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { customerAccountsEnabled } from "@/lib/studio/site-brief/schema";
+import { maskGhanaMobile } from "@/lib/studio/bundles";
 import { formatMoney, STATUS_LABELS } from "@/lib/studio/valmont-pay";
 
 export const dynamic = "force-dynamic";
@@ -15,6 +16,14 @@ export const dynamic = "force-dynamic";
  * method: a paid card/Valmont Pay order, a bank/Mobile Money order awaiting a
  * manual transfer, or a cash-on-delivery order. It only ever reflects the real
  * recorded status — nothing here claims a payment that has not happened.
+ *
+ * Privacy: this page is reachable with no login (it looks the order up by id
+ * alone), so it never prints a phone number. The one exception is the
+ * recipient of a bundle order, which is masked ("024 ••• 0001") because the
+ * customer needs to confirm the number they are sending data to. The buyer's
+ * own contact number, and the full recipient number, are shown only on
+ * authenticated pages: the Studio order page for the owner and the
+ * customer-account order page for the customer.
  */
 export default async function OrderConfirmedPage({
   params,
@@ -66,13 +75,7 @@ export default async function OrderConfirmedPage({
         {order.recipientPhone && (
           <p className="mt-2 text-sm">
             <span className="font-semibold">Send to: </span>
-            {order.recipientPhone}
-          </p>
-        )}
-        {order.customerPhone && (
-          <p className="mt-1 text-sm">
-            <span className="font-semibold">Contact: </span>
-            {order.customerPhone}
+            {maskGhanaMobile(order.recipientPhone)}
           </p>
         )}
 

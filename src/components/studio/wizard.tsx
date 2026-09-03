@@ -438,12 +438,14 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
             },
           } as CatalogItem;
         });
-        // Stage 3: entering data-bundles must set Valmont Pay only and disable delivery, otherwise new superRefine freezes autosave
+        // Stage 3: entering data-bundles must set Valmont Pay only and disable
+        // delivery, otherwise the superRefine rule freezes autosave. The
+        // methods list is sanitised even when payments are switched off: an
+        // owner who turns payments on *later* would otherwise land on a stale
+        // ["cod"], and by then the toggle that could fix it is hidden.
         const sanitizedPayments = {
           ...brief.payments,
-          methods: brief.payments.enabled
-            ? (["valmont_pay"] as PaymentMethodId[])
-            : brief.payments.methods,
+          methods: ["valmont_pay"] as PaymentMethodId[],
           delivery: {
             ...brief.payments.delivery,
             enabled: false,

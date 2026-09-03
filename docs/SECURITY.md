@@ -348,6 +348,19 @@ received. When Live is selected but the connection is incomplete, online
 methods are refused with 409 **before** an order row exists; the fail-closed
 webhook therefore never has an orphaned pending order to ignore.
 
+### Unauthenticated order pages — no personal data
+
+`/orders/[id]/confirmed` is reachable with no session: it looks the order up by
+id alone, so anything printed there is public to whoever holds the link. It
+therefore prints no phone number at all, with one deliberate exception — the
+recipient of a data-bundle order, masked by `maskGhanaMobile` as
+`024 ••• 0001`, because the customer needs to confirm the number they are
+sending data to. Masking keeps the first three and last four characters only;
+input shorter than 8 characters is masked in full rather than echoed back, so
+an unexpected value cannot leak. The buyer's own contact number is never
+printed on a guest page, and full numbers appear only behind authentication:
+the owner's Studio order page and the customer-account order page.
+
 ### Customer registration — no account enumeration
 
 `POST /api/customer/auth/register` answers with the same neutral message
