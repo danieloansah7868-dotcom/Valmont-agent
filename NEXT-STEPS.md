@@ -6,13 +6,37 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
-## Data Bundles — Stage 2 implemented, Stage 3–6 pending
+## Data Bundles — Stages 1–3 merged, Stage 4–6 pending
 
-Stage 2 (catalogue field `bundle: { network, dataMb, validity }`, superRefine, starter merge, wizard table, readiness v2, storefront tabs, Ghana mobile single-source validation, network-mismatch warning only) is on this branch `arena/01a062e7-valmont-agent`.
+Stages 1–2 (catalogue field `bundle: { network, dataMb, validity }`, superRefine,
+starter merge, wizard table, readiness v2, storefront tabs, Ghana mobile
+single-source validation, network-mismatch warning only) and Stage 3 are on
+`main`.
 
-Stage 3: recipient phone column + validation in orders table and checkout API (no new DB migration in Stage 2).
-Stage 4: delivery integration (provider API, status callbacks).
-Stage 5: TechChief key provisioning — awaiting TechChief integration doc (API spec, auth, pricing, callback format).
+**Stage 3 — merged** as PR #44 (merge commit `b260c9c`) plus review fixes in PR
+#45 (merge commit `79f23b5`). It adds the `recipient_phone` column (migration
+`0011`), a required recipient number and an optional buyer contact at checkout,
+and **Valmont Pay only / no delivery** for bundle shops (superRefine + wizard +
+checkout route).
+
+Carried by the #45 review fixes:
+
+- The guest confirmation page `/orders/[id]/confirmed` is unauthenticated, so it
+  prints no phone number except a masked recipient line (`024 ••• 0001`); full
+  numbers appear only on authenticated owner/customer pages.
+- Stale bundle configs saved before the online-only rule are repaired on read in
+  `normalizeBrief`, so the owner's next autosave cannot freeze.
+- The non-bundle `customerPhone` minimum length (6) was restored in the checkout
+  route, which the optional-field change had dropped.
+- **Decision:** the buyer's own contact accepts any country (diaspora buyers),
+  while the recipient stays Ghana-mobile-only.
+
+Stage 4: delivery integration (provider API, status callbacks) — the simulator
+can be built now; the real provider is blocked on the API doc below.
+Stage 5: TechChief key provisioning — **blocked awaiting the TechChief
+integration doc** (API spec, auth, pricing, callback format). Nothing in the
+codebase can substitute for it; until it arrives, bundle delivery can only run
+in test mode against the simulator.
 Stage 6: analytics, rate-limits, fraud checks, documentation polish.
 
 ---
