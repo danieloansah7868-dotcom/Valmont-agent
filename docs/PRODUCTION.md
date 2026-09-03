@@ -293,6 +293,22 @@ customer-facing message (no order row is created) rather than falling
 back to the simulator; cash-on-delivery and other offline methods keep
 working, and readiness reports `dependencies.payments = live_misconfigured`.
 
+### Bundle delivery: simulator only until TechChief is connected
+
+Paid data-bundle orders create one delivery row per bundle line
+(`studio_deliveries`, migration `0012`) and dispatch a top-up through the
+provider selected by `BUNDLE_DELIVERY_PROVIDER`. The default (and any
+production value today) is `simulator`: it rehearses the full lifecycle with
+no real data moving, so delivered-looking rows in a self-hosted test shop
+move no data. `techchief` is a stub that fails every send with an
+owner-visible reason until the Stage 5 integration document arrives — there
+is no real-provider mode to enable before then. An unknown value fails
+closed the same loud way, so a typo can never make the simulator record fake
+deliveries for a live shop. Delivery failures never affect payments: the
+webhook marks the order paid and answers 200 first, dispatches
+fire-and-forget, and rows the provider could not deliver stay `failed` for
+the merchant to retry from Studio → Orders.
+
 ### What Phase 1 does not do in production
 
 No file uploads, no payment processing, no repository generation, and no

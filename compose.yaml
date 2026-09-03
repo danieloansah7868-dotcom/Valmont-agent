@@ -63,6 +63,10 @@ services:
       VALMONT_PAY_API_URL: ${VALMONT_PAY_API_URL:-}
       VALMONT_PAY_API_KEY: ${VALMONT_PAY_API_KEY:-}
       VALMONT_PAY_WEBHOOK_SECRET: ${VALMONT_PAY_WEBHOOK_SECRET:-}
+      # Bundle top-up provider (Stage 4): "simulator" (default) or "techchief"
+      # (a stub until the Stage 5 integration doc lands). Unknown values fail
+      # closed — they never fall back to the simulator silently.
+      BUNDLE_DELIVERY_PROVIDER: ${BUNDLE_DELIVERY_PROVIDER:-}
       # GitHub logins allowed to change payment settings (comma-separated).
       STUDIO_PAYMENT_ADMINS: ${STUDIO_PAYMENT_ADMINS:-}
       # Custom-domain CNAME target; same value as the build arg above.

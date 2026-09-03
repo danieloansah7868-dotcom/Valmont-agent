@@ -343,3 +343,74 @@ weakened for tests. The production Dockerfile installs no browser binaries.
 Uploads and object storage, repository generation, sandboxed builds, preview
 deployments, admin roles, e-commerce, payments, and template versioning all
 remain unimplemented.
+
+## Data Bundles — Stage 4: bundle delivery engine
+
+Stage 3 made a paid bundle order possible; Stage 4 delivers it. The engine
+(`src/lib/studio/bundle-delivery.ts`) turns each bundle line of a **paid**
+order into one delivery row and asks a provider to top up the recipient. Only
+`data-bundles` websites are involved; every other website type is untouched.
+
+### Flow
+
+1. Checkout snapshots the line's bundle metadata (`network`, `dataMb`,
+   `validity`) into `studio_orders.lines_json`, so a later catalogue edit can
+   never change what a paid order owes the customer. Orders paid before
+   Stage 4 have no snapshot and resolve against the live catalogue instead.
+2. The payments webhook calls `dispatchBundleDeliveriesForOrder(orderId)`
+   **fire-and-forget** right after it moves an order to `paid`: the payment
+   answer is already committed, so a slow or broken provider can never delay
+   or break the webhook's 200. Duplicate webhooks re-enter safely.
+3. `recheckBundleDeliveriesForOrder(orderId)` runs on order-page loads
+   (owner order page and guest confirmation page). It creates rows the
+   webhook could not create (recovery after an outage), flushes rows stuck at
+   `pending`, and polls the provider for rows at `processing`. It never
+   throws, so a page renders with or without the engine.
+4. The owner's `/studio/orders/[id]` page shows a **Bundle delivery** panel
+   (full recipient, per-row status, attempts, provider reference, last
+   error) with a **Retry** action for failed top-ups, routed to
+   `POST /api/studio/orders/[id]/bundle-deliveries/retry`.
+5. The unauthenticated confirmation page shows one **masked aggregate line**
+   ("3GB of data to 024 ••• 0001 — …") — never a full number, provider
+   reference, attempt count or error detail.
+
+### Invariants (each has a dedicated test)
+
+- **I1 paid-first** — no delivery row exists and the provider is never called
+  before the order is paid.
+- **I2 idempotent** — exactly one row per paid bundle line, enforced by the
+  unique `(order_id, item_id)` index; replays and rechecks re-run safely.
+- **I3 terminal success** — `delivered` is final; rechecks, retries and
+  provider callbacks never move or double-send a delivered row.
+- **I4 isolated failure** — provider failures land on the row (`failed` +
+  owner-readable error) and are never thrown into the caller; only `failed`
+  rows can be retried, and only by the owner.
+- **I5 bundle-only** — deliveries exist only for data-bundles orders; other
+  website types get no rows, no provider calls, no UI changes.
+- **I6 guest privacy** — unauthenticated surfaces see only the masked
+  aggregate line.
+
+### Providers
+
+`BundleDeliveryProvider` (`sendBundle` + `checkStatus`) is selected by
+`BUNDLE_DELIVERY_PROVIDER`:
+
+- `simulator` (default): accepts every top-up as `processing` and reports it
+  `delivered` on the next status check — the offline rehearsal of the whole
+  lifecycle, mirroring the payment simulator.
+- `techchief`: a stub. The Stage 5 integration document (API spec, auth,
+  pricing, callback format) has not landed, so every send fails fast with an
+  owner-visible, retryable error instead of fabricating deliveries.
+- any other value fails closed (`MisconfiguredDeliveryProvider`), so a typo
+  can never silently activate the simulator in production.
+
+### Persistence
+
+`studio_deliveries` (migration `0012_studio_deliveries`, SQLite
+`ensureBundleDeliveriesSchema` beside the orders schema) stores the snapshot
+(item id/name, network, size, validity, quantity, full recipient — server
+side only) plus engine state (`provider`, `status`, `attempts`,
+`provider_ref`, `last_error`, `delivered_at`). Status transitions are guarded
+at the statement level (`pending|failed → processing`, `→ failed`,
+`pending|processing → delivered`), so an ill-timed callback or retry can
+never resurrect or double-send a row.

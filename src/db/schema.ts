@@ -431,6 +431,67 @@ export const studioOrders = pgTable(
 );
 
 /**
+ * Data-bundles Stage 4 deliveries. One row per paid bundle line of an order,
+ * created lazily by the delivery engine the first time a payment is confirmed
+ * (and never before — see `src/lib/studio/bundle-delivery.ts` for invariants
+ * I1–I6). Every column after `quantity` is engine-owned state: the provider
+ * name, the pending → processing → delivered/failed lifecycle, the attempt
+ * counter, the provider's reference and the last error the owner should see.
+ * The unique `(order_id, item_id)` index is what makes webhook replays,
+ * double-dispatches and page-load rechecks idempotent (I2).
+ */
+export const studioDeliveries = pgTable(
+  "studio_deliveries",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orderId: uuid("order_id")
+      .notNull()
+      .references(() => studioOrders.id, { onDelete: "cascade" }),
+    ownerId: uuid("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Catalogue line id and display name, snapshotted at dispatch time. */
+    itemId: text("item_id").notNull(),
+    itemName: text("item_name").notNull(),
+    /** Bundle size and network resolved from the order snapshot. */
+    network: text("network").notNull(),
+    dataMb: integer("data_mb").notNull(),
+    validity: text("validity"),
+    quantity: integer("quantity").notNull().default(1),
+    /** Full recipient number — server-side only, masked on guest pages. */
+    recipientPhone: text("recipient_phone").notNull(),
+    /**
+     * Which provider handled the latest dispatch attempt ("simulator" in test
+     * mode; "techchief" once the Stage 5 integration lands).
+     */
+    provider: text("provider").notNull().default("simulator"),
+    /** "pending" | "processing" | "delivered" | "failed". */
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    providerRef: text("provider_ref"),
+    lastError: text("last_error"),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("studio_deliveries_order_idx").on(table.orderId),
+    index("studio_deliveries_owner_created_idx").on(
+      table.ownerId,
+      table.createdAt,
+    ),
+    uniqueIndex("studio_deliveries_order_item_unique").on(
+      table.orderId,
+      table.itemId,
+    ),
+  ],
+);
+
+/**
  * Studio payment settings — a single row (id always 1) holding the Valmont
  * Pay account details saved on the Studio → Settings → Payments page. The
  * secret fields are AES-256-GCM envelopes (see `encryptSessionValue`); the

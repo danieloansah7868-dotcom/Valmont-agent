@@ -197,6 +197,11 @@ export async function POST(
         price: item.price,
         quantity: line.quantity,
         image: item.image,
+        // Stage 4: data-bundles lines snapshot their delivery metadata into
+        // the order so a later catalogue edit can never change what a paid
+        // order must deliver. Undefined for every other website type, so
+        // nothing about non-bundle orders changes (JSON drops the key).
+        bundle: item.bundle,
       });
       pricedLines.push({ price: item.price, quantity: line.quantity });
     }

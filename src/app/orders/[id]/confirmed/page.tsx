@@ -8,6 +8,10 @@ import { getOrdersStore } from "@/lib/studio/orders";
 import { customerAccountsEnabled } from "@/lib/studio/site-brief/schema";
 import { maskGhanaMobile } from "@/lib/studio/bundles";
 import { formatMoney, STATUS_LABELS } from "@/lib/studio/valmont-pay";
+import {
+  guestBundleDeliverySummary,
+  recheckBundleDeliveriesForOrder,
+} from "@/lib/studio/bundle-delivery";
 
 export const dynamic = "force-dynamic";
 
@@ -53,6 +57,17 @@ export default async function OrderConfirmedPage({
     ? await getCustomerSession().catch(() => null)
     : null;
   const destination = orderConfirmationDestination(order, viewer);
+  // Stage 4: reconcile bundle top-ups on load so the page shows live delivery
+  // progress (and a paid order recovers any top-up the webhook could not
+  // start). The engine never throws, and only data-bundles orders ever have
+  // rows. Guests get one masked aggregate line — never a full number,
+  // provider reference or error detail.
+  const bundleDeliveries = order.recipientPhone
+    ? await recheckBundleDeliveriesForOrder(order.id)
+    : [];
+  const bundleDeliveryLine =
+    guestBundleDeliverySummary(bundleDeliveries, order.recipientPhone)?.line ??
+    null;
   const paid = order.status === "paid";
   const cod = order.status === "cod_pending";
   const failed = order.status === "payment_failed";
@@ -76,6 +91,11 @@ export default async function OrderConfirmedPage({
           <p className="mt-2 text-sm">
             <span className="font-semibold">Send to: </span>
             {maskGhanaMobile(order.recipientPhone)}
+          </p>
+        )}
+        {bundleDeliveryLine && (
+          <p className="mt-2 text-sm" data-testid="bundle-delivery-line">
+            {bundleDeliveryLine}
           </p>
         )}
 

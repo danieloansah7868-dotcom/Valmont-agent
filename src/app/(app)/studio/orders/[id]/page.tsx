@@ -9,6 +9,20 @@ import { formatAccra } from "@/lib/studio/format";
 import { PAYMENT_METHODS } from "@/lib/studio/site-brief/schema";
 import { OrderActions } from "@/components/studio/order-actions";
 import { PaymentModeBadge } from "@/components/studio/payment-mode-badge";
+import {
+  DELIVERY_STATUS_LABELS,
+  recheckBundleDeliveriesForOrder,
+  type DeliveryStatus,
+} from "@/lib/studio/bundle-delivery";
+import { bundleNetworkLabel, formatDataMb } from "@/lib/studio/bundles";
+import { BundleDeliveryRetryButton } from "@/components/studio/bundle-delivery-panel";
+
+const DELIVERY_BADGE_CLASS: Record<DeliveryStatus, string> = {
+  pending: "bg-amber-100 text-amber-900",
+  processing: "bg-blue-100 text-blue-900",
+  delivered: "bg-green-100 text-green-800",
+  failed: "bg-red-100 text-red-800",
+};
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +35,17 @@ export default async function OrderDetailPage({
   const { id } = await params;
   const order = await getOrdersStore().getForOwner(canonicalUserId(user), id);
   if (!order) notFound();
+
+  // Stage 4: reconcile bundle top-ups on every page load (recovery after an
+  // outage flushes rows stuck at "pending" and polls "processing" ones). The
+  // engine never throws; only data-bundles orders ever produce rows, so this
+  // stays empty — and the panel stays hidden — for every other website type.
+  const bundleDeliveries = order.recipientPhone
+    ? await recheckBundleDeliveriesForOrder(order.id)
+    : [];
+  const failedTopUps = bundleDeliveries.filter(
+    (delivery) => delivery.status === "failed",
+  ).length;
 
   const methodLabel =
     PAYMENT_METHODS.find((method) => method.id === order.paymentMethod)
@@ -149,6 +174,83 @@ export default async function OrderDetailPage({
           </li>
         </ul>
       </section>
+
+      {bundleDeliveries.length > 0 && (
+        <section
+          className="mt-4 rounded-xl border border-line bg-white p-4"
+          data-testid="bundle-delivery-panel"
+        >
+          <h2 className="text-sm font-semibold text-navy">Bundle delivery</h2>
+          <ul className="mt-3 grid gap-3">
+            {bundleDeliveries.map((delivery) => (
+              <li
+                key={delivery.id}
+                className="rounded-lg border border-line p-3 text-sm"
+                data-testid={`bundle-delivery-${delivery.status}`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-semibold">
+                    {bundleNetworkLabel(delivery.network)}{" "}
+                    {formatDataMb(delivery.dataMb)} × {delivery.quantity}
+                  </span>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                      DELIVERY_BADGE_CLASS[delivery.status] ??
+                      "bg-slate-200 text-slate-700"
+                    }`}
+                  >
+                    {DELIVERY_STATUS_LABELS[delivery.status]}
+                  </span>
+                </div>
+                <dl className="mt-1 grid gap-0.5 text-xs text-slate-600">
+                  <div>
+                    <dt className="inline font-semibold">To: </dt>
+                    <dd className="inline">{delivery.recipientPhone}</dd>
+                  </div>
+                  {delivery.itemName && (
+                    <div>
+                      <dt className="inline font-semibold">Item: </dt>
+                      <dd className="inline">{delivery.itemName}</dd>
+                    </div>
+                  )}
+                  <div>
+                    <dt className="inline font-semibold">Attempts: </dt>
+                    <dd className="inline">{delivery.attempts}</dd>
+                  </div>
+                  {delivery.providerRef && (
+                    <div>
+                      <dt className="inline font-semibold">Reference: </dt>
+                      <dd className="inline font-mono">
+                        {delivery.providerRef}
+                      </dd>
+                    </div>
+                  )}
+                  {delivery.deliveredAt && (
+                    <div>
+                      <dt className="inline font-semibold">Delivered: </dt>
+                      <dd className="inline">
+                        {formatAccra(delivery.deliveredAt)}
+                      </dd>
+                    </div>
+                  )}
+                  {delivery.status === "failed" && delivery.lastError && (
+                    <div>
+                      <dt className="inline font-semibold">Problem: </dt>
+                      <dd className="inline text-red-700">
+                        {delivery.lastError}
+                      </dd>
+                    </div>
+                  )}
+                </dl>
+              </li>
+            ))}
+          </ul>
+          <BundleDeliveryRetryButton
+            orderId={order.id}
+            failedCount={failedTopUps}
+          />
+        </section>
+      )}
 
       {order.statusHistory.length > 0 && (
         <section className="mt-4 rounded-xl border border-line bg-white p-4">
