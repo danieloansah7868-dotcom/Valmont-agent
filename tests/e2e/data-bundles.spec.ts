@@ -213,7 +213,9 @@ test.describe("data-bundles shop", () => {
         name: new RegExp(`Order ${orderId.slice(0, 8)}`),
       }),
     ).toBeVisible();
-    await expect(page.getByText(firstBundle.name)).toBeVisible();
+    // The Items row renders "<name> × <qty>" — assert that full line, because
+    // the delivery panel below also prints the bare bundle name per unit.
+    await expect(page.getByText(`${firstBundle.name} × 1`)).toBeVisible();
     // The owner's own page keeps the full numbers: recipient in the tel link
     // of the Customer section, buyer as Phone.
     await expect(page.getByRole("link", { name: "0240000001" })).toBeVisible();
@@ -224,7 +226,11 @@ test.describe("data-bundles shop", () => {
     const bundlePanel = page.getByTestId("bundle-delivery-panel");
     await expect(bundlePanel).toBeVisible();
     await page.reload();
-    await expect(bundlePanel.getByText("Delivered")).toBeVisible();
+    const deliveredRow = page.getByTestId("bundle-delivery-delivered");
+    await expect(deliveredRow).toBeVisible();
+    await expect(
+      deliveredRow.getByText("Delivered", { exact: true }),
+    ).toBeVisible();
 
     // Landline refusal — client shows error
     const owner2 = nextOwner();
