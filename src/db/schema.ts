@@ -1,3 +1,4 @@
+import { desc } from "drizzle-orm";
 import {
   bigint,
   boolean,
@@ -548,6 +549,39 @@ export const studioSettings = pgTable("studio_settings", {
     .defaultNow(),
   updatedBy: text("updated_by"),
 });
+
+/**
+ * The owner's private notebook of ideas and future plans. Scoped to the
+ * signed-in account like chat memories: `user_id` is the GitHub user id
+ * (text, matching the chat store's `user_id`), every query filters by it, and
+ * idea content is never fed to the chat model. Status moves through
+ * idea → planned → building → done (or dropped); priority is 1 = Now,
+ * 2 = Soon, 3 = Later.
+ */
+export const ideas = pgTable(
+  "ideas",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: text("user_id").notNull(),
+    title: text("title").notNull(),
+    details: text("details").notNull().default(""),
+    status: text("status").notNull().default("idea"),
+    priority: integer("priority").notNull().default(2),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("ideas_user_status_updated_idx").on(
+      table.userId,
+      table.status,
+      desc(table.updatedAt),
+    ),
+  ],
+);
 
 export const pullRequests = pgTable("pull_requests", {
   id: uuid("id").primaryKey().defaultRandom(),

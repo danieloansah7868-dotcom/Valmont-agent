@@ -7,6 +7,7 @@ import {
   FolderGit2,
   Home,
   LayoutDashboard,
+  Lightbulb,
   ListChecks,
   MessageSquareText,
   PanelsTopLeft,
@@ -20,6 +21,7 @@ const links = [
   { href: "/studio", label: "Website Studio", icon: PanelsTopLeft },
   { href: "/repositories", label: "Repositories", icon: FolderGit2 },
   { href: "/tasks", label: "Tasks", icon: ListChecks },
+  { href: "/ideas", label: "Ideas", icon: Lightbulb },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

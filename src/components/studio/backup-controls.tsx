@@ -23,6 +23,8 @@ interface ImportSummary {
   customerTokens: number;
   customDomains: number;
   skippedDomains: number;
+  /** Ideas restored (0 for backups made before the Ideas page). */
+  ideas: number;
   atomicity: "single-transaction" | "coordinated";
   notice?: string;
 }
@@ -138,7 +140,7 @@ export function BackupControls() {
       </div>
 
       <p className="text-xs text-slate-500">
-        The backup holds your chats, memories and website drafts. Older
+        The backup holds your chats, memories, website drafts and ideas. Older
         chat-only backups still work.
       </p>
 
@@ -168,6 +170,19 @@ export function BackupControls() {
           </span>
         )}
       </p>
+
+      {/* Ideas ride in the same optional section as domains: a backup made
+          before the Ideas page has none, so only mention a restore count. */}
+      {status.kind === "done" && (status.summary.ideas ?? 0) > 0 && (
+        <p
+          role="status"
+          data-testid="import-ideas"
+          className="text-sm text-green-800"
+        >
+          {status.summary.ideas} idea{status.summary.ideas === 1 ? "" : "s"}{" "}
+          restored to your private notebook.
+        </p>
+      )}
 
       {/* Accounts already on this machine are deliberately left untouched —
           a restore never overwrites a customer's current password. */}

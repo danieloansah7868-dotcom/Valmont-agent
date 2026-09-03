@@ -103,10 +103,13 @@ Drizzle/PostgreSQL entities:
 - workspaces
 - model/tool executions
 - pull request records
+- owner ideas (`ideas` table — per-user private notebook, never fed to prompts)
 
 `PostgresTaskStore` is selected automatically when `DATABASE_URL` is configured and enforces session ownership in every task query. It hydrates normalized event, approval, tool, and pull-request records. Raw repository content and assembled model prompts are not stored in these tables. Account token ciphertext is explicitly server-only. The task JSON fallback uses `.data/task-store.json`, atomic rename writes, and a process-local serialization queue; it starts empty and is never seeded with fixtures.
 
 `CustomerAccountStore` uses the same automatic SQLite/PostgreSQL selection as Studio orders. Customer email addresses are normalized, passwords are stored as parameterized scrypt hashes, session/token values are stored only as SHA-256 hashes, and customer order queries always filter by the authenticated customer account id. The feature is an owner opt-in per website (`brief.features.customerAccounts`, default off): the storefront account link, checkout auto-linking, order claiming, and `/account` order visibility are all gated on it. The Studio backup v2 `customers` section exports these tables (hashes only — password scrypt envelopes and SHA-256 token digests, never plaintext or payment credentials), and the restore path inserts with or-ignore semantics inside the existing single-transaction (SQLite) or fenced-coordinator (PostgreSQL) import, so a restore never overwrites an existing account.
+
+`IdeaStore` (`src/lib/idea-store.ts`, behind `getIdeaStore()` which picks SQLite or PostgreSQL exactly like `getOrdersStore()`) persists the owner's private idea notebook: `id`, `user_id` (the signed-in GitHub user id), `title` (≤120), `details` (≤4000), `status` (`idea` / `planned` / `building` / `done` / `dropped`, default `idea`), `priority` (1 = Now, 2 = Soon, 3 = Later, default 2), and timestamps, with a `(user_id, status, updated_at DESC)` index. SQLite creates the table with `CREATE TABLE IF NOT EXISTS` on the shared `getSqliteChatStore()` connection (the same handle the Studio stores use); PostgreSQL gets it from Drizzle migration `0013_ideas.sql`. Every list/create/update/remove query filters by the authenticated user id, and an update or delete addressed at another user's id returns `null` / `false` (the API answers 404). Ideas are personal scratch space: they are **never** loaded into model prompts, context, memory capture, or any chat path — the Ideas page states this and the store has no importer into the chat pipeline. Write routes carry the same guards as `/api/memories` (CSRF, rate limit bucket `idea-write` at 30/min, 16 KB bounded body, zod validation, and `redactSecrets` with a 400 "Ideas cannot contain secrets" when redaction fires). The complete backup file carries an optional `ideas` section (version 1, array capped at 10,000); old files without it still import, and restore upserts by id with the owner forced to the importing user.
 
 `SqliteChatStore` persists user-owned session metadata, redacted message history, FTS retrieval rows, summaries, memories, and memory preferences in ignored local SQLite storage. `CHAT_STORE_PATH` is retained solely as the backwards-compatible legacy JSON input (default `.data/chat-store.json`). `CHAT_SQLITE_PATH` optionally selects the SQLite destination; when omitted, the destination is a distinct sibling `.sqlite` path next to the configured legacy source (for example `chat-store.json` becomes `chat-store.sqlite`). Startup validates that source and destination are distinct before opening SQLite, copies the source to an adjacent `.pre-sqlite-backup`, migrates rows and the completion marker in one immediate transaction, and rechecks the marker under the transaction lock to make restarts idempotent. The legacy JSON is never opened as SQLite or overwritten. Every get/list/delete operation includes the authenticated GitHub user ID. Repository context is deliberately absent from persisted messages; it is retrieved again after authorization checks for each repository-aware turn. This local-first store is intended for the trusted self-hosted runtime. A multi-instance production deployment must replace it with a transactional, encrypted, user-scoped store and retention/deletion controls.
 
@@ -161,6 +164,7 @@ from the codebase.
 | `src/lib/studio/site-brief/defaults.ts`  | Ghana defaults, region list, `formatGhanaPhone`, planned-payment labels.           |
 | `src/lib/studio/site-brief/readiness.ts` | `computeBriefCompleteness` and the preview placeholder helper.                     |
 | `src/lib/studio/draft-store.ts`          | `SqliteStudioDraftStore` and `PostgresStudioDraftStore` behind one interface.      |
+| `src/lib/idea-store.ts`                  | Owner's private idea notebook: `SqliteIdeaStore` / `PostgresIdeaStore`, per-user.  |
 | `src/lib/studio/merge.ts`                | Field-level three-way merge used by the 409 recovery path.                         |
 | `src/lib/studio/backup.ts`               | Backup v2 build, parse, and transactional import.                                  |
 | `src/lib/sqlite-path.ts`                 | The single SQLite path resolver shared by Chat and Studio.                         |
@@ -194,6 +198,19 @@ never point at an incompatible layout.
   migration `0002_uneven_the_anarchist.sql`: uuid primary key, `owner_id`
   referencing `users` with cascade delete, a `jsonb` brief, and the
   `studio_drafts_owner_updated_idx` index.
+
+The owner's ideas follow the same two-engine pattern in
+`src/lib/idea-store.ts`. On SQLite the `ideas` table is created with
+`CREATE TABLE IF NOT EXISTS` on the shared chat-store connection (so it joins
+the same single-transaction backup import as chat, memories and drafts). On
+PostgreSQL it is created by Drizzle migration `0013_ideas.sql`: uuid primary
+key, `user_id text not null` (the GitHub user id, matching the chat store's
+text `user_id` rather than the Studio `owner_id` uuid), `title`, `details`,
+`status`, `priority`, timestamps, and `ideas_user_status_updated_idx` on
+`(user_id, status, updated_at DESC)`. Scope is per user in both engines:
+every query filters by `user_id`, another user's idea answers update `null`
+/ delete `false`, and backups force the importing user as the owner. Ideas
+are never read by the chat or model-prompt paths.
 
 `src/lib/user-identity.ts` maps a GitHub id to a canonical UUID with
 `deterministicUuid("github:" + id)`, and `ensureStudioUser` upserts the row only

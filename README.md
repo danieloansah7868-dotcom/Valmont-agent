@@ -13,6 +13,7 @@ Valmont Agent is a private, web-based software assistant with reopenable convers
 - Approved dependency/test/lint/type-check/build command execution with real output and diffs
 - Persisted approval-first task state machine and visible audit timeline
 - **Chat with Valmont** for normal, reopenable conversations, with optional read-only repository/branch context and an explicit conversation-to-task handoff
+- **Ideas page** — the owner's private notebook (`/ideas`) for ideas and future plans, with status (idea / planned / building / done / dropped), Now/Soon/Later priority, client-side search, and the same CSRF, rate-limit, zod-validation and secret-redaction guards as memories. Ideas are scoped to the signed-in account and are never sent to the chat model or included in any model prompt; they are stored in SQLite (or PostgreSQL when `DATABASE_URL` is set) and ride along in the complete backup file.
 - Repository retrieval with sensitive/generated/binary path exclusions, bounded files, lexical/symbol search, and secret redaction
 - Provider-neutral `ModelProvider` supporting chat, structured output, tools, streaming, usage, and normalized errors
 - OpenAI-compatible server adapter configured only through server environment variables
@@ -229,7 +230,7 @@ does today.
 - **Ghana-friendly defaults** — Ghana, GHS/GH₵, `Africa/Accra`, automatic +233
   phone formatting, the sixteen Ghana regions, WhatsApp, and service or delivery
   areas.
-- **Backups** — download everything (chats, memories, and website drafts) as one
+- **Backups** — download everything (chats, memories, website drafts, and ideas) as one
   JSON file, and restore it later.
 
 ### What Phase 1 cannot do

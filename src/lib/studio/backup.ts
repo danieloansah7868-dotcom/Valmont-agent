@@ -4,6 +4,12 @@ import type { DatabaseSync } from "node:sqlite";
 import type { SessionUser } from "@/lib/auth";
 import { getSqliteChatStore, type ChatMemory } from "@/lib/chat-store";
 import type { ChatSession } from "@/lib/types";
+import {
+  ensureIdeaSchema,
+  IDEA_PRIORITIES,
+  IDEA_STATUSES,
+  type IdeaRecord,
+} from "@/lib/idea-store";
 import { canonicalUserId } from "@/lib/user-identity";
 import {
   siteBriefSchemaV1,
@@ -231,7 +237,29 @@ export const domainSectionSchema = z.object({
   domains: z.array(domainBackupSchema).max(5_000),
 });
 
-/** A complete backup: chat, memories and website drafts together. */
+/**
+ * Optional backup section: the owner's private idea notebook. Ideas are
+ * per-user scratch space, never fed to the chat model. The section is absent
+ * in backups made before the Ideas page existed; those files still import.
+ */
+const ideaBackupSchema = z.object({
+  id: draftId,
+  // Ignored on import — the importing user always becomes the owner.
+  userId: z.string().max(200).optional(),
+  title: z.string().max(120),
+  details: z.string().max(4000),
+  status: z.enum(IDEA_STATUSES),
+  priority: z.number().int().min(1).max(3),
+  createdAt: isoTimestamp,
+  updatedAt: isoTimestamp,
+});
+
+export const ideaSectionSchema = z.object({
+  version: z.literal(1),
+  ideas: z.array(ideaBackupSchema).max(10_000),
+});
+
+/** A complete backup: chat, memories, website drafts and ideas together. */
 export const backupV2Schema = z.object({
   backupVersion: z.literal(2),
   exportedAt: isoTimestamp,
@@ -239,6 +267,7 @@ export const backupV2Schema = z.object({
   studio: studioSectionSchema,
   customers: customerSectionSchema.optional(),
   domains: domainSectionSchema.optional(),
+  ideas: ideaSectionSchema.optional(),
 });
 
 /** The older chat-only file produced by /api/memories/export. */
@@ -248,6 +277,7 @@ export type BackupV2 = z.infer<typeof backupV2Schema>;
 export type StudioSection = z.infer<typeof studioSectionSchema>;
 export type CustomerSection = z.infer<typeof customerSectionSchema>;
 export type DomainSection = z.infer<typeof domainSectionSchema>;
+export type IdeaSection = z.infer<typeof ideaSectionSchema>;
 
 export interface NormalizedBackup {
   chat: z.infer<typeof chatSectionSchema>;
@@ -256,6 +286,8 @@ export interface NormalizedBackup {
   customers?: CustomerSection;
   /** Present only in backups written after custom domains were exported. */
   domains?: DomainSection;
+  /** Present only in backups written after the Ideas page existed. */
+  ideas?: IdeaSection;
   sourceVersion: 1 | 2;
 }
 
@@ -279,6 +311,7 @@ export function parseBackup(input: unknown): NormalizedBackup {
       studio: parsed.data.studio,
       customers: parsed.data.customers,
       domains: parsed.data.domains,
+      ideas: parsed.data.ideas,
       sourceVersion: 2,
     };
   }
@@ -324,7 +357,8 @@ export async function buildBackup(
     const drafts = await new PostgresStudioDraftStore().list(user);
     const customers = await exportCustomersPostgres(canonicalUserId(user));
     const domains = await exportDomainsPostgres(canonicalUserId(user));
-    return assembleBackup(chat, drafts, customers, domains);
+    const ideas = await exportIdeasPostgres(user.id);
+    return assembleBackup(chat, drafts, customers, domains, ideas);
   }
 
   // Chat and drafts are read back to back from the one shared connection
@@ -338,6 +372,7 @@ export async function buildBackup(
   // a read snapshot would force a write upgrade and fail under concurrency.
   ensureCustomerAccountSchema(store.connection);
   ensureDomainsSchema(store.connection);
+  ensureIdeaSchema(store.connection);
   let chat: {
     version: number;
     sessions: ChatSession[];
@@ -349,11 +384,13 @@ export async function buildBackup(
   // mid-export cannot split the file between two points in time.
   let customers: CustomerSection | undefined;
   let domains: DomainSection | undefined;
+  let ideas: IdeaSection = { version: 1, ideas: [] };
   store.runInReadTransaction(() => {
     chat = store.exportUserSync(user.id);
     // Test hook: proves the export cannot combine records from different
     // points in time by letting another connection commit mid-export.
     options.afterChatReadForTests?.();
+    ideas = exportIdeasSnapshot(store.connection, user.id);
     const rows = store.connection
       .prepare(
         "SELECT * FROM studio_drafts WHERE owner_id = ? ORDER BY updated_at DESC",
@@ -382,7 +419,7 @@ export async function buildBackup(
     customers = exportCustomersSnapshot(store.connection, ownerId);
     domains = exportDomainsSnapshot(store.connection, ownerId);
   });
-  return assembleBackup(chat!, drafts, customers, domains);
+  return assembleBackup(chat!, drafts, customers, domains, ideas);
 }
 
 function assembleBackup(
@@ -395,6 +432,7 @@ function assembleBackup(
   drafts: StudioDraft[],
   customers?: CustomerSection,
   domains?: DomainSection,
+  ideas?: IdeaSection,
 ): BackupV2 {
   return {
     backupVersion: BACKUP_VERSION,
@@ -417,6 +455,62 @@ function assembleBackup(
       tokens: [],
     },
     domains: domains ?? { version: 1, domains: [] },
+    ideas: ideas ?? { version: 1, ideas: [] },
+  };
+}
+
+/**
+ * The owner's ideas, read inside the caller's read transaction. Scoped by the
+ * signed-in GitHub user id (`ideas.user_id`), like chat memories.
+ */
+function exportIdeasSnapshot(db: DatabaseSync, userId: string): IdeaSection {
+  const rows = db
+    .prepare("SELECT * FROM ideas WHERE user_id = ? ORDER BY updated_at DESC")
+    .all(userId) as unknown as Array<Record<string, string | number>>;
+  return {
+    version: 1,
+    ideas: rows.map((row) => ({
+      id: String(row.id),
+      title: String(row.title),
+      details: row.details === null ? "" : String(row.details),
+      status: (IDEA_STATUSES as readonly string[]).includes(String(row.status))
+        ? (String(row.status) as IdeaRecord["status"])
+        : "idea",
+      priority: IDEA_PRIORITIES.includes(Number(row.priority) as 1 | 2 | 3)
+        ? (Number(row.priority) as IdeaRecord["priority"])
+        : 2,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    })),
+  };
+}
+
+async function exportIdeasPostgres(userId: string): Promise<IdeaSection> {
+  const { eq, desc } = await import("drizzle-orm");
+  const { getDatabase } = await import("@/db");
+  const { ideas } = await import("@/db/schema");
+  const rows = await getDatabase()
+    .select()
+    .from(ideas)
+    .where(eq(ideas.userId, userId))
+    .orderBy(desc(ideas.updatedAt));
+  return {
+    version: 1,
+    ideas: rows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      details: row.details ?? "",
+      status: (IDEA_STATUSES as readonly string[]).includes(row.status)
+        ? (row.status as IdeaRecord["status"])
+        : "idea",
+      priority: IDEA_PRIORITIES.includes(
+        Number(row.priority) as IdeaRecord["priority"],
+      )
+        ? (Number(row.priority) as IdeaRecord["priority"])
+        : 2,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    })),
   };
 }
 
@@ -846,15 +940,22 @@ export interface ImportOptions {
  * Owner ids inside the file are never trusted. Chat rows are reassigned by the
  * chat store, studio rows by this function.
  */
+/**
+ * What an import returns. `ImportSummary` is the documented, contract-tested
+ * body shared by chat/studio/customers/domains; `ideas` is added alongside it
+ * (zero for older files with no ideas section) without changing that shape.
+ */
+export type ImportResult = ImportSummary & { ideas: number };
+
 export async function importBackup(
   user: SessionUser,
   backup: NormalizedBackup,
   options: ImportOptions = {},
-): Promise<ImportSummary> {
+): Promise<ImportResult> {
   // Counts start empty and are filled in from what each store reports it wrote.
   // Trusting the file's own lengths is what previously let a dropped memory be
   // reported as restored.
-  const summary: ImportSummary = {
+  const summary: ImportResult = {
     sourceVersion: backup.sourceVersion,
     chatSessions: 0,
     memories: 0,
@@ -867,6 +968,7 @@ export async function importBackup(
     customerTokens: 0,
     customDomains: 0,
     skippedDomains: 0,
+    ideas: 0,
     atomicity: process.env.DATABASE_URL ? "coordinated" : "single-transaction",
   };
 
@@ -882,7 +984,7 @@ export async function importBackup(
 async function importIntoSqlite(
   user: SessionUser,
   backup: NormalizedBackup,
-  summary: ImportSummary,
+  summary: ImportResult,
   options: ImportOptions,
 ): Promise<void> {
   const store = getStudioSqliteStore();
@@ -918,6 +1020,9 @@ async function importIntoSqlite(
       }
       if (backup.domains) {
         importDomainsSqlite(db, ownerId, backup.domains, draftIds, summary);
+      }
+      if (backup.ideas) {
+        summary.ideas = importIdeasSqlite(db, user.id, backup.ideas);
       }
       // Test hook: proves a failure after inserts rolls the whole import back.
       options.failAfterInsertForTests?.();
@@ -1016,6 +1121,43 @@ export function importDomainsSqlite(
 }
 
 /**
+ * Upserts the owner's private ideas. The owner in the file is never trusted:
+ * every row is forced to the importing user id, so restoring a foreign file
+ * can never file an idea under another account. An id that already exists
+ * (from any user) gets a fresh id, so importing the same backup twice never
+ * collides or merges. Runs inside the caller's single import transaction.
+ */
+export function importIdeasSqlite(
+  db: DatabaseSync,
+  userId: string,
+  section: IdeaSection,
+): number {
+  ensureIdeaSchema(db);
+  const insert = db.prepare(
+    `INSERT INTO ideas (id, user_id, title, details, status, priority, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  let written = 0;
+  for (const idea of section.ideas.slice(0, 10_000)) {
+    const collides = Boolean(
+      db.prepare("SELECT 1 FROM ideas WHERE id = ?").get(idea.id),
+    );
+    insert.run(
+      collides ? randomUUID() : idea.id,
+      userId,
+      idea.title,
+      idea.details,
+      idea.status,
+      idea.priority,
+      idea.createdAt,
+      idea.updatedAt,
+    );
+    written += 1;
+  }
+  return written;
+}
+
+/**
  * Restores customer accounts, sessions and one-time tokens. INSERT OR IGNORE
  * means a row that already exists — same account id OR same email address —
  * is never overwritten, so restoring an older backup cannot roll a customer's
@@ -1097,7 +1239,7 @@ export function importCustomersSqlite(
 async function importIntoPostgres(
   user: SessionUser,
   backup: NormalizedBackup,
-  summary: ImportSummary,
+  summary: ImportResult,
   options: ImportOptions,
 ): Promise<void> {
   const { getDatabase } = await import("@/db");
@@ -1105,6 +1247,7 @@ async function importIntoPostgres(
     customerAccounts,
     customerSessions,
     customerTokens,
+    ideas: ideasTable,
     studioDomains,
     studioDrafts,
   } = await import("@/db/schema");
@@ -1394,6 +1537,33 @@ async function importIntoPostgres(
           summary.customDomains = inserted.length;
           summary.skippedDomains += fresh.length - inserted.length;
         }
+      }
+
+      // The owner's private idea notebook rides in the same Studio
+      // transaction. The owner id in the file is ignored: every row is forced
+      // to the importing user. Colliding ids get a fresh generated id so
+      // importing twice never overwrites.
+      if (backup.ideas && backup.ideas.ideas.length > 0) {
+        const existing = await tx
+          .select({ id: ideasTable.id })
+          .from(ideasTable);
+        const taken = new Set(existing.map((row) => row.id));
+        const values = backup.ideas.ideas.slice(0, 10_000).map((idea) => ({
+          id: taken.has(idea.id) ? randomUUID() : idea.id,
+          userId: user.id,
+          title: idea.title,
+          details: idea.details,
+          status: idea.status,
+          priority: idea.priority,
+          createdAt: new Date(idea.createdAt),
+          updatedAt: new Date(idea.updatedAt),
+        }));
+        const insertedIdeas = await tx
+          .insert(ideasTable)
+          .values(values)
+          .onConflictDoNothing()
+          .returning({ id: ideasTable.id });
+        summary.ideas = insertedIdeas.length;
       }
       // A throw here rolls the PostgreSQL transaction back; the coordinator
       // still restores the already-committed chat half.
