@@ -166,6 +166,11 @@ test.describe("data-bundles shop", () => {
     await expect(page.getByTestId("order-success")).toBeVisible();
     const payLink = page.getByTestId("order-pay-link");
     await expect(payLink).toBeVisible();
+    // Read the simulator pay link now — after any page.goto the checkout
+    // success screen is gone and this locator would never resolve again.
+    const payHref = await payLink.getAttribute("href");
+    const accessCode = payHref?.match(/^\/pay\/([0-9a-f]+)$/)?.[1];
+    if (!accessCode) throw new Error("Checkout did not return a pay link");
     const detailsLink = page.getByRole("link", {
       name: "View order details",
     });
@@ -187,9 +192,6 @@ test.describe("data-bundles shop", () => {
 
     // Complete the test-mode payment: the simulator's webhook call confirms
     // the order and fires the bundle delivery engine fire-and-forget.
-    const payHref = await payLink.getAttribute("href");
-    const accessCode = payHref?.match(/^\/pay\/([0-9a-f]+)$/)?.[1];
-    if (!accessCode) throw new Error("Checkout did not return a pay link");
     const payResponse = await request.post(
       `/api/payments/webhook?access_code=${accessCode}`,
       { data: { status: "success" } },
