@@ -1,4 +1,6 @@
 import { formatMoney } from "./valmont-pay";
+import { bundleNetworkLabel, formatDataMb } from "./bundles";
+import type { BundleDeliveryRecord } from "./bundle-delivery";
 import type { OrderRecord } from "./orders";
 import type { SiteBriefV1 } from "./site-brief/schema";
 
@@ -170,6 +172,73 @@ async function sendWhatsAppOrSms(to: string, text: string) {
   }
 
   return "skipped" as const;
+}
+
+/** The delivery-failure alert payload (Stage 4). */
+export interface MerchantDeliveryFailureInput {
+  order: OrderRecord;
+  brief: Pick<SiteBriefV1, "businessName" | "payments">;
+  /** The rows that entered "failed" during this engine pass (≥ 1). */
+  deliveries: ReadonlyArray<Pick<BundleDeliveryRecord, "network" | "dataMb">>;
+  /** Total delivery rows for the order — the "n of total" denominator. */
+  total: number;
+}
+
+/**
+ * One aggregated message per engine pass, e.g.
+ * "2 of 3 bundle top-ups failed for order ab12cd34 (MTN 1GB to 0240000001).
+ * Retry from Studio → Orders."
+ * The parenthetical samples the first failed row; run over every failed row
+ * and you get unique networks/sizes only in the extreme, so the count carries
+ * the rest. The full recipient is deliberate: this is the merchant's own
+ * alert (the owner page shows full numbers too), never a guest surface.
+ */
+export function deliveryFailureAlertText(
+  input: MerchantDeliveryFailureInput,
+): string {
+  const first = input.deliveries[0];
+  const sample = first
+    ? `${bundleNetworkLabel(first.network)} ${formatDataMb(first.dataMb)}`
+    : "bundle";
+  return `${input.deliveries.length} of ${input.total} bundle top-ups failed for order ${input.order.id.slice(0, 8)} (${sample} to ${input.order.recipientPhone}). Retry from Studio → Orders.`;
+}
+
+/**
+ * Tells the merchant that bundle top-ups failed. Same discipline as
+ * notifyMerchantNewOrder: missing API keys are a no-op, channel failures are
+ * reported, and it never throws — a delivery failure must never introduce a
+ * second failure into the engine that recorded it (Stage 4 invariant I4).
+ */
+export async function notifyMerchantDeliveryFailed(
+  input: MerchantDeliveryFailureInput,
+): Promise<NotifyResult> {
+  const text = deliveryFailureAlertText(input);
+  const subject = `Bundle delivery failed ${input.order.id.slice(0, 8)} · ${input.brief.businessName}`;
+  const html = `<!doctype html>
+<html><body style="font-family:system-ui,sans-serif;color:#0A1F44">
+  <h1>Bundle delivery failed — ${escapeHtml(input.brief.businessName)}</h1>
+  <p>${escapeHtml(text)}</p>
+</body></html>`;
+
+  const emailTo = input.brief.payments.notifications.email;
+  const phoneTo = input.brief.payments.notifications.whatsapp;
+
+  const result: NotifyResult = { email: "skipped", whatsapp: "skipped" };
+  try {
+    if (emailTo) {
+      result.email = await sendEmail(emailTo, subject, html, text);
+    }
+  } catch {
+    result.email = "failed";
+  }
+  try {
+    if (phoneTo) {
+      result.whatsapp = await sendWhatsAppOrSms(phoneTo, text);
+    }
+  } catch {
+    result.whatsapp = "failed";
+  }
+  return result;
 }
 
 /**

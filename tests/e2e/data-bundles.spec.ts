@@ -182,6 +182,28 @@ test.describe("data-bundles shop", () => {
     await expect(page.getByText("0240000001")).toHaveCount(0);
     await expect(page.getByText("0200000002")).toHaveCount(0);
     await expect(page.getByText(/Contact:/)).toHaveCount(0);
+    // Stage 4: unpaid order — no top-up line yet.
+    await expect(page.getByTestId("bundle-delivery-line")).toHaveCount(0);
+
+    // Complete the test-mode payment: the simulator's webhook call confirms
+    // the order and fires the bundle delivery engine fire-and-forget.
+    const payHref = await payLink.getAttribute("href");
+    const accessCode = payHref?.match(/^\/pay\/([0-9a-f]+)$/)?.[1];
+    if (!accessCode) throw new Error("Checkout did not return a pay link");
+    const payResponse = await request.post(
+      `/api/payments/webhook?access_code=${accessCode}`,
+      { data: { status: "success" } },
+    );
+    expect(payResponse.status()).toBe(200);
+
+    // The guest page reconciles deliveries on load and shows one masked
+    // aggregate line — still never a full number.
+    await page.goto(`/orders/${orderId}/confirmed`);
+    const topUpLine = page.getByTestId("bundle-delivery-line");
+    await expect(topUpLine).toContainText("top-up");
+    await expect(topUpLine).toContainText("024 ••• 0001");
+    await expect(page.getByText("0240000001")).toHaveCount(0);
+    await expect(page.getByText("0200000002")).toHaveCount(0);
 
     await page.goto(`/studio/orders/${orderId}`);
     await expect(
@@ -190,11 +212,17 @@ test.describe("data-bundles shop", () => {
       }),
     ).toBeVisible();
     await expect(page.getByText(firstBundle.name)).toBeVisible();
-    // The owner's own page keeps the full numbers: recipient as Send to, buyer
-    // as Phone.
-    await expect(page.getByText("0240000001")).toBeVisible();
+    // The owner's own page keeps the full numbers: recipient in the tel link
+    // of the Customer section, buyer as Phone.
+    await expect(page.getByRole("link", { name: "0240000001" })).toBeVisible();
     await expect(page.getByText(/Send to/)).toBeVisible();
     await expect(page.getByText("0200000002")).toBeVisible();
+    // Stage 4: the paid bundle order shows the delivery panel; after one
+    // reload the top-up is Delivered (recheck settles it on page load).
+    const bundlePanel = page.getByTestId("bundle-delivery-panel");
+    await expect(bundlePanel).toBeVisible();
+    await page.reload();
+    await expect(bundlePanel.getByText("Delivered")).toBeVisible();
 
     // Landline refusal — client shows error
     const owner2 = nextOwner();
@@ -278,5 +306,10 @@ test.describe("data-bundles shop", () => {
     await expect(page.getByText("12 Independence Ave, Accra")).toBeVisible();
     // 030 landline accepted for non-bundle shop
     await expect(page.getByText("0301234567")).toBeVisible();
+    // Stage 4 regression: non-bundle orders get no delivery panel…
+    await expect(page.getByTestId("bundle-delivery-panel")).toHaveCount(0);
+    // …and no top-up line on the guest page.
+    await page.goto(`/orders/${orderId}/confirmed`);
+    await expect(page.getByTestId("bundle-delivery-line")).toHaveCount(0);
   });
 });

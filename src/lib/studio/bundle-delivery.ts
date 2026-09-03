@@ -1,14 +1,17 @@
 /**
  * Data-bundles Stage 4 — the bundle delivery engine (simulator first).
  *
- * When a bundle order is paid, the engine turns each purchased bundle line
+ * When a bundle order is paid, the engine turns every purchased bundle UNIT
  * into a delivery row and asks a provider to top up the recipient's phone.
  * Two providers exist today:
  *
  *  - {@link SimulatedProvider} (default): accepts every top-up as
  *    "processing" and reports it "delivered" on the next status check, so the
  *    whole lifecycle is exercisable with no external account and no real data
- *    moving — the exact analogue of the payment simulator.
+ *    moving — the exact analogue of the payment simulator. Test hooks:
+ *    a recipient ending `0000` always fails; one ending `9999` stays
+ *    "processing" for 60 seconds, so "Failed → Retry" and slow delivery can
+ *    be rehearsed by hand.
  *  - {@link TechChiefProvider}: a stub. The TechChief integration document
  *    (API spec, auth, pricing, callback format) has not landed (Stage 5), so
  *    every send fails fast with an owner-visible error instead of pretending
@@ -17,26 +20,35 @@
  * The engine is held to six invariants. Each has a dedicated test in
  * `bundle-delivery.test.ts`:
  *
- *  I1  Paid-first. No delivery row is created and the provider is never
- *      called before the order is paid. Pending, failed-payment, cancelled
- *      and refunded orders have zero deliveries.
- *  I2  Idempotent. Exactly one delivery row per paid bundle line, guaranteed
- *      by the unique (order_id, item_id) index: replayed payment webhooks,
- *      repeated dispatches and page-load rechecks never create a second row
- *      or a second top-up.
+ *  I1  Paid-first, and live-money safety. No delivery row is created and the
+ *      provider is never called before the order is paid. And when an order
+ *      was paid with REAL money (`payment_mode === "live"`), the engine only
+ *      dispatches through a provider that is itself live — until a real
+ *      provider key exists (Stage 5), checkout refuses live bundle orders
+ *      with 409 before any order row, and the engine's backstop records a
+ *      failed row saying nothing was sent rather than dispatching through
+ *      the simulator.
+ *  I2  Idempotent, also under concurrency. Exactly one delivery row per
+ *      purchased bundle unit, guaranteed by the unique
+ *      (order_id, line_index, unit_index) index, and a row is handed to the
+ *      provider exactly once per attempt: `claimForDispatch` moves
+ *      pending|failed → processing atomically, so a webhook replay and a
+ *      simultaneous customer page load can never both send the same unit.
  *  I3  Terminal success. "delivered" is final. Rechecks, retries and
  *      provider callbacks never move, modify or re-dispatch a delivered row.
  *  I4  Isolated failure. A provider failure is recorded on the row
- *      (status "failed" + an owner-readable error) and is never thrown back
- *      into the caller: the payment webhook still answers 200 and the order
- *      stays paid. Only "failed" rows can be retried, and only by the owner.
+ *      (status "failed" + an owner-readable error, and an aggregated
+ *      merchant alert) and is never thrown back into the caller: the payment
+ *      webhook still answers 200 and the order stays paid. Only "failed"
+ *      rows can be retried, and only by the owner.
  *  I5  Bundle-only. Deliveries exist only for data-bundles orders (recipient
  *      phone + resolvable bundle lines). Every other website type is
- *      untouched — no rows, no provider calls, no rendering changes.
+ *      untouched — no rows, no provider calls, no rendering changes, no
+ *      alerts.
  *  I6  Guest privacy. Unauthenticated surfaces show one masked aggregate line
  *      ("3GB of data to 024 ••• 0001 — delivered"). Full numbers, provider
  *      references, attempt counts and error text appear only on the
- *      authenticated owner page.
+ *      authenticated owner page and in the merchant's own alert.
  *
  * Entry points:
  *
@@ -67,6 +79,10 @@ import {
   type BundleNetworkId,
 } from "./bundles";
 import { publicGetDraft } from "./draft-public";
+import {
+  notifyMerchantDeliveryFailed,
+  type MerchantDeliveryFailureInput,
+} from "./notifications";
 import {
   getOrdersStore,
   type OrderLine,
@@ -103,18 +119,20 @@ export const DELIVERY_STATUS_LABELS: Record<DeliveryStatus, string> = {
   failed: "Failed",
 };
 
-/** One purchased bundle line that the provider must top up. */
+/** One purchased bundle unit that the provider must top up. */
 export interface BundleDeliveryRecord {
   id: string;
   orderId: string;
   ownerId: string;
+  /** Position of the order line and of the unit inside that line. */
+  lineIndex: number;
+  unitIndex: number;
   /** Catalogue line id and display name, snapshotted at dispatch time. */
   itemId: string;
   itemName: string;
   network: BundleNetworkId;
   dataMb: number;
   validity?: string;
-  quantity: number;
   /** Full recipient number — server-side only; guest pages mask it (I6). */
   recipientPhone: string;
   /** Provider id that made the latest dispatch attempt. */
@@ -132,12 +150,13 @@ export interface BundleDeliveryRecord {
 export interface NewBundleDeliveryInput {
   orderId: string;
   ownerId: string;
+  lineIndex: number;
+  unitIndex: number;
   itemId: string;
   itemName: string;
   network: BundleNetworkId;
   dataMb: number;
   validity?: string;
-  quantity: number;
   recipientPhone: string;
   provider: string;
 }
@@ -146,17 +165,19 @@ export interface NewBundleDeliveryInput {
 // Providers
 // ---------------------------------------------------------------------------
 
-/** What the engine hands to a provider for one top-up. */
+/** What the engine hands to a provider for one top-up (one bundle unit). */
 export interface BundleDeliveryDispatchRequest {
   orderId: string;
   deliveryId: string;
   /** 1-based attempt number (a retry is attempt ≥ 2). */
   attempt: number;
+  /** Which order line and unit this top-up covers — a natural idempotency key. */
+  lineIndex: number;
+  unitIndex: number;
   recipientPhone: string;
   network: BundleNetworkId;
   dataMb: number;
   validity?: string;
-  quantity: number;
 }
 
 export type BundleDeliverySendResult =
@@ -186,12 +207,29 @@ export interface BundleDeliveryProvider {
   ): Promise<BundleDeliveryStatusResult>;
 }
 
+/** Recipient suffixes the simulator uses to rehearse failure and slowness. */
+export const SIMULATED_FAIL_SUFFIX = "0000";
+export const SIMULATED_SLOW_SUFFIX = "9999";
+/** How long a `9999` top-up reports "processing" after it was accepted. */
+export const SIMULATED_SLOW_MS = 60_000;
+
+export const SIMULATED_FAIL_MESSAGE =
+  "Simulated failure (test number ending 0000)";
+
 /**
  * The default provider. It accepts every top-up as "processing" and answers
  * the next status check with "delivered" — deterministic, offline, and safe:
  * no real data can ever move while it is active. It exists so owners can
  * rehearse the full paid → top-up → delivered flow before TechChief is
  * connected, exactly like the payment simulator stands in for Valmont Pay.
+ *
+ * Rehearsal hooks (test numbers only):
+ *  - recipient ending {@link SIMULATED_FAIL_SUFFIX}: the send is refused, so
+ *    the row goes "failed" and the owner can rehearse the alert and Retry.
+ *  - recipient ending {@link SIMULATED_SLOW_SUFFIX}: the send is accepted but
+ *    reports "processing" for {@link SIMULATED_SLOW_MS} after acceptance. The
+ *    acceptance time is encoded in the provider reference
+ *    (`sim-slow-<epochMs>-<uuid>`), so no in-memory state survives a restart.
  */
 export class SimulatedProvider implements BundleDeliveryProvider {
   readonly id = "simulator";
@@ -208,12 +246,28 @@ export class SimulatedProvider implements BundleDeliveryProvider {
         error: "The recipient is not a valid Ghana mobile number.",
       };
     }
+    const cleaned = request.recipientPhone.replace(/[\s\-()]/g, "");
+    if (cleaned.endsWith(SIMULATED_FAIL_SUFFIX)) {
+      return { ok: false, error: SIMULATED_FAIL_MESSAGE };
+    }
+    if (cleaned.endsWith(SIMULATED_SLOW_SUFFIX)) {
+      return {
+        ok: true,
+        providerRef: `sim-slow-${Date.now()}-${randomUUID()}`,
+      };
+    }
     return { ok: true, providerRef: `sim-${randomUUID()}` };
   }
 
   async checkStatus(
     request: BundleDeliveryStatusRequest,
   ): Promise<BundleDeliveryStatusResult> {
+    const slow = /^sim-slow-(\d+)-/.exec(request.providerRef);
+    if (slow) {
+      return Date.now() - Number(slow[1]) >= SIMULATED_SLOW_MS
+        ? { status: "delivered" }
+        : { status: "processing" };
+    }
     if (request.providerRef.startsWith("sim-")) {
       return { status: "delivered" };
     }
@@ -293,6 +347,25 @@ export function getBundleDeliveryProvider(): BundleDeliveryProvider {
   return new MisconfiguredDeliveryProvider(raw);
 }
 
+export interface BundleDeliveryAvailability {
+  /** Which provider is currently selected ("simulator", "techchief", …). */
+  provider: string;
+  /**
+   * True only when the selected provider moves REAL data for real money.
+   * Everything available today — the simulator, the TechChief stub and the
+   * misconfigured fail-closed provider — is not live; Stage 5 returns true
+   * here once a real TechChief key is provisioned. The checkout route refuses
+   * live-money bundle orders while this is false.
+   */
+  live: boolean;
+}
+
+export function bundleDeliveryAvailability(
+  provider: BundleDeliveryProvider = getBundleDeliveryProvider(),
+): BundleDeliveryAvailability {
+  return { provider: provider.id, live: false };
+}
+
 /** Status checks go to the provider that owns the row's reference. */
 function providerForRow(
   row: BundleDeliveryRecord,
@@ -311,25 +384,35 @@ function providerForRow(
 export interface BundleDeliveriesStore {
   /**
    * Idempotent row creation (I2): rows that already exist for
-   * (order_id, item_id) are left alone; returns the full list for the order.
+   * (order_id, line_index, unit_index) are left alone; returns the full list
+   * for the order.
    */
   createMany(inputs: NewBundleDeliveryInput[]): Promise<BundleDeliveryRecord[]>;
   listForOrder(orderId: string): Promise<BundleDeliveryRecord[]>;
   getById(id: string): Promise<BundleDeliveryRecord | null>;
-  /** pending | failed → processing: the row is (re-)dispatched. */
-  markProcessing(
+  /**
+   * pending | failed → processing, atomically, counting the attempt. Returns
+   * true only for the one caller that actually moved the row — the single
+   * mechanism that makes a concurrent webhook dispatch and page-load recheck
+   * (or two retries) unable to hand the same unit to the provider twice (I2).
+   * The provider reference is cleared here and re-set by `setProviderRef`
+   * once the provider has accepted the send.
+   */
+  claimForDispatch(id: string, patch: { provider: string }): Promise<boolean>;
+  /** Records the provider's reference after a successful send. */
+  setProviderRef(
     id: string,
-    patch: { provider: string; providerRef: string | null },
+    providerRef: string | null,
   ): Promise<BundleDeliveryRecord | null>;
   /**
-   * → failed: an attempt went wrong (I4). Reads as pending | processing |
-   * failed → failed so a failed retry refreshes the error; `countAttempt`
-   * distinguishes a dispatch that was handed to the provider (counts) from a
-   * failed status poll on an in-flight row (does not count).
+   * → failed: an attempt went wrong (I4). Accepts pending (never-yet-sent
+   * rows, e.g. the live-provider backstop), processing and failed (a retry
+   * that failed again — the error is refreshed in place). Attempt counting
+   * lives in `claimForDispatch`, so this never bumps the counter.
    */
   markFailed(
     id: string,
-    patch: { error: string; countAttempt?: boolean },
+    patch: { error: string },
   ): Promise<BundleDeliveryRecord | null>;
   /** pending | processing → delivered: terminal (I3); failed rows are not resurrectable — only an explicit retry moves them. */
   markDelivered(id: string): Promise<BundleDeliveryRecord | null>;
@@ -341,12 +424,13 @@ interface DeliveryRow {
   id: string;
   order_id: string;
   owner_id: string;
+  line_index: number;
+  unit_index: number;
   item_id: string;
   item_name: string;
   network: string;
   data_mb: number;
   validity: string | null;
-  quantity: number;
   recipient_phone: string;
   provider: string;
   status: string;
@@ -363,12 +447,13 @@ function rowToDelivery(row: DeliveryRow): BundleDeliveryRecord {
     id: row.id,
     orderId: row.order_id,
     ownerId: row.owner_id,
+    lineIndex: row.line_index,
+    unitIndex: row.unit_index,
     itemId: row.item_id,
     itemName: row.item_name,
     network: row.network as BundleNetworkId,
     dataMb: row.data_mb,
     validity: row.validity ?? undefined,
-    quantity: row.quantity,
     recipientPhone: row.recipient_phone,
     provider: row.provider,
     status: isDeliveryStatus(row.status) ? row.status : "pending",
@@ -390,12 +475,13 @@ export function ensureBundleDeliveriesSchema(db: DatabaseSync): void {
       id TEXT PRIMARY KEY,
       order_id TEXT NOT NULL,
       owner_id TEXT NOT NULL,
+      line_index INTEGER NOT NULL,
+      unit_index INTEGER NOT NULL,
       item_id TEXT NOT NULL,
       item_name TEXT NOT NULL,
       network TEXT NOT NULL,
       data_mb INTEGER NOT NULL,
       validity TEXT,
-      quantity INTEGER NOT NULL DEFAULT 1,
       recipient_phone TEXT NOT NULL,
       provider TEXT NOT NULL DEFAULT 'simulator',
       status TEXT NOT NULL DEFAULT 'pending',
@@ -408,7 +494,7 @@ export function ensureBundleDeliveriesSchema(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS studio_deliveries_order ON studio_deliveries(order_id);
     CREATE INDEX IF NOT EXISTS studio_deliveries_owner_created ON studio_deliveries(owner_id, created_at);
-    CREATE UNIQUE INDEX IF NOT EXISTS studio_deliveries_order_item ON studio_deliveries(order_id, item_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS studio_deliveries_order_line_unit ON studio_deliveries(order_id, line_index, unit_index);
   `);
 }
 
@@ -426,22 +512,23 @@ export class SqliteBundleDeliveriesStore implements BundleDeliveriesStore {
     const now = new Date().toISOString();
     const insert = this.db.prepare(
       `INSERT OR IGNORE INTO studio_deliveries(
-         id, order_id, owner_id, item_id, item_name, network, data_mb,
-         validity, quantity, recipient_phone, provider, status, attempts,
-         created_at, updated_at
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'pending', 0, ?, ?)`,
+         id, order_id, owner_id, line_index, unit_index, item_id, item_name,
+         network, data_mb, validity, recipient_phone, provider, status,
+         attempts, created_at, updated_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', 0, ?, ?)`,
     );
     for (const input of inputs) {
       insert.run(
         randomUUID(),
         input.orderId,
         input.ownerId,
+        input.lineIndex,
+        input.unitIndex,
         input.itemId,
         input.itemName,
         input.network,
         input.dataMb,
         input.validity ?? null,
-        input.quantity,
         input.recipientPhone,
         input.provider,
         now,
@@ -467,39 +554,48 @@ export class SqliteBundleDeliveriesStore implements BundleDeliveriesStore {
     return row ? rowToDelivery(row) : null;
   }
 
-  async markProcessing(
+  async claimForDispatch(
     id: string,
-    patch: { provider: string; providerRef: string | null },
-  ): Promise<BundleDeliveryRecord | null> {
-    this.db
+    patch: { provider: string },
+  ): Promise<boolean> {
+    const result = this.db
       .prepare(
         `UPDATE studio_deliveries
-            SET status = 'processing', provider = ?, provider_ref = ?,
+            SET status = 'processing', provider = ?, provider_ref = NULL,
                 last_error = NULL, delivered_at = NULL,
                 attempts = attempts + 1, updated_at = ?
           WHERE id = ? AND status IN ('pending','failed')`,
       )
-      .run(patch.provider, patch.providerRef, new Date().toISOString(), id);
+      .run(patch.provider, new Date().toISOString(), id);
+    return result.changes === 1;
+  }
+
+  async setProviderRef(
+    id: string,
+    providerRef: string | null,
+  ): Promise<BundleDeliveryRecord | null> {
+    this.db
+      .prepare(
+        `UPDATE studio_deliveries
+            SET provider_ref = ?, updated_at = ?
+          WHERE id = ? AND status = 'processing'`,
+      )
+      .run(providerRef, new Date().toISOString(), id);
     return this.getById(id);
   }
 
   async markFailed(
     id: string,
-    patch: { error: string; countAttempt?: boolean },
+    patch: { error: string },
   ): Promise<BundleDeliveryRecord | null> {
     this.db
       .prepare(
         `UPDATE studio_deliveries
             SET status = 'failed', last_error = ?, delivered_at = NULL,
-                attempts = attempts + ?, updated_at = ?
+                updated_at = ?
           WHERE id = ? AND status IN ('pending','processing','failed')`,
       )
-      .run(
-        patch.error,
-        patch.countAttempt ? 1 : 0,
-        new Date().toISOString(),
-        id,
-      );
+      .run(patch.error, new Date().toISOString(), id);
     return this.getById(id);
   }
 
@@ -525,12 +621,13 @@ function pgRowToDelivery(
     id: row.id,
     orderId: row.orderId,
     ownerId: row.ownerId,
+    lineIndex: row.lineIndex,
+    unitIndex: row.unitIndex,
     itemId: row.itemId,
     itemName: row.itemName,
     network: row.network as BundleNetworkId,
     dataMb: row.dataMb,
     validity: row.validity ?? undefined,
-    quantity: row.quantity,
     recipientPhone: row.recipientPhone,
     provider: row.provider,
     status: isDeliveryStatus(row.status) ? row.status : "pending",
@@ -554,18 +651,23 @@ export class PostgresBundleDeliveriesStore implements BundleDeliveriesStore {
         inputs.map((input) => ({
           orderId: input.orderId,
           ownerId: input.ownerId,
+          lineIndex: input.lineIndex,
+          unitIndex: input.unitIndex,
           itemId: input.itemId,
           itemName: input.itemName,
           network: input.network,
           dataMb: input.dataMb,
           validity: input.validity ?? null,
-          quantity: input.quantity,
           recipientPhone: input.recipientPhone,
           provider: input.provider,
         })),
       )
       .onConflictDoNothing({
-        target: [studioDeliveries.orderId, studioDeliveries.itemId],
+        target: [
+          studioDeliveries.orderId,
+          studioDeliveries.lineIndex,
+          studioDeliveries.unitIndex,
+        ],
       });
     return this.listForOrder(inputs[0].orderId);
   }
@@ -588,16 +690,16 @@ export class PostgresBundleDeliveriesStore implements BundleDeliveriesStore {
     return row ? pgRowToDelivery(row) : null;
   }
 
-  async markProcessing(
+  async claimForDispatch(
     id: string,
-    patch: { provider: string; providerRef: string | null },
-  ): Promise<BundleDeliveryRecord | null> {
-    await getDatabase()
+    patch: { provider: string },
+  ): Promise<boolean> {
+    const claimed = await getDatabase()
       .update(studioDeliveries)
       .set({
         status: "processing",
         provider: patch.provider,
-        providerRef: patch.providerRef,
+        providerRef: null,
         lastError: null,
         deliveredAt: null,
         attempts: sql`${studioDeliveries.attempts} + 1`,
@@ -608,13 +710,30 @@ export class PostgresBundleDeliveriesStore implements BundleDeliveriesStore {
           eq(studioDeliveries.id, id),
           inArray(studioDeliveries.status, ["pending", "failed"]),
         ),
+      )
+      .returning({ id: studioDeliveries.id });
+    return claimed.length === 1;
+  }
+
+  async setProviderRef(
+    id: string,
+    providerRef: string | null,
+  ): Promise<BundleDeliveryRecord | null> {
+    await getDatabase()
+      .update(studioDeliveries)
+      .set({ providerRef, updatedAt: new Date() })
+      .where(
+        and(
+          eq(studioDeliveries.id, id),
+          eq(studioDeliveries.status, "processing"),
+        ),
       );
     return this.getById(id);
   }
 
   async markFailed(
     id: string,
-    patch: { error: string; countAttempt?: boolean },
+    patch: { error: string },
   ): Promise<BundleDeliveryRecord | null> {
     await getDatabase()
       .update(studioDeliveries)
@@ -622,7 +741,6 @@ export class PostgresBundleDeliveriesStore implements BundleDeliveriesStore {
         status: "failed",
         lastError: patch.error,
         deliveredAt: null,
-        attempts: sql`${studioDeliveries.attempts} + ${patch.countAttempt ? 1 : 0}`,
         updatedAt: new Date(),
       })
       .where(
@@ -663,10 +781,15 @@ export interface BundleDeliveryDeps {
   orders?: OrdersStore;
   deliveries?: BundleDeliveriesStore;
   provider?: BundleDeliveryProvider;
+  /** Replaces the merchant alert in tests; defaults to the real notifier. */
+  notifyDeliveryFailed?: (
+    input: MerchantDeliveryFailureInput,
+  ) => Promise<unknown>;
 }
 
 interface ResolvedBundleLine {
   line: OrderLine;
+  lineIndex: number;
   network: BundleNetworkId;
   dataMb: number;
   validity?: string;
@@ -694,7 +817,7 @@ function resolveBundleLines(
   draftItems: Map<string, CatalogItem> | null,
 ): ResolvedBundleLine[] {
   const resolved: ResolvedBundleLine[] = [];
-  for (const line of order.lines) {
+  order.lines.forEach((line, lineIndex) => {
     let network: BundleNetworkId | null = null;
     let dataMb: number | null = null;
     let validity: string | undefined;
@@ -723,17 +846,17 @@ function resolveBundleLines(
     }
 
     if (network && dataMb) {
-      resolved.push({ line, network, dataMb, validity });
+      resolved.push({ line, lineIndex, network, dataMb, validity });
     }
-  }
+  });
   return resolved;
 }
 
 /**
- * Ensures the one-row-per-paid-bundle-line state exists (I1, I2, I5).
- * Returns null when the order is not deliverable — not paid, no recipient,
- * or not a data-bundles order — so callers share one cheap shape for "there
- * is nothing to do here".
+ * Ensures the one-row-per-paid-bundle-unit state exists (I1, I2, I5): every
+ * resolved order line is expanded into `quantity` unit rows. Returns null
+ * when the order is not deliverable — not paid, no recipient, or not a
+ * data-bundles order — so callers share one cheap shape for "nothing to do".
  */
 async function ensureBundleDeliveryRows(
   order: OrderRecord,
@@ -760,20 +883,27 @@ async function ensureBundleDeliveryRows(
   const resolved = resolveBundleLines(order, draftItems);
   if (resolved.length === 0) return null;
 
-  return store.createMany(
-    resolved.map(({ line, network, dataMb, validity }) => ({
-      orderId: order.id,
-      ownerId: order.ownerId,
-      itemId: line.itemId,
-      itemName: line.name,
-      network,
-      dataMb,
-      validity,
-      quantity: line.quantity,
-      recipientPhone,
-      provider: provider.id,
-    })),
-  );
+  const inputs: NewBundleDeliveryInput[] = [];
+  for (const { line, lineIndex, network, dataMb, validity } of resolved) {
+    const quantity =
+      Number.isInteger(line.quantity) && line.quantity > 0 ? line.quantity : 1;
+    for (let unitIndex = 0; unitIndex < quantity; unitIndex += 1) {
+      inputs.push({
+        orderId: order.id,
+        ownerId: order.ownerId,
+        lineIndex,
+        unitIndex,
+        itemId: line.itemId,
+        itemName: line.name,
+        network,
+        dataMb,
+        validity,
+        recipientPhone,
+        provider: provider.id,
+      });
+    }
+  }
+  return store.createMany(inputs);
 }
 
 /** A provider throw is a delivery failure, never a caller failure (I4). */
@@ -792,34 +922,73 @@ async function safeSend(
   }
 }
 
-/** Sends every "pending" row to the provider and records the outcome. */
+/** Live-money orders must never be sent through a non-live provider (I1). */
+export const NO_LIVE_DELIVERY_PROVIDER_MESSAGE =
+  "No real delivery provider is connected; nothing was sent.";
+
+/**
+ * What a live-money bundle checkout is told while no live delivery provider
+ * exists (Stage 5 makes it live-capable). Shown before any order row exists.
+ */
+export const LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE =
+  "This shop cannot send bundles automatically yet. Please contact the shop.";
+
+interface EnginePassContext {
+  provider: BundleDeliveryProvider;
+  deliveries: BundleDeliveriesStore;
+  /** True when the order was paid with real money but no live provider exists. */
+  liveBlocked: boolean;
+  /** Rows that entered "failed" during this pass (alert candidates, I4). */
+  newlyFailed: BundleDeliveryRecord[];
+}
+
+function dispatchRequestFor(
+  row: BundleDeliveryRecord,
+): BundleDeliveryDispatchRequest {
+  return {
+    orderId: row.orderId,
+    deliveryId: row.id,
+    attempt: row.attempts + 1,
+    lineIndex: row.lineIndex,
+    unitIndex: row.unitIndex,
+    recipientPhone: row.recipientPhone,
+    network: row.network,
+    dataMb: row.dataMb,
+    validity: row.validity,
+  };
+}
+
+/** Sends every "pending" unit row to the provider and records the outcome. */
 async function dispatchPendingRows(
   rows: BundleDeliveryRecord[],
-  provider: BundleDeliveryProvider,
-  store: BundleDeliveriesStore,
+  ctx: EnginePassContext,
 ): Promise<void> {
   for (const row of rows) {
     if (row.status !== "pending") continue;
-    const result = await safeSend(provider, {
-      orderId: row.orderId,
-      deliveryId: row.id,
-      attempt: row.attempts + 1,
-      recipientPhone: row.recipientPhone,
-      network: row.network,
-      dataMb: row.dataMb,
-      validity: row.validity,
-      quantity: row.quantity,
-    });
+    if (ctx.liveBlocked) {
+      const failed = await ctx.deliveries.markFailed(row.id, {
+        error: NO_LIVE_DELIVERY_PROVIDER_MESSAGE,
+      });
+      if (failed) ctx.newlyFailed.push(failed);
+      continue;
+    }
+    // Claim-before-send: exactly one concurrent caller moves the row to
+    // "processing" and gets to send; every loser simply skips this unit (I2).
+    if (
+      !(await ctx.deliveries.claimForDispatch(row.id, {
+        provider: ctx.provider.id,
+      }))
+    ) {
+      continue;
+    }
+    const result = await safeSend(ctx.provider, dispatchRequestFor(row));
     if (result.ok) {
-      await store.markProcessing(row.id, {
-        provider: provider.id,
-        providerRef: result.providerRef ?? null,
-      });
+      await ctx.deliveries.setProviderRef(row.id, result.providerRef ?? null);
     } else {
-      await store.markFailed(row.id, {
+      const failed = await ctx.deliveries.markFailed(row.id, {
         error: result.error,
-        countAttempt: true,
       });
+      if (failed) ctx.newlyFailed.push(failed);
     }
   }
 }
@@ -827,12 +996,12 @@ async function dispatchPendingRows(
 /** Polls the provider for "processing" rows; transient outages are simply retried on the next recheck. */
 async function refreshProcessingRows(
   rows: BundleDeliveryRecord[],
-  provider: BundleDeliveryProvider,
-  store: BundleDeliveriesStore,
+  ctx: EnginePassContext,
 ): Promise<void> {
+  if (ctx.liveBlocked) return; // nothing to poll without a live provider
   for (const row of rows) {
     if (row.status !== "processing") continue;
-    const rowProvider = providerForRow(row, provider);
+    const rowProvider = providerForRow(row, ctx.provider);
     if (!rowProvider || !row.providerRef) continue;
     let outcome: BundleDeliveryStatusResult;
     try {
@@ -843,13 +1012,57 @@ async function refreshProcessingRows(
       continue;
     }
     if (outcome.status === "delivered") {
-      await store.markDelivered(row.id); // terminal (I3)
+      await ctx.deliveries.markDelivered(row.id); // terminal (I3)
     } else if (outcome.status === "failed") {
-      await store.markFailed(row.id, {
+      const failed = await ctx.deliveries.markFailed(row.id, {
         error: outcome.error || "The delivery provider reported a failure.",
       });
+      if (failed) ctx.newlyFailed.push(failed);
     }
   }
+}
+
+/**
+ * One aggregated merchant alert per engine pass when at least one row
+ * entered "failed" during this pass (I4). Rows that were already failed when
+ * the pass started are never re-alerted. Alerts are best-effort and can
+ * never break the engine — same discipline as the new-order notification.
+ */
+async function alertMerchantIfNeeded(
+  order: OrderRecord,
+  ctx: EnginePassContext,
+  deps: BundleDeliveryDeps,
+): Promise<void> {
+  if (ctx.newlyFailed.length === 0) return;
+  try {
+    const draft = await publicGetDraft(order.draftId).catch(() => null);
+    if (!draft) return;
+    const total = (await ctx.deliveries.listForOrder(order.id)).length;
+    const notify = deps.notifyDeliveryFailed ?? notifyMerchantDeliveryFailed;
+    await notify({
+      order,
+      brief: draft.brief,
+      deliveries: ctx.newlyFailed,
+      total,
+    }).catch(() => "failed");
+  } catch {
+    /* An alert must never break the engine (I4). */
+  }
+}
+
+function passContext(
+  order: OrderRecord,
+  provider: BundleDeliveryProvider,
+  deliveries: BundleDeliveriesStore,
+): EnginePassContext {
+  return {
+    provider,
+    deliveries,
+    liveBlocked:
+      order.paymentMode === "live" &&
+      !bundleDeliveryAvailability(provider).live,
+    newlyFailed: [],
+  };
 }
 
 /**
@@ -869,7 +1082,9 @@ export async function dispatchBundleDeliveriesForOrder(
   const provider = deps.provider ?? getBundleDeliveryProvider();
   const rows = await ensureBundleDeliveryRows(order, provider, deliveries);
   if (!rows) return [];
-  await dispatchPendingRows(rows, provider, deliveries);
+  const ctx = passContext(order, provider, deliveries);
+  await dispatchPendingRows(rows, ctx);
+  await alertMerchantIfNeeded(order, ctx, deps);
   return deliveries.listForOrder(order.id);
 }
 
@@ -892,12 +1107,10 @@ export async function recheckBundleDeliveriesForOrder(
     const provider = deps.provider ?? getBundleDeliveryProvider();
     const rows = await ensureBundleDeliveryRows(order, provider, deliveries);
     if (!rows) return [];
-    await dispatchPendingRows(rows, provider, deliveries);
-    await refreshProcessingRows(
-      await deliveries.listForOrder(order.id),
-      provider,
-      deliveries,
-    );
+    const ctx = passContext(order, provider, deliveries);
+    await dispatchPendingRows(rows, ctx);
+    await refreshProcessingRows(await deliveries.listForOrder(order.id), ctx);
+    await alertMerchantIfNeeded(order, ctx, deps);
     return deliveries.listForOrder(order.id);
   } catch {
     return [];
@@ -936,30 +1149,29 @@ export async function retryBundleDeliveryFailures(
 
   const provider = deps.provider ?? getBundleDeliveryProvider();
   const rows = await deliveries.listForOrder(order.id);
+  const ctx = passContext(order, provider, deliveries);
   for (const row of rows) {
     if (row.status !== "failed") continue;
-    const result = await safeSend(provider, {
-      orderId: row.orderId,
-      deliveryId: row.id,
-      attempt: row.attempts + 1,
-      recipientPhone: row.recipientPhone,
-      network: row.network,
-      dataMb: row.dataMb,
-      validity: row.validity,
-      quantity: row.quantity,
-    });
-    if (result.ok) {
-      await deliveries.markProcessing(row.id, {
-        provider: provider.id,
-        providerRef: result.providerRef ?? null,
-      });
-    } else {
+    if (ctx.liveBlocked) {
+      // Never pretend a send happened: row stays failed with the reason.
       await deliveries.markFailed(row.id, {
-        error: result.error,
-        countAttempt: true,
+        error: NO_LIVE_DELIVERY_PROVIDER_MESSAGE,
       });
+      continue;
+    }
+    if (!(await deliveries.claimForDispatch(row.id, { provider: provider.id })))
+      continue;
+    const result = await safeSend(provider, dispatchRequestFor(row));
+    if (result.ok) {
+      await deliveries.setProviderRef(row.id, result.providerRef ?? null);
+    } else {
+      const failed = await deliveries.markFailed(row.id, {
+        error: result.error,
+      });
+      if (failed) ctx.newlyFailed.push(failed);
     }
   }
+  await alertMerchantIfNeeded(order, ctx, deps);
   return { order, deliveries: await deliveries.listForOrder(order.id) };
 }
 
@@ -983,9 +1195,7 @@ export interface GuestBundleDeliverySummary {
  * counts and error text cannot leak onto an unauthenticated page (I6).
  */
 export function guestBundleDeliverySummary(
-  deliveries: ReadonlyArray<
-    Pick<BundleDeliveryRecord, "status" | "dataMb" | "quantity">
-  >,
+  deliveries: ReadonlyArray<Pick<BundleDeliveryRecord, "status" | "dataMb">>,
   recipientPhone: string | null | undefined,
 ): GuestBundleDeliverySummary | null {
   if (deliveries.length === 0 || !recipientPhone) return null;
@@ -996,10 +1206,7 @@ export function guestBundleDeliverySummary(
     (row) => row.status === "delivered",
   ).length;
   const failed = deliveries.filter((row) => row.status === "failed").length;
-  const totalDataMb = deliveries.reduce(
-    (sum, row) => sum + row.dataMb * Math.max(1, row.quantity),
-    0,
-  );
+  const totalDataMb = deliveries.reduce((sum, row) => sum + row.dataMb, 0);
   const size = formatDataMb(totalDataMb);
 
   let line: string;

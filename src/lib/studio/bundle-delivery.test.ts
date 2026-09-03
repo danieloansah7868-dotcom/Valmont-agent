@@ -12,13 +12,17 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SqliteChatStore, setSqliteChatStoreForTests } from "@/lib/chat-store";
 import {
+  bundleDeliveryAvailability,
   BundleDeliveryRetryError,
   dispatchBundleDeliveriesForOrder,
   getBundleDeliveryProvider,
   guestBundleDeliverySummary,
+  LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE,
   MisconfiguredDeliveryProvider,
+  NO_LIVE_DELIVERY_PROVIDER_MESSAGE,
   recheckBundleDeliveriesForOrder,
   retryBundleDeliveryFailures,
+  SIMULATED_FAIL_MESSAGE,
   SimulatedProvider,
   SqliteBundleDeliveriesStore,
   TECHCHIEF_NOT_CONNECTED_MESSAGE,
@@ -33,6 +37,7 @@ import {
 import { SqliteOrdersStore, type NewOrderInput } from "./orders";
 import { SqliteStudioDraftStore } from "./draft-store";
 import { createDefaultBrief } from "./site-brief/defaults";
+import type { MerchantDeliveryFailureInput } from "./notifications";
 
 const dirs: string[] = [];
 let orders: SqliteOrdersStore;
@@ -70,8 +75,11 @@ class StubProvider implements BundleDeliveryProvider {
   }
 }
 
-function depsWith(provider: BundleDeliveryProvider): BundleDeliveryDeps {
-  return { orders, deliveries, provider };
+function depsWith(
+  provider: BundleDeliveryProvider,
+  extra: Partial<BundleDeliveryDeps> = {},
+): BundleDeliveryDeps {
+  return { orders, deliveries, provider, ...extra };
 }
 
 const BUNDLE_LINES = [
@@ -127,6 +135,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.useRealTimers();
   setSqliteChatStoreForTests(null);
   for (const dir of dirs.splice(0))
     rmSync(dir, { recursive: true, force: true });
@@ -162,7 +171,44 @@ describe("bundle delivery engine invariants", () => {
     }
   });
 
-  it("I2 — exactly one row per paid bundle line across webhook replays and rechecks", async () => {
+  it("I1 — a live-money order is never dispatched through a non-live provider", async () => {
+    const order = await orders.create(bundleOrder({ paymentMode: "live" }));
+    const simulator = new SimulatedProvider();
+    const sendSpy = vi.spyOn(simulator, "sendBundle");
+
+    const rows = await dispatchBundleDeliveriesForOrder(
+      order.id,
+      depsWith(simulator),
+    );
+
+    // Rows exist (so the merchant sees the problem) but nothing was sent…
+    expect(rows).toHaveLength(2);
+    expect(sendSpy).not.toHaveBeenCalled();
+    for (const row of rows) {
+      expect(row.status).toBe("failed");
+      expect(row.lastError).toBe(NO_LIVE_DELIVERY_PROVIDER_MESSAGE);
+      expect(row.attempts).toBe(0);
+    }
+    expect((await orders.getById(order.id))?.status).toBe("paid");
+
+    // …and the owner's Retry stays honest rather than fabricating sends.
+    const retried = await retryBundleDeliveryFailures(
+      "owner-1",
+      order.id,
+      depsWith(simulator),
+    );
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(
+      retried?.deliveries.every(
+        (row) =>
+          row.status === "failed" &&
+          row.lastError === NO_LIVE_DELIVERY_PROVIDER_MESSAGE &&
+          row.attempts === 0,
+      ),
+    ).toBe(true);
+  });
+
+  it("I2 — exactly one row per purchased bundle unit across webhook replays and rechecks", async () => {
     // The realistic sequence: checkout created a pending order, the webhook
     // marked it paid, dispatched — then the same webhook was delivered again.
     const order = await orders.create(bundleOrder({ status: "pending" }));
@@ -189,14 +235,150 @@ describe("bundle delivery engine invariants", () => {
     await recheckBundleDeliveriesForOrder(order.id, depsWith(provider));
     const rows = await deliveries.listForOrder(order.id);
     expect(rows).toHaveLength(BUNDLE_LINES.length);
-    expect(new Set(rows.map((row) => row.itemId))).toEqual(
-      new Set(BUNDLE_LINES.map((line) => line.itemId)),
-    );
     expect(provider.sends).toHaveLength(BUNDLE_LINES.length);
     expect(rows.every((row) => row.attempts === 1)).toBe(true);
+    expect(
+      rows.map((row) => `${row.lineIndex}.${row.unitIndex}`).sort(),
+    ).toEqual(["0.0", "1.0"]);
   });
 
-  it("I3 — delivered is terminal: rechecks, retries and store guards cannot move it", async () => {
+  it("I2 — claim-before-send survives concurrent passes: no unit is sent twice", async () => {
+    const order = await orders.create(bundleOrder());
+
+    // A provider that pauses mid-send until the test lets it through.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sends: BundleDeliveryDispatchRequest[] = [];
+    const provider: BundleDeliveryProvider = {
+      id: "gated",
+      async sendBundle(request) {
+        sends.push(request);
+        await gate;
+        return { ok: true, providerRef: `gated-${sends.length}` };
+      },
+      async checkStatus() {
+        return { status: "processing" };
+      },
+    };
+
+    // A webhook dispatch and a page-load recheck that overlap in time.
+    const pass1 = dispatchBundleDeliveriesForOrder(
+      order.id,
+      depsWith(provider),
+    );
+    const pass2 = recheckBundleDeliveriesForOrder(order.id, depsWith(provider));
+    release();
+    await Promise.all([pass1, pass2]);
+
+    // Two rows, exactly two sends — the atomic claim gave every unit to
+    // exactly one concurrent caller.
+    expect(await deliveries.listForOrder(order.id)).toHaveLength(2);
+    expect(sends).toHaveLength(2);
+    expect(
+      sends.map((send) => `${send.lineIndex}.${send.unitIndex}`).sort(),
+    ).toEqual(["0.0", "1.0"]);
+
+    // The same holds for two concurrent owner retries on failed rows.
+    const failing = new StubProvider();
+    failing.sendResult = { ok: false, error: "down" };
+    const failedOrder = await orders.create(bundleOrder());
+    await dispatchBundleDeliveriesForOrder(failedOrder.id, depsWith(failing));
+
+    let releaseRetry!: () => void;
+    const retryGate = new Promise<void>((resolve) => {
+      releaseRetry = resolve;
+    });
+    const retrySends: BundleDeliveryDispatchRequest[] = [];
+    const retryProvider: BundleDeliveryProvider = {
+      id: "gated-retry",
+      async sendBundle(request) {
+        retrySends.push(request);
+        await retryGate;
+        return { ok: true, providerRef: `gated-retry-${retrySends.length}` };
+      },
+      async checkStatus() {
+        return { status: "processing" };
+      },
+    };
+    const retries = [
+      retryBundleDeliveryFailures(
+        "owner-1",
+        failedOrder.id,
+        depsWith(retryProvider),
+      ),
+      retryBundleDeliveryFailures(
+        "owner-1",
+        failedOrder.id,
+        depsWith(retryProvider),
+      ),
+    ];
+    releaseRetry();
+    await Promise.all(retries);
+    expect(retrySends).toHaveLength(2);
+    const settled = await deliveries.listForOrder(failedOrder.id);
+    expect(
+      settled.every((row) => row.status === "processing" && row.attempts === 2),
+    ).toBe(true);
+  });
+
+  it("I2 — a line with quantity 3 gets exactly 3 rows and 3 sends; a replay adds none", async () => {
+    const order = await orders.create(
+      bundleOrder({
+        lines: [
+          {
+            itemId: "b1",
+            name: "MTN 1GB",
+            price: 10,
+            quantity: 3,
+            bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+          },
+        ],
+      }),
+    );
+    const provider = new StubProvider();
+
+    const rows = await dispatchBundleDeliveriesForOrder(
+      order.id,
+      depsWith(provider),
+    );
+    expect(rows).toHaveLength(3);
+    expect(provider.sends).toHaveLength(3);
+    expect(rows.map((row) => row.unitIndex).sort((a, b) => a - b)).toEqual([
+      0, 1, 2,
+    ]);
+    expect(rows.every((row) => row.lineIndex === 0)).toBe(true);
+
+    // Replay creates nothing and the steady state stays at 3 units.
+    await dispatchBundleDeliveriesForOrder(order.id, depsWith(provider));
+    await recheckBundleDeliveriesForOrder(order.id, depsWith(provider));
+    expect(await deliveries.listForOrder(order.id)).toHaveLength(3);
+    expect(provider.sends).toHaveLength(3);
+  });
+
+  it("I2 — two order lines carrying the same item id do not collapse into one delivery", async () => {
+    // A crafted checkout body could put the same item on two lines; the
+    // (order_id, line_index, unit_index) key keeps both units addressable.
+    const order = await orders.create(
+      bundleOrder({
+        lines: [
+          { ...BUNDLE_LINES[0] },
+          { ...BUNDLE_LINES[0], price: 10, quantity: 1 },
+        ],
+      }),
+    );
+    const provider = new StubProvider();
+    const rows = await dispatchBundleDeliveriesForOrder(
+      order.id,
+      depsWith(provider),
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.lineIndex).sort()).toEqual([0, 1]);
+    expect(provider.sends).toHaveLength(2);
+  });
+
+  it("I3 — delivered is terminal: rechecks, retries, claims and store guards cannot move it", async () => {
     const order = await orders.create(bundleOrder());
     const provider = new StubProvider();
 
@@ -237,25 +419,29 @@ describe("bundle delivery engine invariants", () => {
     // Store-level guards agree: nothing moves a delivered row.
     const id = done[0].id;
     await deliveries.markFailed(id, { error: "late failure" });
-    await deliveries.markProcessing(id, {
-      provider: "stub",
-      providerRef: "stub-ref-late",
-    });
+    expect(await deliveries.claimForDispatch(id, { provider: "stub" })).toBe(
+      false,
+    );
     const settled = await deliveries.getById(id);
     expect(settled?.status).toBe("delivered");
     expect(settled?.deliveredAt).toBe(deliveredAt);
     expect(settled?.attempts).toBe(1);
   });
 
-  it("I4 — a provider failure lands on the row as failed, never thrown back at the caller", async () => {
-    const order = await orders.create(bundleOrder());
+  it("I4 — a provider failure lands on the row as failed, never thrown back at the caller, and alerts once per pass", async () => {
+    const order = await orders.create(
+      bundleOrder({ draftId: await seededDraftId() }),
+    );
     const provider = new StubProvider();
     provider.throwOnSend = true;
+    const notify = vi.fn<
+      (input: MerchantDeliveryFailureInput) => Promise<unknown>
+    >(async () => ({}));
 
     // Dispatch resolves normally despite the provider blowing up…
     const rows = await dispatchBundleDeliveriesForOrder(
       order.id,
-      depsWith(provider),
+      depsWith(provider, { notifyDeliveryFailed: notify }),
     );
     // …every failure is recorded on the row…
     expect(rows).toHaveLength(BUNDLE_LINES.length);
@@ -264,8 +450,30 @@ describe("bundle delivery engine invariants", () => {
       expect(row.lastError).toMatch(/could not be reached/i);
       expect(row.attempts).toBe(1);
     }
-    // …and the payment is untouched.
+    // …the payment is untouched…
     expect((await orders.getById(order.id))?.status).toBe("paid");
+    // …and the merchant got exactly one aggregated alert for this pass.
+    expect(notify).toHaveBeenCalledTimes(1);
+    const alertInput = notify.mock.calls[0][0];
+    expect(alertInput.order.id).toBe(order.id);
+    expect(alertInput.deliveries).toHaveLength(2);
+    expect(alertInput.total).toBe(2);
+
+    // A later recheck sees only already-failed rows: it must NOT alert again.
+    await recheckBundleDeliveriesForOrder(
+      order.id,
+      depsWith(provider, { notifyDeliveryFailed: notify }),
+    );
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // A retry that fails again transitions rows in this pass, so it alerts
+    // again — the owner needs to know their retry did not fix it.
+    await retryBundleDeliveryFailures(
+      "owner-1",
+      order.id,
+      depsWith(provider, { notifyDeliveryFailed: notify }),
+    );
+    expect(notify).toHaveBeenCalledTimes(2);
 
     // Explicit owner retry once the provider recovers: failed → processing →
     // delivered, with the attempt counter proving a second dispatch happened.
@@ -273,25 +481,25 @@ describe("bundle delivery engine invariants", () => {
     const retried = await retryBundleDeliveryFailures(
       "owner-1",
       order.id,
-      depsWith(provider),
+      depsWith(provider, { notifyDeliveryFailed: notify }),
     );
-    expect(provider.sends).toHaveLength(BUNDLE_LINES.length * 2);
     expect(
       retried?.deliveries.every(
         (row) =>
           row.status === "processing" &&
-          row.attempts === 2 &&
+          row.attempts === 3 &&
           row.lastError === undefined,
       ),
     ).toBe(true);
     const settled = await recheckBundleDeliveriesForOrder(
       order.id,
-      depsWith(provider),
+      depsWith(provider, { notifyDeliveryFailed: notify }),
     );
     expect(settled.every((row) => row.status === "delivered")).toBe(true);
+    expect(notify).toHaveBeenCalledTimes(2);
   });
 
-  it("I5 — other website types are untouched: no rows, no provider calls", async () => {
+  it("I5 — other website types are untouched: no rows, no provider calls, no alerts", async () => {
     // A restaurant-style paid order: no recipient, no bundle metadata.
     const restaurant = await orders.create(
       bundleOrder({
@@ -300,11 +508,18 @@ describe("bundle delivery engine invariants", () => {
       }),
     );
     const provider = new StubProvider();
+    const notify = vi.fn<
+      (input: MerchantDeliveryFailureInput) => Promise<unknown>
+    >(async () => ({}));
     expect(
-      await dispatchBundleDeliveriesForOrder(restaurant.id, depsWith(provider)),
+      await dispatchBundleDeliveriesForOrder(
+        restaurant.id,
+        depsWith(provider, { notifyDeliveryFailed: notify }),
+      ),
     ).toEqual([]);
     expect(await deliveries.listForOrder(restaurant.id)).toEqual([]);
     expect(provider.sends).toEqual([]);
+    expect(notify).not.toHaveBeenCalled();
 
     // Even an inconsistent order that somehow carries a recipient but belongs
     // to a non-bundle website is vetoed by the draft's category.
@@ -325,10 +540,14 @@ describe("bundle delivery engine invariants", () => {
       }),
     );
     expect(
-      await dispatchBundleDeliveriesForOrder(odd.id, depsWith(provider)),
+      await dispatchBundleDeliveriesForOrder(
+        odd.id,
+        depsWith(provider, { notifyDeliveryFailed: notify }),
+      ),
     ).toEqual([]);
     expect(await deliveries.listForOrder(odd.id)).toEqual([]);
     expect(provider.sends).toEqual([]);
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it("I6 — the guest line is an aggregate with a masked number and no internals", async () => {
@@ -385,10 +604,11 @@ describe("providers", () => {
       orderId: "o1",
       deliveryId: "d1",
       attempt: 1,
+      lineIndex: 0,
+      unitIndex: 0,
       recipientPhone: "0240000001",
       network: "mtn",
       dataMb: 1024,
-      quantity: 1,
     });
     expect(sent.ok).toBe(true);
     if (sent.ok) expect(sent.providerRef).toMatch(/^sim-/);
@@ -405,12 +625,94 @@ describe("providers", () => {
       orderId: "o1",
       deliveryId: "d2",
       attempt: 1,
+      lineIndex: 0,
+      unitIndex: 0,
       recipientPhone: "12345",
       network: "mtn",
       dataMb: 1024,
-      quantity: 1,
     });
     expect(refused.ok).toBe(false);
+  });
+
+  it("simulator fails a test number ending 0000 so Failed → Retry can be rehearsed", async () => {
+    const simulator = new SimulatedProvider();
+    const request = {
+      orderId: "o1",
+      deliveryId: "d1",
+      attempt: 1,
+      lineIndex: 0,
+      unitIndex: 0,
+      recipientPhone: "0240000000",
+      network: "mtn" as const,
+      dataMb: 1024,
+    };
+    const sent = await simulator.sendBundle(request);
+    expect(sent).toEqual({ ok: false, error: SIMULATED_FAIL_MESSAGE });
+
+    // Through the engine the refusal becomes a failed, retryable row.
+    const order = await orders.create(
+      bundleOrder({ recipientPhone: "0240000000" }),
+    );
+    const rows = await dispatchBundleDeliveriesForOrder(
+      order.id,
+      depsWith(simulator),
+    );
+    expect(
+      rows.every(
+        (row) =>
+          row.status === "failed" && row.lastError === SIMULATED_FAIL_MESSAGE,
+      ),
+    ).toBe(true);
+  });
+
+  it("simulator keeps a test number ending 9999 processing for 60 seconds, then delivers", async () => {
+    const simulator = new SimulatedProvider();
+    const sent = await simulator.sendBundle({
+      orderId: "o1",
+      deliveryId: "d1",
+      attempt: 1,
+      lineIndex: 0,
+      unitIndex: 0,
+      recipientPhone: "0240009999",
+      network: "mtn",
+      dataMb: 1024,
+    });
+    expect(sent.ok).toBe(true);
+    const ref = sent.ok ? sent.providerRef! : "";
+    expect(ref).toMatch(/^sim-slow-\d+-/);
+
+    // Fresh slow refs are still in flight…
+    await expect(simulator.checkStatus({ providerRef: ref })).resolves.toEqual({
+      status: "processing",
+    });
+    // …a ref minted long enough ago settles. The send time travels inside the
+    // reference, so this works across restarts with no in-memory state.
+    await expect(
+      simulator.checkStatus({ providerRef: "sim-slow-1-00000000" }),
+    ).resolves.toEqual({ status: "delivered" });
+
+    // The boundary itself, against a frozen clock.
+    vi.useFakeTimers();
+    const start = Date.now();
+    vi.setSystemTime(start);
+    const timed = await simulator.sendBundle({
+      orderId: "o1",
+      deliveryId: "d2",
+      attempt: 1,
+      lineIndex: 0,
+      unitIndex: 0,
+      recipientPhone: "0240009999",
+      network: "mtn",
+      dataMb: 1024,
+    });
+    const timedRef = timed.ok ? timed.providerRef! : "";
+    await expect(
+      simulator.checkStatus({ providerRef: timedRef }),
+    ).resolves.toEqual({ status: "processing" });
+    vi.setSystemTime(start + 61_000);
+    await expect(
+      simulator.checkStatus({ providerRef: timedRef }),
+    ).resolves.toEqual({ status: "delivered" });
   });
 
   it("techchief stub fails every send loudly and records the reason on the row", async () => {
@@ -457,13 +759,27 @@ describe("providers", () => {
       orderId: "o1",
       deliveryId: "d1",
       attempt: 1,
+      lineIndex: 0,
+      unitIndex: 0,
       recipientPhone: "0240000001",
       network: "mtn",
       dataMb: 1024,
-      quantity: 1,
     });
     expect(refused.ok).toBe(false);
     if (!refused.ok) expect(refused.error).toContain("techcheif");
+  });
+
+  it("availability: nothing connected today is live-capable", () => {
+    expect(bundleDeliveryAvailability(new SimulatedProvider())).toEqual({
+      provider: "simulator",
+      live: false,
+    });
+    expect(bundleDeliveryAvailability(new TechChiefProvider())).toEqual({
+      provider: "techchief",
+      live: false,
+    });
+    expect(bundleDeliveryAvailability()).toMatchObject({ live: false });
+    expect(LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE).toContain("contact");
   });
 });
 
@@ -476,31 +792,6 @@ describe("bundle metadata resolution", () => {
       price: line.price,
       quantity: line.quantity,
     }));
-  }
-
-  async function seedBundleDraft() {
-    const draftStore = new SqliteStudioDraftStore();
-    return draftStore.create(
-      { id: "owner-1", login: "merchant", name: "Merchant" },
-      createDefaultBrief({
-        businessName: "Bundle Shop",
-        category: "data-bundles",
-        items: [
-          {
-            id: "b1",
-            name: "MTN 1GB",
-            price: 10,
-            bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
-          },
-          {
-            id: "b2",
-            name: "Telecel 2GB",
-            price: 14,
-            bundle: { network: "telecel", dataMb: 2048, validity: "30 days" },
-          },
-        ],
-      }),
-    );
   }
 
   it("resolves legacy orders (no snapshot) from the live catalogue", async () => {
@@ -591,17 +882,84 @@ describe("retry route semantics", () => {
   });
 
   it("a failed check from the provider marks the row failed with its reason", async () => {
-    const order = await orders.create(bundleOrder());
+    const order = await orders.create(
+      bundleOrder({ draftId: await seededDraftId() }),
+    );
     const provider = new StubProvider();
     provider.checkResult = { status: "failed", error: "insufficient balance" };
+    const notify = vi.fn<
+      (input: MerchantDeliveryFailureInput) => Promise<unknown>
+    >(async () => ({}));
     await dispatchBundleDeliveriesForOrder(order.id, depsWith(provider));
     const rows = await recheckBundleDeliveriesForOrder(
       order.id,
-      depsWith(provider),
+      depsWith(provider, { notifyDeliveryFailed: notify }),
     );
     expect(rows.every((row) => row.status === "failed")).toBe(true);
     expect(rows.every((row) => row.lastError === "insufficient balance")).toBe(
       true,
     );
+    // Provider-reported failures on recheck also alert, once, aggregated.
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].deliveries).toHaveLength(2);
+  });
+
+  it("claimForDispatch moves pending→processing exactly once and counts the attempt", async () => {
+    const order = await orders.create(bundleOrder());
+    const provider = new StubProvider();
+    await dispatchBundleDeliveriesForOrder(order.id, depsWith(provider));
+    const [row] = await deliveries.listForOrder(order.id);
+
+    // The row is already processing after dispatch, so a fresh claim fails…
+    expect(row.status).toBe("processing");
+    expect(row.attempts).toBe(1);
+    expect(await deliveries.claimForDispatch(row.id, { provider: "x" })).toBe(
+      false,
+    );
+    // …but after a failure the row is claimable again for Retry.
+    await deliveries.markFailed(row.id, { error: "boom" });
+    expect(await deliveries.claimForDispatch(row.id, { provider: "x" })).toBe(
+      true,
+    );
+    const claimed = await deliveries.getById(row.id);
+    expect(claimed?.status).toBe("processing");
+    expect(claimed?.attempts).toBe(2);
+    expect(claimed?.provider).toBe("x");
+    expect(claimed?.providerRef).toBeUndefined();
+    expect(claimed?.lastError).toBeUndefined();
+    // setProviderRef only applies to claimed rows.
+    await deliveries.setProviderRef(row.id, "ref-123");
+    expect((await deliveries.getById(row.id))?.providerRef).toBe("ref-123");
   });
 });
+
+// --------------------------------------------------------------------------
+
+function seedBundleDraft() {
+  const draftStore = new SqliteStudioDraftStore();
+  return draftStore.create(
+    { id: "owner-1", login: "merchant", name: "Merchant" },
+    createDefaultBrief({
+      businessName: "Bundle Shop",
+      category: "data-bundles",
+      items: [
+        {
+          id: "b1",
+          name: "MTN 1GB",
+          price: 10,
+          bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+        },
+        {
+          id: "b2",
+          name: "Telecel 2GB",
+          price: 14,
+          bundle: { network: "telecel", dataMb: 2048, validity: "30 days" },
+        },
+      ],
+    }),
+  );
+}
+
+async function seededDraftId(): Promise<string> {
+  return (await seedBundleDraft()).id;
+}

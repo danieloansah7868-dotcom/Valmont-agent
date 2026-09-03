@@ -2,9 +2,9 @@
  * PostgreSQL bundle delivery contract tests (Stage 4).
  *
  * These exercise the real PostgreSQL store — idempotent creation through the
- * unique (order_id, item_id) index, the guarded status transitions, and a
- * full engine pass — against the actual database engine. They are skipped
- * when no throwaway database is supplied:
+ * unique (order_id, line_index, unit_index) index, the atomic
+ * claim-before-send guard, and a full engine pass — against the actual
+ * database engine. They are skipped when no throwaway database is supplied:
  *
  *   STUDIO_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/valmont_test
  */
@@ -45,9 +45,9 @@ describe.runIf(connectionString)("PostgreSQL bundle deliveries", () => {
       accessCode: `pg-delivery-${Date.now()}-${Math.random()}`,
       status: "paid",
       currency: "GHS",
-      subtotal: 24,
+      subtotal: 38,
       deliveryFee: 0,
-      total: 24,
+      total: 38,
       lines: [
         {
           itemId: "b1",
@@ -60,7 +60,7 @@ describe.runIf(connectionString)("PostgreSQL bundle deliveries", () => {
           itemId: "b2",
           name: "Telecel 2GB",
           price: 14,
-          quantity: 1,
+          quantity: 2,
           bundle: { network: "telecel", dataMb: 2048, validity: "30 days" },
         },
       ],
@@ -133,21 +133,20 @@ describe.runIf(connectionString)("PostgreSQL bundle deliveries", () => {
     delete process.env.DATABASE_URL;
   });
 
-  it("is idempotent through the unique index and guards every transition", async () => {
+  it("expands units, stays idempotent through the unique index, and settles deterministically", async () => {
     const order = await ordersStore.create(paidBundleOrder());
 
-    const first = await deliveriesStore.listForOrder(order.id);
-    expect(first).toEqual([]);
+    expect(await deliveriesStore.listForOrder(order.id)).toEqual([]);
 
+    const sends: string[] = [];
     const engineDeps = {
       orders: ordersStore,
       deliveries: deliveriesStore,
       provider: {
         id: "stub",
-        sends: [] as string[],
         async sendBundle(request: { recipientPhone: string }) {
-          this.sends.push(request.recipientPhone);
-          return { ok: true, providerRef: `pg-stub-${this.sends.length}` };
+          sends.push(request.recipientPhone);
+          return { ok: true, providerRef: `pg-stub-${sends.length}` };
         },
         async checkStatus() {
           return { status: "delivered" };
@@ -155,26 +154,34 @@ describe.runIf(connectionString)("PostgreSQL bundle deliveries", () => {
       },
     };
 
-    // Dispatch, then replay: one row per line, no second send.
+    // 1 + 2 units = three rows and three sends; a replay adds nothing.
     const dispatched = await engine.dispatchBundleDeliveriesForOrder(
       order.id,
       engineDeps,
     );
-    expect(dispatched).toHaveLength(2);
-    expect(engineDeps.provider.sends).toHaveLength(2);
+    expect(dispatched).toHaveLength(3);
+    expect(sends).toHaveLength(3);
     expect(
       dispatched.every(
         (row: { status: string; attempts: number }) =>
           row.status === "processing" && row.attempts === 1,
       ),
     ).toBe(true);
+    expect(
+      dispatched
+        .map(
+          (row: { lineIndex: number; unitIndex: number }) =>
+            `${row.lineIndex}.${row.unitIndex}`,
+        )
+        .sort(),
+    ).toEqual(["0.0", "1.0", "1.1"]);
 
     const replayed = await engine.dispatchBundleDeliveriesForOrder(
       order.id,
       engineDeps,
     );
-    expect(replayed).toHaveLength(2);
-    expect(engineDeps.provider.sends).toHaveLength(2);
+    expect(replayed).toHaveLength(3);
+    expect(sends).toHaveLength(3);
 
     // A recheck settles the rows; the next one leaves them alone.
     const settled = await engine.recheckBundleDeliveriesForOrder(
@@ -187,13 +194,12 @@ describe.runIf(connectionString)("PostgreSQL bundle deliveries", () => {
     expect(settled[0].deliveredAt).toBeTruthy();
     expect(settled[0].providerRef).toMatch(/^pg-stub-/);
 
-    // Store guards: a delivered row cannot be moved by any transition.
+    // Store guards: a delivered row can be neither claimed nor failed.
     const id = settled[0].id;
+    expect(
+      await deliveriesStore.claimForDispatch(id, { provider: "stub" }),
+    ).toBe(false);
     await deliveriesStore.markFailed(id, { error: "late" });
-    await deliveriesStore.markProcessing(id, {
-      provider: "stub",
-      providerRef: null,
-    });
     await deliveriesStore.markDelivered(id);
     const after = await deliveriesStore.getById(id);
     expect(after.status).toBe("delivered");

@@ -431,14 +431,16 @@ export const studioOrders = pgTable(
 );
 
 /**
- * Data-bundles Stage 4 deliveries. One row per paid bundle line of an order,
- * created lazily by the delivery engine the first time a payment is confirmed
- * (and never before — see `src/lib/studio/bundle-delivery.ts` for invariants
- * I1–I6). Every column after `quantity` is engine-owned state: the provider
- * name, the pending → processing → delivered/failed lifecycle, the attempt
- * counter, the provider's reference and the last error the owner should see.
- * The unique `(order_id, item_id)` index is what makes webhook replays,
- * double-dispatches and page-load rechecks idempotent (I2).
+ * Data-bundles Stage 4 deliveries. One row per purchased bundle UNIT of a
+ * paid order — a line with quantity 3 produces three rows keyed by
+ * (order_id, line_index, unit_index) — created lazily by the delivery engine
+ * the first time a payment is confirmed (and never before; see
+ * `src/lib/studio/bundle-delivery.ts` for invariants I1–I6). Per-unit rows
+ * keep partial delivery inside a line trackable and make a Retry unable to
+ * resend units that already went through. The columns after `validity` are
+ * engine-owned state: provider, lifecycle, attempts, reference, last error.
+ * The unique index is what makes webhook replays, double-dispatches and
+ * page-load rechecks idempotent (I2).
  */
 export const studioDeliveries = pgTable(
   "studio_deliveries",
@@ -450,6 +452,9 @@ export const studioDeliveries = pgTable(
     ownerId: uuid("owner_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
+    /** Position of the order line and of the unit inside that line. */
+    lineIndex: integer("line_index").notNull(),
+    unitIndex: integer("unit_index").notNull(),
     /** Catalogue line id and display name, snapshotted at dispatch time. */
     itemId: text("item_id").notNull(),
     itemName: text("item_name").notNull(),
@@ -457,7 +462,6 @@ export const studioDeliveries = pgTable(
     network: text("network").notNull(),
     dataMb: integer("data_mb").notNull(),
     validity: text("validity"),
-    quantity: integer("quantity").notNull().default(1),
     /** Full recipient number — server-side only, masked on guest pages. */
     recipientPhone: text("recipient_phone").notNull(),
     /**
@@ -484,9 +488,10 @@ export const studioDeliveries = pgTable(
       table.ownerId,
       table.createdAt,
     ),
-    uniqueIndex("studio_deliveries_order_item_unique").on(
+    uniqueIndex("studio_deliveries_order_line_unit_unique").on(
       table.orderId,
-      table.itemId,
+      table.lineIndex,
+      table.unitIndex,
     ),
   ],
 );

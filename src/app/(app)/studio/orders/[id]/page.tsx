@@ -46,6 +46,14 @@ export default async function OrderDetailPage({
   const failedTopUps = bundleDeliveries.filter(
     (delivery) => delivery.status === "failed",
   ).length;
+  // Rows are per purchased unit; a line bought N times shows N unit rows.
+  const unitsPerLine = new Map<number, number>();
+  for (const delivery of bundleDeliveries) {
+    unitsPerLine.set(
+      delivery.lineIndex,
+      (unitsPerLine.get(delivery.lineIndex) ?? 0) + 1,
+    );
+  }
 
   const methodLabel =
     PAYMENT_METHODS.find((method) => method.id === order.paymentMethod)
@@ -191,7 +199,14 @@ export default async function OrderDetailPage({
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="font-semibold">
                     {bundleNetworkLabel(delivery.network)}{" "}
-                    {formatDataMb(delivery.dataMb)} × {delivery.quantity}
+                    {formatDataMb(delivery.dataMb)}
+                    {(unitsPerLine.get(delivery.lineIndex) ?? 1) > 1 && (
+                      <span className="font-normal text-slate-600">
+                        {" "}
+                        — unit {delivery.unitIndex + 1} of{" "}
+                        {unitsPerLine.get(delivery.lineIndex)}
+                      </span>
+                    )}
                   </span>
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
