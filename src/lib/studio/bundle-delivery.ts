@@ -1561,16 +1561,44 @@ async function dispatchPendingRows(
   }
 }
 
+/**
+ * How many in-flight rows ONE recheck pass may ask a provider about (Stage 4b).
+ *
+ * A recheck runs on every load of the owner's order page and of the
+ * unauthenticated guest confirmation page, so without a ceiling the cost of a
+ * page load scales with the size of the order: an order created before the
+ * basket caps, or one with many lines, would mean one provider call per row
+ * per refresh. The rows that wait longest go first, so a busy order works
+ * through its queue steadily instead of always re-asking about the newest
+ * top-ups. Rows that cannot be polled yet (no provider reference) are skipped
+ * and do **not** consume the budget — otherwise a row stuck without a
+ * reference would permanently hold a slot at the front of the queue.
+ *
+ * This bounds one pass only; TechChief's own 50-request hourly budget and the
+ * 10-minute per-row throttle inside the provider still apply on top of it.
+ */
+export const MAX_PROCESSING_POLLS_PER_PASS = 25;
+
 /** Polls the provider for "processing" rows; transient outages are simply retried on the next recheck. */
 async function refreshProcessingRows(
   rows: BundleDeliveryRecord[],
   ctx: EnginePassContext,
 ): Promise<void> {
   if (ctx.liveBlocked) return; // nothing to poll without a live provider
-  for (const row of rows) {
-    if (row.status !== "processing") continue;
+  // Oldest first: `updated_at` moves when a row is polled (the heartbeat) or
+  // settled, so this is a fair queue rather than whatever order the database
+  // happened to return.
+  const inFlight = rows
+    .filter((row) => row.status === "processing")
+    .sort(
+      (a, b) => (Date.parse(a.updatedAt) || 0) - (Date.parse(b.updatedAt) || 0),
+    );
+  let polls = 0;
+  for (const row of inFlight) {
+    if (polls >= MAX_PROCESSING_POLLS_PER_PASS) break;
     const rowProvider = await providerForRow(row, ctx);
     if (!rowProvider || !row.providerRef) continue;
+    polls += 1;
     let outcome: BundleDeliveryStatusResult;
     try {
       outcome = await rowProvider.checkStatus({

@@ -19,6 +19,9 @@ import {
   normalizeGhanaMobile,
   checkRecipientNetworkMatch,
   validateGhanaMobile,
+  MAX_BUNDLE_UNITS_PER_LINE,
+  MAX_BUNDLE_UNITS_PER_ORDER,
+  BUNDLE_ORDER_CAP_MESSAGE,
 } from "@/lib/studio/bundles";
 
 interface CheckoutResponse {
@@ -106,6 +109,11 @@ export function BundleShop({
     [lines],
   );
   const itemCount = lines.reduce((sum, line) => sum + line.quantity, 0);
+  // Stage 4b: the storefront stops at the same numbers the checkout route
+  // enforces, so a customer is told here rather than refused after filling in
+  // a phone number. The server still checks — this is the courtesy, not the
+  // control.
+  const overOrderCap = itemCount > MAX_BUNDLE_UNITS_PER_ORDER;
 
   useEffect(() => {
     document.body.style.overflow = cartOpen ? "hidden" : "";
@@ -115,12 +123,22 @@ export function BundleShop({
   }, [cartOpen]);
 
   function setQty(id: string, quantity: number) {
-    setCart((current) => ({ ...current, [id]: Math.max(0, quantity) }));
-    if (quantity > 0) setCartOpen(true);
+    // The "+" stops at the per-line cap: pressing it again changes nothing, so
+    // a stuck button or an impatient double-tap cannot build an order the
+    // checkout route would refuse.
+    const clamped = Math.min(MAX_BUNDLE_UNITS_PER_LINE, Math.max(0, quantity));
+    setCart((current) => ({ ...current, [id]: clamped }));
+    if (clamped > 0) setCartOpen(true);
   }
 
   async function placeOrder() {
     if (!draftId) return;
+    // The Checkout button is already disabled over the cap; this is the guard
+    // for a form that was opened before the basket grew past it.
+    if (overOrderCap) {
+      setError(BUNDLE_ORDER_CAP_MESSAGE);
+      return;
+    }
     const recipientErr = validateGhanaMobile(recipientPhone);
     if (recipientErr) {
       setRecipientError(recipientErr);
@@ -409,6 +427,23 @@ export function BundleShop({
                       Checkout runs on the saved draft. Save this draft to place
                       a test order.
                     </p>
+                  ) : overOrderCap ? (
+                    <div className="mt-4 grid gap-2">
+                      <p
+                        className="text-xs font-semibold text-slate-700"
+                        data-testid="bundle-cap-message"
+                      >
+                        {BUNDLE_ORDER_CAP_MESSAGE}
+                      </p>
+                      <button
+                        type="button"
+                        disabled
+                        className="btn-primary w-full disabled:opacity-60"
+                        data-testid="start-checkout"
+                      >
+                        Checkout
+                      </button>
+                    </div>
                   ) : !checkingOut ? (
                     <button
                       type="button"

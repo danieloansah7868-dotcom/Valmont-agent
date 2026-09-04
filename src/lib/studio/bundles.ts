@@ -17,6 +17,54 @@ export function isBundleNetworkId(value: string): value is BundleNetworkId {
   return BUNDLE_NETWORKS.some((n) => n.id === value);
 }
 
+// ---------------------------------------------------------------------------
+// Order caps (Stage 4b)
+// ---------------------------------------------------------------------------
+
+/**
+ * How many of ONE bundle a data-bundles customer may buy in a single line.
+ *
+ * Every unit becomes one real top-up through the shop's own TechChief key, so
+ * an unbounded basket is an unbounded bill and an unbounded delivery queue:
+ * quantity 999 on one line means 999 provider calls and 999 tracked rows for
+ * one order. The cap keeps a mistake — a stuck "+" button, a scripted
+ * checkout — inside a size a merchant can actually fund and send.
+ */
+export const MAX_BUNDLE_UNITS_PER_LINE = 10;
+
+/** How many bundle units one order may contain across all its lines. */
+export const MAX_BUNDLE_UNITS_PER_ORDER = 20;
+
+/**
+ * The exact wording both the checkout route (400) and the storefront show.
+ * Built from the two constants so the sentence can never drift away from the
+ * numbers it quotes.
+ */
+export const BUNDLE_ORDER_CAP_MESSAGE = `You can order up to ${MAX_BUNDLE_UNITS_PER_LINE} of one bundle and ${MAX_BUNDLE_UNITS_PER_ORDER} bundles per order.`;
+
+/**
+ * The single place the caps are counted, so the storefront and the checkout
+ * route cannot disagree about what "too many" means.
+ *
+ * Returns {@link BUNDLE_ORDER_CAP_MESSAGE} when any line exceeds the per-line
+ * cap or the units add up to more than the per-order cap, and `null` when the
+ * basket is acceptable. Quantities below 1 are the caller's problem (the
+ * checkout schema already rejects them), so they are treated as 0 here rather
+ * than silently reducing the total.
+ */
+export function bundleOrderCapError(
+  lines: ReadonlyArray<{ quantity: number }>,
+): string | null {
+  let total = 0;
+  for (const line of lines) {
+    const quantity = Number(line.quantity);
+    if (!Number.isFinite(quantity)) continue;
+    if (quantity > MAX_BUNDLE_UNITS_PER_LINE) return BUNDLE_ORDER_CAP_MESSAGE;
+    total += Math.max(0, quantity);
+  }
+  return total > MAX_BUNDLE_UNITS_PER_ORDER ? BUNDLE_ORDER_CAP_MESSAGE : null;
+}
+
 export function bundleNetworkLabel(id: string): string {
   return BUNDLE_NETWORKS.find((n) => n.id === id)?.label ?? id;
 }

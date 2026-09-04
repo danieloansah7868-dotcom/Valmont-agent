@@ -917,3 +917,209 @@ describe("bundle checkout live-money guard", () => {
     expect(mocks.create).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Stage 4b — basket caps on a data-bundles website.
+ *
+ * Every unit in a bundle basket becomes one real top-up through the shop's own
+ * TechChief key, so an unbounded basket is an unbounded bill. These pin the
+ * server-side half of the rule (the storefront clamping is courtesy): the exact
+ * 400 sentence, that it fires before any order row exists, that the boundary
+ * values 10 and 20 are still accepted, and — the part that protects every
+ * other client — that a website which is not a bundle shop is untouched.
+ */
+describe("bundle checkout order caps", () => {
+  const capDraft = {
+    ...draft,
+    brief: {
+      ...draft.brief,
+      category: "data-bundles",
+      businessName: "Capped Bundles Shop",
+      items: [
+        {
+          id: "bundle-00",
+          name: "MTN 1GB",
+          price: 10,
+          category: "mtn",
+          bundle: { network: "mtn", dataMb: 1024, validity: "7 days" },
+        },
+        {
+          id: "bundle-01",
+          name: "Telecel 1GB",
+          price: 9,
+          category: "telecel",
+          bundle: { network: "telecel", dataMb: 1024, validity: "7 days" },
+        },
+        {
+          id: "bundle-02",
+          name: "AirtelTigo 1GB",
+          price: 8,
+          category: "airteltigo",
+          bundle: { network: "airteltigo", dataMb: 1024, validity: "7 days" },
+        },
+      ],
+      payments: {
+        enabled: true,
+        methods: ["valmont_pay"],
+        delivery: {
+          enabled: false,
+          fee: 0,
+          minimumOrder: 0,
+          freeDeliveryAbove: 0,
+        },
+      },
+    },
+  };
+
+  const CAP_MESSAGE =
+    "You can order up to 10 of one bundle and 20 bundles per order.";
+
+  function capRequest(lines: Array<{ itemId: string; quantity: number }>) {
+    return new NextRequest(
+      `http://localhost/api/studio/drafts/${draftId}/checkout`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          lines,
+          customerName: "Kwame Buyer",
+          recipientPhone: "0240000001",
+          customerPhone: "0200000002",
+          paymentMethod: "valmont_pay",
+        }),
+      },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("APP_URL", "https://shop.example");
+    mocks.internalGetDraftForCheckout.mockResolvedValue(capDraft);
+    mocks.getCustomerSession.mockResolvedValue(null);
+    mocks.getOrdersStore.mockReturnValue({ create: mocks.create });
+    mocks.computeTotals.mockReturnValue({
+      subtotal: 20,
+      deliveryFee: 0,
+      total: 20,
+    });
+    mocks.create.mockResolvedValue({ ...createdOrder, status: "pending" });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "/pay/simulated",
+      live: false,
+    });
+    mocks.notifyMerchantNewOrder.mockResolvedValue({
+      email: "skipped",
+      whatsapp: "skipped",
+    });
+    // Test mode, so the Stage 5 live-money guard is not what these cases hit.
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "test",
+    });
+    mocks.bundleDeliveryAvailability.mockReturnValue({
+      provider: "simulator",
+      live: false,
+    });
+    mocks.bundleDeliveryAvailabilityForDraft.mockResolvedValue({
+      provider: "simulator",
+      live: false,
+    });
+  });
+
+  it("refuses more than the per-line cap with 400 and the exact sentence", async () => {
+    const response = await POST(
+      capRequest([{ itemId: "bundle-00", quantity: 11 }]),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: CAP_MESSAGE });
+  });
+
+  it("refuses a basket over the per-order cap even when no single line is too big", async () => {
+    const response = await POST(
+      capRequest([
+        { itemId: "bundle-00", quantity: 7 },
+        { itemId: "bundle-01", quantity: 7 },
+        { itemId: "bundle-02", quantity: 7 },
+      ]),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: CAP_MESSAGE });
+  });
+
+  it("creates nothing at all when it refuses", async () => {
+    const response = await POST(
+      capRequest([{ itemId: "bundle-00", quantity: 21 }]),
+      params(),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.createPaymentLink).not.toHaveBeenCalled();
+    expect(mocks.notifyMerchantNewOrder).not.toHaveBeenCalled();
+    // Refused before the payment rail is even asked about.
+    expect(mocks.bundleDeliveryAvailabilityForDraft).not.toHaveBeenCalled();
+  });
+
+  it("accepts exactly the per-line cap", async () => {
+    const response = await POST(
+      capRequest([{ itemId: "bundle-00", quantity: 10 }]),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lines: [expect.objectContaining({ quantity: 10 })],
+      }),
+    );
+  });
+
+  it("accepts exactly the per-order cap spread over two lines", async () => {
+    const response = await POST(
+      capRequest([
+        { itemId: "bundle-00", quantity: 10 },
+        { itemId: "bundle-01", quantity: 10 },
+      ]),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a website that is not a bundle shop completely alone", async () => {
+    // The default fixture is a food shop: 999 of one line is a big catering
+    // order, not 999 provider calls, and must stay allowed.
+    mocks.internalGetDraftForCheckout.mockResolvedValue(draft);
+
+    const response = await POST(
+      new NextRequest(
+        `http://localhost/api/studio/drafts/${draftId}/checkout`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            lines: [{ itemId: "item-1", quantity: 999 }],
+            customerName: "Ama Mensah",
+            customerPhone: "+233240000000",
+            customerAddress: "12 Independence Avenue",
+            paymentMethod: "cod",
+          }),
+        },
+      ),
+      params(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lines: [expect.objectContaining({ quantity: 999 })],
+      }),
+    );
+  });
+});
