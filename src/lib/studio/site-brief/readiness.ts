@@ -224,3 +224,71 @@ export function displayValue(value: unknown): {
     return { text: value.trim(), isPlaceholder: false };
   return { text: PLACEHOLDER_TEXT, isPlaceholder: true };
 }
+
+// ---------------------------------------------------------------------------
+// Readiness v2 — dependencies outside the Brief (Stage 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The Brief says whether a website is *finished*; these dependencies say
+ * whether it may take **real money**. Filling in every field still cannot make
+ * a data-bundles shop sell for real while nothing behind it can deliver a
+ * top-up, so the two questions are kept apart and answered separately.
+ */
+export const READINESS_DEPENDENCY_IDS = ["payments", "bundleDelivery"] as const;
+export type ReadinessDependencyId = (typeof READINESS_DEPENDENCY_IDS)[number];
+
+export interface ReadinessDependency {
+  id: ReadinessDependencyId;
+  /** What the owner sees, e.g. "Bundle delivery". */
+  label: string;
+  /** True when this website can really do the thing. */
+  satisfied: boolean;
+  /** What to do about it, in everyday words. */
+  hint: string;
+  /** Only applies to some websites (bundle delivery: data-bundles shops). */
+  applies: boolean;
+}
+
+export interface LiveSalesReadiness {
+  /** True when every dependency that applies to this website is satisfied. */
+  readyForLiveSales: boolean;
+  dependencies: ReadinessDependency[];
+  /** The dependencies that apply and are not satisfied. */
+  blockers: ReadinessDependency[];
+}
+
+/** The wallet connection a data-bundles shop needs before it can sell live. */
+export function bundleDeliveryDependency(
+  isBundleSite: boolean,
+  connection: { status: string | null } | null,
+): ReadinessDependency {
+  const verified = connection?.status === "verified";
+  return {
+    id: "bundleDelivery",
+    label: "Bundle delivery",
+    applies: isBundleSite,
+    satisfied: verified,
+    hint: verified
+      ? "TechChief is connected, so top-ups are sent automatically."
+      : "Connect your TechChief API key under Bundle delivery. Until it is connected this shop cannot take real money for bundles — every paid top-up has to be sent by hand.",
+  };
+}
+
+/**
+ * Answers "is this website ready for live sales?" from the dependencies that
+ * apply to it. A dependency that does not apply (bundle delivery on a food
+ * shop, say) is reported but never blocks, so adding a new website type cannot
+ * silently make every existing shop unready.
+ */
+export function computeLiveSalesReadiness(
+  dependencies: ReadinessDependency[],
+): LiveSalesReadiness {
+  const applicable = dependencies.filter((dependency) => dependency.applies);
+  const blockers = applicable.filter((dependency) => !dependency.satisfied);
+  return {
+    readyForLiveSales: blockers.length === 0,
+    dependencies,
+    blockers,
+  };
+}

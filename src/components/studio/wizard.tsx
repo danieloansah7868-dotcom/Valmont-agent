@@ -30,6 +30,7 @@ import {
 import { formatPricedItems, parsePricedItems } from "@/lib/studio/catalog";
 import { ShareLinkButton } from "./share-link-button";
 import { CustomDomainCard } from "./custom-domain-card";
+import { TechChiefConnectionCard } from "./techchief-connection";
 import { ProductImagesEditor } from "./product-images";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { evaluateSaveGate } from "@/lib/studio/save-gate";
@@ -1458,6 +1459,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           </section>
 
           <CustomDomainCard draftId={id} />
+
+          {/* Stage 5: only a data-bundles shop has bundles to deliver, so only
+              it gets the TechChief connection card. */}
+          {isBundleSite && <TechChiefConnectionCard draftId={id} />}
 
           <div className="mt-4">
             <BusinessPreview brief={brief} draftId={id} />

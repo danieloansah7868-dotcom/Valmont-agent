@@ -14,6 +14,10 @@ const mocks = vi.hoisted(() => ({
   onlinePaymentAvailability: vi.fn(),
   notifyMerchantNewOrder: vi.fn(),
   bundleDeliveryAvailability: vi.fn(),
+  // Stage 5: the live-money guard now asks about THIS website's own TechChief
+  // connection, so the per-draft resolver is mocked too. Without it the route
+  // would reach the real integration store and write to `.data/` during tests.
+  bundleDeliveryAvailabilityForDraft: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => ({
@@ -50,6 +54,7 @@ vi.mock("@/lib/studio/valmont-pay", () => ({
 vi.mock("@/lib/studio/bundle-delivery", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/studio/bundle-delivery")>()),
   bundleDeliveryAvailability: mocks.bundleDeliveryAvailability,
+  bundleDeliveryAvailabilityForDraft: mocks.bundleDeliveryAvailabilityForDraft,
 }));
 
 vi.mock("@/lib/studio/notifications", () => ({
@@ -413,6 +418,10 @@ describe("checkout data-bundles Ghana mobile validation", () => {
       provider: "simulator",
       live: false,
     });
+    mocks.bundleDeliveryAvailabilityForDraft.mockResolvedValue({
+      provider: "simulator",
+      live: false,
+    });
     mocks.createPaymentLink.mockResolvedValue({
       paymentLink: "/pay/simulated",
       live: false,
@@ -647,6 +656,10 @@ describe("checkout bundle buyer contact accepts any country", () => {
       provider: "simulator",
       live: false,
     });
+    mocks.bundleDeliveryAvailabilityForDraft.mockResolvedValue({
+      provider: "simulator",
+      live: false,
+    });
   });
 
   it("accepts a UK number as the BUYER contact with 200", async () => {
@@ -782,6 +795,10 @@ describe("bundle checkout live-money guard", () => {
       provider: "simulator",
       live: false,
     });
+    mocks.bundleDeliveryAvailabilityForDraft.mockResolvedValue({
+      provider: "simulator",
+      live: false,
+    });
   });
 
   it("refuses a live-money bundle checkout with 409 before any order row exists", async () => {
@@ -826,6 +843,72 @@ describe("bundle checkout live-money guard", () => {
       available: false,
       mode: "live",
       reason: "Live mode is selected but keys are missing.",
+    });
+
+    const response = await POST(guardRequest(), params());
+
+    expect(response.status).toBe(409);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  // --- Stage 5: the guard is now per website -------------------------------
+
+  it("accepts a live-money bundle checkout once this website's TechChief key is verified", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "live",
+    });
+    // The shop connected its own TechChief account, so it can really deliver.
+    mocks.bundleDeliveryAvailabilityForDraft.mockResolvedValue({
+      provider: "techchief",
+      live: true,
+    });
+    mocks.createPaymentLink.mockResolvedValue({
+      paymentLink: "https://pay.example/checkout",
+      live: true,
+    });
+
+    const response = await POST(guardRequest(), params());
+
+    expect(response.status).toBe(200);
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentMode: "live" }),
+    );
+    await expect(response.json()).resolves.toMatchObject({
+      orderId: createdOrder.id,
+      status: "pending",
+      live: true,
+    });
+  });
+
+  it("asks about the shop's own connection, never the server-wide default", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "live",
+    });
+    mocks.bundleDeliveryAvailabilityForDraft.mockResolvedValue({
+      provider: "techchief",
+      live: true,
+    });
+
+    await POST(guardRequest(), params());
+
+    expect(mocks.bundleDeliveryAvailabilityForDraft).toHaveBeenCalledWith(
+      draftId,
+    );
+    // One client's key must never unlock live sales for another website, so
+    // the environment-level answer is no longer consulted here at all.
+    expect(mocks.bundleDeliveryAvailability).not.toHaveBeenCalled();
+  });
+
+  it("a connection that is saved but not verified still refuses live money", async () => {
+    mocks.onlinePaymentAvailability.mockResolvedValue({
+      available: true,
+      mode: "live",
+    });
+    mocks.bundleDeliveryAvailabilityForDraft.mockResolvedValue({
+      provider: "simulator",
+      live: false,
     });
 
     const response = await POST(guardRequest(), params());

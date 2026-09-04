@@ -19,6 +19,8 @@ export function containsLikelySecret(value: string): boolean {
     /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/,
     /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/,
     /\bAKIA[0-9A-Z]{16}\b/,
+    // TechChief developer API key (Stage 5 bundle delivery).
+    /\bTCHX-[A-Za-z0-9]{16,}\b/,
     /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
     /postgres(?:ql)?:\/\/[^:\s/]+:[^@\s]+@/i,
   ].some((pattern) => pattern.test(value));

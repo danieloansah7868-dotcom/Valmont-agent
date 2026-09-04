@@ -12,10 +12,19 @@
  *    a recipient ending `0000` always fails; one ending `9999` stays
  *    "processing" for 60 seconds, so "Failed → Retry" and slow delivery can
  *    be rehearsed by hand.
- *  - {@link TechChiefProvider}: a stub. The TechChief integration document
- *    (API spec, auth, pricing, callback format) has not landed (Stage 5), so
- *    every send fails fast with an owner-visible error instead of pretending
- *    to deliver. Nothing in the codebase substitutes for that document.
+ *  - {@link TechChiefProvider} (Stage 5): the real wholesaler, reached with
+ *    the API key each shop owner saves for their own website. It orders by
+ *    TechChief's bundle id, records their order reference, mirrors the wallet
+ *    balance back onto the connection, and maps every refusal — no float,
+ *    revoked key, bundle withdrawn, rate limit — onto owner-readable wording.
+ *    Constructed without a key it is the old fail-fast stub, so nothing can
+ *    select it by accident.
+ *
+ * Which provider runs is decided per order by {@link resolveProviderForOrder}:
+ * a live-money order on a website whose TechChief connection is `verified`
+ * goes to TechChief, and everything else — above all every TEST-mode order —
+ * stays on the environment default. Test mode never touches TechChief, even
+ * when a key is saved.
  *
  * The engine is held to six invariants. Each has a dedicated test in
  * `bundle-delivery.test.ts`:
@@ -23,11 +32,11 @@
  *  I1  Paid-first, and live-money safety. No delivery row is created and the
  *      provider is never called before the order is paid. And when an order
  *      was paid with REAL money (`payment_mode === "live"`), the engine only
- *      dispatches through a provider that is itself live — until a real
- *      provider key exists (Stage 5), checkout refuses live bundle orders
- *      with 409 before any order row, and the engine's backstop records a
- *      failed row saying nothing was sent rather than dispatching through
- *      the simulator.
+ *      dispatches through a provider that is itself live — while a website
+ *      has no verified TechChief connection, checkout refuses live bundle
+ *      orders with 409 before any order row, and the engine's backstop
+ *      records a failed row saying nothing was sent rather than dispatching
+ *      through the simulator.
  *  I2  Idempotent, also under concurrency. Exactly one delivery row per
  *      purchased bundle unit, guaranteed by the unique
  *      (order_id, line_index, unit_index) index, and a row is handed to the
@@ -70,19 +79,40 @@ import { studioDeliveries } from "@/db/schema";
 import { ConflictError } from "@/lib/api-errors";
 import { getSqliteChatStore } from "@/lib/chat-store";
 import {
+  bundleNetworkLabel,
   formatDataMb,
   getBundleNetwork,
   guessDataMbFromItem,
   isBundleNetworkId,
   isValidGhanaMobile,
   maskGhanaMobile,
+  normalizeGhanaMobile,
   type BundleNetworkId,
 } from "./bundles";
 import { publicGetDraft } from "./draft-public";
 import {
+  getTechChiefIntegrationWithKey,
+  getTechChiefIntegration,
+  getIntegrationsStore,
+  consumeTechChiefBudget,
+  markIntegrationError,
+  recordWalletFromOrder,
+  techChiefBundlesForDelivery,
+  techChiefCallback,
+  type IntegrationsStore,
+} from "./integrations";
+import {
   notifyMerchantDeliveryFailed,
+  notifyMerchantLowBalance,
   type MerchantDeliveryFailureInput,
+  type MerchantLowBalanceInput,
 } from "./notifications";
+import {
+  matchTechChiefBundle,
+  placeTechChiefOrder,
+  getTechChiefStatus,
+  type TechChiefFailureKind,
+} from "./techchief";
 import {
   getOrdersStore,
   type OrderLine,
@@ -185,12 +215,33 @@ export type BundleDeliverySendResult =
 
 export interface BundleDeliveryStatusRequest {
   providerRef: string;
+  /**
+   * When the row last changed, so a provider that is billed or rate-limited
+   * per poll can throttle itself (Stage 5: TechChief allows 60 requests an
+   * hour for orders *and* status checks together). The simulator ignores it.
+   */
+  updatedAt?: string;
+  /** When the row was created — long-stuck rows are polled less often. */
+  createdAt?: string;
+  /** The delivery row's id, for provider-side bookkeeping. */
+  deliveryId?: string;
 }
 
+/**
+ * What a provider answered about one in-flight row.
+ *
+ * `polled` says whether the provider really asked upstream, as opposed to
+ * declining to (its own throttle, or an exhausted hourly budget). The engine
+ * uses it as a heartbeat: a genuine poll moves the row's `updated_at`, which
+ * is what the next throttle decision reads. Without that, a row whose status
+ * never changes would be re-polled on every single page load — and the guest
+ * confirmation page is unauthenticated, so anybody could spend a shop's
+ * TechChief allowance by refreshing it.
+ */
 export type BundleDeliveryStatusResult =
-  | { status: "processing" }
-  | { status: "delivered" }
-  | { status: "failed"; error: string };
+  | { status: "processing"; polled?: boolean }
+  | { status: "delivered"; polled?: boolean }
+  | { status: "failed"; error: string; polled?: boolean };
 
 /**
  * A top-up provider. Implementations must be cheap to construct and must
@@ -199,6 +250,13 @@ export type BundleDeliveryStatusResult =
  */
 export interface BundleDeliveryProvider {
   readonly id: string;
+  /**
+   * True only when this instance moves REAL data for REAL money — i.e. a
+   * TechChief adapter holding a verified key. Absent (or false) for the
+   * simulator, the keyless TechChief stub and the misconfigured provider,
+   * which is what keeps the live-money guard (I1) fail-closed by default.
+   */
+  readonly live?: boolean;
   sendBundle(
     request: BundleDeliveryDispatchRequest,
   ): Promise<BundleDeliverySendResult>;
@@ -276,30 +334,396 @@ export class SimulatedProvider implements BundleDeliveryProvider {
 }
 
 export const TECHCHIEF_NOT_CONNECTED_MESSAGE =
-  "TechChief delivery is not connected yet: the integration document (API spec, authentication, pricing and callback format) is still pending, so this top-up was not sent. It can be retried once the connection is live.";
+  "TechChief delivery is not connected for this website: no verified API key is saved, so this top-up was not sent. Save the key under Bundle delivery in Studio, then press Retry.";
+
+/** Owner-readable outcomes of a real TechChief call (Stage 5). */
+export const TECHCHIEF_KEY_REJECTED_DELIVERY_MESSAGE =
+  "TechChief key rejected or disabled — save a new key under Bundle delivery in Studio.";
+export const TECHCHIEF_BUNDLE_WITHDRAWN_MESSAGE =
+  "This bundle is no longer offered by TechChief.";
+export const TECHCHIEF_RATE_LIMITED_MESSAGE =
+  "TechChief rate limit reached — Retry in a few minutes.";
+/**
+ * The answer to a timeout, a connection failure or a 5xx: TechChief has no
+ * idempotency key and no "safe retry", so after one of these nobody knows
+ * whether the wallet was charged. The row is failed with this wording and the
+ * system NEVER resends on its own — the owner checks their TechChief dashboard
+ * first and presses Retry only if the top-up really did not go out.
+ */
+export const TECHCHIEF_UNKNOWN_OUTCOME_MESSAGE =
+  "Unknown outcome — check your TechChief dashboard before retrying.";
+export const TECHCHIEF_INVALID_RECIPIENT_MESSAGE =
+  "The recipient is not a valid Ghana mobile number.";
+
+/** "No TechChief bundle matches MTN 500MB. Sync bundles or change this item." */
+export function techChiefNoMatchMessage(
+  network: BundleNetworkId | string,
+  dataMb: number,
+): string {
+  return `No TechChief bundle matches ${bundleNetworkLabel(network)} ${formatDataMb(dataMb)}. Sync bundles or change this item.`;
+}
 
 /**
- * Stub for the real wholesaler. Until the TechChief integration document
- * arrives (Stage 5) there is no endpoint, credential or callback contract to
- * implement against, so every send fails fast and says why. Selecting
- * `techchief` early therefore produces loud, retryable failures — never a
- * fabricated delivery.
+ * The 402 wording. Both figures come from TechChief's own response, so the
+ * owner sees exactly how much float is missing rather than a guess; either may
+ * be absent, and the message degrades instead of printing "GHS null".
+ */
+export function techChiefLowBalanceMessage(
+  walletBalance: number | null | undefined,
+  required: number | null | undefined,
+): string {
+  const balance =
+    typeof walletBalance === "number" && Number.isFinite(walletBalance)
+      ? `GHS ${walletBalance.toFixed(2)}`
+      : null;
+  const cost =
+    typeof required === "number" && Number.isFinite(required)
+      ? `GHS ${required.toFixed(2)}`
+      : null;
+  if (balance && cost) {
+    return `TechChief wallet too low (${balance}, this bundle needs ${cost}). Top up your TechChief wallet, then Retry.`;
+  }
+  if (balance) {
+    return `TechChief wallet too low (${balance}). Top up your TechChief wallet, then Retry.`;
+  }
+  return "TechChief wallet too low for this bundle. Top up your TechChief wallet, then Retry.";
+}
+
+/** A `status:"failed"` answer to an order call — their words, plus the refund. */
+export function techChiefRefusedMessage(message: string | null): string {
+  const detail = message?.trim();
+  return detail
+    ? `${detail} (TechChief refunded the wallet for this top-up)`
+    : "TechChief could not send this top-up (the wallet was refunded).";
+}
+
+// ---------------------------------------------------------------------------
+// TechChief polling throttle
+// ---------------------------------------------------------------------------
+
+/** A processing row is polled at most once every 10 minutes. */
+export const TECHCHIEF_STATUS_POLL_MIN_INTERVAL_MS = 10 * 60 * 1000;
+/** After 24 h at "processing" a row is stale… */
+export const TECHCHIEF_STALE_PROCESSING_AFTER_MS = 24 * 60 * 60 * 1000;
+/** …and is then polled at most once every 6 hours. */
+export const TECHCHIEF_STALE_PROCESSING_POLL_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/** What makes a TechChief adapter live: a key and the connection it came from. */
+export interface TechChiefProviderConfig {
+  /** Decrypted key. Held in memory for one request; never logged or returned. */
+  apiKey: string;
+  integrationId: string;
+  draftId: string;
+}
+
+/** Injectable seams for tests; production callers use the defaults. */
+export interface TechChiefProviderDeps {
+  integrations?: IntegrationsStore;
+  orders?: OrdersStore;
+  /** Replaces the low-balance alert in tests. */
+  notifyLowBalance?: (
+    input: MerchantLowBalanceInput,
+    throttleKey: string,
+  ) => Promise<boolean>;
+  now?: () => number;
+}
+
+/** Bookkeeping after an outcome must never change that outcome. */
+async function quietly(work: () => Promise<unknown>): Promise<void> {
+  try {
+    await work();
+  } catch {
+    /* a failed balance write must not fail a delivery that succeeded */
+  }
+}
+
+/**
+ * The real wholesaler (Stage 5).
+ *
+ * Constructed with a {@link TechChiefProviderConfig} it is live: it turns one
+ * purchased bundle unit into one `dev_order.php` call, keyed by TechChief's
+ * bundle id, and reports their outcome. Constructed without one it is the
+ * Stage 4 fail-fast stub — every send fails loudly with
+ * {@link TECHCHIEF_NOT_CONNECTED_MESSAGE} and `live` stays false, so the
+ * live-money guard (I1) can never be satisfied by an adapter that has no key.
+ *
+ * Three disciplines shape it:
+ *
+ *  - **Budget first.** Every call claims a slot from the connection's rolling
+ *    hourly budget before it is made, because TechChief counts orders and
+ *    status checks together against 60/hour. Status polls stop at 50 so a
+ *    selling shop always has room to dispatch.
+ *  - **Never resend after an unknown outcome.** A timeout, a connection
+ *    failure or a 5xx leaves the wallet state unknowable, so the row is failed
+ *    with {@link TECHCHIEF_UNKNOWN_OUTCOME_MESSAGE} and only the owner's
+ *    explicit Retry can send again.
+ *  - **No side channel for secrets.** The key is used only to build the
+ *    `X-API-Key` header inside `techchief.ts`; error wording, alerts and rows
+ *    carry the balance, the price and the reason — never the key.
  */
 export class TechChiefProvider implements BundleDeliveryProvider {
   readonly id = "techchief";
+  /** True only with a key: this instance really moves data for real money. */
+  readonly live: boolean;
+  /**
+   * The connection this adapter acts for — held in true ECMAScript private
+   * fields, not TypeScript `private` ones. The distinction is the security
+   * control: a `private` field is still an ordinary own property, so
+   * `JSON.stringify(provider)`, a debug log or an error reporter that
+   * serialises the adapter would print the decrypted API key. `#` fields are
+   * invisible to all three.
+   */
+  readonly #config: TechChiefProviderConfig | null;
+  readonly #deps: TechChiefProviderDeps;
+
+  constructor(
+    config?: TechChiefProviderConfig | null,
+    deps: TechChiefProviderDeps = {},
+  ) {
+    this.#config =
+      config && config.apiKey.trim() && config.integrationId ? config : null;
+    this.#deps = deps;
+    this.live = this.#config !== null;
+  }
+
+  private get store(): IntegrationsStore {
+    return this.#deps.integrations ?? getIntegrationsStore();
+  }
+
+  private now(): number {
+    return (this.#deps.now ?? Date.now)();
+  }
 
   async sendBundle(
     request: BundleDeliveryDispatchRequest,
   ): Promise<BundleDeliverySendResult> {
-    void request;
-    return { ok: false, error: TECHCHIEF_NOT_CONNECTED_MESSAGE };
+    const config = this.#config;
+    if (!config) {
+      return { ok: false, error: TECHCHIEF_NOT_CONNECTED_MESSAGE };
+    }
+    // Last-line recipient check: a malformed legacy row must never be sent to
+    // a wholesaler that would charge the wallet for a rejected top-up.
+    if (!normalizeGhanaMobile(request.recipientPhone)) {
+      return { ok: false, error: TECHCHIEF_INVALID_RECIPIENT_MESSAGE };
+    }
+
+    const store = this.store;
+    const bundle = await techChiefBundlesForDelivery(
+      config.integrationId,
+      store,
+    );
+    const match = matchTechChiefBundle(
+      bundle.bundles,
+      request.network,
+      request.dataMb,
+    );
+    if (!match) {
+      return {
+        ok: false,
+        error: techChiefNoMatchMessage(request.network, request.dataMb),
+      };
+    }
+
+    // Orders get the headroom the polls leave behind, but never push past
+    // TechChief's own ceiling: a local refusal is free, their 429 is not.
+    const budget = await consumeTechChiefBudget(
+      store,
+      config.integrationId,
+      "order",
+      this.now(),
+    );
+    if (!budget.allowed) {
+      return { ok: false, error: TECHCHIEF_RATE_LIMITED_MESSAGE };
+    }
+
+    // TechChief only calls https callbacks, so on a deployment without an
+    // https APP_URL we simply omit it and rely on polling instead.
+    const callback = techChiefCallback(config.integrationId);
+    const result = await placeTechChiefOrder(config.apiKey, {
+      network: request.network,
+      bundleId: match.id,
+      phone: request.recipientPhone,
+      ...(callback.url ? { callbackUrl: callback.url } : {}),
+    });
+
+    if (result.ok) {
+      const order = result.data;
+      await quietly(() =>
+        recordWalletFromOrder(
+          config.integrationId,
+          { balance: order.walletBalance },
+          store,
+        ),
+      );
+      if (order.status === "failed") {
+        return { ok: false, error: techChiefRefusedMessage(order.message) };
+      }
+      // accepted | processing: the top-up is theirs now, and the reference is
+      // what the webhook and every later status check are keyed on.
+      return { ok: true, providerRef: order.orderRef };
+    }
+
+    return this.mapSendFailure(result, request, config, store);
+  }
+
+  /** Turns one TechChief refusal into owner-facing wording and side effects. */
+  private async mapSendFailure(
+    result: Extract<
+      Awaited<ReturnType<typeof placeTechChiefOrder>>,
+      { ok: false }
+    >,
+    request: BundleDeliveryDispatchRequest,
+    config: TechChiefProviderConfig,
+    store: IntegrationsStore,
+  ): Promise<BundleDeliverySendResult> {
+    const kind: TechChiefFailureKind = result.kind;
+
+    if (kind === "balance") {
+      const balance = result.walletBalance ?? null;
+      // Their 402 is authoritative: the wallet is short, so say so on the
+      // connection (the Studio card turns red) and tell the owner once an hour.
+      await quietly(() =>
+        recordWalletFromOrder(
+          config.integrationId,
+          { balance, lowBalance: true },
+          store,
+        ),
+      );
+      await this.alertLowBalance(request, balance, result.required ?? null);
+      return {
+        ok: false,
+        error: techChiefLowBalanceMessage(balance, result.required),
+      };
+    }
+
+    if (kind === "auth") {
+      // A revoked or disabled key is not a per-order problem: stop treating
+      // this website as live until the owner saves a new key.
+      await quietly(() =>
+        markIntegrationError(
+          config.integrationId,
+          TECHCHIEF_KEY_REJECTED_DELIVERY_MESSAGE,
+          store,
+        ),
+      );
+      return { ok: false, error: TECHCHIEF_KEY_REJECTED_DELIVERY_MESSAGE };
+    }
+
+    if (kind === "bundle") {
+      return { ok: false, error: TECHCHIEF_BUNDLE_WITHDRAWN_MESSAGE };
+    }
+    if (kind === "validation") {
+      return { ok: false, error: result.message };
+    }
+    if (kind === "rate_limited") {
+      return { ok: false, error: TECHCHIEF_RATE_LIMITED_MESSAGE };
+    }
+    // timeout | network | server: the outcome is unknown, so nothing is
+    // retried automatically (see TECHCHIEF_UNKNOWN_OUTCOME_MESSAGE).
+    return { ok: false, error: TECHCHIEF_UNKNOWN_OUTCOME_MESSAGE };
+  }
+
+  /** One merchant alert an hour when the wallet cannot cover a top-up. */
+  private async alertLowBalance(
+    request: BundleDeliveryDispatchRequest,
+    walletBalance: number | null,
+    required: number | null,
+  ): Promise<void> {
+    const config = this.#config;
+    if (!config) return;
+    try {
+      const orders = this.#deps.orders ?? getOrdersStore();
+      const order = await orders.getById(request.orderId);
+      if (!order) return;
+      const draft = await publicGetDraft(order.draftId).catch(() => null);
+      if (!draft) return;
+      const notify = this.#deps.notifyLowBalance ?? notifyMerchantLowBalance;
+      await notify(
+        {
+          order,
+          brief: draft.brief,
+          walletBalance,
+          required,
+          network: request.network,
+          dataMb: request.dataMb,
+        },
+        // Per connection, not per order: one shop, one alert an hour.
+        config.integrationId,
+      );
+    } catch {
+      /* an alert must never break the engine (I4) */
+    }
+  }
+
+  /**
+   * Whether this row may be polled right now. The gate is the row's own
+   * `updated_at`, so it survives restarts and is shared by every process:
+   * the unauthenticated guest confirmation page rechecks on every load, and
+   * each poll costs the owner a slice of their 60/hour allowance.
+   */
+  private shouldPoll(request: BundleDeliveryStatusRequest): boolean {
+    const now = this.now();
+    const updatedAt = request.updatedAt ? Date.parse(request.updatedAt) : NaN;
+    const createdAt = request.createdAt ? Date.parse(request.createdAt) : NaN;
+    const age = Number.isFinite(createdAt) ? now - createdAt : 0;
+    const interval =
+      age > TECHCHIEF_STALE_PROCESSING_AFTER_MS
+        ? TECHCHIEF_STALE_PROCESSING_POLL_INTERVAL_MS
+        : TECHCHIEF_STATUS_POLL_MIN_INTERVAL_MS;
+    return !(Number.isFinite(updatedAt) && now - updatedAt < interval);
   }
 
   async checkStatus(
     request: BundleDeliveryStatusRequest,
   ): Promise<BundleDeliveryStatusResult> {
-    void request;
-    return { status: "processing" };
+    const config = this.#config;
+    // A keyless adapter has nothing to ask; reporting "processing" leaves the
+    // row exactly as it was instead of inventing an outcome.
+    if (!config || !request.providerRef) return { status: "processing" };
+    if (!this.shouldPoll(request)) return { status: "processing" };
+
+    const store = this.store;
+    const budget = await consumeTechChiefBudget(
+      store,
+      config.integrationId,
+      "poll",
+      this.now(),
+    );
+    if (!budget.allowed) return { status: "processing" };
+
+    const result = await getTechChiefStatus(config.apiKey, request.providerRef);
+    if (!result.ok) {
+      if (result.kind === "auth") {
+        await quietly(() =>
+          markIntegrationError(
+            config.integrationId,
+            TECHCHIEF_KEY_REJECTED_DELIVERY_MESSAGE,
+            store,
+          ),
+        );
+      }
+      // Transient: leave the row alone and let the next recheck, or their
+      // webhook, decide. Guessing "failed" here could fail a delivered top-up.
+      // It WAS a real request, so it counts as a poll for throttle purposes —
+      // otherwise an outage would let every page load hammer them.
+      return { status: "processing", polled: true };
+    }
+
+    switch (result.data.status) {
+      case "delivered":
+        return { status: "delivered", polled: true };
+      case "failed":
+      case "refunded":
+        return {
+          status: "failed",
+          polled: true,
+          error:
+            result.data.message ??
+            "TechChief reported this top-up as failed (the wallet was refunded).",
+        };
+      default:
+        return { status: "processing", polled: true };
+    }
   }
 }
 
@@ -351,11 +775,11 @@ export interface BundleDeliveryAvailability {
   /** Which provider is currently selected ("simulator", "techchief", …). */
   provider: string;
   /**
-   * True only when the selected provider moves REAL data for real money.
-   * Everything available today — the simulator, the TechChief stub and the
-   * misconfigured fail-closed provider — is not live; Stage 5 returns true
-   * here once a real TechChief key is provisioned. The checkout route refuses
-   * live-money bundle orders while this is false.
+   * True only when the selected provider moves REAL data for real money:
+   * a TechChief adapter holding a key from a `verified` connection. The
+   * simulator, the keyless TechChief stub and the misconfigured fail-closed
+   * provider are all false, so the checkout route refuses live-money bundle
+   * orders until a shop has really connected (I1).
    */
   live: boolean;
 }
@@ -363,17 +787,95 @@ export interface BundleDeliveryAvailability {
 export function bundleDeliveryAvailability(
   provider: BundleDeliveryProvider = getBundleDeliveryProvider(),
 ): BundleDeliveryAvailability {
-  return { provider: provider.id, live: false };
+  return { provider: provider.id, live: provider.live === true };
 }
 
-/** Status checks go to the provider that owns the row's reference. */
-function providerForRow(
+/**
+ * Provider selection for one order — the single decision point (Stage 5).
+ *
+ * A TechChief adapter is returned only when **both** hold: the order was paid
+ * with real money (`paymentMode === "live"`) and this website has a TechChief
+ * connection whose status is `verified` with a readable key. Everything else
+ * falls back to the environment default, which is the simulator unless
+ * `BUNDLE_DELIVERY_PROVIDER` says otherwise.
+ *
+ * The rule that matters most is the one this makes impossible: **a TEST-mode
+ * order never touches TechChief, even when a key is saved.** Test mode exists
+ * so an owner can rehearse the whole flow without spending money, and a
+ * rehearsal that quietly bought a real 1 GB bundle for a stranger's phone
+ * would be the worst possible surprise.
+ */
+export async function resolveProviderForOrder(
+  order: Pick<OrderRecord, "paymentMode" | "draftId">,
+  deps: { integrations?: IntegrationsStore } = {},
+): Promise<BundleDeliveryProvider> {
+  if (order.paymentMode === "live") {
+    const store = deps.integrations ?? getIntegrationsStore();
+    // A connection read failure must never break dispatch: fall back to the
+    // environment default, whose live-money backstop then records the truth.
+    const integration = await getTechChiefIntegrationWithKey(
+      order.draftId,
+      store,
+    ).catch(() => null);
+    if (
+      integration &&
+      integration.status === "verified" &&
+      integration.apiKey
+    ) {
+      return new TechChiefProvider(
+        {
+          apiKey: integration.apiKey,
+          integrationId: integration.id,
+          draftId: order.draftId,
+        },
+        { integrations: store },
+      );
+    }
+  }
+  return getBundleDeliveryProvider();
+}
+
+/**
+ * Whether THIS website can deliver for real money — what the checkout route
+ * asks before accepting a live bundle order. Unlike the environment-level
+ * {@link bundleDeliveryAvailability}, this reads the shop's own connection, so
+ * one shop being connected never unlocks live sales for another.
+ */
+export async function bundleDeliveryAvailabilityForDraft(
+  draftId: string,
+  deps: { integrations?: IntegrationsStore } = {},
+): Promise<BundleDeliveryAvailability> {
+  const store = deps.integrations ?? getIntegrationsStore();
+  const integration = await getTechChiefIntegration(draftId, store).catch(
+    () => null,
+  );
+  if (integration && integration.status === "verified") {
+    return { provider: "techchief", live: true };
+  }
+  return bundleDeliveryAvailability(getBundleDeliveryProvider());
+}
+
+/**
+ * Status checks go to the provider that owns the row's reference.
+ *
+ * A row dispatched through TechChief is polled with that shop's key, resolved
+ * from the order's own draft — never with another website's connection. A
+ * TechChief row on an order that is not live is skipped entirely: whatever
+ * created it, a test-mode order must not cause a call to the wholesaler.
+ */
+async function providerForRow(
   row: BundleDeliveryRecord,
-  configured: BundleDeliveryProvider,
-): BundleDeliveryProvider | null {
-  if (row.provider === configured.id) return configured;
+  ctx: EnginePassContext,
+): Promise<BundleDeliveryProvider | null> {
+  if (row.provider === ctx.provider.id) return ctx.provider;
   if (row.provider === "simulator") return new SimulatedProvider();
-  if (row.provider === "techchief") return new TechChiefProvider();
+  if (row.provider === "techchief") {
+    if (ctx.order.paymentMode !== "live") return null;
+    const resolved = await resolveProviderForOrder(ctx.order, {
+      integrations: ctx.integrations,
+    });
+    return resolved.live ? resolved : null;
+  }
   return null;
 }
 
@@ -391,6 +893,13 @@ export interface BundleDeliveriesStore {
   listForOrder(orderId: string): Promise<BundleDeliveryRecord[]>;
   getById(id: string): Promise<BundleDeliveryRecord | null>;
   /**
+   * Rows carrying a given provider reference — the TechChief webhook's only
+   * handle on a delivery (their `order_ref`). Callers must still check that
+   * the row's order belongs to the connection that was called back, so a
+   * reference guessed for one shop can never move another shop's row.
+   */
+  listByProviderRef(providerRef: string): Promise<BundleDeliveryRecord[]>;
+  /**
    * pending | failed → processing, atomically, counting the attempt. Returns
    * true only for the one caller that actually moved the row — the single
    * mechanism that makes a concurrent webhook dispatch and page-load recheck
@@ -399,6 +908,13 @@ export interface BundleDeliveriesStore {
    * once the provider has accepted the send.
    */
   claimForDispatch(id: string, patch: { provider: string }): Promise<boolean>;
+  /**
+   * Heartbeat for a row that was polled and is still in flight: moves
+   * `updated_at` without touching the status, so a provider that throttles on
+   * `updated_at` does not ask again for another interval. Rows that are not
+   * "processing" are left alone — a delivered row never changes (I3).
+   */
+  touchProcessing(id: string): Promise<void>;
   /** Records the provider's reference after a successful send. */
   setProviderRef(
     id: string,
@@ -495,6 +1011,7 @@ export function ensureBundleDeliveriesSchema(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS studio_deliveries_order ON studio_deliveries(order_id);
     CREATE INDEX IF NOT EXISTS studio_deliveries_owner_created ON studio_deliveries(owner_id, created_at);
     CREATE UNIQUE INDEX IF NOT EXISTS studio_deliveries_order_line_unit ON studio_deliveries(order_id, line_index, unit_index);
+    CREATE INDEX IF NOT EXISTS studio_deliveries_provider_ref ON studio_deliveries(provider_ref);
   `);
 }
 
@@ -554,6 +1071,18 @@ export class SqliteBundleDeliveriesStore implements BundleDeliveriesStore {
     return row ? rowToDelivery(row) : null;
   }
 
+  async listByProviderRef(
+    providerRef: string,
+  ): Promise<BundleDeliveryRecord[]> {
+    if (!providerRef) return [];
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM studio_deliveries WHERE provider_ref = ? ORDER BY created_at ASC, id ASC",
+      )
+      .all(providerRef) as unknown as DeliveryRow[];
+    return rows.map(rowToDelivery);
+  }
+
   async claimForDispatch(
     id: string,
     patch: { provider: string },
@@ -568,6 +1097,15 @@ export class SqliteBundleDeliveriesStore implements BundleDeliveriesStore {
       )
       .run(patch.provider, new Date().toISOString(), id);
     return result.changes === 1;
+  }
+
+  async touchProcessing(id: string): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE studio_deliveries SET updated_at = ?
+          WHERE id = ? AND status = 'processing'`,
+      )
+      .run(new Date().toISOString(), id);
   }
 
   async setProviderRef(
@@ -690,6 +1228,18 @@ export class PostgresBundleDeliveriesStore implements BundleDeliveriesStore {
     return row ? pgRowToDelivery(row) : null;
   }
 
+  async listByProviderRef(
+    providerRef: string,
+  ): Promise<BundleDeliveryRecord[]> {
+    if (!providerRef) return [];
+    const rows = await getDatabase()
+      .select()
+      .from(studioDeliveries)
+      .where(eq(studioDeliveries.providerRef, providerRef))
+      .orderBy(asc(studioDeliveries.createdAt), asc(studioDeliveries.id));
+    return rows.map(pgRowToDelivery);
+  }
+
   async claimForDispatch(
     id: string,
     patch: { provider: string },
@@ -713,6 +1263,18 @@ export class PostgresBundleDeliveriesStore implements BundleDeliveriesStore {
       )
       .returning({ id: studioDeliveries.id });
     return claimed.length === 1;
+  }
+
+  async touchProcessing(id: string): Promise<void> {
+    await getDatabase()
+      .update(studioDeliveries)
+      .set({ updatedAt: new Date() })
+      .where(
+        and(
+          eq(studioDeliveries.id, id),
+          eq(studioDeliveries.status, "processing"),
+        ),
+      );
   }
 
   async setProviderRef(
@@ -781,6 +1343,8 @@ export interface BundleDeliveryDeps {
   orders?: OrdersStore;
   deliveries?: BundleDeliveriesStore;
   provider?: BundleDeliveryProvider;
+  /** Connection store used when the provider has to be resolved per order. */
+  integrations?: IntegrationsStore;
   /** Replaces the merchant alert in tests; defaults to the real notifier. */
   notifyDeliveryFailed?: (
     input: MerchantDeliveryFailureInput,
@@ -934,8 +1498,12 @@ export const LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE =
   "This shop cannot send bundles automatically yet. Please contact the shop.";
 
 interface EnginePassContext {
+  /** The order this pass is for — provider resolution and alerts need it. */
+  order: OrderRecord;
   provider: BundleDeliveryProvider;
   deliveries: BundleDeliveriesStore;
+  /** Connection store shared by the pass, so tests can inject one. */
+  integrations?: IntegrationsStore;
   /** True when the order was paid with real money but no live provider exists. */
   liveBlocked: boolean;
   /** Rows that entered "failed" during this pass (alert candidates, I4). */
@@ -1001,12 +1569,17 @@ async function refreshProcessingRows(
   if (ctx.liveBlocked) return; // nothing to poll without a live provider
   for (const row of rows) {
     if (row.status !== "processing") continue;
-    const rowProvider = providerForRow(row, ctx.provider);
+    const rowProvider = await providerForRow(row, ctx);
     if (!rowProvider || !row.providerRef) continue;
     let outcome: BundleDeliveryStatusResult;
     try {
       outcome = await rowProvider.checkStatus({
         providerRef: row.providerRef,
+        deliveryId: row.id,
+        // The row's own timestamps are what let a billed provider throttle
+        // itself: TechChief polls at most once per 10 minutes per row.
+        updatedAt: row.updatedAt,
+        createdAt: row.createdAt,
       });
     } catch {
       continue;
@@ -1018,6 +1591,10 @@ async function refreshProcessingRows(
         error: outcome.error || "The delivery provider reported a failure.",
       });
       if (failed) ctx.newlyFailed.push(failed);
+    } else if (outcome.polled) {
+      // Still in flight, but we really did ask: record the heartbeat so the
+      // provider's own throttle keeps the next page load free.
+      await ctx.deliveries.touchProcessing(row.id);
     }
   }
 }
@@ -1054,10 +1631,13 @@ function passContext(
   order: OrderRecord,
   provider: BundleDeliveryProvider,
   deliveries: BundleDeliveriesStore,
+  integrations?: IntegrationsStore,
 ): EnginePassContext {
   return {
+    order,
     provider,
     deliveries,
+    integrations,
     liveBlocked:
       order.paymentMode === "live" &&
       !bundleDeliveryAvailability(provider).live,
@@ -1079,10 +1659,11 @@ export async function dispatchBundleDeliveriesForOrder(
   const deliveries = deps.deliveries ?? getBundleDeliveriesStore();
   const order = await orders.getById(orderId);
   if (!order) return [];
-  const provider = deps.provider ?? getBundleDeliveryProvider();
+  const provider =
+    deps.provider ?? (await resolveProviderForOrder(order, deps));
   const rows = await ensureBundleDeliveryRows(order, provider, deliveries);
   if (!rows) return [];
-  const ctx = passContext(order, provider, deliveries);
+  const ctx = passContext(order, provider, deliveries, deps.integrations);
   await dispatchPendingRows(rows, ctx);
   await alertMerchantIfNeeded(order, ctx, deps);
   return deliveries.listForOrder(order.id);
@@ -1104,10 +1685,11 @@ export async function recheckBundleDeliveriesForOrder(
     const deliveries = deps.deliveries ?? getBundleDeliveriesStore();
     const order = await orders.getById(orderId);
     if (!order) return [];
-    const provider = deps.provider ?? getBundleDeliveryProvider();
+    const provider =
+      deps.provider ?? (await resolveProviderForOrder(order, deps));
     const rows = await ensureBundleDeliveryRows(order, provider, deliveries);
     if (!rows) return [];
-    const ctx = passContext(order, provider, deliveries);
+    const ctx = passContext(order, provider, deliveries, deps.integrations);
     await dispatchPendingRows(rows, ctx);
     await refreshProcessingRows(await deliveries.listForOrder(order.id), ctx);
     await alertMerchantIfNeeded(order, ctx, deps);
@@ -1147,9 +1729,10 @@ export async function retryBundleDeliveryFailures(
   if (!order) return null;
   if (order.status !== "paid") throw new BundleDeliveryRetryError(order.status);
 
-  const provider = deps.provider ?? getBundleDeliveryProvider();
+  const provider =
+    deps.provider ?? (await resolveProviderForOrder(order, deps));
   const rows = await deliveries.listForOrder(order.id);
-  const ctx = passContext(order, provider, deliveries);
+  const ctx = passContext(order, provider, deliveries, deps.integrations);
   for (const row of rows) {
     if (row.status !== "failed") continue;
     if (ctx.liveBlocked) {

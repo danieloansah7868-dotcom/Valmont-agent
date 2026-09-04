@@ -290,7 +290,19 @@ export class SqliteStudioDraftStore implements StudioDraftStore {
     const result = this.db
       .prepare("DELETE FROM studio_drafts WHERE id = ? AND owner_id = ?")
       .run(id, canonicalUserId(user));
-    return Number(result.changes) > 0;
+    const deleted = Number(result.changes) > 0;
+    if (deleted) {
+      // The shared SQLite file carries no foreign keys, so deleting a website
+      // must also delete its Stage 5 delivery connections: an orphan row would
+      // keep an owner's encrypted TechChief API key alive for a website that no
+      // longer exists. PostgreSQL cascades from `studio_drafts` instead (and
+      // the contract test in `postgres-integrations.test.ts` proves it). The
+      // import is dynamic so this store never drags the integration module —
+      // and the encryption primitives behind it — into every draft read.
+      const { deleteIntegrationsForDraft } = await import("./integrations");
+      await deleteIntegrationsForDraft(id).catch(() => 0);
+    }
+    return deleted;
   }
 }
 

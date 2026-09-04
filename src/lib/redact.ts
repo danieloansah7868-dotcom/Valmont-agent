@@ -10,6 +10,14 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/\b(gh[pousr]_[A-Za-z0-9_]{20,})\b/g, "[REDACTED_GITHUB_TOKEN]"],
   [/\b(sk-(?:proj-)?[A-Za-z0-9_-]{16,})\b/g, "[REDACTED_API_KEY]"],
   [/\b(AKIA[0-9A-Z]{16})\b/g, "[REDACTED_AWS_KEY]"],
+  /**
+   * A TechChief developer API key (Stage 5). Each shop owner pastes their own
+   * key into Studio; it is stored encrypted and must never appear in a log
+   * line, an error message, a generated file or a backup. The 9-character
+   * `key_prefix` we deliberately show owners ("TCHX-AB12•••") is too short to
+   * match, so masking a real key never hides the prefix.
+   */
+  [/\b(TCHX-[A-Za-z0-9]{16,})\b/g, "[REDACTED_TECHCHIEF_KEY]"],
   [
     /(-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)[\s\S]*?(-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/g,
     "[REDACTED_PRIVATE_KEY]",

@@ -307,25 +307,61 @@ customer-facing message (no order row is created) rather than falling
 back to the simulator; cash-on-delivery and other offline methods keep
 working, and readiness reports `dependencies.payments = live_misconfigured`.
 
-### Bundle delivery: simulator only until TechChief is connected
+### Bundle delivery: one TechChief connection per website
 
 Paid data-bundle orders create one delivery row per purchased bundle unit
-(`studio_deliveries`, migration `0012`) and dispatch a top-up through the
-provider selected by `BUNDLE_DELIVERY_PROVIDER`. The default (and any
-production value today) is `simulator`: it rehearses the full lifecycle with
-no real data moving, so delivered-looking rows in a self-hosted test shop
-move no data. `techchief` is a stub that fails every send with an
-owner-visible reason until the Stage 5 integration document arrives — there
-is no real-provider mode to enable before then. An unknown value fails
-closed the same loud way, so a typo can never make the simulator record fake
-deliveries for a live shop. Two money-safety rules hold while no live
-provider exists: a data-bundles checkout in **live payment mode is refused
-with 409** before any order row exists (a customer who paid real money is
-never owed data nothing can deliver), and the engine itself refuses to
-dispatch a live-money order through a non-live provider. Delivery failures
-never affect payments: the webhook marks the order paid and answers 200
-first, dispatches fire-and-forget, the merchant gets one aggregated alert
-per failing pass, and the failed rows stay retryable from Studio → Orders.
+(`studio_deliveries`, migration `0012`) and dispatch a top-up through a
+provider chosen **per order**. Test-mode orders always go to the provider
+named by `BUNDLE_DELIVERY_PROVIDER` — in practice `simulator`, which rehearses
+the full lifecycle with no real data moving. Live-money orders go through the
+real TechChief provider **only** when that website has its own `verified`
+connection; otherwise the engine refuses to dispatch and the row fails loudly
+with an owner-visible reason. An unknown `BUNDLE_DELIVERY_PROVIDER` value fails
+closed the same way, so a typo can never make the simulator record fake
+deliveries for a live shop.
+
+**The key is the merchant's, not the operator's.** There is no server-wide
+TechChief setting to configure: each website owner pastes their own key in
+Studio → their website → **Bundle delivery**, where it is probed against
+TechChief before it is stored and encrypted with `SESSION_SECRET`
+(`studio_integrations.api_key_enc`, migration `0014`). Operational
+consequences:
+
+- **Rotating `SESSION_SECRET` invalidates every saved key.** The rows survive
+  but cannot be decrypted; the connection reports `error` ("could not be
+  decrypted on this server") and the owner must paste the key again. Treat
+  `SESSION_SECRET` as stable production material and keep it backed up
+  off-box, exactly as for sessions and payment settings.
+- **`APP_URL` must be the public https origin.** The webhook URL shown to the
+  owner (`{APP_URL}/api/bundle-delivery/techchief/webhook?integration=<uuid>`)
+  is built from it; with a non-https `APP_URL` the card says so and callbacks
+  cannot be delivered, leaving status to the owner's **Check status now**
+  button and the page-load recheck.
+- **Outbound egress** to `https://techchiefxdata.com` (TCP 443) must be
+  allowed from the app container. Every call has a 15 s timeout.
+- **60 requests an hour per key** is TechChief's limit. Valmont spends at most
+  50 of them per website per hour on status polls, balance checks and
+  price-list syncs, counted in the database, and always leaves the headroom
+  for orders — a customer's top-up is never refused for budget. Expect
+  `429`-shaped owner-facing messages ("hour's TechChief requests used up")
+  rather than silent gaps when a shop is very busy.
+- **Unknown outcomes are never retried automatically.** A timeout or a 5xx
+  while placing an order leaves the row `failed` with _"check your TechChief
+  dashboard before retrying"_ — the send may have landed, so a human looks
+  first and then presses Retry in Studio → Orders. Do not "fix" this with a
+  cron job that re-sends failed rows.
+
+Delivery failures never affect payments: the payment webhook marks the order
+paid and answers 200 first, dispatches fire-and-forget, the merchant gets one
+aggregated alert per failing pass (plus a separate low-wallet alert when
+TechChief answers 402 or reports the float is low), and the failed rows stay
+retryable from Studio → Orders.
+
+**Monitoring.** The useful signals per website are `studio_integrations.status`
+(`verified` is the only healthy value), `wallet_balance` / `low_balance`,
+`last_error`, and the count of `studio_deliveries` rows stuck at `processing`
+for more than an hour. A shop whose status is `error` cannot take real money
+for bundles: live checkout answers 409 until the owner reconnects.
 
 ### What Phase 1 does not do in production
 

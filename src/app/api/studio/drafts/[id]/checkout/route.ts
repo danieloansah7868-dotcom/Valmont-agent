@@ -26,7 +26,7 @@ import {
   normalizeGhanaMobile,
 } from "@/lib/studio/bundles";
 import {
-  bundleDeliveryAvailability,
+  bundleDeliveryAvailabilityForDraft,
   LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE,
 } from "@/lib/studio/bundle-delivery";
 
@@ -266,16 +266,18 @@ export async function POST(
     // simulator, so only online orders inherit the test marker.
     const paymentMode = needsOnlinePayment ? availability.mode : "live";
 
-    // Stage 4 live-money guard: a bundle shop charging REAL money must be
-    // able to deliver automatically. Until a live delivery provider is
-    // connected (Stage 5), a live bundle checkout is refused BEFORE any order
-    // row exists — otherwise a paid order would owe data the simulator would
-    // only pretend to send. Test-mode checkout is unaffected: simulator
-    // payments pair with the simulated delivery engine.
+    // Stage 4 live-money guard, per website since Stage 5: a bundle shop
+    // charging REAL money must be able to deliver automatically. The question
+    // is asked of THIS shop's own TechChief connection — one client's key must
+    // never unlock live sales for another — and while it is not verified a
+    // live bundle checkout is refused BEFORE any order row exists, because a
+    // paid order would otherwise owe data the simulator only pretends to send.
+    // Test-mode checkout is unaffected: simulator payments pair with the
+    // simulated delivery engine.
     if (
       isBundleSite &&
       paymentMode === "live" &&
-      !bundleDeliveryAvailability().live
+      !(await bundleDeliveryAvailabilityForDraft(draft.id)).live
     ) {
       return NextResponse.json(
         { error: LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE },

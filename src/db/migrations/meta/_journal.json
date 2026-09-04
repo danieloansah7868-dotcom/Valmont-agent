@@ -99,6 +99,13 @@
       "when": 1788393600000,
       "tag": "0013_ideas",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1788480000000,
+      "tag": "0014_studio_integrations",
+      "breakpoints": true
     }
   ]
 }
