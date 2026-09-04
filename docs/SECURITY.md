@@ -11,6 +11,9 @@ This document describes the MVP's boundaries and the additional controls require
 - approval records and audit history
 - user/session identity
 - optional customer account credentials, sessions, and order history
+- **merchants' TechChief API keys and webhook signing secrets** (Stage 5), and
+  the wallet float they can spend — a leaked key is money out of a merchant's
+  own account, not out of Valmont's
 - locally persisted Chat with Valmont conversation history
 
 Valmont must not read or transmit `.env` files, credentials, private keys, payment data, or customer-record exports. Raw source and retrieved repository context are not stored in the application database or chat store. Reopenable chat messages are intentionally persisted after redaction in the ignored local chat store — a SQLite database (`chat-store.sqlite`), with the older JSON file retained only for one-way migration — and must be treated as sensitive user data.
@@ -26,30 +29,35 @@ Valmont must not read or transmit `.env` files, credentials, private keys, payme
 7. **Agent ↔ workspace:** generated paths and commands are adversarial. Only explicit provider methods are exposed. There is no arbitrary shell tool.
 8. **Workspace ↔ host/network:** the included local adapter is not a secure isolation boundary. Production must replace it.
 9. **Database migrations ↔ operator:** migrations are a controlled operator action (`npm run db:migrate` / `db:verify`), never automatic. The full Drizzle journal `meta/_journal.json` is validated (structure, ordering, SHA-256, existence) and ledger membership is checked by hash+timestamp. Timestamp ordering is never used; journal idx is authoritative (regression: `0007` when earlier than `0006` but idx later).
+10. **Valmont ↔ TechChief (Stage 5):** outbound calls carry one merchant's decrypted key in `X-API-Key` and nothing else; the base URL is a compile-time constant, never request input, so the key cannot be aimed at an attacker's host. Inbound, `POST /api/bundle-delivery/techchief/webhook?integration=<uuid>` is unauthenticated and therefore trusted only for a _status transition_: with a stored signing secret the body must carry a matching hex HMAC-SHA256 in `X-TechChiefX-Signature` (constant-time compare), without one the reported status is confirmed against `dev_status.php` before anything is written. Amounts, references and phone numbers are always re-read from the database, the delivery's order must belong to the integration being called back, and `delivered` is terminal.
 
 ## Threats and MVP controls
 
-| Threat                                  | Controls                                                                                                                                                                                                  |
-| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Credential leakage to browser/model/log | server-only env variables; sensitive path exclusion; redaction; no raw repository context in persistence; local chat-history access controls; Resend API key and provider bodies never echoed (typed 502) |
-| OAuth CSRF/session tampering            | random OAuth state; AES-GCM authenticated encryption; HttpOnly, SameSite, Secure-in-production cookies; expiry                                                                                            |
-| Customer credential/session compromise  | scrypt password hashing; opaque random session cookies; SHA-256 token/session storage; expiry, sign-out revocation, and reset revocation                                                                  |
-| Customer order takeover                 | customer id filter on history; checkout email match; one-time access-code claim; claim deferred until the account email is verified                                                                       |
-| Cross-site mutation                     | same-origin check; double-submit CSRF token; JSON APIs                                                                                                                                                    |
-| Unauthorized repository creation        | authenticated session; fixed GitHub endpoint/owner; Zod validation; creation-specific rate limit; no model tool or deletion/settings method                                                               |
-| Accidental public repository            | private client/server default; explicit private/public selection; visibility echoed after creation                                                                                                        |
-| Path traversal/symlink escape           | absolute-path and NUL rejection; resolved-root prefix check; `realpath` verification; symlink component rejection; workspace roots under generated base                                                   |
-| Arbitrary command execution             | exact command-to-argv map; `shell: false`; no command interpolation; timeout; process-group kill; output cap; deployment/migration denylist                                                               |
-| Malicious repository script             | npm lifecycle hooks disabled where possible; **not fully mitigated locally**—requires container sandbox and egress policy                                                                                 |
-| Prompt injection                        | retrieved content is data, not authority; state machine and tools enforce approvals/capabilities outside prompts                                                                                          |
-| Sensitive repository content            | explicit `.env`, key, credential, customer/payment, binary, generated, VCS, dependency exclusions; byte/size checks                                                                                       |
-| Unauthorized PR                         | state must be `awaiting_final_approval`; latest final approval must be approved; only `valmont/*`; force false                                                                                            |
-| Auto-merge/deploy                       | capabilities absent from provider interfaces; no merge/deploy methods; validations deny migrations/deployments                                                                                            |
-| Audit manipulation                      | append-style events with actor/timestamp/metadata; production should add DB constraints and external append-only export                                                                                   |
-| Abuse/DoS                               | request and file/output limits; in-process rate limiting; production requires distributed limiter and quotas; email delivery has 10s timeout with timer cleanup                                           |
-| SSRF                                    | provider base URL is server configuration, not user input; GitHub host is fixed; Resend host fixed; production should allowlist provider hosts and sandbox egress                                         |
-| Migration tampering                     | full journal validation, SHA-256 per file, exact ledger membership, advisory lock, fail-closed on altered/unexpected/duplicate, no timestamp ordering                                                     |
-| Email header injection                  | CR/LF rejected in `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM`, angle-bracket injection rejected, sender validated as plain email or display-name format                                                      |
+| Threat                                      | Controls                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Credential leakage to browser/model/log     | server-only env variables; sensitive path exclusion; redaction; no raw repository context in persistence; local chat-history access controls; Resend API key and provider bodies never echoed (typed 502)                                                                                                                            |
+| OAuth CSRF/session tampering                | random OAuth state; AES-GCM authenticated encryption; HttpOnly, SameSite, Secure-in-production cookies; expiry                                                                                                                                                                                                                       |
+| Customer credential/session compromise      | scrypt password hashing; opaque random session cookies; SHA-256 token/session storage; expiry, sign-out revocation, and reset revocation                                                                                                                                                                                             |
+| Customer order takeover                     | customer id filter on history; checkout email match; one-time access-code claim; claim deferred until the account email is verified                                                                                                                                                                                                  |
+| Cross-site mutation                         | same-origin check; double-submit CSRF token; JSON APIs                                                                                                                                                                                                                                                                               |
+| Unauthorized repository creation            | authenticated session; fixed GitHub endpoint/owner; Zod validation; creation-specific rate limit; no model tool or deletion/settings method                                                                                                                                                                                          |
+| Accidental public repository                | private client/server default; explicit private/public selection; visibility echoed after creation                                                                                                                                                                                                                                   |
+| Path traversal/symlink escape               | absolute-path and NUL rejection; resolved-root prefix check; `realpath` verification; symlink component rejection; workspace roots under generated base                                                                                                                                                                              |
+| Arbitrary command execution                 | exact command-to-argv map; `shell: false`; no command interpolation; timeout; process-group kill; output cap; deployment/migration denylist                                                                                                                                                                                          |
+| Malicious repository script                 | npm lifecycle hooks disabled where possible; **not fully mitigated locally**—requires container sandbox and egress policy                                                                                                                                                                                                            |
+| Prompt injection                            | retrieved content is data, not authority; state machine and tools enforce approvals/capabilities outside prompts                                                                                                                                                                                                                     |
+| Sensitive repository content                | explicit `.env`, key, credential, customer/payment, binary, generated, VCS, dependency exclusions; byte/size checks                                                                                                                                                                                                                  |
+| Unauthorized PR                             | state must be `awaiting_final_approval`; latest final approval must be approved; only `valmont/*`; force false                                                                                                                                                                                                                       |
+| Auto-merge/deploy                           | capabilities absent from provider interfaces; no merge/deploy methods; validations deny migrations/deployments                                                                                                                                                                                                                       |
+| Audit manipulation                          | append-style events with actor/timestamp/metadata; production should add DB constraints and external append-only export                                                                                                                                                                                                              |
+| Abuse/DoS                                   | request and file/output limits; in-process rate limiting; production requires distributed limiter and quotas; email delivery has 10s timeout with timer cleanup                                                                                                                                                                      |
+| SSRF                                        | provider base URL is server configuration, not user input; GitHub host is fixed; Resend host fixed; production should allowlist provider hosts and sandbox egress                                                                                                                                                                    |
+| Migration tampering                         | full journal validation, SHA-256 per file, exact ledger membership, advisory lock, fail-closed on altered/unexpected/duplicate, no timestamp ordering                                                                                                                                                                                |
+| Email header injection                      | CR/LF rejected in `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM`, angle-bracket injection rejected, sender validated as plain email or display-name format                                                                                                                                                                                 |
+| Merchant API key exfiltration (Stage 5)     | AES-256-GCM envelope under `SESSION_SECRET`, per website; only a 9-character prefix is ever read back; no API response, backup export, log line, Brief free-text field or client component can carry the key; ECMAScript private fields so the provider object cannot be serialised; `TCHX-…` added to the shared redaction patterns |
+| Forged delivery callback (Stage 5)          | HMAC-SHA256 signature over the raw body when a secret is stored, otherwise a confirmed status check; owner-scoped integration lookup; the row's order must belong to that integration; `delivered` never changes; no amounts or phone numbers taken from the payload                                                                 |
+| Double-spend on an ambiguous send (Stage 5) | a timeout or 5xx while ordering is recorded as an unknown outcome and the row fails with "check your TechChief dashboard before retrying" — never an automatic resend; retry is an owner action on a `failed` row, behind claim-before-send                                                                                          |
+| Provider allowance starvation (Stage 5)     | 50-request hourly poll budget per connection, counted in the database, leaving headroom so orders are never refused for budget; 10-minute per-row poll throttle; owner rate limits on every connection route                                                                                                                         |
 
 ## Approval semantics
 
@@ -347,6 +355,54 @@ revenue analytics, so a simulator payment can never be presented as money
 received. When Live is selected but the connection is incomplete, online
 methods are refused with 409 **before** an order row exists; the fail-closed
 webhook therefore never has an orphaned pending order to ignore.
+
+### Bundle delivery — a merchant's TechChief key (Stage 5)
+
+A data-bundles shop sends real top-ups through the merchant's own TechChief
+account, so this stage adds a secret that is **not** Valmont's and money that is
+**not** Valmont's. The controls:
+
+- **One key per website, encrypted at rest.** `studio_integrations.api_key_enc`
+  holds the same AES-256-GCM envelope `payment-settings.ts` uses, keyed by
+  `SESSION_SECRET`, with a random IV per write so two merchants with the same
+  key store different ciphertext. The unique `(draft_id, provider)` index makes
+  a second connection for one website impossible at the database level, and the
+  cascade (PostgreSQL) or the explicit delete (SQLite) removes the key with the
+  website.
+- **The key has exactly one destination.** It is decrypted only inside
+  `getTechChiefIntegrationWithKey` / `getIntegrationById` and only to set the
+  `X-API-Key` header on a call to the fixed TechChief base URL. It is never
+  logged, never returned by an API, never included in a backup export, never
+  passed to a client component: `TechChiefConnectionView` has no key field at
+  all and is built from `key_prefix` alone. `TechChiefProvider` stores its
+  config in ECMAScript private fields (`#config`), because TypeScript `private`
+  fields remain enumerable own properties and `JSON.stringify(provider)` in a
+  debug log would otherwise have printed the key. `techchief-secrets.test.ts`
+  asserts each of these surfaces.
+- **Pasted by accident, still redacted.** `TCHX-[A-Za-z0-9]{16,}` is in the
+  shared `SECRET_PATTERNS` and in `containsLikelySecret`, and every Brief
+  free-text field runs through `redactSecrets` at parse time — so a key pasted
+  into a checkout note or a business description is masked before it is stored.
+  The nine-character prefix the UI shows is deliberately below the redaction
+  threshold.
+- **Probe before store.** Connecting calls the wallet endpoint first and only
+  writes a row when TechChief answers `apiActivated: true` and
+  `accountStatus: "active"`. A rejected, unactivated or suspended key leaves
+  nothing stored and never overwrites a working connection, so a typo cannot
+  produce a shop that looks connected and cannot send.
+- **Owner-scoped and rate limited.** Every connection route runs
+  authenticate → CSRF (on mutations) → owner rate limit → owner-scoped draft
+  read, in that order, through one shared preamble
+  (`requireTechChiefDraftAccess`). Somebody else's website and a made-up id both
+  answer 404, so the routes cannot be used to discover draft ids.
+- **Test-mode orders never reach TechChief**, even with a verified key saved:
+  provider selection is per order and `paymentMode: "test"` always resolves to
+  the configured (simulator) provider. Conversely a live-money order is only
+  dispatched through a live provider, and checkout refuses live bundle payment
+  with 409 while that website's connection is anything other than `verified`.
+- **Ambiguity is never retried.** An unknown outcome fails the row with an
+  instruction to check the TechChief dashboard; there is no automatic resend
+  anywhere in the engine, and only the owner can retry a `failed` row.
 
 ### Unauthenticated order pages — no personal data
 

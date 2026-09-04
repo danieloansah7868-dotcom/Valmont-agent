@@ -15,7 +15,10 @@ import {
   type DeliveryStatus,
 } from "@/lib/studio/bundle-delivery";
 import { bundleNetworkLabel, formatDataMb } from "@/lib/studio/bundles";
-import { BundleDeliveryRetryButton } from "@/components/studio/bundle-delivery-panel";
+import {
+  BundleDeliveryRecheckButton,
+  BundleDeliveryRetryButton,
+} from "@/components/studio/bundle-delivery-panel";
 
 const DELIVERY_BADGE_CLASS: Record<DeliveryStatus, string> = {
   pending: "bg-amber-100 text-amber-900",
@@ -46,6 +49,17 @@ export default async function OrderDetailPage({
   const failedTopUps = bundleDeliveries.filter(
     (delivery) => delivery.status === "failed",
   ).length;
+  // In-flight rows are what "Check status now" is for; the provider throttles
+  // itself to one poll per row per ten minutes, so the button is cheap.
+  const sendingTopUps = bundleDeliveries.filter(
+    (delivery) => delivery.status === "processing",
+  ).length;
+  /** The most recent time any row was touched — the owner's "last checked". */
+  const deliveryLastChecked = bundleDeliveries.reduce<string | null>(
+    (latest, delivery) =>
+      !latest || delivery.updatedAt > latest ? delivery.updatedAt : latest,
+    null,
+  );
   // Rows are per purchased unit; a line bought N times shows N unit rows.
   const unitsPerLine = new Map<number, number>();
   for (const delivery of bundleDeliveries) {
@@ -263,6 +277,11 @@ export default async function OrderDetailPage({
           <BundleDeliveryRetryButton
             orderId={order.id}
             failedCount={failedTopUps}
+          />
+          <BundleDeliveryRecheckButton
+            orderId={order.id}
+            processingCount={sendingTopUps}
+            lastChecked={deliveryLastChecked}
           />
         </section>
       )}

@@ -3,6 +3,7 @@ import { bundleNetworkLabel, formatDataMb } from "./bundles";
 import type { BundleDeliveryRecord } from "./bundle-delivery";
 import type { OrderRecord } from "./orders";
 import type { SiteBriefV1 } from "./site-brief/schema";
+import { checkRateLimit } from "@/lib/security";
 
 export interface NotifyResult {
   email: "sent" | "skipped" | "failed";
@@ -239,6 +240,109 @@ export async function notifyMerchantDeliveryFailed(
     result.whatsapp = "failed";
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// TechChief wallet alerts (Stage 5)
+// ---------------------------------------------------------------------------
+
+/** One low-balance alert per integration per hour. */
+export const LOW_BALANCE_ALERT_WINDOW_MS = 60 * 60 * 1000;
+
+/** GHS formatting for the wallet figures in an alert. */
+export function formatGhs(amount: number | null | undefined): string {
+  if (amount === null || amount === undefined || !Number.isFinite(amount)) {
+    return "GHS —";
+  }
+  return `GHS ${amount.toFixed(2)}`;
+}
+
+/** What the merchant is told when TechChief refuses a top-up for want of float. */
+export interface MerchantLowBalanceInput {
+  order: OrderRecord;
+  brief: Pick<SiteBriefV1, "businessName" | "payments">;
+  /** The balance TechChief reported with the 402, when it sent one. */
+  walletBalance: number | null;
+  /** The wholesale price of the bundle that did not fit, when reported. */
+  required: number | null;
+  network: BundleDeliveryRecord["network"];
+  dataMb: number;
+}
+
+/**
+ * "Your TechChief wallet is too low to send this top-up (GHS 4.20; the 1GB MTN
+ * bundle costs GHS 8.50). Top up your TechChief wallet, then Retry from
+ * Studio → Orders."
+ *
+ * The merchant tops up their own wallet at TechChief, so this alert is the
+ * only warning they get that real money is stuck: the order is paid, the
+ * customer is waiting, and nothing can be sent until the float arrives.
+ */
+export function lowBalanceAlertText(input: MerchantLowBalanceInput): string {
+  const bundle = `${formatDataMb(input.dataMb)} ${bundleNetworkLabel(input.network)}`;
+  const balance = formatGhs(input.walletBalance);
+  const cost =
+    input.required === null
+      ? null
+      : `the ${bundle} bundle costs ${formatGhs(input.required)}`;
+  return [
+    `Your TechChief wallet is too low to send a top-up for order ${input.order.id.slice(0, 8)} (${balance}${cost ? `; ${cost}` : ""}).`,
+    `Top up your TechChief wallet, then press Retry on the ${bundle} top-up in Studio → Orders.`,
+  ].join(" ");
+}
+
+/**
+ * Tells the merchant their TechChief wallet ran dry — at most once an hour
+ * per integration, because a busy shop can hit 402 on every unit of every
+ * order and one alert an hour is enough to act on. The throttle is the same
+ * in-process window the API rate limiter uses; it is deliberately per
+ * integration id, so two shops never suppress each other's alerts.
+ *
+ * Returns false when the alert was suppressed or nothing could be sent, so a
+ * caller can tell "told the owner" from "stayed quiet" in tests.
+ */
+export async function notifyMerchantLowBalance(
+  input: MerchantLowBalanceInput,
+  throttleKey: string,
+): Promise<boolean> {
+  if (
+    !checkRateLimit(
+      `techchief-low-balance:${throttleKey}`,
+      1,
+      LOW_BALANCE_ALERT_WINDOW_MS,
+    )
+  ) {
+    return false;
+  }
+
+  const text = lowBalanceAlertText(input);
+  const subject = `TechChief wallet too low · ${input.brief.businessName}`;
+  const html = `<!doctype html>
+<html><body style="font-family:system-ui,sans-serif;color:#0A1F44">
+  <h1>TechChief wallet too low — ${escapeHtml(input.brief.businessName)}</h1>
+  <p>${escapeHtml(text)}</p>
+</body></html>`;
+
+  const emailTo = input.brief.payments.notifications.email;
+  const phoneTo = input.brief.payments.notifications.whatsapp;
+
+  let announced = false;
+  try {
+    if (emailTo) {
+      announced = (await sendEmail(emailTo, subject, html, text)) === "sent";
+    }
+  } catch {
+    /* an alert must never break the delivery engine (I4) */
+  }
+  try {
+    if (phoneTo) {
+      const sent = await sendWhatsAppOrSms(phoneTo, text);
+      announced = announced || sent === "sent";
+    }
+  } catch {
+    /* ditto */
+  }
+  return announced;
 }
 
 /**

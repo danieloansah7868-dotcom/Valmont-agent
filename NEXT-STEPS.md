@@ -2,8 +2,8 @@
 
 ## Owner's idea backlog (2026-09-03)
 
-1. Stage 5 — per-client TechChief API key: each client website stores its own encrypted key; the engine picks the provider per website (today it is one server setting); Test-connection + balance; live only after a probe passes. Blocked on the TechChief API document.
-2. Client manages own float: show the TechChief wallet balance for that website in Studio; low-balance warning when paid orders are waiting.
+1. ~~Stage 5 — per-client TechChief API key~~ — **done on branch `arena/01a06950-valmont-agent`** (PR pending review): each website stores its own encrypted key, the engine picks the provider per order, Test connection shows the balance, and live checkout opens only after the probe passes. Details under _Data Bundles_ below.
+2. ~~Client manages own float~~ — **done on the same branch**: the Bundle delivery card shows that website's wallet balance, the cached TechChief price list and the bundles TechChief cannot deliver, and the merchant gets a low-balance email when TechChief answers 402 or reports the float is low.
 3. Client admin page (Stage 6): a login for the shop owner (not the agency team) with orders, delivery status, Retry, API key + balance. Changes the earlier "agency team only" decision — owner to confirm login method (phone OTP or email).
 4. Sub-agents (Stage 7, DataMartGH style): shop owner creates agents with their own prices and wallets; agent orders tracked separately; commission report.
 5. Checkout caps: max 10 units per line / 20 per order; cap rows per recheck pass.
@@ -19,12 +19,12 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
-## Data Bundles — Stages 1–3 merged, Stage 4 on branch, Stage 5–6 pending
+## Data Bundles — Stages 1–4 merged, Stage 5 on branch, Stage 6 pending
 
 Stages 1–2 (catalogue field `bundle: { network, dataMb, validity }`, superRefine,
 starter merge, wizard table, readiness v2, storefront tabs, Ghana mobile
-single-source validation, network-mismatch warning only) and Stage 3 are on
-`main`.
+single-source validation, network-mismatch warning only), Stage 3 and Stage 4
+are on `main`.
 
 **Stage 3 — merged** as PR #44 (merge commit `b260c9c`) plus review fixes in PR
 #45 (merge commit `79f23b5`). It adds the `recipient_phone` column (migration
@@ -44,8 +44,8 @@ Carried by the #45 review fixes:
 - **Decision:** the buyer's own contact accepts any country (diaspora buyers),
   while the recipient stays Ghana-mobile-only.
 
-**Stage 4 — implemented on this branch** (PR #47 "feat(studio): bundle
-delivery engine with simulator (stage 4)", not yet merged):
+**Stage 4 — merged** as PR #47 "feat(studio): bundle delivery engine with
+simulator (stage 4)" (merge commit `2d033ae`):
 
 - Migration `0012_studio_deliveries` adds `studio_deliveries`: one row per
   purchased bundle **unit** (`unique(order_id, line_index, unit_index)`), a
@@ -57,8 +57,9 @@ delivery engine with simulator (stage 4)", not yet merged):
   contract, the default **SimulatedProvider** (accepts as `processing`,
   reports `delivered` on the next status check; rehearsal hooks: recipient
   ending `0000` always fails, `9999` stays processing for 60 s via a
-  timestamped `sim-slow-` reference), the **TechChief stub** (fails every
-  send loudly until the Stage 5 doc lands), a fail-closed answer to unknown
+  timestamped `sim-slow-` reference), the **TechChief stub** (which failed
+  every send loudly — replaced by the real provider in Stage 5), a fail-closed
+  answer to unknown
   `BUNDLE_DELIVERY_PROVIDER` values, the dual SQLite/PostgreSQL stores, and
   the engine. Invariants I1–I6 are documented in the module header and each
   has a dedicated test (`bundle-delivery.test.ts`):
@@ -87,29 +88,90 @@ delivery engine with simulator (stage 4)", not yet merged):
   provider references, no error internals). `notifyMerchantDeliveryFailed`
   sends the merchant one aggregated alert per failing engine pass.
 
-Stage 5: TechChief key provisioning — **still blocked awaiting the TechChief
-integration doc** (API spec, auth, pricing, callback format). The Stage 4
-stub is the only code that needs replacing once it arrives; until then bundle
-delivery runs against the simulator only.
-**Stage 5 notes (from the Stage 4 review — do before a real provider goes
-live):**
+**Stage 5 — implemented on this branch** (`arena/01a06950-valmont-agent`, PR
+open, **not merged**): the real per-website TechChief connection and delivery
+adapter. The TechChief stub is gone; nothing else in the Stage 4 engine changed
+shape, so all six invariants still hold and their tests were not touched.
 
-- Throttle per-row status polls to once per 30–60 s (compare `updated_at`
-  before calling `checkStatus`): the unauthenticated guest confirmation page
-  runs `recheckPending` on every load, and a real provider would rate-limit
-  or bill each poll. The simulator makes this unnecessary today.
-- Add a readiness v2 rule `dependencies.bundleDelivery` (simulator /
-  stub / misconfigured) next to `dependencies.payments`, and think about a
-  Stage 5 "provisioned" flag on TechChief flipped only when a live key is
-  confirmed by a probe call — that is the moment
-  `bundleDeliveryAvailability().live` may return true.
-- Cap units per bundle order at checkout (e.g. max 10 per line, 20 per
-  order) and cap the rows processed per recheck pass — per-unit rows ×
-  quantity 999 × 100 lines would otherwise mean ~100k provider calls on a
-  single guest page load.
-- Show the same masked aggregate line on the customer-account order page
-  (it currently gets the full owner-style view or nothing — the guest
-  summary is the nice middle ground).
+- Migration `0014_studio_integrations` adds `studio_integrations` — one row per
+  `(draft_id, provider)` behind a **unique index**, holding `api_key_enc` (the
+  same AES-256-GCM envelope as `payment-settings.ts`, keyed by
+  `SESSION_SECRET`), a nine-character `key_prefix`, `webhook_secret_enc`,
+  `status`, `wallet_balance numeric(12,2)`, `low_balance`, `account_status`,
+  `last_error`, `bundles_json`, `bundles_synced_at` and the hourly budget
+  counters (`poll_window_start`, `poll_count`). Foreign keys to `studio_drafts`
+  and `users` cascade; SQLite has none, so `SqliteStudioDraftStore.delete`
+  removes the connections explicitly. The same migration adds
+  `studio_deliveries_provider_ref_idx` for the webhook's lookup.
+- `src/lib/studio/techchief.ts` is the HTTP client only: `dev_wallet.php`,
+  `dev_bundles.php`, `dev_order.php`, `dev_status.php` under a fixed base URL,
+  `X-API-Key` auth, a 15 s `AbortController` timeout on every call, rate-limit
+  header parsing, and a `TechChiefResult<T>` that classifies failures
+  (`rejected` / `unreachable` / `timeout` / `invalid` / `budget`) instead of
+  throwing. It owns the network mapping (`mtn → MTN`, `telecel → Telecel`,
+  `airteltigo → AirtelTigo`), Ghana phone normalization and
+  `matchTechChiefBundle` (`Math.round(sizeGb * 1024) === dataMb`, `* 1000`
+  fallback).
+- `src/lib/studio/integrations.ts` is the store plus service layer:
+  **probe before store** (`connectTechChief` only writes a row when TechChief
+  answers `apiActivated` and `accountStatus: "active"`, so a bad key leaves
+  nothing behind and never overwrites a good one), the 50/hour poll budget with
+  orders always allowed the remaining headroom, the 24 h bundle cache,
+  `techChiefConnectionView` (which has **no key field**), and
+  `unmatchedBundleItems` (priced catalogue items TechChief cannot deliver, with
+  the reason).
+- Routes: `GET/PUT/DELETE
+/api/studio/drafts/[id]/integrations/techchief`, `POST …/test` (balance),
+  `POST …/sync-bundles`, and `POST /api/studio/orders/[id]/bundle-deliveries/
+recheck` (the owner's **Check status now**). All four connection routes share
+  one preamble — authenticate → CSRF on mutations → owner rate limit →
+  owner-scoped draft read — so somebody else's website and a made-up id both
+  answer 404.
+- `resolveProviderForOrder(order)` picks per order: a **live** order with a
+  `verified` connection gets `TechChiefProvider` built from that website's own
+  key; everything else — **including every test-mode order, key or no key** —
+  gets the configured provider, i.e. the simulator. Checkout now asks
+  `bundleDeliveryAvailabilityForDraft(draftId)` instead of the server default,
+  so live bundle checkout opens per website as soon as that website is
+  verified and stays 409 while it is not.
+- `TechChiefProvider` keeps its config in ECMAScript private fields (`#config`)
+  because TypeScript `private` fields are still enumerable and
+  `JSON.stringify(provider)` would have printed the key. An unknown outcome
+  (timeout, 5xx) fails the row with _"check your TechChief dashboard before
+  retrying"_ — **no automatic resend anywhere**.
+- Webhook `POST /api/bundle-delivery/techchief/webhook?integration=<uuid>`:
+  with a stored secret the raw body must carry a matching hex HMAC-SHA256 in
+  `X-TechChiefX-Signature` (constant-time compare) and the signed path does
+  database work only; without one the callback is a hint and the status is
+  confirmed against `dev_status.php` inside a 6 s deadline. Either way amounts,
+  references and phone numbers are re-read from the database, the delivery's
+  order must belong to the integration called back, and `delivered` never
+  changes.
+- Studio UI: the **Bundle delivery** card
+  (`src/components/studio/techchief-connection.tsx`) on the draft page —
+  connect / test / sync / remove, balance, low-balance warning, bundle cache
+  age, the unmatched-item list, the webhook URL to paste, and the request
+  budget — plus a **Check status now** button beside Retry on the owner's order
+  page. Readiness v2 gained `bundleDelivery` (`bundleDeliveryDependency` +
+  `computeLiveSalesReadiness`): a data-bundles shop is not ready for live sales
+  until its own connection is verified, and a dependency that does not apply
+  never blocks.
+- Poll throttling (the first Stage 4 review note) is in: one real poll per row
+  per 10 minutes, 6 hours for rows older than a day, gated on `updated_at`.
+  Because a skipped poll must not look like a fresh answer, `checkStatus`
+  returns `{ status, polled }` and the engine calls the new `touchProcessing()`
+  heartbeat only when a request actually went out — without it a row polled at
+  T+11 min would keep its old `updated_at` and every later recheck would pass
+  the gate.
+
+**Still open from the Stage 4 review notes** (deliberately not in Stage 5):
+
+- Cap units per bundle order at checkout (e.g. max 10 per line, 20 per order)
+  and cap the rows processed per recheck pass. The 50/hour budget and the
+  per-row throttle now bound the _provider_ cost, but a 999-unit order still
+  creates 999 rows and 999 send attempts — backlog item 5.
+- Show the masked aggregate delivery line on the customer-account order page —
+  backlog item 6.
 
 Stage 6: analytics, rate-limits, fraud checks, documentation polish.
 

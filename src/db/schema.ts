@@ -5,6 +5,7 @@ import {
   index,
   integer,
   jsonb,
+  numeric,
   pgEnum,
   pgTable,
   text,
@@ -494,6 +495,89 @@ export const studioDeliveries = pgTable(
       table.lineIndex,
       table.unitIndex,
     ),
+    /**
+     * Stage 5: the TechChief webhook arrives with only an `order_ref`, so the
+     * delivery row is found by provider reference. Without this index every
+     * callback would scan the whole table.
+     */
+    index("studio_deliveries_provider_ref_idx").on(table.providerRef),
+  ],
+);
+
+/**
+ * Stage 5 — one row per (website, delivery provider) connection.
+ *
+ * Each shop owner pastes **their own** TechChief developer API key, so each
+ * website tops up bundles from its own wallet and the agency never holds a
+ * client's float. The key is stored as an AES-256-GCM envelope
+ * (`encryptSessionValue`, the same primitive that protects OAuth sessions and
+ * the Valmont Pay settings) and is decrypted only on the server, inside the
+ * delivery adapter. It is never logged, never returned by an API, never
+ * included in a Studio backup and never sent to a client component; the only
+ * part anyone ever sees again is the 9-character `key_prefix`.
+ *
+ * `status` is the provisioning gate: a row is only ever `verified` after a
+ * live `dev_wallet.php` probe succeeded with `api_activated` and
+ * `account_status === "active"`, and only a verified row makes
+ * `bundleDeliveryAvailabilityForDraft` report `live: true` — which is what
+ * lets a live-money bundle checkout through and lets the engine dispatch a
+ * real top-up.
+ *
+ * `poll_window_start` / `poll_count` implement the shared hourly request
+ * budget: TechChief allows 60 requests per hour per key (orders and status
+ * checks together), so this deployment spends at most 50 and always lets
+ * orders go first.
+ */
+export const studioIntegrations = pgTable(
+  "studio_integrations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    draftId: uuid("draft_id")
+      .notNull()
+      .references(() => studioDrafts.id, { onDelete: "cascade" }),
+    ownerId: uuid("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Which wholesaler this row connects. Only "techchief" exists today. */
+    provider: text("provider").notNull().default("techchief"),
+    /** AES-256-GCM envelope. Never selected into an API response. */
+    apiKeyEnc: text("api_key_enc").notNull(),
+    /** The visible reminder of the saved key, e.g. "TCHX-AB12". */
+    keyPrefix: text("key_prefix").notNull(),
+    /** AES-256-GCM envelope of the account webhook secret, if one was set. */
+    webhookSecretEnc: text("webhook_secret_enc"),
+    /** "unverified" | "verified" | "error". */
+    status: text("status").notNull().default("unverified"),
+    /** When the wallet was last probed (save, "Check balance", or an order). */
+    lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
+    /** Last balance reported by TechChief, in GHS. */
+    walletBalance: numeric("wallet_balance", { precision: 12, scale: 2 }),
+    /** TechChief's own low-balance flag, mirrored for the Studio warning. */
+    lowBalance: boolean("low_balance").notNull().default(false),
+    /** "active" | "suspended" | … exactly as the wallet probe reported it. */
+    accountStatus: text("account_status"),
+    /** Owner-readable reason for the latest failure (never the key itself). */
+    lastError: text("last_error"),
+    /** Cached `dev_bundles.php` price list: `{ network, id, sizeGb, price }[]`. */
+    bundlesJson: jsonb("bundles_json"),
+    bundlesSyncedAt: timestamp("bundles_synced_at", { withTimezone: true }),
+    /** Start of the rolling one-hour request budget window. */
+    pollWindowStart: timestamp("poll_window_start", { withTimezone: true }),
+    /** Requests already spent against TechChief inside the current window. */
+    pollCount: integer("poll_count").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("studio_integrations_draft_provider_unique").on(
+      table.draftId,
+      table.provider,
+    ),
+    index("studio_integrations_owner_idx").on(table.ownerId),
   ],
 );
 

@@ -441,15 +441,19 @@ processing` atomically, so a webhook dispatch and a simultaneous page-load
 0000)"`), one ending `9999` stays `processing` for 60 s (the acceptance
   time travels inside the `sim-slow-<epochMs>-<uuid>` reference, so no
   in-memory state survives a restart).
-- `techchief`: a stub. The Stage 5 integration document (API spec, auth,
-  pricing, callback format) has not landed, so every send fails fast with an
-  owner-visible, retryable error instead of fabricating deliveries.
+- `techchief`: the real provider (Stage 5). It is **not** selected by the
+  environment variable any more: it is constructed per order from the
+  website's own stored connection (see the next section), because the key is
+  the merchant's, not the server's.
 - any other value fails closed (`MisconfiguredDeliveryProvider`), so a typo
   can never silently activate the simulator in production.
 
-`bundleDeliveryAvailability()` reports `{ provider, live }`; every provider
-listed above is `live: false` today — Stage 5 makes TechChief the first
-`live: true` once a real key is provisioned.
+`bundleDeliveryAvailability()` reports the **server default** `{ provider,
+live }` — every value it can return is `live: false`. Whether one particular
+website may take real money for bundles is answered per draft by
+`bundleDeliveryAvailabilityForDraft(draftId)`, which is `live: true` only when
+that draft's own TechChief connection is `verified`. Checkout uses the
+per-draft answer, never the server default.
 
 ### Persistence
 
@@ -464,3 +468,128 @@ that moved the row), `setProviderRef` (`processing` only), `markFailed`
 (pending/processing/failed, error refreshed in place), `markDelivered`
 (`pending|processing` only), so an ill-timed callback, recheck or retry can
 never resurrect or double-send a row.
+
+## Data Bundles — Stage 5: per-website TechChief connection
+
+Stage 4 built the engine and deliberately left the real provider empty. Stage
+5 fills it in, and the one design decision that shapes everything else is
+**whose key it is**: the TechChief API key belongs to the merchant, is paid
+for from the merchant's own wallet, and is therefore stored **per website**,
+never as a server-wide setting. Two shops on one Valmont deployment send
+through two different TechChief accounts and cannot see or spend each other's
+float.
+
+### Modules
+
+- `src/lib/studio/techchief.ts` — the HTTP client and nothing else. Typed
+  calls to `POST dev_order.php`, `GET dev_bundles.php`, `GET dev_status.php`
+  and `GET dev_wallet.php` under `https://techchiefxdata.com/api/`, each with
+  a 15 s `AbortController` timeout, `X-API-Key` auth, and a `TechChiefResult<T>`
+  that classifies every failure (`rejected`, `unreachable`, `timeout`,
+  `invalid`, `budget`) instead of throwing. Also owns the two mappings the
+  rest of the code depends on: canonical network id → TechChief network name
+  (`mtn → MTN`, `telecel → Telecel`, `airteltigo → AirtelTigo`) and phone
+  normalization to Ghana `0xxxxxxxxx`, plus `matchTechChiefBundle`
+  (`Math.round(sizeGb * 1024) === dataMb`, with a `* 1000` fallback).
+- `src/lib/studio/integrations.ts` — the connection store and service layer:
+  encryption, verification, the hourly request budget, the cached price list,
+  and the owner-facing `TechChiefConnectionView`.
+- `src/lib/studio/techchief-routes.ts` — the shared preamble for the four
+  connection routes (authenticate → CSRF on mutations → owner rate limit →
+  owner-scoped draft read), so a new route cannot forget one of them.
+- `src/app/api/bundle-delivery/techchief/webhook/route.ts` — the callback.
+- `src/components/studio/techchief-connection.tsx` — the **Bundle delivery**
+  card on the draft page.
+
+### Persistence
+
+`studio_integrations` (migration `0014_studio_integrations`) holds one row per
+`(draft_id, provider)` — a **unique index**, so "one connection per website" is
+a database rule rather than an application hope. Columns: `api_key_enc` (the
+AES-256-GCM envelope), `key_prefix` (nine characters, `TCHX-9F8E` — the only
+part anybody ever sees again), `webhook_secret_enc`, `status`
+(`unverified|verified|error`), `wallet_balance` `numeric(12,2)`, `low_balance`,
+`account_status`, `last_error`, `bundles_json` (the cached wholesale price
+list), `bundles_synced_at`, `poll_window_start` + `poll_count` (the hourly
+budget), and timestamps. Foreign keys to `studio_drafts` and `users` are
+`ON DELETE CASCADE`, so deleting a website takes its encrypted key with it; the
+SQLite store has no foreign keys and therefore deletes integrations explicitly
+in `SqliteStudioDraftStore.delete`. The same migration adds
+`studio_deliveries_provider_ref_idx` — the webhook's lookup path.
+
+### Connecting (PUT)
+
+`connectTechChief` is **probe before store**: the key format is checked
+(`^TCHX-`), the wallet endpoint is called, and the connection is only written
+when TechChief answers `apiActivated: true` and `accountStatus: "active"`. A
+rejected key, an unactivated key, a suspended account or an unreachable API all
+leave **nothing stored** — so a typo can never produce a "connected" shop that
+cannot actually send, and a previous good key is never overwritten by a bad
+one. On success the price list is synced best-effort: a failed sync does not
+downgrade a verified key, because the cached list is an optimisation and the
+order call is authoritative.
+
+### Provider selection
+
+`resolveProviderForOrder(order)` decides per order, not per deployment:
+
+| order                 | connection                   | provider                                                                                                   |
+| --------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `paymentMode: "test"` | any, including verified      | `getBundleDeliveryProvider()` — **the simulator. TechChief is never called.**                              |
+| `paymentMode: "live"` | `verified` + decryptable key | `TechChiefProvider` built from that website's own key                                                      |
+| `paymentMode: "live"` | anything else                | `getBundleDeliveryProvider()`, whose `live: false` makes the engine's Stage 4 backstop fail the row loudly |
+
+The first row is the invariant worth restating: **a test-mode order never
+touches TechChief even when a real key is saved.** Test numbers keep rehearsing
+against the simulator, and a merchant testing their shop cannot spend real
+float by accident.
+
+`TechChiefProvider` keeps its config in ECMAScript private fields (`#config`),
+not TypeScript `private`: TypeScript's are still enumerable own properties, so
+`JSON.stringify(provider)` in a debug log would have printed the key.
+An unknown outcome — a timeout, a 5xx, a dropped connection — is reported as
+`{ status: "unknown" }` and the row is marked `failed` with _"check your
+TechChief dashboard before retrying"_. It is **never** resent automatically:
+the top-up may already have been sent, and a guess that turns into a second
+order spends the merchant's money twice.
+
+### The hourly budget
+
+TechChief allows 60 requests an hour per key. Polling is capped at
+`TECHCHIEF_HOURLY_POLL_BUDGET = 50`, tracked in the database
+(`poll_window_start`, `poll_count`) so it survives a restart and is shared by
+every worker. Status polls, balance checks and price-list syncs stop at 50;
+**orders use the remaining headroom and are never refused by the budget** —
+spending the last of the allowance on a curiosity poll while a paying customer
+waits would be the wrong trade. The budget is per connection, i.e. per website,
+so one busy shop cannot starve another.
+
+Polling is throttled per row as well: a `processing` row is asked about at most
+once every 10 minutes (24 h-old rows, 6 h), gated on `updated_at`. Because a
+throttled skip must not look like a fresh answer, `checkStatus` returns
+`{ status, polled }` and the engine calls `touchProcessing()` only when a real
+request was made — the heartbeat that keeps the throttle honest.
+
+### The webhook
+
+`POST /api/bundle-delivery/techchief/webhook?integration=<uuid>` is the only
+unauthenticated write path in Stage 5, so it is narrow:
+
+- With a stored signing secret, the body's hex HMAC-SHA256 must match
+  `X-TechChiefX-Signature` (constant-time compare). A signature that matches is
+  trusted for the status only — **all amounts, references and phone numbers are
+  re-read from the database**, never from the payload.
+- Without a secret, the callback is treated as a _hint_: the delivery is looked
+  up by `provider_ref`, and the status is confirmed against `dev_status.php`
+  inside a 6 s deadline before anything is written.
+- Either way the row's order must belong to the integration that was called
+  back, so a reference guessed for one shop cannot move another shop's row, and
+  a `delivered` row never changes (I3). The route answers 200 quickly and does
+  its database work only — no provider calls on the signed path.
+
+### Owner-facing alerts
+
+Two merchant emails: a delivery failure (Stage 4's aggregated alert) and a
+**wallet too low** alert when TechChief answers 402 or reports
+`lowBalance: true`. Both can legitimately fire for the same event, so tests
+filter by subject rather than counting emails.

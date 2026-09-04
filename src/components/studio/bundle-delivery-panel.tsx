@@ -62,3 +62,82 @@ export function BundleDeliveryRetryButton({
     </div>
   );
 }
+
+/**
+ * The owner's "Check status now" action (Stage 5).
+ *
+ * With a real wholesaler every status poll costs the shop a slice of its hourly
+ * TechChief allowance, so polling is throttled server-side to once per row per
+ * ten minutes. This button is the owner's way of asking anyway — and because
+ * the throttle is the provider's, clicking it twice in a row costs one call,
+ * not two. Shown while any top-up is still in flight.
+ */
+export function BundleDeliveryRecheckButton({
+  orderId,
+  processingCount,
+  lastChecked,
+}: {
+  orderId: string;
+  processingCount: number;
+  /** When a row was last asked about, rendered by the page. */
+  lastChecked?: string | null;
+}) {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [checkedAt, setCheckedAt] = useState<string | null>(null);
+
+  if (processingCount === 0) return null;
+
+  async function recheck() {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await apiMutation<{ checkedAt?: string }>(
+        `/api/studio/orders/${orderId}/bundle-deliveries/recheck`,
+        {},
+      );
+      setCheckedAt(result.checkedAt ?? new Date().toISOString());
+      router.refresh();
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not check the top-up status.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const shown = checkedAt ?? lastChecked ?? null;
+
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-3">
+      <button
+        type="button"
+        className="btn-secondary"
+        disabled={busy}
+        onClick={() => void recheck()}
+        data-testid="recheck-bundle-deliveries"
+      >
+        {busy
+          ? "Checking…"
+          : `Check status now${processingCount === 1 ? "" : ` (${processingCount} sending)`}`}
+      </button>
+      {shown && (
+        <span
+          className="text-xs text-slate-600"
+          data-testid="delivery-last-checked"
+        >
+          Last checked {new Date(shown).toLocaleTimeString()}
+        </span>
+      )}
+      {error && (
+        <p role="alert" className="text-sm text-red-700">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}

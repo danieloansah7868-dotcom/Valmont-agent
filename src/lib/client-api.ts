@@ -21,7 +21,7 @@ export class ApiError extends Error {
 
 async function apiRequest<T>(
   url: string,
-  method: "POST" | "PATCH" | "DELETE",
+  method: "POST" | "PUT" | "PATCH" | "DELETE",
   body?: unknown,
 ): Promise<T> {
   const response = await fetch(url, {
@@ -67,6 +67,15 @@ export function apiMutation<T>(url: string, body: unknown): Promise<T> {
 
 export function apiPatch<T>(url: string, body: unknown): Promise<T> {
   return apiRequest<T>(url, "PATCH", body);
+}
+
+/**
+ * A whole-resource replace. Used by the Studio → TechChief connection card
+ * (Stage 5), where saving a key replaces the connection rather than patching
+ * one field of it.
+ */
+export function apiPut<T>(url: string, body: unknown): Promise<T> {
+  return apiRequest<T>(url, "PUT", body);
 }
 
 export function apiDelete(url: string): Promise<void> {
