@@ -6,6 +6,7 @@ import { isTemplateId, isTemplateCompatible } from "../templates";
 import { isThemeId, HEX_COLOR_RE } from "../themes";
 import { isGhanaRegion } from "./defaults";
 import { ACCEPTED_MIME_TYPES } from "../assets";
+import { PLAN_IDS } from "../plans";
 
 export const SITE_BRIEF_VERSION = 1 as const;
 
@@ -519,6 +520,17 @@ const baseSiteBriefV1 = z.object({
   requiredPages: z.array(freeText(40)).max(20).default([]),
   specialInstructions: freeText(2000).optional(),
   selectedPackage: z.string().refine(isPackageId, "Invalid package"),
+  /**
+   * Stage 6 commercial package — which priced feature set this data-bundles
+   * website was sold under (agency price sheet; the owner can never change
+   * it). The default keeps every pre-package brief on Auto-Dispatch Pro, the
+   * exact feature set shops already had, so no existing website changes
+   * behaviour. Ignored for every other category (see ../plans.ts).
+   */
+  plan: z
+    .enum(PLAN_IDS)
+    .default("auto_dispatch")
+    .describe("Data-bundles commercial package; ignored for other categories"),
   selectedTheme: z.string().refine(isThemeId, "Invalid theme"),
   selectedTemplate: z
     .string()

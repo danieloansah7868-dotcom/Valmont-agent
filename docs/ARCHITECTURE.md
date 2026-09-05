@@ -593,3 +593,80 @@ Two merchant emails: a delivery failure (Stage 4's aggregated alert) and a
 **wallet too low** alert when TechChief answers 402 or reports
 `lowBalance: true`. Both can legitimately fire for the same event, so tests
 filter by subject rather than counting emails.
+
+## Data Bundles — Stage 6a: commercial packages + manual delivery (Starter)
+
+Stage 6 sells each data-bundles website under one of three **packages**
+(`src/lib/studio/plans.ts`): Starter Shop, Auto-Dispatch Pro, Command Center.
+The agency picks the package in the wizard; the owner never can; prices are
+labels only. `plan` lives on the brief
+(`z.enum(PLAN_IDS).default("auto_dispatch")`), so a brief saved before Stage 6
+— or read raw from the database, where rows are normalised but never
+re-parsed — resolves to Auto-Dispatch Pro through the defensive `planOf()`
+reader. That default is the whole compatibility story: it is the exact
+feature set pre-package shops already had, which is why no existing test
+changes. `planAllows(plan, feature)` is the single server-side gate; the
+refusal answer is 403 "Not included in your package." Every gate sits behind
+`category === "data-bundles"` first: for every other website type the plan is
+ignored everywhere it is read.
+
+### The manual provider
+
+A Starter package includes the shop and checkout but not the supplier API, so
+`resolveProviderForOrder` gained a decision that runs **before the payment
+mode and before any TechChief key**: a Starter website resolves to
+`ManualProvider` for BOTH payment modes. The engine still creates one
+delivery row per purchased bundle unit exactly as before — the customer sees
+progress, the merchant alert fires — but rows are born `provider = "manual"`,
+`status = "pending"`, with no provider reference and no external call. They
+wait for a human (Stage 6c adds the marking buttons).
+
+### The two engine guards
+
+Two places in the engine would happily destroy manual rows if left unaware of
+them; both read a `manual` flag on the provider contract:
+
+- **Guard a — never claim a manual row.** `dispatchPendingRows` used to claim
+  EVERY pending row (`claimForDispatch`: pending → processing) and send it
+  through `ctx.provider`. A manual row must be skipped BEFORE the claim, or a
+  dispatch pass would drag it to "processing" and then fail it through a
+  provider that was never supposed to see it. The skip is on the row's
+  provider id, so it also protects manual rows left behind after a package
+  switch.
+- **Guard b — the live-money block exempts manual.** `passContext` computes
+  `liveBlocked` for live orders without a live provider; a ManualProvider is
+  `live: false` (it moves no data) yet it is exactly what a live Starter order
+  is supposed to dispatch through. Without the exemption every live Starter
+  order would arrive with all rows failed as
+  `NO_LIVE_DELIVERY_PROVIDER_MESSAGE` — the opposite of the package's promise.
+
+`refreshProcessingRows` needed no change: manual rows are never claimed, so
+they never sit at "processing" and hold no provider reference to poll.
+`ManualProvider.sendBundle` always answers not-ok ("This shop sends bundles
+by hand."), so even a stray Retry can never fabricate a send, and
+`checkStatus` is never reached. Recheck passes therefore spend no TechChief
+budget on Starter websites at all.
+
+### What each surface shows
+
+- **Checkout** asks `bundleDeliveryAvailabilityForDraft`, which reads the
+  website's own brief: Starter answers `{ provider: "manual", live: false,
+manual: true, plan: "starter" }` and the 409
+  "This shop cannot send bundles automatically yet…" fires only when
+  `!live && !manual`. The automatic branch keeps returning the exact two-field
+  answer `{ provider, live }` it always did.
+- **Readiness v2** (`bundleDeliveryDependency`) takes the plan as an optional
+  third argument: a Starter bundle shop is satisfied with no connection —
+  "Manual delivery (Starter Shop): you send bundles yourself." — while
+  payments still block on their own.
+- **The guest/customer line** for pending manual rows reads "The shop will
+  send your bundle to 024 ••• 0001 by hand. Contact the shop if it does not
+  arrive." (masked as always; delivered/failed wording unchanged).
+  `guestBundleDeliverySummary`'s input Pick widened additively with
+  `provider` to tell the two kinds apart.
+- **Studio order panel** shows the package badge ("Starter Shop · Manual
+  delivery") and labels pending manual rows "To send by hand"
+  (`deliveryStatusLabel`).
+- **The TechChief card** is hidden on Starter and replaced by a note pointing
+  at the package; the connection is not even fetched, and a stored key is
+  kept but never used while the package is Starter.

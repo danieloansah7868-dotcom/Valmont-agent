@@ -170,6 +170,9 @@ export function createDefaultBrief(
     products: [],
     requiredPages: [],
     selectedPackage: "starter",
+    // Stage 6: the commercial package every pre-package website effectively
+    // had. Kept explicit so the literal satisfies the (defaulted) schema type.
+    plan: "auto_dispatch",
     selectedTheme: "clean-corporate",
     selectedTemplate: "classic-hero",
     adminEmail: "owner@example.com",

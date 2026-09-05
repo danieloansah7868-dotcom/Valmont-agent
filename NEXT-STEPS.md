@@ -19,7 +19,18 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
-## Data Bundles — Stages 1–5 merged, Stage 4b on branch, Stage 6 pending
+## Data Bundles — Stages 1–5 and 4b merged, Stage 6 in progress (6a done)
+
+Stage 6 — the shop-owner admin side — is split into four parts, one PR each,
+in order: **6a** package per website + manual delivery (Starter) — **done,
+open for review**; **6b** shop owner login, team, read-only dashboard;
+**6c** admin actions (mark delivered/failed, Retry/Check status, bundle
+pause, price edit); **6d** supplier page + sales & margin dashboard.
+
+Owner decisions already confirmed for Stage 6: the owner logs in with email +
+password; the owner adds more logins and picks a role per person — the
+Admin/Support/Viewer idea maps onto this spec's owner/member + permission
+boxes; the agency creates the first owner login from Studio.
 
 Stages 1–2 (catalogue field `bundle: { network, dataMb, validity }`, superRefine,
 starter merge, wizard table, readiness v2, storefront tabs, Ghana mobile
@@ -467,3 +478,55 @@ backup/export, and Playwright e2e coverage of the checkout flow.
 PR still requires an independent review from a separate Arena session before any
 merge decision; it states this on the PR itself and must not be merged by the
 same session that authored it.
+
+## Website Studio Stage 6a — packages per website + manual delivery (Starter)
+
+Implemented on branch `arena/01a06f0c-valmont-agent`, based on `main` after
+PR #50 (Stage 4b). Status: **open for review — do not merge** until checked.
+
+What landed:
+
+- `src/lib/studio/plans.ts` — the three packages, labels, price labels,
+  `planAllows` feature matrix, `planOf` defensive reader, and the exact 403
+  wording "Not included in your package." for 6b/6c routes.
+- `site-brief/schema.ts` — `plan: z.enum(PLAN_IDS).default("auto_dispatch")`;
+  the default is what keeps every pre-package website on its exact current
+  behaviour. `createDefaultBrief` spells the default out for the literal.
+- `bundle-delivery.ts` — `ManualProvider` (id `manual`, `live: false`,
+  `manual: true`), plan-first `resolveProviderForOrder` (Starter ⇒ manual in
+  BOTH payment modes, even with a verified key),
+  `bundleDeliveryAvailabilityForDraft` answering `manual`/`plan` on the
+  Starter branch, guard (a) the dispatch pass never claims a manual row,
+  guard (b) the live-money block exempts manual providers, the widened
+  `guestBundleDeliverySummary` Pick + the "sent by hand" pending line, and
+  `deliveryStatusLabel` ("To send by hand") for the owner panel.
+- Checkout — the live-bundle 409 now fires only when `!live && !manual`;
+  Starter + live + no key creates the order normally; caps and every other
+  check unchanged.
+- Readiness — `bundleDeliveryDependency(isBundleSite, connection, plan?)`;
+  Starter bundle shops are live-ready with no TechChief connection; the seven
+  Stage 5 readiness tests pass unedited (the parameter is optional).
+- Wizard — "Which bundle package did the client buy?" radio group (bundle
+  sites only), and the TechChief card knows the package: on Starter it is
+  hidden and replaced by the switch-package note (the connection is never
+  even fetched; a stored key is kept but unused).
+- Studio order panel — package badge (Starter adds "· Manual delivery") and
+  pending manual rows read "To send by hand".
+- Notifications were NOT touched: the merchant new-order alert already prints
+  "Send to: <full recipient>" and the per-line bundle summary.
+
+Tests added (new files only): `plans.test.ts` (13),
+`bundle-delivery-manual.test.ts` (20), checkout `plan-gating.test.ts` (4),
+`live-sales-readiness-plans.test.ts` (6). Local suite: **1117 passed /
+54 skipped** (floor was 1074/54; the 54 are the postgres-*.test.ts files that
+run in CI with `STUDIO_TEST_DATABASE_URL`).
+
+Notes for 6b–6d:
+
+- 6b must not import the agency session helpers into the admin side; its own
+  `valmont_shop_session` cookie and its own `getShopAdminSession()`.
+- 6c adds the human marking buttons for manual rows (pending→delivered /
+  pending→failed / failed→delivered; delivered terminal).
+- 6d needs migration 0016 for the per-row provider cost (TechChief
+  `api_price` is already in hand at dispatch time) and can reuse
+  `techChiefConnectionView` for the supplier page.

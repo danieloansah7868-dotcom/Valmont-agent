@@ -13,6 +13,12 @@ import {
   type EcomSubcategoryId,
 } from "@/lib/studio/categories";
 import { packages } from "@/lib/studio/packages";
+import {
+  PLAN_IDS,
+  PLAN_LABELS,
+  PLAN_PRICE_LABELS,
+  planOf,
+} from "@/lib/studio/plans";
 import { themes } from "@/lib/studio/themes";
 import {
   templatesForCategory,
@@ -534,6 +540,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
 
   const availableTemplates = templatesForCategory(brief.category);
   const isBundleSite = brief.category === "data-bundles";
+  // Stage 6a: the commercial package, read defensively — a draft saved before
+  // packages existed carries no `plan`, and it must behave as Auto-Dispatch
+  // Pro (the feature set it always had) rather than show an empty radio group.
+  const plan = planOf(brief);
 
   return (
     <div className="mx-auto w-full max-w-[980px] p-4 sm:p-6">
@@ -684,39 +694,87 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           )}
 
           {step === 2 && (
-            <fieldset className="grid gap-3">
-              <legend className="text-sm font-semibold">
-                Which package do you want?
-              </legend>
-              {packages.map((item) => (
-                <label
-                  key={item.id}
-                  className="flex items-start gap-3 rounded-lg border border-line p-3"
-                >
-                  <input
-                    type="radio"
-                    name="selectedPackage"
-                    value={item.id}
-                    checked={brief.selectedPackage === item.id}
-                    onChange={() => update({ selectedPackage: item.id })}
-                    className="mt-1"
-                  />
-                  <span>
-                    <span className="block text-sm font-semibold">
-                      {item.label}
+            <>
+              <fieldset className="grid gap-3">
+                <legend className="text-sm font-semibold">
+                  Which package do you want?
+                </legend>
+                {packages.map((item) => (
+                  <label
+                    key={item.id}
+                    className="flex items-start gap-3 rounded-lg border border-line p-3"
+                  >
+                    <input
+                      type="radio"
+                      name="selectedPackage"
+                      value={item.id}
+                      checked={brief.selectedPackage === item.id}
+                      onChange={() => update({ selectedPackage: item.id })}
+                      className="mt-1"
+                    />
+                    <span>
+                      <span className="block text-sm font-semibold">
+                        {item.label}
+                      </span>
+                      <span className="block text-xs text-slate-600">
+                        Up to {item.limits.maxPages} pages,{" "}
+                        {item.limits.maxProducts} products
+                      </span>
                     </span>
-                    <span className="block text-xs text-slate-600">
-                      Up to {item.limits.maxPages} pages,{" "}
-                      {item.limits.maxProducts} products
-                    </span>
-                  </span>
-                </label>
-              ))}
-              <p className="text-xs text-slate-500">
-                The package is separate from the website type. Changing it does
-                not affect anything else you have filled in.
-              </p>
-            </fieldset>
+                  </label>
+                ))}
+                <p className="text-xs text-slate-500">
+                  The package is separate from the website type. Changing it
+                  does not affect anything else you have filled in.
+                </p>
+              </fieldset>
+
+              {/* Stage 6a: the commercial package for a data-bundles website —
+                which priced feature set the client bought. Bundle sites only;
+                every other website type never sees a plan at all. */}
+              {isBundleSite && (
+                <fieldset className="mt-6 grid gap-3">
+                  <legend className="text-sm font-semibold">
+                    Which bundle package did the client buy?
+                  </legend>
+                  {PLAN_IDS.map((id) => (
+                    <label
+                      key={id}
+                      className="flex items-start gap-3 rounded-lg border border-line p-3"
+                    >
+                      <input
+                        type="radio"
+                        name="plan"
+                        value={id}
+                        checked={plan === id}
+                        onChange={() => update({ plan: id })}
+                        className="mt-1"
+                        data-testid={`plan-${id}`}
+                      />
+                      <span>
+                        <span className="block text-sm font-semibold">
+                          {PLAN_LABELS[id]} — {PLAN_PRICE_LABELS[id]}
+                        </span>
+                        <span className="block text-xs text-slate-600">
+                          {id === "starter" &&
+                            "Shop + Valmont Pay checkout. Bundles are sent by hand."}
+                          {id === "auto_dispatch" &&
+                            "TechChief sends bundles automatically. Live status page and bundle pause."}
+                          {id === "command_center" &&
+                            "Everything in Auto-Dispatch Pro, plus a second supplier slot, sales reports and agent wallets."}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+                  <p className="text-xs text-slate-500">
+                    The bundle package decides what the shop can do. Starter
+                    sends bundles by hand; Auto-Dispatch Pro and Command Center
+                    send them through TechChief automatically. The shop owner
+                    cannot change it.
+                  </p>
+                </fieldset>
+              )}
+            </>
           )}
 
           {step === 3 && (
@@ -1461,8 +1519,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           <CustomDomainCard draftId={id} />
 
           {/* Stage 5: only a data-bundles shop has bundles to deliver, so only
-              it gets the TechChief connection card. */}
-          {isBundleSite && <TechChiefConnectionCard draftId={id} />}
+              it gets the TechChief connection card. Stage 6a: the card also
+              knows the commercial package, so a Starter Shop shows the
+              manual-delivery note instead of a supplier connection UI. */}
+          {isBundleSite && <TechChiefConnectionCard draftId={id} plan={plan} />}
 
           <div className="mt-4">
             <BusinessPreview brief={brief} draftId={id} />

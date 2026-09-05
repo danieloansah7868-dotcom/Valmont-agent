@@ -289,15 +289,21 @@ export async function POST(
     // paid order would otherwise owe data the simulator only pretends to send.
     // Test-mode checkout is unaffected: simulator payments pair with the
     // simulated delivery engine.
-    if (
-      isBundleSite &&
-      paymentMode === "live" &&
-      !(await bundleDeliveryAvailabilityForDraft(draft.id)).live
-    ) {
-      return NextResponse.json(
-        { error: LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE },
-        { status: 409 },
-      );
+    //
+    // Stage 6a: a Starter Shop is the deliberate exception — its delivery
+    // mechanism is the owner, who sends every bundle by hand — so a live
+    // Starter checkout is accepted with no key at all. The refusal now fires
+    // only when the website has neither a live provider NOR manual delivery,
+    // and bundleDeliveryAvailabilityForDraft answers both in one call (plus
+    // the plan) so the route never re-reads the brief.
+    if (isBundleSite && paymentMode === "live") {
+      const bundleDelivery = await bundleDeliveryAvailabilityForDraft(draft.id);
+      if (!bundleDelivery.live && !bundleDelivery.manual) {
+        return NextResponse.json(
+          { error: LIVE_BUNDLE_DELIVERY_UNAVAILABLE_MESSAGE },
+          { status: 409 },
+        );
+      }
     }
 
     const code = accessCode();

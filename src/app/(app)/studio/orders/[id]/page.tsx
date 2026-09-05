@@ -10,10 +10,12 @@ import { PAYMENT_METHODS } from "@/lib/studio/site-brief/schema";
 import { OrderActions } from "@/components/studio/order-actions";
 import { PaymentModeBadge } from "@/components/studio/payment-mode-badge";
 import {
-  DELIVERY_STATUS_LABELS,
+  deliveryStatusLabel,
   recheckBundleDeliveriesForOrder,
   type DeliveryStatus,
 } from "@/lib/studio/bundle-delivery";
+import { PLAN_LABELS, planOf } from "@/lib/studio/plans";
+import { publicGetDraft } from "@/lib/studio/draft-public";
 import { bundleNetworkLabel, formatDataMb } from "@/lib/studio/bundles";
 import {
   BundleDeliveryRecheckButton,
@@ -46,6 +48,14 @@ export default async function OrderDetailPage({
   const bundleDeliveries = order.recipientPhone
     ? await recheckBundleDeliveriesForOrder(order.id)
     : [];
+  // Stage 6a: the delivery panel carries the shop's commercial package as a
+  // read-only badge, so the owner can see WHY a row says "To send by hand".
+  // Only read when this order actually has bundle rows; a draft read failure
+  // must never take the page down.
+  const deliveryPlan =
+    bundleDeliveries.length > 0
+      ? planOf((await publicGetDraft(order.draftId).catch(() => null))?.brief)
+      : null;
   const failedTopUps = bundleDeliveries.filter(
     (delivery) => delivery.status === "failed",
   ).length;
@@ -203,6 +213,15 @@ export default async function OrderDetailPage({
           data-testid="bundle-delivery-panel"
         >
           <h2 className="text-sm font-semibold text-navy">Bundle delivery</h2>
+          {deliveryPlan && (
+            <span
+              data-testid="delivery-package-badge"
+              className="rounded-full bg-slate-200 px-2 py-0.5 text-xs font-semibold text-slate-700"
+            >
+              {PLAN_LABELS[deliveryPlan]}
+              {deliveryPlan === "starter" ? " · Manual delivery" : ""}
+            </span>
+          )}
           <ul className="mt-3 grid gap-3">
             {bundleDeliveries.map((delivery) => (
               <li
@@ -228,7 +247,7 @@ export default async function OrderDetailPage({
                       "bg-slate-200 text-slate-700"
                     }`}
                   >
-                    {DELIVERY_STATUS_LABELS[delivery.status]}
+                    {deliveryStatusLabel(delivery)}
                   </span>
                 </div>
                 <dl className="mt-1 grid gap-0.5 text-xs text-slate-600">
