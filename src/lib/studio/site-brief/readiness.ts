@@ -1,5 +1,6 @@
 import type { SiteBriefV1 } from "./schema";
 import { isStarterValue } from "./defaults";
+import { type PlanId } from "../plans";
 
 export const READINESS_RULES_VERSION = 2;
 
@@ -258,11 +259,31 @@ export interface LiveSalesReadiness {
   blockers: ReadinessDependency[];
 }
 
-/** The wallet connection a data-bundles shop needs before it can sell live. */
+/**
+ * The wallet connection a data-bundles shop needs before it can sell live.
+ *
+ * Stage 6a adds the website's commercial `plan` as an optional third
+ * argument (defaulting to Auto-Dispatch Pro, the pre-package behaviour): a
+ * Starter Shop is *manual delivery by design*, so it is ready for live sales
+ * without any TechChief connection — the owner sends every bundle by hand
+ * and marks it sent in Stage 6c. For every other package — and every
+ * non-bundle website, where the plan is ignored — the dependency is
+ * unchanged.
+ */
 export function bundleDeliveryDependency(
   isBundleSite: boolean,
   connection: { status: string | null } | null,
+  plan: PlanId = "auto_dispatch",
 ): ReadinessDependency {
+  if (isBundleSite && plan === "starter") {
+    return {
+      id: "bundleDelivery",
+      label: "Bundle delivery",
+      applies: isBundleSite,
+      satisfied: true,
+      hint: "Manual delivery (Starter Shop): you send bundles yourself.",
+    };
+  }
   const verified = connection?.status === "verified";
   return {
     id: "bundleDelivery",

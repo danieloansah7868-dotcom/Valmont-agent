@@ -6,6 +6,7 @@ import {
   bundleDeliveryDependency,
   computeLiveSalesReadiness,
 } from "@/lib/studio/site-brief/readiness";
+import { PLAN_LABELS, type PlanId } from "@/lib/studio/plans";
 
 /**
  * The "Bundle delivery" card on a data-bundles draft (Stage 5).
@@ -21,6 +22,12 @@ import {
  * is no "edit key" affordance: to change it you paste a new one, and to see it
  * again you go to TechChief. Nothing in this file ever receives the key back
  * from the server, because the API never sends it.
+ *
+ * Stage 6a: the website's commercial package decides whether the card shows
+ * at all. On a Starter Shop the whole connection UI is replaced by one note —
+ * automatic sending is simply not in that package — and the connection is
+ * never even fetched. A key saved earlier is kept but never used while the
+ * package is Starter; switching back to Auto-Dispatch Pro restores it.
  */
 
 interface UnmatchedItemView {
@@ -63,7 +70,14 @@ function Mono({ children }: { children: string }) {
   );
 }
 
-export function TechChiefConnectionCard({ draftId }: { draftId: string }) {
+export function TechChiefConnectionCard({
+  draftId,
+  plan = "auto_dispatch",
+}: {
+  draftId: string;
+  /** The website's commercial package (Stage 6a); Starter hides the card. */
+  plan?: PlanId;
+}) {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<TechChiefConnectionView | null>(null);
   const [apiKey, setApiKey] = useState("");
@@ -97,6 +111,11 @@ export function TechChiefConnectionCard({ draftId }: { draftId: string }) {
   useEffect(() => {
     let cancelled = false;
     async function start() {
+      // A Starter Shop has no supplier to read: skip the request entirely.
+      if (plan === "starter") {
+        setLoading(false);
+        return;
+      }
       const next = await fetchView();
       if (cancelled) return;
       if (next) setView(next);
@@ -106,7 +125,7 @@ export function TechChiefConnectionCard({ draftId }: { draftId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [fetchView]);
+  }, [fetchView, plan]);
 
   function messageOf(cause: unknown, fallback: string): string {
     return cause instanceof ApiError ? cause.message : fallback;
@@ -210,10 +229,40 @@ export function TechChiefConnectionCard({ draftId }: { draftId: string }) {
     );
   }
 
+  // Stage 6a: on a Starter Shop the connection UI is hidden entirely and one
+  // note explains why. The package is the agency's decision, so there is no
+  // control here to change it — only the wording of where to change it.
+  if (plan === "starter") {
+    return (
+      <section
+        id="bundle-delivery-card"
+        data-testid="techchief-card-starter"
+        className="mt-4 scroll-mt-24 rounded-xl border border-line bg-white p-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold text-navy">Bundle delivery</h2>
+          <span
+            data-testid="package-badge"
+            className="rounded-full bg-slate-200 px-2 py-0.5 text-xs font-semibold text-slate-700"
+          >
+            {PLAN_LABELS[plan]}
+          </span>
+        </div>
+        <p
+          className="mt-3 text-xs text-slate-600"
+          data-testid="starter-package-note"
+        >
+          Your package is Starter Shop — automatic sending is not included.
+          Switch the package to Auto-Dispatch Pro to connect a supplier.
+        </p>
+      </section>
+    );
+  }
+
   const connected = Boolean(view?.connected);
   const verified = view?.status === "verified";
   const readiness = computeLiveSalesReadiness([
-    bundleDeliveryDependency(true, { status: view?.status ?? null }),
+    bundleDeliveryDependency(true, { status: view?.status ?? null }, plan),
   ]);
   const unmatched = view?.unmatchedItems ?? [];
 

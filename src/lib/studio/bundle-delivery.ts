@@ -26,6 +26,14 @@
  * stays on the environment default. Test mode never touches TechChief, even
  * when a key is saved.
  *
+ * Stage 6a adds a third provider, {@link ManualProvider}, ahead of all of
+ * that: a website sold as **Starter Shop** resolves to manual delivery for
+ * BOTH payment modes, even with a verified TechChief key saved. Manual rows
+ * are created per unit exactly like automatic ones but wait at "pending"
+ * until a human marks them (6c); the dispatch pass never claims them (guard
+ * a) and the live-money block exempts them (guard b), so a live Starter
+ * order is real and deliverable with no supplier API at all.
+ *
  * The engine is held to six invariants. Each has a dedicated test in
  * `bundle-delivery.test.ts`:
  *
@@ -121,6 +129,7 @@ import {
   type OrderStatus,
 } from "./orders";
 import type { CatalogItem } from "./site-brief/schema";
+import { planOf, type PlanId } from "./plans";
 
 // ---------------------------------------------------------------------------
 // Records and statuses
@@ -148,6 +157,24 @@ export const DELIVERY_STATUS_LABELS: Record<DeliveryStatus, string> = {
   delivered: "Delivered",
   failed: "Failed",
 };
+
+/**
+ * What the owner panel calls one row (Stage 6a). A pending row on the manual
+ * provider is not "waiting to send" in the automatic sense — nothing will
+ * ever pick it up — so it reads "To send by hand" and the owner knows the
+ * next move is theirs (Stage 6c adds the buttons). Every other status, and
+ * every automatic row, keeps its existing label.
+ */
+export const MANUAL_DELIVERY_PENDING_LABEL = "To send by hand";
+
+export function deliveryStatusLabel(
+  row: Pick<BundleDeliveryRecord, "status" | "provider">,
+): string {
+  if (row.provider === MANUAL_PROVIDER_ID && row.status === "pending") {
+    return MANUAL_DELIVERY_PENDING_LABEL;
+  }
+  return DELIVERY_STATUS_LABELS[row.status];
+}
 
 /** One purchased bundle unit that the provider must top up. */
 export interface BundleDeliveryRecord {
@@ -257,6 +284,14 @@ export interface BundleDeliveryProvider {
    * which is what keeps the live-money guard (I1) fail-closed by default.
    */
   readonly live?: boolean;
+  /**
+   * True only for {@link ManualProvider} (Stage 6a, Starter Shop): the
+   * "provider" is a human who sends the bundle by hand, so the engine must
+   * exempt these rows from the live-money guard — a Starter shop takes real
+   * money with no automatic sending at all, and its rows wait at "pending"
+   * until a person marks them (6c). Both engine guards read this flag.
+   */
+  readonly manual?: boolean;
   sendBundle(
     request: BundleDeliveryDispatchRequest,
   ): Promise<BundleDeliverySendResult>;
@@ -329,6 +364,56 @@ export class SimulatedProvider implements BundleDeliveryProvider {
     if (request.providerRef.startsWith("sim-")) {
       return { status: "delivered" };
     }
+    return { status: "processing" };
+  }
+}
+
+/**
+ * Stage 6a — the Starter Shop's "provider": the shop owner's hands.
+ *
+ * A Starter package includes the shop and Valmont Pay checkout but NOT the
+ * supplier API, so the engine still creates one tracked row per purchased
+ * bundle unit — the customer sees delivery progress, the merchant's alert
+ * still fires — yet nothing is ever sent automatically. The row is born
+ * "pending" with `provider = "manual"` and stays exactly there until a human
+ * marks it (Stage 6c); rechecks and dispatch passes skip it, and no TechChief
+ * budget is ever spent on it.
+ *
+ * The class exists so the plan gate has something to resolve to, and so the
+ * two engine guards can recognise manual rows through the provider contract:
+ *
+ *  - `manual: true` exempts the order from the live-money block (guard b):
+ *    a Starter shop may take REAL money with no automatic provider at all,
+ *    which is precisely what its customer paid for.
+ *  - `sendBundle` always answers not-ok with {@link
+ *    MANUAL_DELIVERY_SEND_MESSAGE}, so even a stray Retry can never fabricate
+ *    a send — the row simply fails with that plain sentence.
+ *  - `checkStatus` reports "processing" and is never reached in practice
+ *    (manual rows are never claimed, so they never hold a provider ref).
+ */
+export const MANUAL_PROVIDER_ID = "manual";
+
+/** What a stray send attempt on a manual row answers, in plain words. */
+export const MANUAL_DELIVERY_SEND_MESSAGE = "This shop sends bundles by hand.";
+
+export class ManualProvider implements BundleDeliveryProvider {
+  readonly id = MANUAL_PROVIDER_ID;
+  /** Manual delivery moves no data itself, so it is never "live"… */
+  readonly live = false;
+  /** …but it IS the intended delivery method, which the live-block exempts. */
+  readonly manual = true;
+
+  async sendBundle(
+    request: BundleDeliveryDispatchRequest,
+  ): Promise<BundleDeliverySendResult> {
+    void request;
+    return { ok: false, error: MANUAL_DELIVERY_SEND_MESSAGE };
+  }
+
+  async checkStatus(
+    request: BundleDeliveryStatusRequest,
+  ): Promise<BundleDeliveryStatusResult> {
+    void request;
     return { status: "processing" };
   }
 }
@@ -804,11 +889,23 @@ export function bundleDeliveryAvailability(
  * so an owner can rehearse the whole flow without spending money, and a
  * rehearsal that quietly bought a real 1 GB bundle for a stranger's phone
  * would be the worst possible surprise.
+ *
+ * Stage 6a adds one decision that comes BEFORE the payment-mode branch: a
+ * website sold as **Starter Shop** delivers by hand in BOTH payment modes.
+ * The plan is read from the website's own brief, so even a verified TechChief
+ * key saved earlier can never make a Starter shop send automatically — the
+ * agency would have to switch the package first. A brief read failure falls
+ * through to the pre-package behaviour (Auto-Dispatch Pro) and can never
+ * break dispatch.
  */
 export async function resolveProviderForOrder(
   order: Pick<OrderRecord, "paymentMode" | "draftId">,
   deps: { integrations?: IntegrationsStore } = {},
 ): Promise<BundleDeliveryProvider> {
+  const draft = await publicGetDraft(order.draftId).catch(() => null);
+  if (planOf(draft?.brief) === "starter") {
+    return new ManualProvider();
+  }
   if (order.paymentMode === "live") {
     const store = deps.integrations ?? getIntegrationsStore();
     // A connection read failure must never break dispatch: fall back to the
@@ -840,12 +937,38 @@ export async function resolveProviderForOrder(
  * asks before accepting a live bundle order. Unlike the environment-level
  * {@link bundleDeliveryAvailability}, this reads the shop's own connection, so
  * one shop being connected never unlocks live sales for another.
+ *
+ * Stage 6a adds `manual` and `plan` for the package gate: `manual: true` says
+ * the website delivers by hand (Starter Shop), and `plan` echoes that package
+ * so callers never have to re-read the brief. Both fields are present ONLY
+ * on the manual branch — the automatic branch keeps returning exactly the
+ * two-field answer it always did (`{ provider, live }`), which the Stage 5
+ * contract tests assert as-is. The checkout refusal rule becomes "no live
+ * provider AND no manual delivery": a Starter shop is accepted live with no
+ * key, because its owner is the delivery mechanism.
  */
+export interface DraftBundleDeliveryAvailability extends BundleDeliveryAvailability {
+  /** True only when this website sends its bundles by hand (Starter Shop). */
+  manual?: boolean;
+  /** The commercial package, echoed on the manual branch ("starter"). */
+  plan?: PlanId;
+}
+
 export async function bundleDeliveryAvailabilityForDraft(
   draftId: string,
   deps: { integrations?: IntegrationsStore } = {},
-): Promise<BundleDeliveryAvailability> {
+): Promise<DraftBundleDeliveryAvailability> {
   const store = deps.integrations ?? getIntegrationsStore();
+  const draft = await publicGetDraft(draftId).catch(() => null);
+  const plan = planOf(draft?.brief);
+  if (plan === "starter") {
+    return {
+      provider: MANUAL_PROVIDER_ID,
+      live: false,
+      manual: true,
+      plan,
+    };
+  }
   const integration = await getTechChiefIntegration(draftId, store).catch(
     () => null,
   );
@@ -1533,6 +1656,13 @@ async function dispatchPendingRows(
 ): Promise<void> {
   for (const row of rows) {
     if (row.status !== "pending") continue;
+    // Stage 6a guard (a): a manual row is never claimed. claimForDispatch
+    // moves pending → processing unconditionally, so a manual row must be
+    // skipped BEFORE the claim or the dispatch pass would drag it to
+    // "processing" and then fail it through a provider that was never
+    // supposed to see it. Manual rows wait at "pending" until a human marks
+    // them (6c).
+    if (row.provider === MANUAL_PROVIDER_ID) continue;
     if (ctx.liveBlocked) {
       const failed = await ctx.deliveries.markFailed(row.id, {
         error: NO_LIVE_DELIVERY_PROVIDER_MESSAGE,
@@ -1666,8 +1796,15 @@ function passContext(
     provider,
     deliveries,
     integrations,
+    // Stage 6a guard (b): a ManualProvider is live:false (it moves no data)
+    // yet it is exactly what a live Starter order is SUPPOSED to dispatch
+    // through, so the manual flag exempts it — otherwise every live Starter
+    // order would arrive at dispatchPendingRows live-blocked and all its
+    // rows would be failed with NO_LIVE_DELIVERY_PROVIDER_MESSAGE, the exact
+    // opposite of what the package promises.
     liveBlocked:
       order.paymentMode === "live" &&
+      provider.manual !== true &&
       !bundleDeliveryAvailability(provider).live,
     newlyFailed: [],
   };
@@ -1804,9 +1941,16 @@ export interface GuestBundleDeliverySummary {
  * fields needed, and the recipient reaches the output only through
  * `maskGhanaMobile` — so full phone numbers, provider references, attempt
  * counts and error text cannot leak onto an unauthenticated page (I6).
+ *
+ * Stage 6a: `provider` joined the Pick because a manual row (Starter Shop)
+ * gets its own pending wording — "sent by hand" — instead of the automatic
+ * "Sending… so far" line. Both existing callers pass whole records, so the
+ * widening is additive; delivered and failed rows keep their exact wording.
  */
 export function guestBundleDeliverySummary(
-  deliveries: ReadonlyArray<Pick<BundleDeliveryRecord, "status" | "dataMb">>,
+  deliveries: ReadonlyArray<
+    Pick<BundleDeliveryRecord, "status" | "dataMb" | "provider">
+  >,
   recipientPhone: string | null | undefined,
 ): GuestBundleDeliverySummary | null {
   if (deliveries.length === 0 || !recipientPhone) return null;
@@ -1819,6 +1963,7 @@ export function guestBundleDeliverySummary(
   const failed = deliveries.filter((row) => row.status === "failed").length;
   const totalDataMb = deliveries.reduce((sum, row) => sum + row.dataMb, 0);
   const size = formatDataMb(totalDataMb);
+  const manual = deliveries.some((row) => row.provider === MANUAL_PROVIDER_ID);
 
   let line: string;
   if (delivered === total) {
@@ -1833,6 +1978,10 @@ export function guestBundleDeliverySummary(
         : `Top-ups for ${masked} hit a problem — the shop can retry them (${size} total).`;
   } else if (failed > 0) {
     line = `${delivered} of ${total} top-ups delivered to ${masked}; ${failed} hit a problem — the shop can retry it.`;
+  } else if (manual) {
+    // A Starter shop's rows wait for a person, not a provider: the customer
+    // is told plainly that the shop sends by hand and where to complain.
+    line = `The shop will send your bundle${total === 1 ? "" : "s"} to ${masked} by hand. Contact the shop if it does not arrive.`;
   } else {
     line = `Sending ${size} of data to ${masked} — ${delivered} of ${total} delivered so far.`;
   }
