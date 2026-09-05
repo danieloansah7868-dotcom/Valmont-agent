@@ -1201,7 +1201,8 @@ export interface TechChiefSyncResult {
  * Ordering is by TechChief's bundle **id**, never by size, so this list is the
  * join table between a shop's catalogue and what can actually be sent. One
  * call per network (their `network` parameter is a filter, not a grouping),
- * which costs 3 of the 60 hourly slots — affordable once a day, and the
+ * which costs 4 of the 60 hourly slots — MTN, AirtelTigo, Telecel and BigTime,
+ * one request each — affordable once a day, and the
  * adapter falls back to the stale cache rather than blocking an order when a
  * refresh fails.
  */

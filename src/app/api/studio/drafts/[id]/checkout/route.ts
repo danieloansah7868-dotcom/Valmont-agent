@@ -24,6 +24,7 @@ import { notifyMerchantNewOrder } from "@/lib/studio/notifications";
 import {
   validateGhanaMobile,
   normalizeGhanaMobile,
+  bundleOrderCapError,
 } from "@/lib/studio/bundles";
 import {
   bundleDeliveryAvailabilityForDraft,
@@ -208,6 +209,20 @@ export async function POST(
         bundle: item.bundle,
       });
       pricedLines.push({ price: item.price, quantity: line.quantity });
+    }
+
+    // Stage 4b: a data-bundles basket is capped, because every unit becomes
+    // one real top-up through this shop's own TechChief key — a stuck "+" or a
+    // scripted checkout would otherwise turn into hundreds of paid sends and
+    // hundreds of tracked rows for one order. Counted here, before the totals,
+    // before the payment rail is chosen and before any order row exists, so an
+    // over-large basket is refused with nothing to undo. Every other website
+    // type is untouched: a food shop may still order 999 of one line.
+    if (isBundleSite) {
+      const capError = bundleOrderCapError(lines);
+      if (capError) {
+        return NextResponse.json({ error: capError }, { status: 400 });
+      }
     }
 
     const totals = computeTotals(pricedLines, {

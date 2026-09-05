@@ -2,12 +2,12 @@
 
 ## Owner's idea backlog (2026-09-03)
 
-1. ~~Stage 5 — per-client TechChief API key~~ — **done on branch `arena/01a06950-valmont-agent`** (PR pending review): each website stores its own encrypted key, the engine picks the provider per order, Test connection shows the balance, and live checkout opens only after the probe passes. Details under _Data Bundles_ below.
-2. ~~Client manages own float~~ — **done on the same branch**: the Bundle delivery card shows that website's wallet balance, the cached TechChief price list and the bundles TechChief cannot deliver, and the merchant gets a low-balance email when TechChief answers 402 or reports the float is low.
+1. ~~Stage 5 — per-client TechChief API key~~ — **merged (PR #49**, merge commit `1952e36`**)**: each website stores its own encrypted key, the engine picks the provider per order, Test connection shows the balance, and live checkout opens only after the probe passes. Details under _Data Bundles_ below.
+2. ~~Client manages own float~~ — **merged (PR #49)**: the Bundle delivery card shows that website's wallet balance, the cached TechChief price list and the bundles TechChief cannot deliver, and the merchant gets a low-balance email when TechChief answers 402 or reports the float is low.
 3. Client admin page (Stage 6): a login for the shop owner (not the agency team) with orders, delivery status, Retry, API key + balance. Changes the earlier "agency team only" decision — owner to confirm login method (phone OTP or email).
 4. Sub-agents (Stage 7, DataMartGH style): shop owner creates agents with their own prices and wallets; agent orders tracked separately; commission report.
-5. Checkout caps: max 10 units per line / 20 per order; cap rows per recheck pass.
-6. Masked delivery line on the customer-account order page.
+5. ~~Checkout caps: max 10 units per line / 20 per order; cap rows per recheck pass~~ — **done on branch `arena/01a06950-valmont-agent`** (Stage 4b, PR pending review): `MAX_BUNDLE_UNITS_PER_LINE` / `MAX_BUNDLE_UNITS_PER_ORDER` in `bundles.ts`, one shared `bundleOrderCapError` counter, a 400 in the checkout route before any order row, the storefront "+" stopping at 10 and its Checkout button disabled with the same sentence over 20, and `MAX_PROCESSING_POLLS_PER_PASS = 25` per recheck pass (oldest `updated_at` first).
+6. ~~Masked delivery line on the customer-account order page~~ — **done on the same branch** (Stage 4b): `/account/orders/[id]` renders `guestBundleDeliverySummary` for bundle orders only, `data-testid="bundle-delivery-line"`, read-only (no recheck, so a customer refresh cannot spend the shop's TechChief allowance).
 7. Connectors (roadmap priority 2).
 8. Lovable-style chat features (roadmap priority 3).
 9. Real deployment of main (migrations 0011 + 0012) so there is a preview link that does not die with a sandbox.
@@ -19,7 +19,7 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
-## Data Bundles — Stages 1–4 merged, Stage 5 on branch, Stage 6 pending
+## Data Bundles — Stages 1–5 merged, Stage 4b on branch, Stage 6 pending
 
 Stages 1–2 (catalogue field `bundle: { network, dataMb, validity }`, superRefine,
 starter merge, wizard table, readiness v2, storefront tabs, Ghana mobile
@@ -88,9 +88,8 @@ simulator (stage 4)" (merge commit `2d033ae`):
   provider references, no error internals). `notifyMerchantDeliveryFailed`
   sends the merchant one aggregated alert per failing engine pass.
 
-**Stage 5 — implemented on this branch** (`arena/01a06950-valmont-agent`, PR
-open, **not merged**): the real per-website TechChief connection and delivery
-adapter. The TechChief stub is gone; nothing else in the Stage 4 engine changed
+**Stage 5 — merged** as PR #49 (merge commit `1952e36`, head `b4a5a20`): the
+real per-website TechChief connection and delivery adapter. The TechChief stub is gone; nothing else in the Stage 4 engine changed
 shape, so all six invariants still hold and their tests were not touched.
 
 - Migration `0014_studio_integrations` adds `studio_integrations` — one row per
@@ -164,14 +163,48 @@ recheck` (the owner's **Check status now**). All four connection routes share
   T+11 min would keep its old `updated_at` and every later recheck would pass
   the gate.
 
-**Still open from the Stage 4 review notes** (deliberately not in Stage 5):
+**Stage 4b — implemented on this branch** (`arena/01a06950-valmont-agent`, PR
+open, **not merged**): the two safety items the Stage 4 review asked for and
+Stage 5 deliberately left out — backlog items 5 and 6.
 
-- Cap units per bundle order at checkout (e.g. max 10 per line, 20 per order)
-  and cap the rows processed per recheck pass. The 50/hour budget and the
-  per-row throttle now bound the _provider_ cost, but a 999-unit order still
-  creates 999 rows and 999 send attempts — backlog item 5.
-- Show the masked aggregate delivery line on the customer-account order page —
-  backlog item 6.
+- `src/lib/studio/bundles.ts` exports `MAX_BUNDLE_UNITS_PER_LINE = 10`,
+  `MAX_BUNDLE_UNITS_PER_ORDER = 20`, the exact refusal sentence
+  `BUNDLE_ORDER_CAP_MESSAGE` (built from the two numbers so it cannot drift
+  away from them) and `bundleOrderCapError(lines)` — the **one** place the caps
+  are counted, so the storefront and the checkout route cannot disagree about
+  what "too many" means.
+- The checkout route refuses an over-large data-bundles basket with **400** and
+  that exact message, counted after the lines are re-priced from the catalogue
+  but **before** the totals, before the payment rail is chosen and before any
+  order row exists — so there is nothing to undo. The check sits inside
+  `if (isBundleSite)`: every other website type may still order 999 of a line.
+- `bundle-shop.tsx`: the "+" stops at 10 per bundle (clamped in `setQty`, so a
+  stuck button cannot build an order the server would refuse), and over 20
+  units total the Checkout button is rendered **disabled** with the same
+  sentence above it (`data-testid="bundle-cap-message"`); `placeOrder` guards
+  too, for a form opened before the basket grew past the cap.
+- `refreshProcessingRows` — the polling half of
+  `recheckBundleDeliveriesForOrder` — asks a provider about at most
+  `MAX_PROCESSING_POLLS_PER_PASS = 25` rows per pass, **oldest `updated_at`
+  first**, so a big order works through its queue fairly instead of always
+  re-asking about the newest top-ups. Rows that cannot be polled yet (no
+  provider reference) are skipped and do **not** consume the budget, otherwise
+  one stuck row would hold a slot at the front of the queue forever. This
+  bounds a single pass only: TechChief's 50-request hourly budget and the
+  10-minute per-row throttle still apply on top. The simulator and every
+  Stage 5 TechChief behaviour are unchanged.
+- `/account/orders/[id]` now shows the masked `guestBundleDeliverySummary` line
+  for bundle orders only (`data-testid="bundle-delivery-line"`) — total data,
+  top-up count, delivered count, masked recipient — with no full number, no
+  provider reference and no error text. It **reads** the rows instead of
+  rechecking them, so a customer refreshing their own order page cannot spend
+  the shop's hourly TechChief allowance.
+- Also carried in this branch: the `syncTechChiefBundles` comment said a sync
+  "costs 3 of the 60 hourly slots" — it is **4**, one per network (MTN,
+  AirtelTigo, Telecel, BigTime).
+
+Still open: nothing from the Stage 4 review notes. Stage 6 needs one decision
+from the owner first (login method and roles — see the backlog item 3).
 
 Stage 6: analytics, rate-limits, fraud checks, documentation polish.
 

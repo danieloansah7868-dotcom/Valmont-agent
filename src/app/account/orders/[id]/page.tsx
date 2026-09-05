@@ -14,6 +14,10 @@ import {
 } from "@/lib/studio/site-brief/schema";
 import { formatMoney } from "@/lib/studio/valmont-pay";
 import { formatAccra } from "@/lib/studio/format";
+import {
+  getBundleDeliveriesStore,
+  guestBundleDeliverySummary,
+} from "@/lib/studio/bundle-delivery";
 
 export const dynamic = "force-dynamic";
 
@@ -59,6 +63,22 @@ export default async function CustomerOrderPage({
     STATUS_COPY[order.status] ??
     `Your order status is ${STATUS_LABELS[order.status]}.`;
 
+  // Stage 4b: a bundle order shows the same single masked aggregate line the
+  // guest confirmation page shows — how much data, how many top-ups, how many
+  // delivered — and nothing else. No provider reference, no attempt count and
+  // no provider error text: those belong to the owner's Studio order page. The
+  // rows are only READ here, never reconciled, so a customer refreshing this
+  // page cannot spend the shop's hourly TechChief allowance. A website that is
+  // not a bundle shop has no delivery rows at all, so the line never appears
+  // for it.
+  const bundleDeliveries =
+    draft.brief.category === "data-bundles" && order.recipientPhone
+      ? await getBundleDeliveriesStore().listForOrder(order.id)
+      : [];
+  const bundleDeliveryLine =
+    guestBundleDeliverySummary(bundleDeliveries, order.recipientPhone)?.line ??
+    null;
+
   return (
     <section className="mx-auto w-full max-w-3xl px-5 py-10 sm:px-8 sm:py-14">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -98,6 +118,15 @@ export default async function CustomerOrderPage({
       <p className="mt-5 rounded-xl bg-brandblue-50 p-4 text-sm leading-6 text-navy">
         {statusCopy}
       </p>
+
+      {bundleDeliveryLine ? (
+        <p
+          className="mt-3 rounded-xl border border-line bg-white p-4 text-sm leading-6 text-navy"
+          data-testid="bundle-delivery-line"
+        >
+          {bundleDeliveryLine}
+        </p>
+      ) : null}
 
       <section className="mt-5 rounded-xl border border-line bg-white p-5">
         <h2 className="text-base font-semibold text-navy">Order timeline</h2>
