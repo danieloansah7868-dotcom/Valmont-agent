@@ -811,3 +811,75 @@ The TechChief key beyond its nine-character prefix, the webhook secret, the
 agency's payment settings, the package selector, other shops, and agency
 user names. None of those flow into a shop-admin page or response; the layout
 reads only `brief.businessName` and the plan.
+
+## Website Studio — Stage B: Brand Kit (no-brand clients)
+
+Stage B gives the Studio wizard a Brand Kit for a client who arrives with no
+brand at all: name ideas, a tagline, a colour palette, a simple text logo and
+a one-page brand sheet. Everything is a **suggestion**; the only write paths
+into the brief are the apply and logo routes, and both use the same
+validated, optimistic-concurrency `store.update()` the wizard PATCH uses.
+
+### Files and data flow
+
+```
+wizard step (business details, under the business-name field)
+  └─ src/components/studio/brand-kit.tsx  (pure client; type-only imports)
+       ├─ POST /api/studio/drafts/[id]/brand-kit/suggest
+       │    → requireBrandKitDraftAccess (session → CSRF → owner 404 →
+       │      package gate 403) → hourly suggest budget (10/h/owner,
+       │      model calls cost money) → tryCreateModelProvider (null → 503)
+       │    → src/lib/studio/brand-kit.ts  suggestBrandKit(input, provider)
+       │      zod input → ONE structured model call (temperature 0.8,
+       │      maxTokens 1200, 20 s AbortSignal) → protected-brand filter +
+       │      dedupe → ONE re-ask only when fewer than 3 names survive →
+       │      WCAG contrast fix per palette → { names[], palettes[] }
+       ├─ POST .../brand-kit/apply   { name?, tagline?, palette? }
+       │    → patches exactly businessName / tagline / selectedTheme /
+       │      preferredColours and re-validates the whole brief
+       ├─ GET  .../brand-kit/logo.svg?layout&name&primary&accent&surface
+       │    → src/lib/studio/brand-logo.ts renderBrandLogo (deterministic
+       │      SVG, Inter/Arial/sans-serif, every text escaped) for preview
+       ├─ POST .../brand-kit/logo    { layout, palette, name, initials? }
+       │    → renders the same SVG, rasterises ≤600×600 PNG with next/og
+       │      (the opengraph-image library), validates it with the EXISTING
+       │      validateUploadedImage/checkAssetBudget helpers, saves into
+       │      brief.assets.logo
+       └─ GET  .../brand-kit/sheet   → 1200×1600 brand sheet PNG via
+            src/lib/studio/brand-sheet.tsx, no-store, never stored
+```
+
+The shared preamble lives in `src/lib/studio/brand-kit-routes.ts`
+(`requireBrandKitDraftAccess`), mirroring the TechChief route guards — one
+place that cannot be forgotten: another agency user's draft is the same 404
+as a made-up id, and the package gate (`brandKitAllowed` in
+`src/lib/studio/plans.ts`, wired through `planAllows(plan, "brand_kit")` plus
+the brief's `brandKitAddon` tick) answers the standard 403 "Not included in
+your package." before any money is spent.
+
+### What the model receives
+
+Exactly the four answers — `whatTheySell` (≤300 chars), `town` (≤60),
+`feeling` (trusted/friendly/premium/young), `mustInclude` (≤3 words of ≤20
+chars), plus the website `category` and a `language` that defaults to
+`"en"`. **Never** API keys, orders, or any other draft: the prompt is built
+from the validated input object alone (`brandKitMessages`), and the route
+holds nothing else. Output is constrained by a JSON schema and re-validated
+with zod; then the server — not the model — drops names that copy protected
+brands (word-based so "AT" never blocks "Data", squashed so "MyMTNShop" is
+caught), drops duplicates, fixes any text/surface pair below WCAG AA 4.5 to
+#111827 or #FFFFFF, and computes the white-on-primary header check
+(`readableTextOn`). Domain and social availability are **not** checked
+online: the response carries `domainCandidates` (slug.com / slug.com.gh) and
+`checkLinks` URLs the agency opens by hand.
+
+### The text logo and the brand sheet
+
+`renderBrandLogo` is pure string SVG: wordmark (name + accent dot), badge
+(initials, 1–3 letters, in a rounded square on primary, name beside it) and
+stacked (badge above the name). Same renderer serves the live preview
+(`logo.svg`, owner-only, `no-store`) and, wrapped in an `<img>` inside
+next/og's `ImageResponse`, the stored PNG — what the agency previews is what
+gets stored. The sheet composes name, tagline, the brief's current colours
+(`preferredColours`, else the theme's), the saved logo when present, the font
+stack and "Made with Valmont - valmontweb.com" on a 1200×1600 canvas.

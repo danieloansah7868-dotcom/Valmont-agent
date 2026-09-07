@@ -64,6 +64,7 @@ describe("planAllows — the feature matrix", () => {
       second_supplier: false,
       reports: false,
       wallets: false,
+      brand_kit: false,
     },
     auto_dispatch: {
       auto_dispatch: true,
@@ -72,6 +73,7 @@ describe("planAllows — the feature matrix", () => {
       second_supplier: false,
       reports: false,
       wallets: false,
+      brand_kit: false,
     },
     command_center: {
       auto_dispatch: true,
@@ -80,6 +82,7 @@ describe("planAllows — the feature matrix", () => {
       second_supplier: true,
       reports: true,
       wallets: true,
+      brand_kit: true,
     },
   };
 

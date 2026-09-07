@@ -531,6 +531,15 @@ const baseSiteBriefV1 = z.object({
     .enum(PLAN_IDS)
     .default("auto_dispatch")
     .describe("Data-bundles commercial package; ignored for other categories"),
+  /**
+   * Stage B — the agency ticked "Client paid the Brand Kit add-on" in the
+   * wizard (data-bundles sites on Starter / Auto-Dispatch only; Command
+   * Center includes the Brand Kit already). A paid label only — the software
+   * never charges it. Defaults false so every brief saved before Stage B
+   * keeps the Brand Kit gated exactly as it was. Ignored for every other
+   * website type, which is always allowed the Brand Kit (see ../plans.ts).
+   */
+  brandKitAddon: z.boolean().default(false),
   selectedTheme: z.string().refine(isThemeId, "Invalid theme"),
   selectedTemplate: z
     .string()

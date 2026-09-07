@@ -50,6 +50,7 @@ import {
 } from "@/lib/studio/site-brief/defaults";
 import { changedFields, mergeBriefs } from "@/lib/studio/merge";
 import { AssetUploader } from "./asset-uploader";
+import { BrandKitCard } from "./brand-kit";
 import {
   BUNDLE_NETWORKS,
   type BundleNetworkId,
@@ -521,6 +522,23 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
     setSaveState({ kind: "saved", at: new Date().toISOString() });
   }, [conflictPair]);
 
+  /**
+   * Stage B: the Brand Kit card applies suggestions through its own routes,
+   * which return the saved draft (like an asset upload). Adopting it
+   * wholesale — revision, saved base, cleared pending edits — keeps the
+   * autosave loop from ever re-sending an older on-screen brief over the
+   * server's copy.
+   */
+  const adoptServerDraft = useCallback((updated: StudioDraft) => {
+    revisionRef.current = updated.revision;
+    savedBriefRef.current = updated.brief;
+    pendingRef.current = null;
+    setBrief(updated.brief);
+    setPendingCount(0);
+    setServerRevision(updated.revision);
+    setSaveState({ kind: "saved", at: updated.updatedAt });
+  }, []);
+
   async function removeDraft() {
     setDeleting(true);
     try {
@@ -877,6 +895,17 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 required
                 value={brief.businessName}
                 onChange={(value) => update({ businessName: value })}
+              />
+              {/* Stage B: a brand for a client who has none yet. Collapsed;
+                  every suggestion waits for a "Use this" click before the
+                  brief changes. Bundle shops on smaller packages see the
+                  add-on tick box instead of the tools. */}
+              <BrandKitCard
+                draftId={id}
+                brief={brief}
+                expectedRevision={serverRevision}
+                onDraftUpdated={adoptServerDraft}
+                onAddonChange={(checked) => update({ brandKitAddon: checked })}
               />
               <TextField
                 id="tagline"
