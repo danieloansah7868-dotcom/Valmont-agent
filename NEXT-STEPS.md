@@ -530,3 +530,56 @@ Notes for 6b–6d:
 - 6d needs migration 0016 for the per-row provider cost (TechChief
   `api_price` is already in hand at dispatch time) and can reuse
   `techChiefConnectionView` for the supplier page.
+
+## Website Studio Stage B — Brand Kit (no-brand clients)
+
+Implemented on branch `arena/01a07af4-valmont-agent`, based on `main` at the
+Stage 6a merge (PR #51, `7d5c715`). Status: **open for review — do not
+merge** until checked.
+
+What landed:
+
+- `src/lib/studio/plans.ts` — `brand_kit` added to the feature matrix
+  (starter ✗ / auto_dispatch ✗ / command_center ✓),
+  `BRAND_KIT_ADDON_PRICE_LABEL = "GH₵ 600 one-time add-on"` (label only,
+  never charged), and the pure `brandKitAllowed(brief)` gate: every category
+  except `data-bundles` is always allowed; bundle shops need the package or
+  the `brandKitAddon` tick.
+- `site-brief/schema.ts` — `brandKitAddon: z.boolean().default(false)`
+  (additive; defaults keep pre-Stage-B briefs gated exactly as before).
+  `createDefaultBrief` spells the default for the literal type.
+- `src/lib/studio/brand-kit.ts` — zod input/output, JSON schema for
+  `structured()`, the Ghana plain-English prompt, protected-brand filter +
+  dedupe with exactly one re-ask (<3 survivors), WCAG contrast fixing,
+  slug/domain-candidate/check-link helpers, and the 10/h per-owner suggest
+  budget.
+- `src/lib/studio/brand-logo.ts` — deterministic SVG for wordmark / badge /
+  stacked, all text escaped, on-primary text chosen by contrast.
+- `src/lib/studio/brand-kit-routes.ts` + five routes (`suggest`, `apply`,
+  `logo` POST, `logo.svg` GET, `sheet` GET) — session, CSRF on POST, owner
+  isolation (404), package gate (403), suggest budget (429), 16 KB bounded
+  bodies, `safeApiError` everywhere. Logo rasterise goes through the EXISTING
+  `validateUploadedImage` / `checkAssetBudget` into `brief.assets.logo`;
+  apply writes exactly the 4 brand fields with wizard-style optimistic
+  concurrency.
+- `src/components/studio/brand-kit.tsx` + a mount in `wizard.tsx` under the
+  business-name field (the wizard's business-name field lives on its
+  "Business details" step — the card sits directly under that field).
+- Tests (all new files): `brand-kit-gate.test.ts`, `brand-kit.test.ts`,
+  `brand-logo.test.ts`, and the route suite
+  `brand-kit/brand-kit-routes.test.ts`. The single allowed edit to an
+  existing test: the `expected` matrix table in `plans.test.ts` gained its
+  `brand_kit` row. Local suite: **1192 passed / 54 skipped** (floor was
+  1117/54 after 6a; +75 new tests).
+
+Later (not in scope here):
+
+- **Picture logos** — an image model could render a mark around the same
+  name/palette. The SVG route pair and the ≤600×600 StoredImage slot already
+  accept whatever replaces the text logo.
+- **Real domain/social checks** — stage B returns links for the agency to
+  open by hand; a registrar API (and Instagram/TikTok handle probes) could
+  pre-fill availability, but it means outbound calls, caching and rate
+  limits, so it stayed out deliberately.
+- Optional: remember chosen-but-not-applied suggestions on the draft so a
+  page reload keeps them (today they live only in the open card).

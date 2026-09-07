@@ -52,6 +52,9 @@ export const PLAN_FEATURES = [
   "second_supplier",
   "reports",
   "wallets",
+  // Stage B: the Brand Kit studio — Command Center includes it; the cheaper
+  // packages can buy it as the one-time add-on (see brandKitAddon below).
+  "brand_kit",
 ] as const;
 
 export type PlanFeature = (typeof PLAN_FEATURES)[number];
@@ -67,6 +70,7 @@ export type PlanFeature = (typeof PLAN_FEATURES)[number];
  * | second_supplier   | —       | —             | ✓ (gap, no provider yet) |
  * | reports           | —       | —             | ✓ (Stage 6d)   |
  * | wallets           | —       | —             | ✓ (Stage 7)    |
+ * | brand_kit         | —       | —             | ✓ (Stage B; cheaper plans: paid add-on) |
  */
 const FEATURE_MATRIX: Record<PlanId, Readonly<Record<PlanFeature, boolean>>> = {
   starter: {
@@ -76,6 +80,7 @@ const FEATURE_MATRIX: Record<PlanId, Readonly<Record<PlanFeature, boolean>>> = {
     second_supplier: false,
     reports: false,
     wallets: false,
+    brand_kit: false,
   },
   auto_dispatch: {
     auto_dispatch: true,
@@ -84,6 +89,7 @@ const FEATURE_MATRIX: Record<PlanId, Readonly<Record<PlanFeature, boolean>>> = {
     second_supplier: false,
     reports: false,
     wallets: false,
+    brand_kit: false,
   },
   command_center: {
     auto_dispatch: true,
@@ -92,6 +98,7 @@ const FEATURE_MATRIX: Record<PlanId, Readonly<Record<PlanFeature, boolean>>> = {
     second_supplier: true,
     reports: true,
     wallets: true,
+    brand_kit: true,
   },
 };
 
@@ -106,6 +113,41 @@ export function planAllows(plan: PlanId, feature: PlanFeature): boolean {
 
 /** The exact wording a packaged refusal answers with (403). */
 export const PACKAGE_NOT_INCLUDED_MESSAGE = "Not included in your package.";
+
+/**
+ * Stage B — the agency price-sheet label for the Brand Kit add-on, shown
+ * beside the "Client paid the Brand Kit add-on" tick box in the wizard.
+ * Display only — the software never charges it.
+ */
+export const BRAND_KIT_ADDON_PRICE_LABEL = "GH₵ 600 one-time add-on";
+
+/**
+ * Stage B — whether a brief may use the Brand Kit studio.
+ *
+ * The gate sits on `category === "data-bundles"` first, exactly like every
+ * other Stage 6 gate: every other website type is always allowed, because
+ * packages only exist for bundle shops. A data-bundles website is allowed
+ * when its package includes the feature (Command Center) or when the agency
+ * has ticked the paid add-on on the brief (`brandKitAddon`, meaning the
+ * client bought {@link BRAND_KIT_ADDON_PRICE_LABEL}; Starter and
+ * Auto-Dispatch only). Read defensively: a raw row saved before Stage B has
+ * no `brandKitAddon` key at all, and `planOf` already maps an unknown or
+ * missing plan onto the Auto-Dispatch default.
+ */
+export function brandKitAllowed(
+  brief:
+    | {
+        category?: string | undefined;
+        plan?: string | undefined;
+        brandKitAddon?: unknown;
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!brief || brief.category !== "data-bundles") return true;
+  if (planAllows(planOf(brief), "brand_kit")) return true;
+  return brief.brandKitAddon === true;
+}
 
 /**
  * Reads a brief's plan defensively. Briefs saved before Stage 6 have no

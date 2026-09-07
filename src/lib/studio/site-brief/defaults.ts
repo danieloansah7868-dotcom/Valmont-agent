@@ -173,6 +173,8 @@ export function createDefaultBrief(
     // Stage 6: the commercial package every pre-package website effectively
     // had. Kept explicit so the literal satisfies the (defaulted) schema type.
     plan: "auto_dispatch",
+    // Stage B: no Brand Kit add-on until the agency ticks it in the wizard.
+    brandKitAddon: false,
     selectedTheme: "clean-corporate",
     selectedTemplate: "classic-hero",
     adminEmail: "owner@example.com",

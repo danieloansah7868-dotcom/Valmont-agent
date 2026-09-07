@@ -368,3 +368,22 @@ for bundles: live checkout answers 409 until the owner reconnects.
 No file uploads, no payment processing, no repository generation, and no
 deployments. Nothing in the Studio can take an order or move money. Do not
 describe a generated Brief to a customer as a working website.
+
+### Brand Kit (Stage B): one paid model call per Suggest
+
+The wizard's Brand Kit (`POST /api/studio/drafts/[id]/brand-kit/suggest`)
+needs the same `MODEL_API_KEY` (plus optional `MODEL_BASE_URL` /
+`MODEL_NAME`) the agent already uses — with no key the suggest route answers
+503 `MODEL_API_KEY is not configured…` and the wizard card says "AI branding
+is not configured on this server". Nothing else in the kit (text logos,
+brand sheets, the apply route) needs the model.
+
+Cost is deliberately bounded: a Suggest makes **about one model call**
+(two only when the protected-brand filter leaves fewer than three names, and
+never a third), at temperature 0.8, max 1200 output tokens, with a 20-second
+timeout. The route is budgeted at **10 suggests per Studio owner per hour**
+(`429` beyond that) because every call is paid, and a website whose package
+does not include the feature is refused with 403 before the provider is even
+created. The rasterising routes use next/og (satori + WASM, already proven
+by the opengraph image) — CPU only, no extra services, no FFI beyond what
+Next already ships.
