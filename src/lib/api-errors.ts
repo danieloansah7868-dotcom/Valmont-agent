@@ -185,3 +185,67 @@ export class GitHubApiError extends ApiError {
     this.name = "GitHubApiError";
   }
 }
+
+/**
+ * Stage 6b shop-admin errors. The admin side is a third kind of login (not the
+ * agency's GitHub session, not a customer account), so it gets its own typed
+ * errors rather than reusing customer messages that talk about "accounts".
+ */
+export class ShopAdminNotSignedInError extends UnauthorizedError {
+  constructor(message = "Please sign in to continue.") {
+    super(message);
+    this.name = "ShopAdminNotSignedInError";
+  }
+}
+
+/** Every login failure — unknown email, wrong password, invited-but-not-yet-active, disabled — says exactly this. */
+export class InvalidShopAdminCredentialsError extends UnauthorizedError {
+  constructor(message = "Email or password is incorrect.") {
+    super(message);
+    this.name = "InvalidShopAdminCredentialsError";
+  }
+}
+
+export class InvalidShopAdminLinkError extends BadRequestError {
+  constructor(message = "This link is invalid or has expired.") {
+    super(message);
+    this.name = "InvalidShopAdminLinkError";
+  }
+}
+
+export class ShopOwnerExistsError extends ConflictError {
+  constructor(message = "This shop already has an owner login.") {
+    super(message);
+    this.name = "ShopOwnerExistsError";
+  }
+}
+
+export class ShopAdminExistsError extends ConflictError {
+  constructor(message = "Someone with that email already has a login here.") {
+    super(message);
+    this.name = "ShopAdminExistsError";
+  }
+}
+
+export class ShopLoginCapError extends ConflictError {
+  constructor(message = "This shop already has 10 logins.") {
+    super(message);
+    this.name = "ShopLoginCapError";
+  }
+}
+
+/** Members may open the Team API, but only the owner may change the team. */
+export class ShopOwnerOnlyError extends ForbiddenError {
+  constructor(message = "Only the shop owner can do this.") {
+    super(message);
+    this.name = "ShopOwnerOnlyError";
+  }
+}
+
+/** The owner row cannot be disabled, downgraded or edited through the admin side. */
+export class ShopOwnerLockedError extends ForbiddenError {
+  constructor(message = "The owner login cannot be changed here.") {
+    super(message);
+    this.name = "ShopOwnerLockedError";
+  }
+}

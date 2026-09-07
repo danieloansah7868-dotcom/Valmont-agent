@@ -19,18 +19,20 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
-## Data Bundles — Stages 1–5 and 4b merged, Stage 6 in progress (6a done)
+## Data Bundles — Stages 1–5 and 4b merged, Stage 6 in progress (6a, 6b done)
 
 Stage 6 — the shop-owner admin side — is split into four parts, one PR each,
 in order: **6a** package per website + manual delivery (Starter) — **done,
-open for review**; **6b** shop owner login, team, read-only dashboard;
+open for review**; **6b** shop owner login, team, read-only dashboard —
+**done, open for review** (see the Stage 6b section at the end of this file);
 **6c** admin actions (mark delivered/failed, Retry/Check status, bundle
-pause, price edit); **6d** supplier page + sales & margin dashboard.
+pause, price edit) — next; **6d** supplier page + sales & margin dashboard.
 
 Owner decisions already confirmed for Stage 6: the owner logs in with email +
-password; the owner adds more logins and picks a role per person — the
-Admin/Support/Viewer idea maps onto this spec's owner/member + permission
-boxes; the agency creates the first owner login from Studio.
+password; the owner adds more logins — there are no fixed roles below
+"owner": the owner ticks permission boxes per person (`orders.fulfil`,
+`bundles.manage`, `supplier.manage`, `reports.view`); the agency creates the
+first owner login from Studio.
 
 Stages 1–2 (catalogue field `bundle: { network, dataMb, validity }`, superRefine,
 starter merge, wizard table, readiness v2, storefront tabs, Ghana mobile
@@ -530,3 +532,66 @@ Notes for 6b–6d:
 - 6d needs migration 0016 for the per-row provider cost (TechChief
   `api_price` is already in hand at dispatch time) and can reuse
   `techChiefConnectionView` for the supplier page.
+
+## Website Studio Stage 6b — shop owner login, team, read-only dashboard
+
+Implemented on branch `arena/01a078b5-valmont-agent`, based on `main` at
+`7d5c715` (after Stage 6a, PR #51). Status: **open for review — do not
+merge** until checked.
+
+What landed:
+
+- Migration `0015_shop_admins` (+ journal entry, Drizzle schema, SQLite
+  mirror in `ensureShopAdminSchema`): `studio_shop_admins` (UNIQUE
+  `(draft_id, email)`), `studio_shop_admin_sessions`,
+  `studio_shop_admin_tokens`; all cascade from `studio_drafts`. The three
+  tables are excluded from the backup export and ignored on import.
+- `src/lib/shop-admin/` — `permissions.ts` (four boxes, allow-list parser,
+  `can()`, cap 10), `store.ts` (SQLite + PostgreSQL: owner/member invites
+  returning the raw token once and storing SHA-256; single-use 24 h invites;
+  1 h reset links; 30-day hashed sessions; dummy-hash `verifyPassword`;
+  disable ⇒ revoke all sessions; opportunistic purge), `auth.ts`
+  (`valmont_shop_session` cookie, `getShopAdminSession`,
+  `requireShopAdminSession` → `/manage/[id]/login?next=…`,
+  `requireShopAdminApi` → 401 / 404 on shop mismatch), `email.ts`
+  (Resend or one-time link), `rate-limit.ts`, `studio-routes.ts` (agency-side
+  guard), `order-view.ts`.
+- Studio: `src/components/studio/shop-logins.tsx` under the TechChief card
+  for every data-bundles package; routes
+  `/api/studio/drafts/[id]/shop-admins` (GET, POST owner invite, PATCH
+  status, resend, reset-link). Without Resend the card shows the link once
+  ("Send this link to the owner on WhatsApp"); with Resend the link is
+  emailed and never returned.
+- Shop side: pages `/manage/[id]/{login,accept-invite,forgot-password,
+reset-password,team,orders/[orderId]}` + the orders list with the
+  `ORDER_FILTERS` tabs, in their own layout (shop name, package badge with
+  "· Manual delivery" on Starter, Orders / Team (owner only) / Logout); API
+  `/api/manage/[id]/auth/*` and `/api/manage/[id]/team/*` (owner-only
+  writes, owner row 403, no delete, cap 10 ⇒ 409). Orders are always read
+  with `draftId`; a sibling website's order is a 404. Recipient number in
+  full; delivery rows through `deliveryStatusLabel`. Read-only.
+- Never on the admin side: `src/lib/auth`, `AppShell`, the TechChief key
+  beyond its prefix, the webhook secret, payment settings, the package
+  selector, other shops, agency user names. `boundary.test.ts` enforces the
+  import rule.
+
+Tests added (new files only): `permissions.test.ts` + `store.test.ts` (33),
+`shop-admin-routes.test.ts` (22), Studio `shop-admins/route.test.ts` (12),
+`backup-exclusion.test.ts` (2), `manage/[id]/pages.test.ts` (12),
+`boundary.test.ts` (5), `postgres-shop-admin.test.ts` (CI only, 7) and
+`tests/e2e/shop-admin.spec.ts` (2 scenarios × 2 projects). No existing test
+was edited or deleted.
+
+Notes for 6c–6d:
+
+- 6c adds the write endpoints the dashboard deliberately lacks: mark manual
+  rows delivered/failed, Retry / Check status for TechChief rows, one-tap
+  bundle pause and price edit — each behind `can(admin, "orders.fulfil")` /
+  `can(admin, "bundles.manage")` from `permissions.ts` and behind
+  `planAllows` for the package. The permission boxes already exist and are
+  stored; 6c only has to read them.
+- The `wallets.topup` permission id is reserved (dropped by the allow-list
+  today) for Stage 7's agent wallets.
+- 6d's supplier page should reuse `techChiefConnectionView` (prefix only)
+  behind `can(admin, "supplier.manage")`, and needs migration 0016 for the
+  per-row provider cost.

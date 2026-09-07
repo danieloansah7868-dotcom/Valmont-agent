@@ -30,6 +30,7 @@ Valmont must not read or transmit `.env` files, credentials, private keys, payme
 8. **Workspace ↔ host/network:** the included local adapter is not a secure isolation boundary. Production must replace it.
 9. **Database migrations ↔ operator:** migrations are a controlled operator action (`npm run db:migrate` / `db:verify`), never automatic. The full Drizzle journal `meta/_journal.json` is validated (structure, ordering, SHA-256, existence) and ledger membership is checked by hash+timestamp. Timestamp ordering is never used; journal idx is authoritative (regression: `0007` when earlier than `0006` but idx later).
 10. **Valmont ↔ TechChief (Stage 5):** outbound calls carry one merchant's decrypted key in `X-API-Key` and nothing else; the base URL is a compile-time constant, never request input, so the key cannot be aimed at an attacker's host. Inbound, `POST /api/bundle-delivery/techchief/webhook?integration=<uuid>` is unauthenticated and therefore trusted only for a _status transition_: with a stored signing secret the body must carry a matching hex HMAC-SHA256 in `X-TechChiefX-Signature` (constant-time compare), without one the reported status is confirmed against `dev_status.php` before anything is written. Amounts, references and phone numbers are always re-read from the database, the delivery's order must belong to the integration being called back, and `delivered` is terminal.
+11. **Shop owner ↔ Next.js (Stage 6b):** the shop admin side (`/manage/[id]/*`, `/api/manage/[id]/*`) is a third sign-in with its own tables, its own `valmont_shop_session` cookie and its own session module; it never imports the agency session (`src/lib/auth`) or the customer session, and a test walks the tree to keep it that way. Passwords are scrypt envelopes and every session and one-time link is stored only as a SHA-256 hash. A session is bound to one website: on another website's pages it is "not signed in" and its API answers 404, the same as an unknown website. Every login failure — unknown email, wrong password, invited-but-not-accepted, disabled, the right email on the wrong shop — answers an identical 401 after a dummy-hash compare. The owner can read this website's orders (with the recipient number in full, because they have to send the data there) and nothing else: no supplier key beyond its prefix, no webhook secret, no payment settings, no package selector, no other shop, no agency user names.
 
 ## Threats and MVP controls
 
@@ -404,6 +405,68 @@ account, so this stage adds a secret that is **not** Valmont's and money that is
   instruction to check the TechChief dashboard; there is no automatic resend
   anywhere in the engine, and only the owner can retry a `failed` row.
 
+### Shop admin — the owner's login (Stage 6b)
+
+A data-bundles shop owner gets a sign-in of their own at `/manage/<website-id>`.
+It is a new principal with a new attack surface, so the controls are listed in
+full:
+
+- **Three sides, never mixed.** Studio (`valmont_session`), customer accounts
+  (`valmont_customer_session`) and shop admin (`valmont_shop_session`) have
+  separate cookies, separate tables (`studio_shop_admins`,
+  `studio_shop_admin_sessions`, `studio_shop_admin_tokens`), separate route
+  trees and separate session modules. `src/lib/shop-admin/boundary.test.ts`
+  fails the build if any file on the admin side imports `@/lib/auth`,
+  `@/lib/customer-auth`, the customer account store or `AppShell`, or if the
+  storefront ever links to `/manage/`. The one deliberate exception is
+  `studio-routes.ts`, the guard for the agency-side routes.
+- **Invites are one-time links, and the agency never learns the password.**
+  The agency user creates the owner's login from Studio (agency session +
+  CSRF + draft ownership + `assertOwnerRateLimit("shop-admins", 30/min)`;
+  another agency user's website is a 404). The raw invite token is returned
+  exactly once and stored as a SHA-256 hash; it expires after 24 hours and is
+  consumed on the first successful accept. With Resend configured the link is
+  emailed and the API response never contains it; without Resend the Studio
+  card shows it once, with "Send this link to the owner on WhatsApp". The
+  shop-side team routes never return a link in either case. The password is
+  chosen by the owner (10–128 characters, the same scrypt helper as customer
+  accounts) and no route ever logs or echoes a password or token.
+- **Identical failure.** `POST /api/manage/[id]/auth/login` compares against
+  `DUMMY_CUSTOMER_PASSWORD_HASH` whenever there is nothing real to compare
+  against (unknown email, no password yet, disabled, email of another shop)
+  and always answers `401 "Email or password is incorrect."`. Rate limits:
+  `assertCustomerRateLimit(request, "shop-login", email, 10)` per minute per
+  email regardless of rotating `X-Forwarded-For`, plus 30/min per IP.
+  Forgot-password answers `200 "If that email exists, we sent a link."` for
+  every input and is limited to 5/h per email; accept-invite and
+  reset-password are 10/min per IP; invites and resends are 10/h per website.
+- **Sessions.** 30 days, `httpOnly`, `SameSite=Lax`, `Secure` outside
+  development, `path=/`; the cookie value is random and only its hash is
+  stored, with the website id denormalised onto the session row.
+  `requireShopAdminApi(request, draftId)` answers 401 with no valid session
+  and **404** when the session belongs to another website — indistinguishable
+  from a website that does not exist. Disabling a login (from Studio or by the
+  owner in Team) and a successful password reset both revoke every session of
+  that login; logout revokes the current one. `next` after login is accepted
+  only when it stays inside this website's own `/manage/[id]/` tree.
+- **Owner isolation on the data.** Orders are read with the website's agency
+  owner id **and** `draftId` (`listForOwner(ownerId, { draftId, … })`), and
+  the detail page re-checks `order.draftId === id` after `getForOwner`, so
+  an order of a sibling website with the same agency owner is a 404. Delivery
+  rows are looked up by that order only. The page is read-only — no
+  transition, retry or mark-as-sent endpoint exists on this side yet.
+- **Team is owner-only, and the owner is not self-service.** Members get a
+  404 for `/manage/[id]/team` and 403 from the team API; the owner's own row
+  cannot be disabled or demoted through the shop API (403) — only the agency
+  can, from Studio — so a compromised member session cannot lock the owner
+  out, and a compromised owner session cannot erase the owner. There is no
+  delete: a login is disabled and keeps its audit trail. At most 10 logins per
+  website (409 beyond). Permissions are an allow-list parsed on write and on
+  read; unknown entries and the reserved `wallets.topup` are dropped.
+- **Backups.** The three shop-admin tables are not part of the export and an
+  import ignores a `shopAdmins` section, so a backup file can never carry or
+  plant a shop's password hashes.
+
 ### Unauthenticated order pages — no personal data
 
 `/orders/[id]/confirmed` is reachable with no session: it looks the order up by
@@ -461,10 +524,10 @@ you want a clean slate.
 Security claims are only worth what has actually been executed. Do not treat a
 past total as a permanent fact — use the latest CI run on the pull request.
 
-| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit + integration (`npm test`) | Run in CI against a real PostgreSQL 16 service (`STUDIO_TEST_DATABASE_URL`), with the Drizzle migrations applied first via controlled `db:migrate` + `db:verify` (full journal validation, no timestamp ordering). The coordinated-import suite injects a failure at every checkpoint and covers lease locking, expired-lease recovery, obsolete-token fencing, monotonic generations, and — with deterministic latches, no sleeps — both orderings of the PostgreSQL fence race (replacement fence first, and obsolete transaction winning the fence row lock). Without that variable the PostgreSQL files are reported as skipped, never as passed. Additional coverage: `resend-config`, `customer-email` (config, rejection, timeout, 502/503, anti-enumeration, no-leak), `api` (opaque 500 for arbitrary errors, typed statuses, Zod 400, JSON 400), `bounded-json` (no echo), `migration-bootstrap` (hash/timestamp sync, journal order regression). |
-| End-to-end (`npm run test:e2e`) | Playwright schedules **11 tests across 2 projects (22 scheduled tests)** — `desktop-chromium` and `iphone` — against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests, the Nigeria/NGN/Africa/Lagos reopen test, and a no-sideways-scroll assertion in both projects. The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs this suite.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Suite                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit + integration (`npm test`) | Run in CI against a real PostgreSQL 16 service (`STUDIO_TEST_DATABASE_URL`), with the Drizzle migrations applied first via controlled `db:migrate` + `db:verify` (full journal validation, no timestamp ordering). The coordinated-import suite injects a failure at every checkpoint and covers lease locking, expired-lease recovery, obsolete-token fencing, monotonic generations, and — with deterministic latches, no sleeps — both orderings of the PostgreSQL fence race (replacement fence first, and obsolete transaction winning the fence row lock). Without that variable the PostgreSQL files are reported as skipped, never as passed. Additional coverage: `resend-config`, `customer-email` (config, rejection, timeout, 502/503, anti-enumeration, no-leak), `api` (opaque 500 for arbitrary errors, typed statuses, Zod 400, JSON 400), `bounded-json` (no echo), `migration-bootstrap` (hash/timestamp sync, journal order regression). Stage 6b adds the shop-admin suites: store (hashed tokens, single-use invites, UNIQUE per shop, allow-listed permissions, disable ⇒ sessions gone), the admin routes (identical 401, login rate limit with rotating proxy headers, cookie flags, cross-shop 404, owner-only team, owner not disableable, cap 10, reset revokes sessions), the Studio routes (other agency user ⇒ 404, link only when email is unconfigured), the pages (full recipient number, sibling-website order ⇒ 404), backup exclusion, the import-boundary test, and a PostgreSQL contract file for migration `0015`. |
+| End-to-end (`npm run test:e2e`) | Playwright schedules **11 tests across 2 projects (22 scheduled tests)** — `desktop-chromium` and `iphone` — against a production build on a throwaway SQLite database. Includes the two-tab 409 conflict tests, the Nigeria/NGN/Africa/Lagos reopen test, and a no-sideways-scroll assertion in both projects. `tests/e2e/shop-admin.spec.ts` (Stage 6b) walks invite → set password → login → open order → logout, and Team, against the same server, following the one-time link the Studio card shows when no email provider is configured. With it the suite schedules 20 tests per project (40 in total). The Phase 1 CI workflow (active since `158f601`) installs Chromium and runs this suite.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 CI runs the unit, integration, PostgreSQL, Playwright and container-build jobs
 on every push and pull request via `.github/workflows/ci.yml`; there is no
