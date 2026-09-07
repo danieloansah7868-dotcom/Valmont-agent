@@ -582,6 +582,100 @@ export const studioIntegrations = pgTable(
 );
 
 /**
+ * Stage 6b shop admins. The people who *run* a bundle shop day to day — the
+ * shop owner and the staff they invite. They are neither agency users (the
+ * GitHub-connected Studio account that built the website) nor customers (the
+ * buyers with `customer_accounts`); they are a third kind of login with its own
+ * tables, cookie and pages under `/manage/[id]`. Every row belongs to exactly
+ * one website: an email may run several shops, but each shop sees only its
+ * own rows, so the uniqueness is per `(draft_id, email)`.
+ *
+ * `permissions` is a JSON array of `SHOP_PERMISSIONS` ids. The owner row
+ * ignores it (an owner can do everything the admin side allows); members get
+ * exactly what the owner ticked. `password_hash` stays NULL until the invite
+ * is accepted, which is what `status = 'invited'` means.
+ */
+export const studioShopAdmins = pgTable(
+  "studio_shop_admins",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    draftId: uuid("draft_id")
+      .notNull()
+      .references(() => studioDrafts.id, { onDelete: "cascade" }),
+    /** Normalised with `normalizeCustomerEmail` before every read and write. */
+    email: text("email").notNull(),
+    name: text("name").notNull(),
+    /** `owner` (exactly one per shop) or `member`. */
+    role: text("role").notNull().default("member"),
+    /** JSON array of granted `SHOP_PERMISSIONS` ids. */
+    permissions: text("permissions").notNull().default("[]"),
+    passwordHash: text("password_hash"),
+    /** `invited` → `active` on accept; `disabled` revokes every session. */
+    status: text("status").notNull().default("invited"),
+    /** Who created the row: the agency owner id or the inviting admin id. */
+    invitedBy: text("invited_by"),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("studio_shop_admins_draft_email_unique").on(
+      table.draftId,
+      table.email,
+    ),
+    index("studio_shop_admins_draft_idx").on(table.draftId),
+  ],
+);
+
+/**
+ * Shop admin browser sessions. Keyed on the SHA-256 of the cookie value, so a
+ * database read never yields a usable cookie. `draft_id` is copied onto the
+ * session so a cookie minted for shop A can be rejected on shop B with one
+ * lookup and no join.
+ */
+export const studioShopAdminSessions = pgTable(
+  "studio_shop_admin_sessions",
+  {
+    tokenHash: text("token_hash").primaryKey(),
+    adminId: uuid("admin_id")
+      .notNull()
+      .references(() => studioShopAdmins.id, { onDelete: "cascade" }),
+    draftId: uuid("draft_id").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [index("studio_shop_admin_sessions_admin_idx").on(table.adminId)],
+);
+
+/**
+ * One-time links for shop admins: `invite` (24 hours, sets the first
+ * password) and `reset` (1 hour). Stored hashed; `used_at` makes each link
+ * single-use.
+ */
+export const studioShopAdminTokens = pgTable(
+  "studio_shop_admin_tokens",
+  {
+    tokenHash: text("token_hash").primaryKey(),
+    adminId: uuid("admin_id")
+      .notNull()
+      .references(() => studioShopAdmins.id, { onDelete: "cascade" }),
+    purpose: text("purpose").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [index("studio_shop_admin_tokens_admin_idx").on(table.adminId)],
+);
+
+/**
  * Studio payment settings — a single row (id always 1) holding the Valmont
  * Pay account details saved on the Studio → Settings → Payments page. The
  * secret fields are AES-256-GCM envelopes (see `encryptSessionValue`); the

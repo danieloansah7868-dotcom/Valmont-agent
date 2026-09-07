@@ -671,6 +671,146 @@ manual: true, plan: "starter" }` and the 409
   at the package; the connection is not even fetched, and a stored key is
   kept but never used while the package is Starter.
 
+## Data Bundles — Stage 6b: the shop owner's login, team and read-only dashboard
+
+Stage 6b adds a **third side** to the product. Until now there were two kinds
+of signed-in person — the agency user in Studio (`valmont_session`, GitHub
+OAuth, `src/lib/auth.ts`) and a buyer with a customer account on one
+storefront (`valmont_customer_session`, `src/lib/customer-auth.ts`). The shop
+owner is neither: they must see their own orders without ever entering Studio
+and without the agency's rights. So the shop admin side is built as its own
+thing, and the rule that the three sides never mix is structural, not
+editorial:
+
+| concern      | Studio              | customer account           | **shop admin**                                           |
+| ------------ | ------------------- | -------------------------- | -------------------------------------------------------- |
+| pages        | `/studio/*`         | `/account/*`               | `/manage/[id]/*`                                         |
+| API          | `/api/studio/*`     | `/api/account/*`           | `/api/manage/[id]/*`                                     |
+| tables       | `users`, `studio_*` | `studio_customer_*`        | `studio_shop_admins`, `_sessions`, `_tokens`             |
+| cookie       | `valmont_session`   | `valmont_customer_session` | `valmont_shop_session`                                   |
+| layout       | `AppShell` + nav    | storefront chrome          | own layout: shop name, package badge, Orders/Team/Logout |
+| session code | `src/lib/auth.ts`   | `src/lib/customer-auth.ts` | `src/lib/shop-admin/auth.ts`                             |
+
+`src/lib/shop-admin/boundary.test.ts` walks every file under the admin side
+and fails if one imports `@/lib/auth`, `@/lib/customer-auth`, the customer
+account store or `AppShell`, and if the storefront ever links to `/manage/`.
+The only file in `src/lib/shop-admin/` allowed to touch the agency session is
+`studio-routes.ts`, which is the guard for the **Studio-side** routes — it
+belongs to the agency by design.
+
+### Data (`0015_shop_admins`)
+
+Three tables, all cascading from `studio_drafts` so deleting a website takes
+its logins, sessions and links with it (the SQLite store deletes them
+explicitly from `draft-store.ts`'s `delete`, via a dynamic import so the
+draft store gains no static dependency on the module):
+
+- `studio_shop_admins` — one row per login: `draft_id`, `email` (normalised,
+  `UNIQUE (draft_id, email)` — the same address may own two different shops),
+  `name`, `role` (`owner` | `member`), `permissions` (JSON array, allow-listed
+  on write and on read), `password_hash` (scrypt, nullable until the invite is
+  accepted), `status` (`invited` | `active` | `disabled`), `invited_by` (the
+  agency user id for the owner, the owner's admin id for members),
+  `last_login_at`.
+- `studio_shop_admin_sessions` — `token_hash` (SHA-256 of the cookie value,
+  primary key), `admin_id`, `draft_id` (denormalised so a session can be
+  matched to a shop without a join), `expires_at`.
+- `studio_shop_admin_tokens` — one-time links: `token_hash`, `admin_id`,
+  `purpose` (`invite` | `reset`), `expires_at`, `used_at`.
+
+Passwords and tokens reuse `src/lib/customer-password.ts` by import
+(`hashCustomerPassword`, `verifyCustomerPassword`,
+`DUMMY_CUSTOMER_PASSWORD_HASH`, `hashCustomerToken`, `createCustomerToken`,
+`normalizeCustomerEmail`) — the file was not moved or renamed. The raw token
+is returned exactly once from `createOwnerInvite` / `createMemberInvite` /
+`createResetToken`; nothing but its hash is ever stored, so a database read
+cannot mint a link. These tables are **not** in the backup export
+(`buildBackup` has no generic table dump, so absence is by construction) and
+a crafted `shopAdmins` section in an import file is ignored
+(`backup-exclusion.test.ts`).
+
+### `src/lib/shop-admin/`
+
+- `permissions.ts` — the four boxes (`orders.fulfil`, `bundles.manage`,
+  `supplier.manage`, `reports.view`), `parsePermissions` (drops anything not
+  on the list, including the reserved `wallets.topup` that Stage 7 will
+  add), `can(admin, permission)` (the owner passes everything),
+  `MAX_SHOP_LOGINS_PER_WEBSITE = 10`.
+- `store.ts` — `SqliteShopAdminStore` / `PostgresShopAdminStore` behind
+  `getShopAdminStore()`. Invites are single-use and expire after 24 h, reset
+  links after 1 h, sessions after 30 days; `verifyPassword` runs the dummy
+  hash for an unknown email, a disabled login and a login with no password
+  yet, so every failure costs the same time; `setStatus("disabled")` revokes
+  every session in the same call; `purgeExpired` runs opportunistically (at
+  most once every 10 minutes, on `createSession`) and removes expired and
+  used tokens plus expired sessions.
+- `auth.ts` — the cookie (`httpOnly`, `SameSite=Lax`, `Secure` outside
+  development, `path=/`, 30 days) and three readers: `getShopAdminSession`
+  (server components), `requireShopAdminSession` (redirects to
+  `/manage/[id]/login?next=…`; `next` is accepted only when it stays inside
+  this shop's own `/manage/[id]/` tree) and `requireShopAdminApi` (401 with
+  no session, **404** when the session belongs to a different shop — the
+  same answer an unknown shop gives, so an admin of A cannot enumerate B).
+- `email.ts` — `deliverShopAdminLink`: sends through `sendCustomerEmail`
+  when Resend is configured and returns `{ delivered: true }`; otherwise
+  `{ delivered: false, link }`. Only the **Studio** routes ever put that
+  `link` in a response; the shop-side team routes drop it and tell the owner
+  to ask the agency.
+- `rate-limit.ts` — `assertHourlyRateLimit`, a thin wrapper over the same
+  `checkRateLimit` bucket store for the per-hour limits.
+- `studio-routes.ts` — `requireShopAdminsDraftAccess`: CSRF, agency session,
+  `canonicalUserId`, draft ownership (another agency user's draft is a 404),
+  `assertOwnerRateLimit("shop-admins", ownerId, 30)`.
+
+### Routes
+
+**Studio side** (`/api/studio/drafts/[id]/shop-admins`, agency session):
+`GET` lists logins (never hashes) plus `emailConfigured`; `POST` invites the
+owner (409 once one exists); `[adminId]` `PATCH { status }`;
+`[adminId]/resend` re-mints an invite (409 once accepted);
+`[adminId]/reset-link` mints a reset link for an active login (409
+otherwise). The card `src/components/studio/shop-logins.tsx` is mounted in
+the wizard for every data-bundles website regardless of package, directly
+under the TechChief card — a Starter owner needs the dashboard most, since
+they deliver by hand.
+
+**Shop side** (`/api/manage/[id]/…`, shop session): `auth/login` (identical
+401 for every failure, `assertCustomerRateLimit(…, "shop-login", email, 10)`
+plus 30/min per IP), `auth/logout`, `auth/accept-invite` and
+`auth/reset-password` (10/min per IP; a reset revokes all sessions),
+`auth/forgot-password` (always `200 "If that email exists, we sent a link."`,
+5/h per email; never returns a link), `team` (`GET` any admin, `POST` owner
+only, cap 10 ⇒ 409), `team/[adminId]` (`PATCH { permissions?, status? }`,
+owner only, the owner row itself ⇒ 403 — no delete, a login is disabled
+instead so its audit trail survives), `team/[adminId]/resend`. Every route:
+`assertCsrf`, `readBoundedJson` (16 KB), zod, `safeApiError`, typed errors
+from `src/lib/api-errors.ts` (`Shop*`).
+
+### Pages (`src/app/manage/[id]/`)
+
+`layout.tsx` resolves the website through `publicGetDraft` (unknown ⇒ 404),
+prints the shop name and `PLAN_LABELS[planOf(brief)]` — with " · Manual
+delivery" on Starter — and shows Orders / Team (owner only) / Logout when a
+session exists; it renders no `AppShell` and no agency navigation. The orders
+list reads `getOrdersStore().listForOwner(publicGetDraftOwnerId(id), {
+draftId: id, filter, limit })` — `draftId` is **always** passed, because the
+agency user usually owns several websites and the owner of one must never
+see another's. The detail page uses `getForOwner(ownerId, orderId)` and then
+checks `order.draftId === id`, so an order of a sibling website with the same
+agency owner is a 404. The page shows the recipient number in full (unlike
+the masked guest/customer views), every line through `bundleNetworkLabel` +
+`formatDataMb`, `STATUS_LABELS`, and delivery rows through the same
+`deliveryStatusLabel` Studio uses, plus the provider reference. It is
+read-only: no transition buttons, no retry, no mark-as-sent — those are
+Stage 6c. `team/page.tsx` calls `notFound()` for a member, so the page does
+not exist as far as staff are concerned.
+
+### What the owner can never see
+
+The TechChief key beyond its nine-character prefix, the webhook secret, the
+agency's payment settings, the package selector, other shops, and agency
+user names. None of those flow into a shop-admin page or response; the layout
+reads only `brief.businessName` and the plan.
 ## Website Studio — Stage B: Brand Kit (no-brand clients)
 
 Stage B gives the Studio wizard a Brand Kit for a client who arrives with no

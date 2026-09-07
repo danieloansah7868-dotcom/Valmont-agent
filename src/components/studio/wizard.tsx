@@ -37,6 +37,7 @@ import { formatPricedItems, parsePricedItems } from "@/lib/studio/catalog";
 import { ShareLinkButton } from "./share-link-button";
 import { CustomDomainCard } from "./custom-domain-card";
 import { TechChiefConnectionCard } from "./techchief-connection";
+import { ShopLoginsCard } from "./shop-logins";
 import { ProductImagesEditor } from "./product-images";
 import { computeBriefCompleteness } from "@/lib/studio/site-brief/readiness";
 import { evaluateSaveGate } from "@/lib/studio/save-gate";
@@ -1552,6 +1553,12 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
               knows the commercial package, so a Starter Shop shows the
               manual-delivery note instead of a supplier connection UI. */}
           {isBundleSite && <TechChiefConnectionCard draftId={id} plan={plan} />}
+
+          {/* Stage 6b: the shop owner's own login. Every package gets it —
+              a Starter Shop owner still needs to see their orders to deliver
+              them by hand — so unlike the card above it does not look at the
+              plan. */}
+          {isBundleSite && <ShopLoginsCard draftId={id} />}
 
           <div className="mt-4">
             <BusinessPreview brief={brief} draftId={id} />

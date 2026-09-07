@@ -152,6 +152,18 @@ Delivery:
 - Provider non-ok responses (400/500 etc.) and fetch rejections/timeouts are normalized to typed 502 `CustomerEmailDeliveryError` with generic message `"Email delivery is temporarily unavailable. Please try again."` — **no** provider bodies, keys, or status texts leak.
 - Anti-enumeration: `assertCustomerEmailDeliveryReady()` checks config **before** any account lookup. `forgot-password` and `resend-verification` routes suppress only `CustomerEmailDeliveryError` after lookup, preserving neutral `ok:true` responses. Configuration errors (503) are **not** suppressed, so misconfiguration is visible to operators but does not leak existence.
 - Compose passes `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` through to the app container.
+- **Shop admin links (Stage 6b) use the same provider.** Owner invites, team
+  invites and password-reset links for `/manage/<website-id>` go through
+  `sendCustomerEmail` when the pair above is `configured`. When it is
+  `not_configured`, the **Studio card** shows the invite/reset link exactly
+  once ("Send this link to the owner on WhatsApp") so an agency can still
+  hand a login to a shop owner on a deployment without email — but the
+  shop-side Team page never shows a link, and the owner's own
+  forgot-password answers the neutral 200 without being able to send
+  anything. So: **set `RESEND_API_KEY` + `NOTIFY_EMAIL_FROM` before giving a
+  shop its owner login**, otherwise every reset has to go through the agency.
+  Every link is built from `APP_URL`, which therefore has to be the public
+  HTTPS origin the owner's phone can open.
 
 ## Critical sandbox boundary
 
@@ -254,6 +266,14 @@ PostgreSQL's authoritative migration ledger is `drizzle.__drizzle_migrations` wi
   version 1 chat-only files are still accepted; unknown versions are rejected
   before anything is written. Authenticated Studio and backup routes rate-limit
   by owner id, not by client-supplied forwarding headers.
+
+The shop-admin tables added in Stage 6b (`studio_shop_admins`,
+`studio_shop_admin_sessions`, `studio_shop_admin_tokens`) are deliberately
+**not** in the export and are ignored on import: a backup file never carries a
+shop's password hashes or live links. On SQLite they live in the same database
+file as everything else, so a file-level copy still contains them; on
+PostgreSQL your normal database backups cover them. After a restore from a
+JSON export the agency re-creates each shop's owner login from Studio.
 
 Backups contain the owner's business details. Treat a downloaded file as
 sensitive: store it encrypted, and delete copies you no longer need. Regular
@@ -362,6 +382,36 @@ retryable from Studio → Orders.
 `last_error`, and the count of `studio_deliveries` rows stuck at `processing`
 for more than an hour. A shop whose status is `error` cannot take real money
 for bundles: live checkout answers 409 until the owner reconnects.
+
+### Shop admin: the owner's login (Stage 6b)
+
+Each data-bundles website can have one **owner login** plus up to nine more
+people, all at `https://<APP_URL>/manage/<website-id>`. Operationally:
+
+- **Migration `0015_shop_admins`** must be applied (`npm run db:migrate` +
+  `db:verify`) before the Studio "Shop logins" card is used on PostgreSQL;
+  SQLite creates the tables on first use.
+- **Email is effectively required.** Invites and resets are emailed through
+  Resend; without it the agency has to copy every link from Studio by hand and
+  an owner cannot reset their own password (see _Email delivery_ above).
+- **`APP_URL` must be the public HTTPS origin.** The links in those emails
+  (`/manage/<id>/accept-invite?token=…`, `/manage/<id>/reset-password?token=…`)
+  are built from it, and the `valmont_shop_session` cookie is `Secure` outside
+  development, so a plain-HTTP deployment cannot keep an owner signed in.
+- **Rate limits** live in the same in-memory bucket store as the rest of the
+  app, so `TRUST_PROXY` matters here too: 10 login attempts per email and 30
+  per IP per minute, 5 forgot-password requests per email per hour, 10
+  invites/resends per website per hour.
+- **Lifecycle.** Invite links expire after 24 hours, reset links after 1
+  hour, sessions after 30 days; expired and used rows are purged
+  opportunistically (at most every 10 minutes, on login) — no cron job is
+  needed. Deleting a website removes its logins, sessions and links.
+- **Support playbook.** Owner forgot their password and email is down → the
+  agency user opens Studio → the website → Shop logins → _Reset link_ and
+  passes it on. Owner left the business → _Disable_ on the same card (signs
+  them out everywhere); only the agency can disable the owner, staff are
+  disabled by the owner from Team. Nothing on this side moves money or
+  changes an order — it is a read-only dashboard until Stage 6c.
 
 ### What Phase 1 does not do in production
 

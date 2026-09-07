@@ -243,7 +243,9 @@ does today.
   work.**
 - No product catalogue, prices, stock, cart, or orders.
 - No repository generation, no sandboxed build, and no deployment.
-- No admin roles or team sharing.
+- No admin roles or team sharing. (Stage 6b later added a shop-owner login
+  with per-person permission boxes for data-bundles shops — see _Shop admin_
+  below; the agency side still has no roles.)
 
 Phases 2–6 (uploads and object storage, repository generation, sandboxed
 builds, preview deployments, roles, e-commerce and payments) are deliberately
@@ -273,6 +275,25 @@ The Care Plan (GH₵ 250/month) and the 40/40/20 payment schedule are agency pro
 
 **Starter in practice:** the checkout 409 "This shop cannot send bundles automatically yet…" no longer applies to Starter — a live Starter order is accepted with no TechChief key, because the owner is the delivery mechanism. Delivery rows are created per purchased unit exactly as usual but carry `provider = "manual"` and stay "pending"; the customer's confirmation line reads "The shop will send your bundle to 024 ••• 0001 by hand. Contact the shop if it does not arrive."; the Studio panel badge reads the package and manual rows read "To send by hand". Even a saved, verified TechChief key is never used while the package is Starter — switching the package back to Auto-Dispatch Pro restores it untouched.
 
+### Shop admin — the owner's own login (Stage 6b)
+
+Until Stage 6b the only person who could see a bundle shop's orders was the agency user in Studio. Stage 6b gives the **shop owner** (and the people they choose) their own sign-in at **`/manage/<website-id>`** — a third side of the product that is kept strictly apart from the other two:
+
+| side             | who                        | signs in with                      | cookie                     | pages                |
+| ---------------- | -------------------------- | ---------------------------------- | -------------------------- | -------------------- |
+| Website Studio   | the agency user            | GitHub OAuth                       | `valmont_session`          | `/studio/*`          |
+| Customer account | a buyer on one storefront  | email + password (per website)     | `valmont_customer_session` | `/account/*`         |
+| **Shop admin**   | **the shop owner + staff** | **email + password (per website)** | **`valmont_shop_session`** | **`/manage/<id>/*`** |
+
+The shop admin side has its own tables (`studio_shop_admins`, `studio_shop_admin_sessions`, `studio_shop_admin_tokens`), its own layout (the shop's name and package badge — no Studio navigation, no agency user names), and its own API under `/api/manage/<id>/*`. It never imports the agency session module; a test (`src/lib/shop-admin/boundary.test.ts`) fails if anyone ever does. The storefront does not link to it — the owner reaches it from the link the agency sends.
+
+**How a shop gets its owner.** In Studio → the website → **Shop logins** (shown for every data-bundles package, under the Bundle delivery card), the agency user enters the owner's name and email and clicks _Create owner login_. Valmont creates an `invited` owner row and a one-time invite link (`/manage/<id>/accept-invite?token=…`, valid 24 hours, single use, stored as a SHA-256 hash). With `RESEND_API_KEY` set the link is emailed; without it the card shows the link **once** with _Send this link to the owner on WhatsApp_, and it is never shown again. The owner opens the link, sees their name and email, chooses a password (10–128 characters), and lands on their orders. The agency never sees or sets the owner's password; the same card can resend an invite, mint a password-reset link for an active owner, and disable or re-enable any of the shop's logins. Exactly one owner per shop.
+
+**What the owner sees.** A read-only dashboard — the orders of **this website only**, newest first, with the same status filter tabs as Studio; each order shows the time (Africa/Accra), customer name, the recipient's phone number **in full** (the owner has to send the data there), every bundle line (`MTN 1GB × 2`), the total, the order status, and one delivery row per purchased unit with the same `deliveryStatusLabel` wording Studio uses plus the supplier reference. Nothing on this side can change an order yet — fulfilment actions are Stage 6c. The owner never sees the TechChief key beyond its nine-character prefix, the webhook secret, the agency's payment settings, the package selector, or any other shop.
+
+**Team.** The owner (only) opens **Team**, invites up to **10 logins per website**, and ticks permission boxes per person — `orders.fulfil`, `bundles.manage`, `supplier.manage`, `reports.view` — there are no fixed roles below "owner". Everyone with a login can see orders; the boxes decide what else they will be able to do once those actions exist, and the owner can change them any time. Disabling a login signs that person out everywhere immediately. The owner's own row cannot be disabled or demoted from inside the shop — only the agency can do that from Studio. Team invites go by email when it is configured; otherwise the page says so and the agency passes the link on from Studio — the shop side never displays a raw invite link.
+
+**Passwords and sessions.** Passwords use the same scrypt helper as customer accounts, and a sign-in failure — unknown email, wrong password, disabled or not-yet-accepted login, email that belongs to another shop — always answers the identical `401 "Email or password is incorrect."` after a dummy-hash comparison, so timing and wording reveal nothing. Sessions live 30 days in an httpOnly, `SameSite=Lax`, `Secure`-in-production cookie whose value is stored only as a hash; a session minted for shop A is simply "not signed in" on shop B (`404` from B's API). Forgot-password always answers `200 "If that email exists, we sent a link."`; reset links last one hour and a successful reset signs out every other session. Rate limits: 10 login attempts per email and 30 per IP per minute, 5 forgot-password requests per email per hour, 10 invites/resends per website per hour. The three shop-admin tables are **not** part of the backup export and an import ignores them, so a restored deployment never carries someone else's password hashes.
 ### Brand Kit (Stage B)
 
 A client who has **no brand yet** can get one in minutes. In the Studio wizard, right under the business-name field, the agency opens the collapsed **"No brand yet? Create one"** card and answers four questions — what the business sells, which town it is based in, how the brand should feel (trusted / friendly / premium / young), and up to three words the name must include. One **Suggest a brand** click (a single model call, two only when the safety filter below eats too many names) returns five name ideas with a one-line meaning and a tagline each, plus three colour palettes sized to the existing theme registry.
