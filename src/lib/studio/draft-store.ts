@@ -301,6 +301,14 @@ export class SqliteStudioDraftStore implements StudioDraftStore {
       // and the encryption primitives behind it — into every draft read.
       const { deleteIntegrationsForDraft } = await import("./integrations");
       await deleteIntegrationsForDraft(id).catch(() => 0);
+      // Stage 6b: the shop's logins, sessions and one-time links go the same
+      // way for the same reason — an orphaned owner login would keep a
+      // password hash alive for a website that no longer exists. PostgreSQL
+      // cascades these from `studio_drafts` too (migration 0015).
+      const { getShopAdminStore } = await import("@/lib/shop-admin/store");
+      await getShopAdminStore()
+        .deleteForDraft(id)
+        .catch(() => 0);
     }
     return deleted;
   }
