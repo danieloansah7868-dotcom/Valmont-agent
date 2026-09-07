@@ -811,6 +811,7 @@ The TechChief key beyond its nine-character prefix, the webhook secret, the
 agency's payment settings, the package selector, other shops, and agency
 user names. None of those flow into a shop-admin page or response; the layout
 reads only `brief.businessName` and the plan.
+
 ## Website Studio — Stage B: Brand Kit (no-brand clients)
 
 Stage B gives the Studio wizard a Brand Kit for a client who arrives with no
