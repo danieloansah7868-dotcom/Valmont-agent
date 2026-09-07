@@ -209,13 +209,23 @@ function sortAdmins(admins: ShopAdmin[]): ShopAdmin[] {
   });
 }
 
+/**
+ * True for a UNIQUE (draft_id, email) violation on either engine. SQLite
+ * throws the constraint error directly ("UNIQUE constraint failed"); drizzle
+ * on PostgreSQL wraps the driver error in a `DrizzleQueryError` whose message
+ * is only "Failed query: insert into …" — the `duplicate key` text and the
+ * SQLSTATE `23505` live on `error.cause`, so the whole chain is inspected.
+ */
 function isUniqueViolation(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    /unique|duplicate/i.test(
-      `${error.message} ${"code" in error ? String(error.code) : ""}`,
-    )
-  );
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
+    const code = "code" in current ? String(current.code) : "";
+    if (code === "23505" || /unique|duplicate/i.test(current.message)) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
 }
 
 /** Minimum gap between opportunistic purges triggered by session creation. */

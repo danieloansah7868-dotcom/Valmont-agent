@@ -263,6 +263,16 @@ describe.runIf(connectionString)("PostgreSQL shop admins", () => {
     const admin = await store.getByEmail(draftId, "pg-owner@example.com");
     await store.createSession(admin.id);
     await store.createResetToken(admin.id);
+    // The second website gets a login of its own here (not in an earlier
+    // test), so this check stands on its own if the other tests change.
+    if ((await store.countForDraft(secondDraftId)) === 0) {
+      await store.createOwnerInvite({
+        draftId: secondDraftId,
+        email: "pg-owner@example.com",
+        name: "Same person, other shop",
+        invitedBy: ownerId,
+      });
+    }
 
     expect(await drafts.delete(owner, draftId)).toBe(true);
 
