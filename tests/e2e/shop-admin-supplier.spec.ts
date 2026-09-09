@@ -162,17 +162,21 @@ test.describe("shop admin supplier + reports", () => {
       pollCount: 0,
     });
 
-    // One paid live order and one delivered unit with a supplier cost — the
-    // report data. The row is written straight into the store; no engine
+    // One live order and one delivered unit with a supplier cost — the
+    // report data. The order starts pending and is paid through markPaid()
+    // (the same store call the real payment webhook uses), which is what
+    // sets status "paid" AND paid_at — a sale in the report needs paidAt
+    // set. The delivery row is written straight into the store; no engine
     // pass runs, so no TechChief call happens.
     const bundle = starterBundleCatalogue().find(
       (item) => item.bundle?.network === "mtn",
     )!;
-    const order = await new SqliteOrdersStore().create({
+    const orders = new SqliteOrdersStore();
+    const order = await orders.create({
       ownerId: canonicalUserId(agency),
       draftId: shop.id,
       accessCode: `e2e-${randomBytes(12).toString("hex")}`,
-      status: "paid",
+      status: "pending",
       currency: "GHS",
       subtotal: bundle.price ?? 10,
       deliveryFee: 0,
@@ -192,6 +196,9 @@ test.describe("shop admin supplier + reports", () => {
       paymentMethod: "valmont_pay",
       paymentMode: "live",
     });
+    const paid = await orders.markPaid(order.accessCode, "e2e-ref");
+    if (!paid || paid.status !== "paid" || !paid.paidAt)
+      throw new Error("order should have been paid through markPaid");
     const deliveries = new SqliteBundleDeliveriesStore();
     const [row] = await deliveries.createMany([
       {
