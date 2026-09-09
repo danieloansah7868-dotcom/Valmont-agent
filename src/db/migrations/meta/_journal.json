@@ -113,6 +113,13 @@
       "when": 1788652800000,
       "tag": "0015_shop_admins",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1788825600000,
+      "tag": "0016_delivery_api_price",
+      "breakpoints": true
     }
   ]
 }

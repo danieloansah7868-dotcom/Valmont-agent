@@ -476,6 +476,12 @@ export const studioDeliveries = pgTable(
     attempts: integer("attempts").notNull().default(0),
     providerRef: text("provider_ref"),
     lastError: text("last_error"),
+    /**
+     * Stage 6d — what TechChief charged for this one top-up, in GHS,
+     * recorded from the `dev_order.php` answer at every successful send
+     * (null for simulator and manual rows, and for rows sent before 0016).
+     */
+    apiPrice: numeric("api_price", { precision: 12, scale: 2 }),
     deliveredAt: timestamp("delivered_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

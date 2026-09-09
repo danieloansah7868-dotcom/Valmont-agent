@@ -5,7 +5,7 @@ import { ShopLogoutButton } from "@/components/shop-admin/forms";
 import { getShopAdminSession } from "@/lib/shop-admin/auth";
 import { can } from "@/lib/shop-admin/permissions";
 import { publicGetDraft } from "@/lib/studio/draft-public";
-import { PLAN_LABELS, planOf } from "@/lib/studio/plans";
+import { PLAN_LABELS, planAllows, planOf } from "@/lib/studio/plans";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +21,12 @@ export const dynamic = "force-dynamic";
  *
  * Stage 6c adds a "Bundles" nav link for exactly the logins holding the
  * "bundles.manage" box (the owner always holds it), next to Orders.
+ *
+ * Stage 6d adds "Supplier" (for logins holding "supplier.manage" on a
+ * package that includes the supplier page) and "Reports" (for logins holding
+ * "reports.view" on a package that includes reports) — each link needs BOTH
+ * the permission box and the package, so a Starter owner never sees a link
+ * to a page that does not exist.
  */
 export default async function ShopAdminLayout({
   children,
@@ -80,6 +86,26 @@ export default async function ShopAdminLayout({
                     Bundles
                   </Link>
                 )}
+                {can(session.admin, "supplier.manage") &&
+                  planAllows(plan, "supplier_page") && (
+                    <Link
+                      href={`${home}/supplier`}
+                      className="rounded-md px-2.5 py-1.5 text-navy hover:bg-ivory-100"
+                      data-testid="shop-admin-supplier-link"
+                    >
+                      Supplier
+                    </Link>
+                  )}
+                {can(session.admin, "reports.view") &&
+                  planAllows(plan, "reports") && (
+                    <Link
+                      href={`${home}/reports`}
+                      className="rounded-md px-2.5 py-1.5 text-navy hover:bg-ivory-100"
+                      data-testid="shop-admin-reports-link"
+                    >
+                      Reports
+                    </Link>
+                  )}
                 {session.admin.role === "owner" && (
                   <Link
                     href={`${home}/team`}

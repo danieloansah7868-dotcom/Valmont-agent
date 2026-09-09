@@ -199,6 +199,13 @@ export interface BundleDeliveryRecord {
   providerRef?: string;
   lastError?: string;
   deliveredAt?: string;
+  /**
+   * Stage 6d — what TechChief charged for THIS top-up, in GHS, captured from
+   * the `dev_order.php` answer at the successful send. Undefined for rows
+   * sent by the simulator or by hand, and for rows sent before migration
+   * 0016 — the sales report then knows the cost is unknown rather than zero.
+   */
+  apiPrice?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -238,7 +245,8 @@ export interface BundleDeliveryDispatchRequest {
 }
 
 export type BundleDeliverySendResult =
-  { ok: true; providerRef?: string } | { ok: false; error: string };
+  | { ok: true; providerRef?: string; apiPrice?: number }
+  | { ok: false; error: string };
 
 export interface BundleDeliveryStatusRequest {
   providerRef: string;
@@ -644,8 +652,15 @@ export class TechChiefProvider implements BundleDeliveryProvider {
         return { ok: false, error: techChiefRefusedMessage(order.message) };
       }
       // accepted | processing: the top-up is theirs now, and the reference is
-      // what the webhook and every later status check are keyed on.
-      return { ok: true, providerRef: order.orderRef };
+      // what the webhook and every later status check are keyed on. Their
+      // answer also names the price of THIS top-up (`api_price`); it travels
+      // back through the send result so the engine can store it as the row's
+      // cost (Stage 6d). A missing price stays undefined — never invented.
+      return {
+        ok: true,
+        providerRef: order.orderRef,
+        apiPrice: order.apiPrice ?? undefined,
+      };
     }
 
     return this.mapSendFailure(result, request, config, store);
@@ -1038,10 +1053,18 @@ export interface BundleDeliveriesStore {
    * "processing" are left alone — a delivered row never changes (I3).
    */
   touchProcessing(id: string): Promise<void>;
-  /** Records the provider's reference after a successful send. */
+  /**
+   * Records the provider's reference after a successful send. The optional
+   * `meta` carries what the provider charged for this one top-up (Stage 6d):
+   * the store writes `api_price` only when `meta.apiPrice` is a finite
+   * number, and otherwise leaves the column untouched — a simulator send, a
+   * manual mark or a pre-0016 row must never gain an invented cost. The
+   * parameter is optional so hand-written test stores stay type-compatible.
+   */
   setProviderRef(
     id: string,
     providerRef: string | null,
+    meta?: { apiPrice?: number },
   ): Promise<BundleDeliveryRecord | null>;
   /**
    * → failed: an attempt went wrong (I4). Accepts pending (never-yet-sent
@@ -1077,6 +1100,7 @@ interface DeliveryRow {
   provider_ref: string | null;
   last_error: string | null;
   delivered_at: string | null;
+  api_price: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -1100,14 +1124,38 @@ function rowToDelivery(row: DeliveryRow): BundleDeliveryRecord {
     providerRef: row.provider_ref ?? undefined,
     lastError: row.last_error ?? undefined,
     deliveredAt: row.delivered_at ?? undefined,
+    apiPrice:
+      row.api_price === null || row.api_price === undefined
+        ? undefined
+        : Number(row.api_price),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
 /**
+ * Adds one column to the deliveries table when it is missing — the same
+ * PRAGMA `table_info` pattern `ensureOrdersSchema` uses, so a database file
+ * created before the column existed is upgraded in place on the next store
+ * access. Kept idempotent: safe to call on every store access.
+ */
+function ensureDeliveryColumn(
+  db: DatabaseSync,
+  name: string,
+  definition: string,
+  existing: Set<string>,
+): void {
+  if (existing.has(name)) return;
+  db.exec(`ALTER TABLE studio_deliveries ADD COLUMN ${name} ${definition}`);
+}
+
+/**
  * Creates the deliveries table on the shared SQLite connection. Idempotent —
  * safe to call on every store access, like the orders schema.
+ *
+ * Stage 6d adds the `api_price` column (what TechChief charged for that one
+ * top-up) to tables created before migration 0016, exactly like the orders
+ * schema upgrades its own historical columns.
  */
 export function ensureBundleDeliveriesSchema(db: DatabaseSync): void {
   db.exec(`CREATE TABLE IF NOT EXISTS studio_deliveries (
@@ -1128,6 +1176,7 @@ export function ensureBundleDeliveriesSchema(db: DatabaseSync): void {
       provider_ref TEXT,
       last_error TEXT,
       delivered_at TEXT,
+      api_price REAL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -1136,6 +1185,18 @@ export function ensureBundleDeliveriesSchema(db: DatabaseSync): void {
     CREATE UNIQUE INDEX IF NOT EXISTS studio_deliveries_order_line_unit ON studio_deliveries(order_id, line_index, unit_index);
     CREATE INDEX IF NOT EXISTS studio_deliveries_provider_ref ON studio_deliveries(provider_ref);
   `);
+
+  // An old file created before 0016 has no api_price column yet; add it
+  // without touching any existing row (null there stays null — no invented
+  // costs for simulator, manual or pre-0016 rows).
+  const existing = new Set(
+    (
+      db.prepare("PRAGMA table_info(studio_deliveries)").all() as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name),
+  );
+  ensureDeliveryColumn(db, "api_price", "REAL", existing);
 }
 
 export class SqliteBundleDeliveriesStore implements BundleDeliveriesStore {
@@ -1234,14 +1295,27 @@ export class SqliteBundleDeliveriesStore implements BundleDeliveriesStore {
   async setProviderRef(
     id: string,
     providerRef: string | null,
+    meta?: { apiPrice?: number },
   ): Promise<BundleDeliveryRecord | null> {
-    this.db
-      .prepare(
-        `UPDATE studio_deliveries
-            SET provider_ref = ?, updated_at = ?
-          WHERE id = ? AND status = 'processing'`,
-      )
-      .run(providerRef, new Date().toISOString(), id);
+    const raw = meta?.apiPrice;
+    const cost = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+    if (cost === null) {
+      this.db
+        .prepare(
+          `UPDATE studio_deliveries
+              SET provider_ref = ?, updated_at = ?
+            WHERE id = ? AND status = 'processing'`,
+        )
+        .run(providerRef, new Date().toISOString(), id);
+    } else {
+      this.db
+        .prepare(
+          `UPDATE studio_deliveries
+              SET provider_ref = ?, api_price = ?, updated_at = ?
+            WHERE id = ? AND status = 'processing'`,
+        )
+        .run(providerRef, cost, new Date().toISOString(), id);
+    }
     return this.getById(id);
   }
 
@@ -1296,6 +1370,12 @@ function pgRowToDelivery(
     providerRef: row.providerRef ?? undefined,
     lastError: row.lastError ?? undefined,
     deliveredAt: row.deliveredAt?.toISOString(),
+    // PostgreSQL `numeric` arrives as a string, so null and string both have
+    // to be normalised here; null means "no cost recorded" (undefined).
+    apiPrice:
+      row.apiPrice === null || row.apiPrice === undefined
+        ? undefined
+        : Number(row.apiPrice),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -1403,10 +1483,19 @@ export class PostgresBundleDeliveriesStore implements BundleDeliveriesStore {
   async setProviderRef(
     id: string,
     providerRef: string | null,
+    meta?: { apiPrice?: number },
   ): Promise<BundleDeliveryRecord | null> {
+    const raw = meta?.apiPrice;
+    const cost = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
     await getDatabase()
       .update(studioDeliveries)
-      .set({ providerRef, updatedAt: new Date() })
+      .set({
+        providerRef,
+        // `numeric(12,2)` is stored as text; undefined/absent means the
+        // column is left untouched (see the interface contract).
+        ...(cost === null ? {} : { apiPrice: String(cost) }),
+        updatedAt: new Date(),
+      })
       .where(
         and(
           eq(studioDeliveries.id, id),
@@ -1681,7 +1770,11 @@ async function dispatchPendingRows(
     }
     const result = await safeSend(ctx.provider, dispatchRequestFor(row));
     if (result.ok) {
-      await ctx.deliveries.setProviderRef(row.id, result.providerRef ?? null);
+      // The successful send may carry what the provider charged (Stage 6d);
+      // the store records it only when it is a finite number.
+      await ctx.deliveries.setProviderRef(row.id, result.providerRef ?? null, {
+        apiPrice: result.apiPrice,
+      });
     } else {
       const failed = await ctx.deliveries.markFailed(row.id, {
         error: result.error,
@@ -1911,7 +2004,11 @@ export async function retryBundleDeliveryFailures(
       continue;
     const result = await safeSend(provider, dispatchRequestFor(row));
     if (result.ok) {
-      await deliveries.setProviderRef(row.id, result.providerRef ?? null);
+      // A retry that really sent again charges again: the fresh api_price
+      // (when the provider reports one) overwrites whatever the row carried.
+      await deliveries.setProviderRef(row.id, result.providerRef ?? null, {
+        apiPrice: result.apiPrice,
+      });
     } else {
       const failed = await deliveries.markFailed(row.id, {
         error: result.error,

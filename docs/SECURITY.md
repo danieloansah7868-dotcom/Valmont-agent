@@ -475,6 +475,31 @@ full:
   identifier), the catalogue through `shopCatalogueView` (no brief, no
   payment settings, no `adminEmail`), and nothing a 6b page did not already
   show.
+- **Supplier page (Stage 6d) — the shop reads the connection, never the
+  key.** The page is a 404 unless the login holds the `supplier.manage` box
+  AND the website's package includes `supplier_page`; it never calls
+  TechChief — it renders only `shopSupplierView(getTechChiefIntegration(id))`.
+  That projection is the security boundary: exactly `connected, status,
+keyPrefix, walletBalance, lowBalance, accountStatus, lastCheckedAt,
+lastError, bundleCount, bundlesSyncedAt, requestsThisHour,
+requestsPerHour`. There is no webhook URL, no webhook-secret flag, no
+  unmatched-items list, no agency `ownerId` and no integration `id` — the
+  object has nowhere to put them — and the only key material ever rendered
+  is the stored 9-character prefix (`TCHX-AB12•••`); a serialised view can
+  never contain a longer slice (`supplier-view.test.ts` pins both). The
+  refresh route re-uses the 6c preamble and then refuses with ZERO TechChief
+  calls when no key is saved (404) or when the last check is younger than 10
+  minutes (429); a permitted refresh calls the same `testTechChiefConnection`
+  the Studio card uses — exactly one budget slot — and every answer (200/400/
+  429/502) carries only the projection plus an `error` sentence.
+- **Reports page (Stage 6d) — aggregates, never identifiers.** The page is a
+  404 unless the login holds `reports.view` on Command Center. Data is
+  pinned owner AND website (`listForOwner(ownerId, { draftId, … })`), and the
+  rendered HTML is a pure aggregate: no customer name, no phone number, no
+  order id, no access code. A delivered top-up's cost comes from `api_price`
+  — recorded server-side from the provider's own `dev_order.php` answer at
+  the successful send, never from a client; simulator, manual and pre-0016
+  rows have no cost and the report says "unknown", not zero.
 - **A paused bundle cannot be bought, whatever the client sends.** The shop
   pauses a bundle from its own dashboard (`paused: true` on the catalogue
   item, package-gated). The public storefront never lists a paused item, and
