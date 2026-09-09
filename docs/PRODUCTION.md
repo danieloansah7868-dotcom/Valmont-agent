@@ -392,7 +392,7 @@ people, all at `https://<APP_URL>/manage/<website-id>`. Operationally:
   `db:verify`) before the Studio "Shop logins" card is used on PostgreSQL;
   SQLite creates the tables on first use. Stage 6c needs NO migration: the
   pause flag lives inside the stored brief's items and the marks reuse the
-  existing delivery rows.
+  existing delivery rows (Stage 6d does add `0016` — see below).
 - **Email is effectively required.** Invites and resets are emailed through
   Resend; without it the agency has to copy every link from Studio by hand and
   an owner cannot reset their own password (see _Email delivery_ above).
@@ -415,6 +415,23 @@ people, all at `https://<APP_URL>/manage/<website-id>`. Operationally:
   (`bundle_pause` package feature only — Starter gets "Not included in your
   package."). A paused bundle disappears from the storefront and checkout
   refuses it with 400 before any order row.
+- **Migration `0016_delivery_api_price`** (Stage 6d) adds `api_price
+numeric(12,2)` to `studio_deliveries` — what TechChief charged for that
+  one top-up, recorded from the `dev_order.php` answer at the successful
+  send. Apply it with `npm run db:migrate` + `db:verify` before the reports
+  page is used on PostgreSQL; SQLite upgrades the shared file in place on
+  first access (the table is created with the column when new). Rows
+  delivered before the migration have no cost; simulator and manual rows
+  never do. There is nothing to back-fill — the sales report says "unknown",
+  not zero, and the margin excludes unknown rows.
+- **Stage 6d refresh behaviour.** The Supplier page never calls TechChief on
+  load. "Refresh balance" spends ONE slot of the website's 60/hour TechChief
+  allowance and is additionally capped at 6 per hour per website and once
+  per 10 minutes (both server-side, so a refresh button mash costs nothing).
+  The sales & margin report runs only on Command Center websites and reads at
+  most the last 2000 orders per range with delivery rows fetched in 500-id
+  chunks — fine for the price sheet; a shop that outgrows it should move to
+  SQL aggregation.
 - **Lifecycle.** Invite links expire after 24 hours, reset links after 1
   hour, sessions after 30 days; expired and used rows are purged
   opportunistically (about once an hour, on login) — no cron job is

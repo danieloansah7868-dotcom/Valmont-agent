@@ -948,6 +948,135 @@ untouched. The wizard's bundle table shows a small "Paused by shop" badge.
 | retry + check status (shared) | `shop-order-delivery` | 40    |
 | bundle price / pause          | `shop-bundle-edit`    | 60    |
 
+## Data Bundles — Stage 6d: supplier page + sales & margin dashboard
+
+Stage 6d gives the shop the two Command Center surfaces the price sheet
+advertises, and starts recording what each top-up actually cost the shop.
+
+### Migration `0016` — the per-row supplier cost
+
+`ALTER TABLE studio_deliveries ADD api_price numeric(12,2)` (nullable, no
+default). The Drizzle field is `apiPrice: numeric("api_price", {precision:
+12, scale: 2})`. The SQLite schema upgrade lives in
+`ensureBundleDeliveriesSchema`: after `CREATE TABLE IF NOT EXISTS`, a PRAGMA
+`table_info` check adds `api_price REAL` when the column is missing — the
+same idempotent pattern `ensureOrdersSchema` uses, so an old file is upgraded
+on the next store access without touching existing rows.
+
+**Who gets a cost.** `BundleDeliveryRecord.apiPrice?: number` (PG `numeric`
+arrives as a string and is converted with `Number`; null/undefined →
+undefined). The ok branch of `BundleDeliverySendResult` carries an optional
+`apiPrice`, and `TechChiefProvider.sendBundle` forwards the `api_price` named
+in the `dev_order.php` answer — a missing price stays undefined, never
+invented. The engine passes it through the optional third argument of
+`setProviderRef(id, ref, meta?: { apiPrice?: number })` at dispatch AND at
+retry. The `BundleDeliveriesStore` interface gains NO method (and the extra
+parameter is optional), so hand-written test stores stay type-compatible.
+Both real stores write `api_price` only when `meta.apiPrice` is a finite
+number and otherwise leave the column untouched. Consequences, each pinned
+by `delivery-api-price.test.ts`:
+
+- the simulator and manual rows never carry a cost — no provider ever
+  reports a price for them;
+- a retry that really sends again overwrites the previous charge;
+- a failure never clears a recorded price (the row may still have been
+  charged before the timeout);
+- rows delivered before migration `0016` have no cost — the report treats a
+  missing cost as _unknown_, never as zero.
+
+`shopDeliveryView` is unchanged — the shop's per-row view does not show
+costs; the number exists for the report.
+
+### The Supplier page and the refresh route
+
+`/manage/[id]/supplier` renders for exactly: a signed-in shop admin holding
+the `supplier.manage` box (the owner always passes; a member without it gets
+the same 404 as a stranger), on a data-bundles website whose package
+includes `supplier_page` (Auto-Dispatch Pro and Command Center — Starter's
+404 matches its package). The page NEVER calls TechChief; it renders the
+last stored state read through the no-secret `getTechChiefIntegration(id)`.
+
+**The projection is the boundary.** `src/lib/shop-admin/supplier.ts` owns
+every constant the page and route share (the TechChief portal URL, the
+refresh operation name `shop-supplier-refresh`, 6/hour, the 10-minute
+interval, and the exact not-connected / too-soon / low-balance / API
+not-connected sentences) and `shopSupplierView(integration)`, which returns
+exactly: `connected, status, keyPrefix, walletBalance, lowBalance,
+accountStatus, lastCheckedAt, lastError, bundleCount, bundlesSyncedAt,
+requestsThisHour, requestsPerHour`. There is deliberately no `webhookUrl`,
+no `webhookSecretSet`, no `unmatchedItems`, no `ownerId` and no `id` — the
+projection has nowhere to put them — and the only key material is the stored
+9-character prefix, rendered `TCHX-AB12•••`. `supplier-view.test.ts` pins
+the key set and that a serialised view never contains a longer key slice.
+
+**POST `/api/manage/[id]/supplier/refresh`** reuses the 6c preamble (CSRF →
+shop session 401 / other-shop 404 → `ShopPermissionError` 403 → hourly rate
+limit → 16 KB bounded body) and then, in order: a non-bundle website → 404;
+a package without `supplier_page` → 403 `PACKAGE_NOT_INCLUDED_MESSAGE`; no
+key saved → 404 `{ supplier: connected:false, error: "This website has no
+TechChief key saved yet." }` with ZERO TechChief calls; a last check younger
+than `SHOP_SUPPLIER_REFRESH_MIN_INTERVAL_MS` → 429
+`SUPPLIER_REFRESH_TOO_SOON_MESSAGE`, also with ZERO TechChief calls. Only
+then does it call `testTechChiefConnection(id)` — the same library call
+Studio's "Check balance" uses, which spends exactly one of the website's
+TechChief budget slots and refreshes balance / low flag / status on the
+stored row — and maps the outcome: ok → 200, rejected → 400, budget → 429,
+unreachable → 502. Every answer from the integration onwards carries
+`{ supplier: shopSupplierView(...) }` and the error answers add `{ error }`.
+The shop rate-limit bucket:
+
+| action           | bucket                  | limit                    |
+| ---------------- | ----------------------- | ------------------------ |
+| supplier refresh | `shop-supplier-refresh` | 6 per hour + 10-min rule |
+
+The layout adds a "Supplier" nav link (`shop-admin-supplier-link`) under the
+same two gates (box AND package), so a Starter owner never sees a link to a
+page that does not exist.
+
+### Sales & margin report (Command Center)
+
+`/manage/[id]/reports` exists only for a login with the `reports.view` box on
+a package with the `reports` feature — Command Center only — on a
+data-bundles website. Ranges `today / 7d / 30d / month` (default 30d) resolve
+to `created_at >= <UTC boundary>`: Ghana is UTC, so "today" and "this month"
+run on UTC midnight / month start. Orders come from
+`listForOwner(ownerId, { limit: 2000, filter: "all", draftId, createdAfter })`
+— owner AND website pinned, a sibling website can never leak in. Delivery
+rows are read by the reports module's own query in chunks of 500 order ids
+(PG `inArray`, SQLite `IN`), chosen by `DATABASE_URL` exactly like
+`manual-delivery.ts`; the `BundleDeliveriesStore` interface is not widened.
+
+**`aggregateShopReport(orders, deliveries)` is pure** and every definition
+below is unit-tested in `reports.test.ts`:
+
+- A **sale** is an order with `paidAt` set, status not "refunded" and not
+  "cancelled", payment mode "live". `orders` = sales count;
+  `moneyCollected` = Σ `total` over sales. Paid TEST-mode orders are counted
+  as `testOrdersExcluded` and never in money.
+- Top-up counts run over the delivery rows of sales: `deliveredTopUps`,
+  `failedTopUps`, `inFlightTopUps` (pending or processing).
+- A row's unit price is its order line's checkout-time snapshot price
+  (`lines[row.lineIndex].price`); 0 when the line is missing.
+- **Costed** rows = delivered rows with a finite `api_price`. `supplierCost`
+  = Σ `api_price` over costed rows. `costedRevenue` = Σ unit price over
+  costed rows. `margin` = `costedRevenue` − `supplierCost`. `marginPercent`
+  = margin ÷ costedRevenue × 100 (0 when costedRevenue is 0). Coverage =
+  { known: costed count, delivered: delivered count }.
+- `perNetwork` (mtn, telecel, airteltigo — only networks that delivered) and
+  `perBundle` (grouped by itemName + network + dataMb, top 10 by delivered
+  units) carry the same money columns per group: `deliveredUnits`, `revenue`
+  (Σ unit price over the group's delivered rows), `cost`, `margin` (the
+  group's costed revenue minus its cost), `costedUnits`.
+- Refunded and cancelled orders are excluded everywhere; failed rows never
+  count in revenue or cost. Money is in major units (GHS), rounded to 2
+  decimals at the end. An empty period is all zeros.
+
+The page renders only totals and the two money tables — no customer name,
+phone number, order id or access code anywhere — with server-rendered range
+links (`?range=…`), the four tiles, the cost-coverage sentence and the
+test-orders note; the layout adds a "Reports" nav link
+(`shop-admin-reports-link`) under the same two gates.
+
 ## Website Studio — Stage B: Brand Kit (no-brand clients)
 
 Stage B gives the Studio wizard a Brand Kit for a client who arrives with no

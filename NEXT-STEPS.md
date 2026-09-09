@@ -19,15 +19,16 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
-## Data Bundles — Stages 1–5 and 4b merged, Stage 6 in progress (6a, 6b, 6c done)
+## Data Bundles — Stages 1–5 and 4b merged, Stage 6 in progress (6a, 6b, 6c merged, 6d open for review)
 
 Stage 6 — the shop-owner admin side — is split into four parts, one PR each,
 in order: **6a** package per website + manual delivery (Starter) — **merged
 (PR #51)**; **6b** shop owner login, team, read-only dashboard — **merged
 (PR #52**, merge commit `55efc92`**)**; **6c** admin actions (mark
-delivered/failed, Retry/Check status, bundle pause, price edit) — **done,
-open for review** (see the Stage 6c section at the end of this file);
-**6d** supplier page + sales & margin dashboard.
+delivered/failed, Retry/Check status, bundle pause, price edit) — **merged
+(PR #54**, merge commit `cd1a521`, see the Stage 6c section below);
+**6d** supplier page + sales & margin dashboard — **done, open for review
+(see the Stage 6d section at the end of this file)**.
 
 Owner decisions already confirmed for Stage 6: the owner logs in with email +
 password; the owner adds more logins — there are no fixed roles below
@@ -758,3 +759,158 @@ created by the real engine pass with zero network). Local suite:
 **1357 passed / 67 skipped** (floor was 1279/61 after 6b+Stage B; +78
 new tests locally, the 6 postgres marks/patch tests run in CI). No
 existing test was edited or deleted.
+
+## Website Studio Stage 6d — supplier page + sales & margin dashboard
+
+Implemented on branch `arena/01a08856-valmont-agent`, based on `main` at
+`cd1a521` (after the Stage 6c merge, PR #54). Status: **open for review — do
+not merge** until checked. 6c itself is now merged (PR #54, merge commit
+`cd1a521`) — everything in its section above landed.
+
+What landed (migration `0016` + the two Command Center surfaces):
+
+- **Migration `0016_delivery_api_price`** (journal idx 16, when
+  `1788825600000`): `ALTER TABLE studio_deliveries ADD api_price
+numeric(12,2)` — nullable, no default. `studioDeliveries.apiPrice`
+  (`numeric("api_price", {precision:12, scale:2})`) on the Drizzle schema;
+  the SQLite `ensureBundleDeliveriesSchema` upgrades an old file in place
+  with the same PRAGMA `table_info` + conditional `ADD COLUMN api_price REAL`
+  pattern `ensureOrdersSchema` uses (idempotent, every store access).
+- **Per-row supplier cost.** `BundleDeliveryRecord.apiPrice?: number`
+  (PG `numeric` string → Number; null → undefined). The ok branch of
+  `BundleDeliverySendResult` gained an optional `apiPrice`;
+  `TechChiefProvider.sendBundle` forwards the `api_price` the `dev_order.php`
+  answer named (a missing price stays undefined — never invented). The engine
+  passes it as the optional third argument of `setProviderRef(id, ref,
+meta?: { apiPrice? })` at dispatch AND at retry, and `BundleDeliveriesStore`
+  was NOT widened — the hand-written store in
+  `bundle-delivery-recheck-cap.test.ts` stays compatible. Both real stores
+  write `api_price` only when `meta.apiPrice` is a finite number and
+  otherwise leave the column untouched: a simulator send, a manual mark and a
+  pre-0016 row never gain a cost, a retry that really sends again overwrites
+  the previous charge, and a failure never clears a recorded price. `dev_status.php`
+  back-fill during rechecks was deliberately NOT added (optional in the spec;
+  the send-time capture already covers every live order). `shopDeliveryView`
+  is unchanged.
+- **Supplier page + refresh route.** `/manage/[id]/supplier` exists only for
+  a login with the `supplier.manage` box (owner always passes; member without
+  → 404, never a hint), on a data-bundles website whose package includes
+  `supplier_page` (Auto-Dispatch Pro and Command Center; Starter → 404), and
+  the page NEVER calls TechChief — it renders `shopSupplierView(integration)`
+  built from the no-secret `getTechChiefIntegration(id)` record. New lib
+  `src/lib/shop-admin/supplier.ts` owns every constant
+  (`TECHCHIEF_PORTAL_URL = "https://techchiefxdata.com/"`,
+  `SHOP_SUPPLIER_REFRESH_RATE_LIMIT_OPERATION = "shop-supplier-refresh"`,
+  `SHOP_SUPPLIER_REFRESH_PER_HOUR = 6`,
+  `SHOP_SUPPLIER_REFRESH_MIN_INTERVAL_MS = 10 minutes`, the exact
+  not-connected / too-soon / low-balance sentences, and the API
+  not-connected sentence "This website has no TechChief key saved yet.") and
+  the projection. `shopSupplierView` returns EXACTLY: connected, status,
+  keyPrefix, walletBalance, lowBalance, accountStatus, lastCheckedAt,
+  lastError, bundleCount, bundlesSyncedAt, requestsThisHour,
+  requestsPerHour — no webhookUrl, no webhookSecretSet, no unmatchedItems,
+  no ownerId, no id, and the only key material is the stored 9-character
+  prefix rendered as "TCHX-AB12•••". The layout gained a "Supplier" nav link
+  (`shop-admin-supplier-link`) under the same two gates.
+  POST `/api/manage/[id]/supplier/refresh` runs the 6c preamble (csrf →
+  session 401/404 → `ShopPermissionError` 403 for a member without the box →
+  `assertHourlyRateLimit("shop-supplier-refresh", id, 6)` → 16 KB bounded
+  body), then: not a data-bundles website → 404; package without
+  `supplier_page` → 403 "Not included in your package."; no key saved → 404
+  `{supplier: connected:false view, error}` with ZERO TechChief calls; last
+  check younger than 10 minutes → 429 too-soon with ZERO TechChief calls;
+  otherwise exactly ONE `testTechChiefConnection(id)` (the same library call
+  Studio's "Check balance" uses — one budget slot, refreshes balance/low
+  flag/status): ok → 200, rejected → 400, budget → 429, unreachable → 502.
+  Every answer from the integration onwards carries `{ supplier: view }` and
+  the error ones add `{ error }`. `src/components/shop-admin/
+supplier-actions.tsx` is the client "Refresh balance" island (apiMutation +
+  ApiError, like the 6c delivery actions).
+- **Reports page (Command Center only).** `/manage/[id]/reports` exists only
+  for logins with the `reports.view` box on a package with the `reports`
+  feature (Command Center only — Auto-Dispatch → 404) on a data-bundles
+  website. Ranges: today / 7d / 30d (default) / month, resolved by
+  `resolveShopReportRange` on UTC boundaries (Ghana is UTC). The pure
+  `aggregateShopReport(orders, deliveries)` in
+  `src/lib/shop-admin/reports.ts` pins every money definition (unit-tested):
+  a SALE is paid + live + not refunded + not cancelled; orders = sales count,
+  moneyCollected = Σ total over sales; paid TEST-mode orders are excluded
+  from money and counted as testOrdersExcluded; delivered/failed/inFlight
+  counts run over the sale rows; a row's unit price is its line's
+  checkout-time snapshot price (0 when the line is missing); costed rows are
+  delivered rows with a finite api_price; supplierCost = Σ api_price over
+  costed; costedRevenue = Σ unit price over costed; margin = costedRevenue −
+  cost; marginPercent = margin ÷ costedRevenue × 100 (0 when costedRevenue is
+  0); cost coverage = known of delivered; perNetwork (mtn → telecel →
+  airteltigo, only networks that delivered) and perBundle (itemName +
+  network + dataMb, top 10 by delivered units) carry the same money columns;
+  refunded/cancelled orders and failed rows contribute nothing anywhere;
+  money rounded to 2 decimals at the end. Delivery rows are read by the
+  module's own query in chunks of 500 order ids — PG `inArray` /
+  SQLite `IN` — chosen by `DATABASE_URL` exactly like `manual-delivery.ts`;
+  the `BundleDeliveriesStore` interface is not widened. The page renders the
+  tiles (orders, money collected, supplier cost, margin with percent,
+  top-ups delivered/failed/in flight, cost-coverage sentence, test-orders
+  note) and the two money tables; range links are plain server-rendered
+  links, the layout gained a "Reports" nav link (`shop-admin-reports-link`)
+  under the same two gates, and NOTHING on the page is an identifier — no
+  customer names, no phone numbers, no order ids, no access codes.
+- Docs: README, ARCHITECTURE, SECURITY and PRODUCTION gained the api_price
+  recording rule, the refresh semantics, the projection boundary and the
+  report definitions (this file lists the spec bullets word for word).
+
+Tests added (new files only): `src/lib/studio/delivery-api-price.test.ts`
+(10: old-table column upgrade, meta persists / absent leaves untouched /
+only its own row, live send stores 4.5 + providerRef, simulator leaves
+undefined, missing `api_price` answer stores none, retry overwrites, failed
+resend never clears, manual mark leaves unset),
+`src/lib/studio/postgres-delivery-api-price.test.ts` (2, CI only, same skip
+pattern as `postgres-manual-delivery.test.ts`),
+`src/lib/shop-admin/reports.test.ts` (21: ranges on UTC boundaries + every
+money definition + top-10 + empty period), `src/lib/shop-admin/
+supplier-view.test.ts` (6: exact key set; null → connected:false; the only
+TCHX- string is the stored 9-character prefix),
+`src/app/api/manage/shop-admin-supplier-routes.test.ts` (13: full
+csrf/401/other-shop 404/member-403/Starter-403/not-bundle 404/
+not-connected 404 matrix with ZERO TechChief calls, member-with-box 200 with
+exactly ONE dev_wallet.php call, too-soon 429 with zero extra calls, 7th
+call in the hour 429 with the last check aged 11 minutes back, rejected 400
+/ budget 429 before any probe / unreachable 502, no secrets in any body),
+`src/app/manage/[id]/pages-supplier-reports.test.ts` (19: supplier page
+states, low-balance banner only when flagged, second-supplier card only on
+Command Center, 404 gates, reports tiles with the REAL aggregate over
+fixture rows, aggregates-only HTML, layout link matrix),
+`tests/e2e/shop-admin-supplier.spec.ts` (2 scenarios × 2 projects, offline:
+Command Center owner sees Supplier + Reports end to end with seeded
+connection/order rows and no TechChief call; Starter owner sees no links and
+404s). No existing test was edited or deleted; shared code files are
+add-only (new constants/lib/page/route/component files plus migration 0016).
+
+### Stage 7 — agents and in-shop wallets (NOT started)
+
+The idea backlog's Stage 7 (DataMartGH style) is next on the roadmap and is
+deliberately NOT started by the 6d PR. Notes for whoever picks it up:
+
+- Sub-agents: a shop owner creates agent logins with their own prices and
+  wallets; agent orders tracked separately; a commission report. The plans
+  matrix already reserves `wallets` (Command Center ✓, never offered
+  anywhere) and `RESERVED_SHOP_PERMISSION = "wallets.topup"` exists so no
+  permission box can ever unlock topping up the supplier wallet — Stage 7
+  will have to introduce the real wallet model deliberately, permission by
+  permission.
+- The Command Center price sheet already advertises "second supplier API
+  slot with backup (provider not chosen yet — a gap, no provider code)". The
+  6d Supplier page renders the "Second supplier (backup)" card ONLY on
+  Command Center (`planAllows(plan, "second_supplier")`) so nothing of a
+  future provider leaks to cheaper packages; `StudioIntegration` is
+  per-provider (`provider` column) so a second TechChief account or another
+  wholesaler plugs into the same rows, budget and webhook machinery.
+- Reports were kept a pure in-memory aggregate over ≤2000 orders with
+  delivery rows fetched in 500-id chunks; a shop that outgrows that should
+  move the report to SQL aggregation rather than widening the page loop.
+- Watch items carried forward: a refresh refused by the 10-minute rule still
+  spends one of the 6/hour shop bucket slots (rate limit is asserted before
+  the interval check), and `last_checked_at` is also updated by Studio
+  connects and order-time wallet records — if the interval rule ever feels
+  too eager, give the refresh its own last-refresh timestamp instead of
+  reusing the row's last check.
