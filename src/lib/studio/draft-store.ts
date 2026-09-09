@@ -176,11 +176,48 @@ export interface StudioDraftStore {
     expectedRevision: number,
   ): Promise<StudioDraft>;
   delete(user: SessionUser, id: string): Promise<boolean>;
+  /**
+   * Stage 6c — the shop side's bundle price / pause edit. No SessionUser is
+   * involved: the caller (the shop-admin bundles route) has already proved
+   * the signed-in login administers this website, so the draft id alone is
+   * the scope. Reads the stored brief, changes ONLY the named item's `price`
+   * and/or `paused`, re-validates the whole brief with `siteBriefSchemaV1`,
+   * and saves with a compare-and-set on `revision` (retrying a lost race up
+   * to three times). A missing draft or a unknown item id is a 404.
+   */
+  patchCatalogueItemAsShop(
+    draftId: string,
+    itemId: string,
+    patch: { price?: number; paused?: boolean },
+  ): Promise<StudioDraft>;
 }
 
 function validatedBrief(input: Partial<SiteBriefV1>): SiteBriefV1 {
   return siteBriefSchemaV1.parse(input);
 }
+
+/**
+ * Stage 6c — applies one shop-side catalogue patch (price and/or paused) to a
+ * stored brief, touching nothing else. Returns null when the item id is not
+ * in the catalogue. Pure: the caller decides about validation and locking.
+ */
+function patchCatalogueItem(
+  brief: SiteBriefV1,
+  itemId: string,
+  patch: { price?: number; paused?: boolean },
+): SiteBriefV1 | null {
+  const index = brief.items.findIndex((item) => item.id === itemId);
+  if (index === -1) return null;
+  const items = brief.items.slice();
+  const item = { ...items[index]! };
+  if (patch.price !== undefined) item.price = patch.price;
+  if (patch.paused !== undefined) item.paused = patch.paused;
+  items[index] = item;
+  return { ...brief, items };
+}
+
+/** How many times a shop-side catalogue patch re-races a lost revision. */
+const SHOP_CATALOGUE_PATCH_ATTEMPTS = 3;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -312,6 +349,45 @@ export class SqliteStudioDraftStore implements StudioDraftStore {
     }
     return deleted;
   }
+
+  async patchCatalogueItemAsShop(
+    draftId: string,
+    itemId: string,
+    patch: { price?: number; paused?: boolean },
+  ): Promise<StudioDraft> {
+    // Compare-and-set with a bounded retry: each attempt re-reads the row, so
+    // a wizard autosave landing between two attempts loses nothing — the
+    // patch is re-applied on top of the newer brief.
+    for (let attempt = 0; attempt < SHOP_CATALOGUE_PATCH_ATTEMPTS; attempt++) {
+      const row = this.db
+        .prepare("SELECT * FROM studio_drafts WHERE id = ?")
+        .get(draftId) as unknown as StudioDraftRow | undefined;
+      if (!row) throw new DraftNotFoundError();
+      const stored = rowToDraft(row);
+      const patched = patchCatalogueItem(
+        normalizeBrief(stored.brief),
+        itemId,
+        patch,
+      );
+      if (!patched) throw new DraftNotFoundError();
+      const validated = validatedBrief(patched);
+      const updated = this.db
+        .prepare(
+          `UPDATE studio_drafts
+              SET brief_json = ?, revision = revision + 1, updated_at = ?
+            WHERE id = ? AND revision = ?
+          RETURNING *`,
+        )
+        .all(
+          JSON.stringify(validated),
+          nowIso(),
+          draftId,
+          stored.revision,
+        ) as unknown as StudioDraftRow[];
+      if (updated.length === 1) return rowToDraft(updated[0]!);
+    }
+    throw new DraftConflictError();
+  }
 }
 
 export class PostgresStudioDraftStore implements StudioDraftStore {
@@ -427,6 +503,45 @@ export class PostgresStudioDraftStore implements StudioDraftStore {
       .where(and(eq(studioDrafts.id, id), eq(studioDrafts.ownerId, ownerId)))
       .returning({ id: studioDrafts.id });
     return deleted.length > 0;
+  }
+
+  async patchCatalogueItemAsShop(
+    draftId: string,
+    itemId: string,
+    patch: { price?: number; paused?: boolean },
+  ): Promise<StudioDraft> {
+    for (let attempt = 0; attempt < SHOP_CATALOGUE_PATCH_ATTEMPTS; attempt++) {
+      const [row] = await getDatabase()
+        .select()
+        .from(studioDrafts)
+        .where(eq(studioDrafts.id, draftId))
+        .limit(1);
+      if (!row) throw new DraftNotFoundError();
+      const stored = pgRowToDraft(row);
+      const patched = patchCatalogueItem(
+        normalizeBrief(stored.brief),
+        itemId,
+        patch,
+      );
+      if (!patched) throw new DraftNotFoundError();
+      const validated = validatedBrief(patched);
+      const updated = await getDatabase()
+        .update(studioDrafts)
+        .set({
+          brief: validated,
+          revision: sql`${studioDrafts.revision} + 1`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(studioDrafts.id, draftId),
+            eq(studioDrafts.revision, stored.revision),
+          ),
+        )
+        .returning();
+      if (updated.length === 1) return pgRowToDraft(updated[0]!);
+    }
+    throw new DraftConflictError();
   }
 }
 

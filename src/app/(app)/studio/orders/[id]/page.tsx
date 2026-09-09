@@ -293,10 +293,23 @@ export default async function OrderDetailPage({
               </li>
             ))}
           </ul>
-          <BundleDeliveryRetryButton
-            orderId={order.id}
-            failedCount={failedTopUps}
-          />
+          {deliveryPlan === "starter" ? (
+            // Stage 6c: a Starter shop's rows wait for the shop owner's
+            // hands, so a Studio Retry would only fabricate failures. The
+            // shop admin (not Studio) is where the manual rows are finished.
+            <p
+              className="mt-3 text-sm text-slate"
+              data-testid="studio-manual-delivery-note"
+            >
+              This shop sends bundles by hand - the shop owner marks delivery in
+              the shop admin.
+            </p>
+          ) : (
+            <BundleDeliveryRetryButton
+              orderId={order.id}
+              failedCount={failedTopUps}
+            />
+          )}
           <BundleDeliveryRecheckButton
             orderId={order.id}
             processingCount={sendingTopUps}

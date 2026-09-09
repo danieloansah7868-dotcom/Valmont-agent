@@ -196,6 +196,16 @@ export async function POST(
           { status: 409 },
         );
       }
+      // Stage 6c: the shop paused this bundle from its own dashboard. Refused
+      // right where the unknown-item 409 lives — before the totals, before
+      // the payment rail and before any order row exists — so a paused bundle
+      // can never be ordered, not even by a request that skips the storefront.
+      if (item.paused === true) {
+        return NextResponse.json(
+          { error: "This bundle is currently unavailable." },
+          { status: 400 },
+        );
+      }
       lines.push({
         itemId: item.id,
         name: item.name,

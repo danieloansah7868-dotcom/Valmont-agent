@@ -151,7 +151,9 @@ export function getBundleNetwork(item: CatalogItem): BundleNetworkId | null {
 
 /**
  * Groups bundles by network, using structured field first, text-guessing fallback.
- * Only priced items are considered bundles for the shop.
+ * Only priced items are considered bundles for the shop. Stage 6c: an item the
+ * shop paused is never listed — the plus button therefore cannot add it, and
+ * checkout refuses it server-side with 400 before any order row exists.
  */
 export function groupBundlesByNetwork(
   items: CatalogItem[],
@@ -164,6 +166,7 @@ export function groupBundlesByNetwork(
 
   for (const item of items) {
     if (item.price === undefined) continue;
+    if (item.paused === true) continue;
     const network = getBundleNetwork(item);
     if (!network) continue;
     grouped[network].push(item);

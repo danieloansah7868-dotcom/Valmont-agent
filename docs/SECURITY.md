@@ -455,6 +455,34 @@ full:
   an order of a sibling website with the same agency owner is a 404. Delivery
   rows are looked up by that order only. The page is read-only — no
   transition, retry or mark-as-sent endpoint exists on this side yet.
+- **Write actions (Stage 6c) are permission-gated, package-gated and
+  rate-limited.** Mark delivered/failed, Retry, and Check status need the
+  `orders.fulfil` box; the bundles price/pause route needs `bundles.manage`
+  (a member without the box gets 403 "Your login does not include this
+  action. Ask the shop owner.", the owner always passes). Every write route
+  re-pins the order (or the draft) to THIS website before touching anything,
+  because the engine functions behind Retry/Check status are owner-scoped,
+  not shop-scoped — a sibling website's order is the same 404 an unknown one
+  is. The manual marks are single atomic UPDATEs with the allowed-transition
+  guards in the WHERE clause (delivered stays terminal), so two people
+  clicking at once move a row exactly once. Pausing a bundle additionally
+  requires the `bundle_pause` package feature (Starter: 403 "Not included in
+  your package."). Rate limits, per website per hour: 60 marks, 60 bundle
+  edits, and Retry + Check status share one bucket of 40 — both can spend
+  the website's TechChief allowance, and the shop order page never runs a
+  recheck on load for the same reason. Responses carry only projections:
+  deliveries through `shopDeliveryView` (no `ownerId` — an agency
+  identifier), the catalogue through `shopCatalogueView` (no brief, no
+  payment settings, no `adminEmail`), and nothing a 6b page did not already
+  show.
+- **A paused bundle cannot be bought, whatever the client sends.** The shop
+  pauses a bundle from its own dashboard (`paused: true` on the catalogue
+  item, package-gated). The public storefront never lists a paused item, and
+  the checkout re-pricing loop — which never trusts a client price — refuses
+  a paused item with 400 "This bundle is currently unavailable." BEFORE any
+  order row exists, in the same place an unknown item gets its 409. A
+  request that skips the storefront and posts the item id directly is
+  refused exactly the same way; existing orders keep their snapshot prices.
 - **Team is owner-only, and the owner is not self-service.** Members get a
   404 for `/manage/[id]/team` and 403 from the team API; the owner's own row
   cannot be disabled or demoted through the shop API (403) — only the agency
