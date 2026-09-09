@@ -242,6 +242,20 @@ export class ShopOwnerOnlyError extends ForbiddenError {
   }
 }
 
+/**
+ * Stage 6c — a shop-admin write the signed-in login lacks the permission box
+ * for. The owner always passes; a member sees this when the owner never
+ * ticked (or unticked) the box for this action.
+ */
+export class ShopPermissionError extends ForbiddenError {
+  constructor(
+    message = "Your login does not include this action. Ask the shop owner.",
+  ) {
+    super(message);
+    this.name = "ShopPermissionError";
+  }
+}
+
 /** The owner row cannot be disabled, downgraded or edited through the admin side. */
 export class ShopOwnerLockedError extends ForbiddenError {
   constructor(message = "The owner login cannot be changed here.") {

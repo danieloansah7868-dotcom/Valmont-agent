@@ -1978,6 +1978,17 @@ export function guestBundleDeliverySummary(
         : `Top-ups for ${masked} hit a problem — the shop can retry them (${size} total).`;
   } else if (failed > 0) {
     line = `${delivered} of ${total} top-ups delivered to ${masked}; ${failed} hit a problem — the shop can retry it.`;
+  } else if (
+    manual &&
+    delivered > 0 &&
+    deliveries.some(
+      (row) => row.provider === MANUAL_PROVIDER_ID && row.status === "pending",
+    )
+  ) {
+    // Stage 6c: a partly delivered manual order — the shop has sent some
+    // top-ups by hand and will send the rest the same way. Sits BEFORE the
+    // all-pending manual branch so that sentence stays exactly as it was.
+    line = `${delivered} of ${total} top-ups delivered to ${masked}; the shop will send the rest by hand.`;
   } else if (manual) {
     // A Starter shop's rows wait for a person, not a provider: the customer
     // is told plainly that the shop sends by hand and where to complain.

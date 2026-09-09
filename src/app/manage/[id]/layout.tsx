@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { LogoMark } from "@/components/logo";
 import { ShopLogoutButton } from "@/components/shop-admin/forms";
 import { getShopAdminSession } from "@/lib/shop-admin/auth";
+import { can } from "@/lib/shop-admin/permissions";
 import { publicGetDraft } from "@/lib/studio/draft-public";
 import { PLAN_LABELS, planOf } from "@/lib/studio/plans";
 
@@ -17,6 +18,9 @@ export const dynamic = "force-dynamic";
  *
  * An unknown website id is a 404 before anything renders, sign-in pages
  * included, so the login form cannot be used to probe for ids.
+ *
+ * Stage 6c adds a "Bundles" nav link for exactly the logins holding the
+ * "bundles.manage" box (the owner always holds it), next to Orders.
  */
 export default async function ShopAdminLayout({
   children,
@@ -67,6 +71,15 @@ export default async function ShopAdminLayout({
                 >
                   Orders
                 </Link>
+                {can(session.admin, "bundles.manage") && (
+                  <Link
+                    href={`${home}/bundles`}
+                    className="rounded-md px-2.5 py-1.5 text-navy hover:bg-ivory-100"
+                    data-testid="shop-admin-bundles-link"
+                  >
+                    Bundles
+                  </Link>
+                )}
                 {session.admin.role === "owner" && (
                   <Link
                     href={`${home}/team`}

@@ -383,14 +383,16 @@ retryable from Studio → Orders.
 for more than an hour. A shop whose status is `error` cannot take real money
 for bundles: live checkout answers 409 until the owner reconnects.
 
-### Shop admin: the owner's login (Stage 6b)
+### Shop admin: the owner's login (Stage 6b) and actions (Stage 6c)
 
 Each data-bundles website can have one **owner login** plus up to nine more
 people, all at `https://<APP_URL>/manage/<website-id>`. Operationally:
 
 - **Migration `0015_shop_admins`** must be applied (`npm run db:migrate` +
   `db:verify`) before the Studio "Shop logins" card is used on PostgreSQL;
-  SQLite creates the tables on first use.
+  SQLite creates the tables on first use. Stage 6c needs NO migration: the
+  pause flag lives inside the stored brief's items and the marks reuse the
+  existing delivery rows.
 - **Email is effectively required.** Invites and resets are emailed through
   Resend; without it the agency has to copy every link from Studio by hand and
   an owner cannot reset their own password (see _Email delivery_ above).
@@ -401,17 +403,29 @@ people, all at `https://<APP_URL>/manage/<website-id>`. Operationally:
 - **Rate limits** live in the same in-memory bucket store as the rest of the
   app, so `TRUST_PROXY` matters here too: 10 login attempts per email and 30
   per IP per minute, 5 forgot-password requests per email per hour, 10
-  invites/resends per website per hour.
+  invites/resends per website per hour, and (Stage 6c) per website per hour
+  60 manual marks, 60 bundle price/pause edits, and Retry + Check status
+  sharing one bucket of 40.
+- **What the shop can do (Stage 6c).** A login with the `orders.fulfil` box
+  can mark a manual top-up delivered or failed (one atomic write; refused
+  transitions answer 409 in plain words), and — on a non-Starter package —
+  Retry failed top-ups and Check status, which spend the website's own
+  TechChief allowance (the order page never spends it on load). A login with
+  `bundles.manage` can change prices (any package) and pause/resume bundles
+  (`bundle_pause` package feature only — Starter gets "Not included in your
+  package."). A paused bundle disappears from the storefront and checkout
+  refuses it with 400 before any order row.
 - **Lifecycle.** Invite links expire after 24 hours, reset links after 1
   hour, sessions after 30 days; expired and used rows are purged
-  opportunistically (at most every 10 minutes, on login) — no cron job is
+  opportunistically (about once an hour, on login) — no cron job is
   needed. Deleting a website removes its logins, sessions and links.
 - **Support playbook.** Owner forgot their password and email is down → the
   agency user opens Studio → the website → Shop logins → _Reset link_ and
   passes it on. Owner left the business → _Disable_ on the same card (signs
   them out everywhere); only the agency can disable the owner, staff are
-  disabled by the owner from Team. Nothing on this side moves money or
-  changes an order — it is a read-only dashboard until Stage 6c.
+  disabled by the owner from Team. Money still never moves from this side:
+  the supplier wallet is topped up only in TechChief, and `wallets.topup`
+  is a reserved permission id no box can ever grant.
 
 ### What Phase 1 does not do in production
 

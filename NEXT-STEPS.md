@@ -19,14 +19,15 @@ caused by that merge; several have since been resolved by the Website Studio
 final-corrections PR (which supersedes PR #9 and must not be merged before an
 independent review).
 
-## Data Bundles — Stages 1–5 and 4b merged, Stage 6 in progress (6a, 6b done)
+## Data Bundles — Stages 1–5 and 4b merged, Stage 6 in progress (6a, 6b, 6c done)
 
 Stage 6 — the shop-owner admin side — is split into four parts, one PR each,
-in order: **6a** package per website + manual delivery (Starter) — **done,
-open for review**; **6b** shop owner login, team, read-only dashboard —
-**done, open for review** (see the Stage 6b section at the end of this file);
-**6c** admin actions (mark delivered/failed, Retry/Check status, bundle
-pause, price edit) — next; **6d** supplier page + sales & margin dashboard.
+in order: **6a** package per website + manual delivery (Starter) — **merged
+(PR #51)**; **6b** shop owner login, team, read-only dashboard — **merged
+(PR #52**, merge commit `55efc92`**)**; **6c** admin actions (mark
+delivered/failed, Retry/Check status, bundle pause, price edit) — **done,
+open for review** (see the Stage 6c section at the end of this file);
+**6d** supplier page + sales & margin dashboard.
 
 Owner decisions already confirmed for Stage 6: the owner logs in with email +
 password; the owner adds more logins — there are no fixed roles below
@@ -536,8 +537,8 @@ Notes for 6b–6d:
 ## Website Studio Stage 6b — shop owner login, team, read-only dashboard
 
 Implemented on branch `arena/01a078b5-valmont-agent`, based on `main` at
-`7d5c715` (after Stage 6a, PR #51). Status: **open for review — do not
-merge** until checked.
+`7d5c715` (after Stage 6a, PR #51). Status: **merged (PR #52**, merge
+commit `55efc92`**)**.
 
 What landed:
 
@@ -589,18 +590,28 @@ Notes for 6c–6d:
   bundle pause and price edit — each behind `can(admin, "orders.fulfil")` /
   `can(admin, "bundles.manage")` from `permissions.ts` and behind
   `planAllows` for the package. The permission boxes already exist and are
-  stored; 6c only has to read them.
+  stored; 6c only has to read them. — **Done: see the Stage 6c section at
+  the end of this file.**
 - The `wallets.topup` permission id is reserved (dropped by the allow-list
   today) for Stage 7's agent wallets.
 - 6d's supplier page should reuse `techChiefConnectionView` (prefix only)
-  behind `can(admin, "supplier.manage")`, and needs migration 0016 for the
-  per-row provider cost.
+  behind `can(admin, "supplier.manage")`, and needs migration `0016` for the
+  per-row provider cost — the `api_price` column on `studio_deliveries`
+  (what TechChief charged for that top-up, already returned by
+  `dev_order.php` and parsed by `parseOrder`), which is what makes the
+  margin half of the dashboard honest. The second supplier slot stays a
+  placeholder in 6d (the `second_supplier` feature is Command Center only
+  and has no provider yet — render the empty state, wire nothing). The
+  sales and margin dashboard itself sits behind
+  `can(admin, "reports.view")` (`reports` feature, Command Center only),
+  reads only this website's orders and delivery rows, and must never
+  surface the API key or another shop's numbers.
 
 ## Website Studio Stage B — Brand Kit (no-brand clients)
 
 Implemented on branch `arena/01a07af4-valmont-agent`, based on `main` at the
-Stage 6a merge (PR #51, `7d5c715`). Status: **open for review — do not
-merge** until checked.
+Stage 6a merge (PR #51, `7d5c715`). Status: **merged (PR #53**, merge
+commit `3c62db4`**)**.
 
 What landed:
 
@@ -648,3 +659,102 @@ Later (not in scope here):
   limits, so it stayed out deliberately.
 - Optional: remember chosen-but-not-applied suggestions on the draft so a
   page reload keeps them (today they live only in the open card).
+
+## Website Studio Stage 6c — shop admin actions (mark, retry, pause, price)
+
+Implemented on branch `arena/01a08566-valmont-agent`, based on `main` at
+`3c62db4` (after Stage 6b PR #52 and Stage B PR #53). Status: **open for
+review — do not merge** until checked.
+
+What landed (no migration; 6d adds `0016`):
+
+- `src/lib/studio/manual-delivery.ts` — the two atomic manual marks. One
+  UPDATE each with the allowed-transition guards inside the WHERE clause
+  (the `claimForDispatch` pattern), SQLite + PostgreSQL; zero rows changed →
+  re-read the row and answer the matching plain-language 409. Allowed:
+  pending+manual → delivered, pending+manual → failed (trimmed note or
+  "Marked as not sent by the shop."), failed (any provider) → delivered.
+  Delivered stays terminal (I3); provider, provider reference and attempts
+  are never touched; no merchant alert (the shop did it itself). The
+  module also owns the stage's constants (all 409 sentences, the Starter
+  retry refusal, the three rate-limit buckets) — route files export
+  nothing extra. The `BundleDeliveriesStore` interface was NOT widened
+  (`bundle-delivery-recheck-cap.test.ts` hand-implements it).
+- Routes under `/api/manage/[id]/`, all with the same preamble (csrf →
+  session 401/404 → permission 403 `ShopPermissionError` "Your login does
+  not include this action. Ask the shop owner." → hourly rate limit keyed
+  on the website id → `readBoundedJson` 16 KB → pin → write/engine):
+  `orders/[orderId]/deliveries/[deliveryId]/mark` (60/h),
+  `deliveries/retry` + `deliveries/recheck` (one shared `shop-order-delivery`
+  bucket of 40/h — both can spend TechChief allowance; the shop order page
+  never rechecks on load), and `bundles/[itemId]` PATCH (60/h,
+  data-bundles only). Retry on a Starter shop answers 409 "This shop sends
+  bundles by hand - mark the top-up delivered instead." and calls nothing.
+  Orders are pinned through `src/lib/shop-admin/order-access.ts`
+  (`pinShopOrder`) BEFORE any engine call — the engine functions are
+  owner-scoped, not shop-scoped.
+- Delivery responses go through `shopDeliveryView`
+  (`src/lib/shop-admin/order-view.ts`): no `ownerId`, nothing the 6b order
+  page did not already show. Bundle responses go through
+  `shopCatalogueView` (`src/lib/shop-admin/bundle-view.ts`): per item
+  `{ id, name, network, dataMb, validity, price, paused }` — never the
+  brief.
+- Pause and price: `paused: z.boolean().optional()` on
+  `catalogItemSchema` (no default — omitted stays distinguishable from
+  false). Price through the exported `priceAmount`, must be > 0; allowed on
+  every package. Pause needs `planAllows(plan, "bundle_pause")` (Starter →
+  403 "Not included in your package."). The write is one new draft-store
+  method, `patchCatalogueItemAsShop(draftId, itemId, patch)` (SQLite +
+  PostgreSQL): normalise the stored brief, change only that item,
+  re-validate with `siteBriefSchemaV1`, compare-and-set on revision
+  (revision + 1, up to three attempts on a lost race). No SessionUser.
+- Wizard safety: the Studio draft PATCH carries the stored item's `paused`
+  over whenever the incoming item has no key (matched by id), so an agency
+  autosave can never silently unpause a bundle; an explicit key wins;
+  `expectedRevision` is untouched. The wizard's bundle table shows a small
+  "Paused by shop" badge.
+- Storefront/checkout/guest: `groupBundlesByNetwork` never lists a paused
+  item; checkout answers 400 "This bundle is currently unavailable." inside
+  the re-pricing loop, before any order row (same place as the
+  unknown-item 409); existing orders keep snapshot prices; and
+  `guestBundleDeliverySummary` gained one branch BEFORE the all-pending
+  manual branch: some delivered, none failed, a manual row pending →
+  "1 of 2 top-ups delivered to 024 ••• 0001; the shop will send the rest
+  by hand." (every pre-6c sentence byte-identical).
+- Pages: the order page renders `DeliveryRowActions` / `DeliveryOrderActions`
+  (`src/components/shop-admin/delivery-actions.tsx`, POSTing the way the 6b
+  Team page does) only for `can(admin, "orders.fulfil")` — a member without
+  the box sees exactly the 6b page. "Mark delivered" on manual pending and
+  failed rows; "Mark failed" (optional note) on manual pending only;
+  "Retry failed top-ups" only when NOT Starter and a failed row exists;
+  "Check status now" only while a processing row exists. Test ids:
+  `shop-mark-delivered`, `shop-mark-failed`, `shop-retry-deliveries`,
+  `shop-recheck-deliveries`. New page `/manage/[id]/bundles` (price input +
+  Save + Pause/Resume; Starter shows "Pause is part of Auto-Dispatch Pro.";
+  test ids `shop-bundle-row`, `shop-bundle-price`, `shop-bundle-save`,
+  `shop-bundle-pause`), with a "Bundles" layout nav link only for
+  `bundles.manage`. The Studio order page on a Starter shop replaces its
+  Retry button with "This shop sends bundles by hand - the shop owner marks
+  delivery in the shop admin."
+- Docs: README, ARCHITECTURE, SECURITY and PRODUCTION gained the
+  transitions table, permissions per action, package gates, the paused
+  checkout rule and the 6c rate limits; the shop-session purge wording was
+  corrected from "every 10 minutes" to "about once an hour"
+  (`PURGE_INTERVAL_MS` is 60 minutes — the TechChief "10 minutes" poll
+  wording was left alone, it is correct).
+
+Tests added (new files only): `src/lib/studio/manual-delivery.test.ts`
+(11), `src/lib/studio/bundle-delivery-guest-mixed.test.ts` (6),
+`src/lib/studio/bundles-paused.test.ts` (6),
+`src/app/api/manage/shop-admin-actions-routes.test.ts` (34),
+`src/app/api/studio/drafts/[id]/checkout/paused-bundles.test.ts` (4),
+`src/app/api/studio/drafts/[id]/paused-carryover.test.ts` (3),
+`src/app/manage/[id]/pages-actions.test.ts` (14),
+`src/lib/studio/postgres-manual-delivery.test.ts` (6, CI only) and
+`tests/e2e/shop-admin-actions.spec.ts` (1 scenario × 2 projects — the 6b
+e2e setup made it cheap: the owner login is minted through the store, the
+sign-in still goes through the real form, the Starter shop's rows are
+created by the real engine pass with zero network). Local suite:
+**1357 passed / 67 skipped** (floor was 1279/61 after 6b+Stage B; +78
+new tests locally, the 6 postgres marks/patch tests run in CI). No
+existing test was edited or deleted.

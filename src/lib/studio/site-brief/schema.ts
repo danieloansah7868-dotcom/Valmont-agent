@@ -432,6 +432,15 @@ export const catalogItemSchema = z.object({
     .regex(/^data:image\//, "Image must be a data URL")
     .optional(),
   bundle: bundleMetaSchema.optional(),
+  /**
+   * Stage 6c — the shop paused this bundle from its own dashboard. Optional
+   * with NO default on purpose: an omitted key must stay distinguishable from
+   * `false`, because the wizard save path keeps the stored value whenever the
+   * key is absent (an agency autosave must never silently unpause a bundle the
+   * shop paused). Only the shop-admin bundles route ever writes it, and only
+   * for data-bundles websites.
+   */
+  paused: z.boolean().optional(),
 });
 
 export type CatalogItem = z.infer<typeof catalogItemSchema>;

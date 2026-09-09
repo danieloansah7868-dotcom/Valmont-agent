@@ -2,7 +2,12 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireShopAdminSession } from "@/lib/shop-admin/auth";
 import { shopOrderLineLabel } from "@/lib/shop-admin/order-view";
-import { publicGetDraftOwnerId } from "@/lib/studio/draft-public";
+import { can } from "@/lib/shop-admin/permissions";
+import {
+  publicGetDraft,
+  publicGetDraftOwnerId,
+} from "@/lib/studio/draft-public";
+import { planOf } from "@/lib/studio/plans";
 import { getOrdersStore } from "@/lib/studio/orders";
 import { STATUS_BADGE_CLASS, STATUS_LABELS } from "@/lib/studio/order-status";
 import { formatMoney } from "@/lib/studio/money";
@@ -11,10 +16,15 @@ import { PAYMENT_METHODS } from "@/lib/studio/site-brief/schema";
 import {
   deliveryStatusLabel,
   getBundleDeliveriesStore,
+  MANUAL_PROVIDER_ID,
   type DeliveryStatus,
 } from "@/lib/studio/bundle-delivery";
 import { bundleNetworkLabel, formatDataMb } from "@/lib/studio/bundles";
 import { PaymentModeBadge } from "@/components/studio/payment-mode-badge";
+import {
+  DeliveryOrderActions,
+  DeliveryRowActions,
+} from "@/components/shop-admin/delivery-actions";
 
 export const dynamic = "force-dynamic";
 
@@ -34,6 +44,12 @@ const DELIVERY_BADGE_CLASS: Record<DeliveryStatus, string> = {
  * The order is read through the owner-scoped store and then pinned to this
  * website: an order that belongs to a sibling website of the same agency
  * user is a 404 here, the same as an order that does not exist.
+ *
+ * Stage 6c adds the action buttons on top of the same read-only load: the
+ * page itself still fetches nothing extra (no recheck on load — a member
+ * refreshing must not spend the TechChief allowance), and the buttons appear
+ * only for a login with the "orders.fulfil" box. A member without it sees
+ * exactly the 6b page.
  */
 export default async function ShopOrderDetailPage({
   params,
@@ -42,7 +58,7 @@ export default async function ShopOrderDetailPage({
 }) {
   const { id, orderId } = await params;
   const base = `/manage/${encodeURIComponent(id)}`;
-  await requireShopAdminSession(
+  const session = await requireShopAdminSession(
     id,
     `${base}/orders/${encodeURIComponent(orderId)}`,
   );
@@ -55,6 +71,14 @@ export default async function ShopOrderDetailPage({
   const deliveries = order.recipientPhone
     ? await getBundleDeliveriesStore().listForOrder(order.id)
     : [];
+  // Stage 6c: the action buttons exist only for a login with the
+  // "orders.fulfil" box (the owner always has it). A member without it sees
+  // exactly the 6b read-only page. Retry additionally never shows on a
+  // Starter shop — there is no automatic provider to retry through — and the
+  // plan is read at most once, and only when there is something to act on.
+  const canFulfil = can(session.admin, "orders.fulfil");
+  const isStarter =
+    planOf((await publicGetDraft(id).catch(() => null))?.brief) === "starter";
   const unitsPerLine = new Map<number, number>();
   for (const delivery of deliveries) {
     unitsPerLine.set(
@@ -208,9 +232,38 @@ export default async function ShopOrderDetailPage({
                     </div>
                   )}
                 </dl>
+                {canFulfil && (
+                  <DeliveryRowActions
+                    draftId={id}
+                    orderId={order.id}
+                    deliveryId={delivery.id}
+                    canMarkDelivered={
+                      (delivery.provider === MANUAL_PROVIDER_ID &&
+                        delivery.status === "pending") ||
+                      delivery.status === "failed"
+                    }
+                    canMarkFailed={
+                      delivery.provider === MANUAL_PROVIDER_ID &&
+                      delivery.status === "pending"
+                    }
+                  />
+                )}
               </li>
             ))}
           </ul>
+          {canFulfil && (
+            <DeliveryOrderActions
+              draftId={id}
+              orderId={order.id}
+              canRetry={
+                !isStarter &&
+                deliveries.some((delivery) => delivery.status === "failed")
+              }
+              canRecheck={deliveries.some(
+                (delivery) => delivery.status === "processing",
+              )}
+            />
+          )}
         </section>
       )}
 

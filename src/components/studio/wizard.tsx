@@ -1980,6 +1980,14 @@ function BundleTable({
                       />
                     </td>
                     <td className="p-1">
+                      {/* Stage 6c: the shop paused this bundle from its own
+                          dashboard; the agency sees why the storefront hides
+                          it but cannot unpause it from here. */}
+                      {item.paused === true && (
+                        <span className="mr-2 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-800">
+                          Paused by shop
+                        </span>
+                      )}
                       <button
                         type="button"
                         onClick={() => deleteItem(item.id)}

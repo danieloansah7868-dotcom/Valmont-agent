@@ -741,9 +741,9 @@ a crafted `shopAdmins` section in an import file is ignored
   links after 1 h, sessions after 30 days; `verifyPassword` runs the dummy
   hash for an unknown email, a disabled login and a login with no password
   yet, so every failure costs the same time; `setStatus("disabled")` revokes
-  every session in the same call; `purgeExpired` runs opportunistically (at
-  most once every 10 minutes, on `createSession`) and removes expired and
-  used tokens plus expired sessions.
+  every session in the same call; `purgeExpired` runs opportunistically
+  (about once an hour, on `createSession` — `PURGE_INTERVAL_MS` is 60
+  minutes) and removes expired and used tokens plus expired sessions.
 - `auth.ts` — the cookie (`httpOnly`, `SameSite=Lax`, `Secure` outside
   development, `path=/`, 30 days) and three readers: `getShopAdminSession`
   (server components), `requireShopAdminSession` (redirects to
@@ -811,6 +811,142 @@ The TechChief key beyond its nine-character prefix, the webhook secret, the
 agency's payment settings, the package selector, other shops, and agency
 user names. None of those flow into a shop-admin page or response; the layout
 reads only `brief.businessName` and the plan.
+
+## Data Bundles — Stage 6c: the shop admin's write actions
+
+Stage 6b's dashboard was deliberately read-only; 6c adds the writes, each
+behind the permission boxes that already existed in `permissions.ts` (the
+owner always passes; a member without the box gets 403
+`ShopPermissionError` — "Your login does not include this action. Ask the
+shop owner.") and, where stated, behind the package
+(`planAllows` → 403 `PACKAGE_NOT_INCLUDED_MESSAGE`).
+
+### Route preamble (same order everywhere)
+
+`assertCsrf` → `requireShopAdminApi` (401 / 404) → permission (403) →
+`assertHourlyRateLimit` keyed on the **website id** → `readBoundedJson`
+(16 KB) → the order pin → the write or the engine. The pin
+(`pinShopOrder` in `src/lib/shop-admin/order-access.ts`) resolves the order
+exactly the 6b pages do — `publicGetDraftOwnerId(draftId)`, then
+`getForOwner(ownerId, orderId)`, then `order.draftId === draftId` — BEFORE
+any engine call, because `retryBundleDeliveryFailures` and
+`recheckBundleDeliveriesForOrder` are owner/order-scoped, not shop-scoped.
+A sibling website's order is a 404.
+
+### Mark by hand — POST `/api/manage/[id]/orders/[orderId]/deliveries/[deliveryId]/mark`
+
+Permission `orders.fulfil`; 60/h per website. Body
+`{ status: "delivered" | "failed", note? ≤ 200 chars }`. The row must belong
+to that order (404 otherwise). Allowed transitions ONLY:
+
+| from                         | to "delivered"                                                | to "failed"                                                              |
+| ---------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| pending + provider `manual`  | ✓                                                             | ✓ (note becomes `last_error`, default "Marked as not sent by the shop.") |
+| failed (any provider)        | ✓ (settled out of band; provider, ref and attempts untouched) | 409 "already marked as failed"                                           |
+| delivered                    | 409 "already delivered" (terminal, I3)                        | 409 "already delivered"                                                  |
+| processing                   | 409 "being sent automatically - use Check status."            | same                                                                     |
+| pending + automatic provider | 409 "queued for automatic sending - use Check status."        | same                                                                     |
+
+Both writes are ONE atomic UPDATE each with the guards inside the WHERE
+clause — the `claimForDispatch` pattern — implemented in
+`src/lib/studio/manual-delivery.ts` (SQLite and PostgreSQL; the
+`BundleDeliveriesStore` interface is NOT widened, an existing test
+hand-implements it). Zero rows changed → the row is re-read and the matching
+409 above is answered. Marking delivered sets `delivered_at`, clears
+`last_error`, and leaves provider, `provider_ref` and attempts alone. No
+merchant alert fires for either mark — the shop did it itself.
+
+### Retry and Check status — POST `…/deliveries/retry` and `…/deliveries/recheck`
+
+Both: permission `orders.fulfil`, ONE shared hourly bucket
+(`shop-order-delivery`, 40/h per website) because both can spend the
+website's TechChief allowance. Both read and ignore the body (the client
+always sends `{}`). Retry calls the same `retryBundleDeliveryFailures` the
+Studio owner's button calls — but first reads
+`bundleDeliveryAvailabilityForDraft(draftId)`: a Starter shop is answered
+409 "This shop sends bundles by hand - mark the top-up delivered instead."
+and the engine is never called. Recheck runs
+`recheckBundleDeliveriesForOrder(order.id)` and answers
+`{ deliveries, checkedAt }`. The shop order page stays read-only on load —
+no recheck, ever; the buttons are the only way to spend the allowance from
+the shop side.
+
+Every delivery that leaves any of these routes is narrowed through
+`shopDeliveryView` (`src/lib/shop-admin/order-view.ts`): id, line/unit,
+network, size, validity, recipient, provider, status, attempts, provider
+reference, last error, delivered/updated timestamps — never `ownerId` (an
+agency identifier), never the order's catalogue bookkeeping.
+
+### Bundle pause and price edit — PATCH `/api/manage/[id]/bundles/[itemId]`
+
+Permission `bundles.manage`; 60/h per website; data-bundles websites only
+(any other category is a 404 — the route does not exist for them). Body
+`{ paused?: boolean, price?: number | string }` (at least one, else 400).
+Price goes through the exported `priceAmount` schema and must be > 0 (400);
+it is allowed on every package. `paused` additionally requires
+`planAllows(plan, "bundle_pause")` — Starter gets 403
+"Not included in your package."
+
+The write is one new draft-store method,
+`patchCatalogueItemAsShop(draftId, itemId, patch)` (SQLite + PostgreSQL): it
+reads the stored brief (normalised, so a pre-Phase-3 brief is not wiped),
+changes ONLY that item's `price` and/or `paused`, re-validates the whole
+brief with `siteBriefSchemaV1`, and saves with a compare-and-set on
+`revision` (revision + 1, up to three attempts on a lost race). No
+`SessionUser` is involved — the draft id is the scope. The response is a
+projection of the catalogue (`shopCatalogueView` in
+`src/lib/shop-admin/bundle-view.ts`): per item `{ id, name, network, dataMb,
+validity, price, paused }` — never the brief, never payments, never
+`adminEmail`.
+
+`paused` is optional on `catalogItemSchema` with NO default, so an omitted
+key stays distinguishable from `false`. The wizard save path
+(`PATCH /api/studio/drafts/[id]`) carries the stored item's `paused` value
+over whenever the incoming item has no key (matched by id), so an agency
+autosave can never silently unpause a bundle the shop paused; an explicit
+key wins, and the existing `expectedRevision` optimistic concurrency is
+untouched. The wizard's bundle table shows a small "Paused by shop" badge.
+
+### Storefront, checkout, guest line
+
+- The public bundle list (`groupBundlesByNetwork`) never lists a paused
+  item, so the storefront plus button cannot add it.
+- Checkout refuses a paused item with 400 "This bundle is currently
+  unavailable." inside the re-pricing loop — the same place the unknown-item
+  409 lives — BEFORE any order row exists. Existing orders keep their
+  snapshot prices.
+- `guestBundleDeliverySummary` gained one branch, placed before the
+  all-pending manual branch: some rows delivered, none failed, a manual row
+  still pending → "1 of 2 top-ups delivered to 024 ••• 0001; the shop will
+  send the rest by hand." (numbers and mask computed; every pre-6c sentence
+  byte-identical).
+- The Studio order page never renders the Retry button for a Starter shop;
+  it renders "This shop sends bundles by hand - the shop owner marks
+  delivery in the shop admin." instead.
+
+### Pages
+
+- The order page renders `DeliveryRowActions` (mark delivered / mark failed,
+  note optional) inside a delivery row and `DeliveryOrderActions` (Retry
+  failed top-ups — only when the website is NOT Starter and a failed row
+  exists; Check status now — only while a processing row exists) under the
+  list, only for a login with `orders.fulfil`. A member without the box sees
+  exactly the 6b page. Test ids: `shop-mark-delivered`, `shop-mark-failed`,
+  `shop-retry-deliveries`, `shop-recheck-deliveries`.
+- `/manage/[id]/bundles` lists the shop's bundles with a price input + Save
+  and a Pause / Resume toggle; on Starter the toggle is replaced by "Pause
+  is part of Auto-Dispatch Pro." Test ids: `shop-bundle-row`,
+  `shop-bundle-price`, `shop-bundle-save`, `shop-bundle-pause`. The layout
+  nav shows "Bundles" only for `can(admin, "bundles.manage")`; the page is a
+  404 without the box.
+
+### Stage 6c rate limits (per website, per hour)
+
+| action                        | bucket                | limit |
+| ----------------------------- | --------------------- | ----- |
+| mark delivered / failed       | `shop-delivery-mark`  | 60    |
+| retry + check status (shared) | `shop-order-delivery` | 40    |
+| bundle price / pause          | `shop-bundle-edit`    | 60    |
 
 ## Website Studio — Stage B: Brand Kit (no-brand clients)
 
