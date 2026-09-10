@@ -346,6 +346,10 @@ export class SqliteStudioDraftStore implements StudioDraftStore {
       await getShopAdminStore()
         .deleteForDraft(id)
         .catch(() => 0);
+      const { getShopAgentStore } = await import("@/lib/shop-agent/store");
+      await getShopAgentStore()
+        .deleteForDraft(id)
+        .catch(() => 0);
     }
     return deleted;
   }

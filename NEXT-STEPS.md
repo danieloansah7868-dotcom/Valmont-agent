@@ -914,3 +914,10 @@ deliberately NOT started by the 6d PR. Notes for whoever picks it up:
   connects and order-time wallet records — if the interval rule ever feels
   too eager, give the refresh its own last-refresh timestamp instead of
   reusing the row's last check.
+
+## Stage 7
+
+- **7b:** agents buy from their wallet at the agent price through the same
+  delivery engine, with agent orders in the admin and “Refund to wallet”.
+- **7c:** agents top up online through Valmont Pay.
+- Agent session and token `purgeExpired` exists in the store but is not scheduled yet.

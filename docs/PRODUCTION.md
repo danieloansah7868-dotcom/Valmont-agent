@@ -468,3 +468,11 @@ does not include the feature is refused with 403 before the provider is even
 created. The rasterising routes use next/og (satori + WASM, already proven
 by the opengraph image) — CPU only, no extra services, no FFI beyond what
 Next already ships.
+
+## Stage 7a deployment
+
+Run migration `0017_shop_agents` before using agent portals on PostgreSQL.
+Configure `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` for agent invites and reset
+messages. Without email configuration the server does not deliver links; the
+owner-side UI explains that Valmont must enable email. Stages 7b (wallet
+purchases) and 7c (Valmont Pay online top-ups) are not part of this migration.

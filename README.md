@@ -325,6 +325,12 @@ Stage 6d finishes the shop side with the two Command Center surfaces and records
 
 **Sales & margin report** (`/manage/<id>/reports`, needs the `reports.view` box on **Command Center** only). One website's own numbers for today / 7 days / 30 days (default) / this month: paid **live** orders (refunded and cancelled orders excluded everywhere; paid test orders counted but never in money), the money those orders collected, what the supplier charged for the delivered top-ups whose cost is known, and the margin left over — plus the same money columns per network and per bundle (top 10 by delivered top-ups), and delivered / failed / in-flight counts. A row's price is its checkout-time snapshot; rows without a recorded cost (sent by hand, by the simulator, or before migration `0016`) never pretend to a cost. The report is **aggregates only**: no customer names, no phone numbers, no order ids on the page.
 
+### Agent logins and in-shop wallets (Stage 7a)
+
+Command Center data-bundles shops can give resellers their own agent login. Owners add agents at `/manage/<SHOP-ID>/agents`; agents sign in at `/a/<SHOP-ID>`. The agent portal shows the shop's bundle catalogue at one shop-wide agent discount, the current wallet balance and the newest 100 ledger entries. It has no buying button in Stage 7a: buying from the wallet is Stage 7b, and online wallet top-ups through Valmont Pay are Stage 7c.
+
+Only the shop owner can add or disable agents, set the shop-wide discount, or add and remove wallet credit. Members cannot unlock wallet actions with a permission box, and `wallets.topup` remains reserved. Every manual wallet change is one signed, append-only ledger entry in integer pesewas; a deduction is rejected atomically when it would make the balance negative. Agent passwords, session values and invite/reset tokens are hashed, and agent sessions last 30 days. The five agent tables are excluded from backups. Agent invites need `RESEND_API_KEY`; when email is not configured the owner page explains that Valmont must enable it and never displays the raw invite link.
+
 ### Brand Kit (Stage B)
 
 A client who has **no brand yet** can get one in minutes. In the Studio wizard, right under the business-name field, the agency opens the collapsed **"No brand yet? Create one"** card and answers four questions — what the business sells, which town it is based in, how the brand should feel (trusted / friendly / premium / young), and up to three words the name must include. One **Suggest a brand** click (a single model call, two only when the safety filter below eats too many names) returns five name ideas with a one-line meaning and a tagline each, plus three colour palettes sized to the existing theme registry.
@@ -448,3 +454,11 @@ schedules 11 tests across 2 projects (22 scheduled tests). Do not treat a
 past test count as a permanent fact — use the latest CI run on the pull request.
 
 The production Docker image does **not** install browser binaries.
+
+### Stage 7a: agent logins and wallets
+
+Command Center shops can invite up to 50 agents at `/a/SHOP-ID`. Agents have
+an independent login, see bundles at the shop-wide agent discount, and see a
+wallet balance and append-only statement. The shop owner is the only person
+who can add or remove wallet credit; each change is one ledger entry. Stage 7a
+does not include buying or online wallet top-ups.

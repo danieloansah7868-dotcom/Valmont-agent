@@ -1148,3 +1148,19 @@ next/og's `ImageResponse`, the stored PNG — what the agency previews is what
 gets stored. The sheet composes name, tagline, the brief's current colours
 (`preferredColours`, else the theme's), the saved logo when present, the font
 stack and "Made with Valmont - valmontweb.com" on a 1200×1600 canvas.
+
+## Stage 7a — agent logins and wallet ledger
+
+Stage 7a adds a fourth login kind under `/a/[shop-id]`, separate from agency
+GitHub sessions, shop-admin logins, and customer accounts. A Command Center
+shop has `studio_shop_agents`, agent sessions, one-time agent tokens,
+`studio_shop_wallet_entries`, and `studio_shop_agent_settings`. Agent
+passwords and tokens are stored only as hashes.
+
+The wallet is an append-only ledger. L1 says every balance change is exactly
+one entry and the stored balance equals that entry's `balance_after`; L2 keeps
+the balance non-negative; L3 exposes no entry update or delete operation; L4
+allows only the shop owner to write credit or deduct entries; and L5 limits
+entries to integer minor units from one pesewa through GH₵5,000. The gate is
+`category === "data-bundles"` plus `planAllows(plan, "wallets")`. Buying and
+online top-ups are deferred to Stages 7b and 7c.

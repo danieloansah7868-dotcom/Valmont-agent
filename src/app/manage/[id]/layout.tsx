@@ -106,6 +106,17 @@ export default async function ShopAdminLayout({
                       Reports
                     </Link>
                   )}
+                {session.admin.role === "owner" &&
+                  draft.brief.category === "data-bundles" &&
+                  planAllows(plan, "wallets") && (
+                    <Link
+                      href={`${home}/agents`}
+                      className="rounded-md px-2.5 py-1.5 text-navy hover:bg-ivory-100"
+                      data-testid="shop-admin-agents-link"
+                    >
+                      Agents
+                    </Link>
+                  )}
                 {session.admin.role === "owner" && (
                   <Link
                     href={`${home}/team`}
