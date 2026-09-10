@@ -111,10 +111,16 @@ test.describe("shop agents", () => {
         path: "/",
       },
     ]);
-    await page.goto(
+    const acceptanceResponse = await page.goto(
       `/a/${shop.id}/accept-invite?token=${encodeURIComponent(inviteToken.token)}`,
     );
-    await page.getByTestId("agent-accept-name").fill("Reseller");
+    const acceptanceForm = page.getByTestId("agent-accept-name");
+    if ((await acceptanceForm.count()) === 0) {
+      throw new Error(
+        `Agent acceptance form missing: status=${acceptanceResponse?.status()} url=${page.url()} body=${(await page.locator("body").innerText()).slice(0, 500)}`,
+      );
+    }
+    await acceptanceForm.fill("Reseller");
     await page
       .getByTestId("agent-accept-password")
       .fill("correct horse battery");
