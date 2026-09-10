@@ -18,8 +18,14 @@ import { starterBundleCatalogue } from "../../src/lib/studio/bundles";
 import { SqliteShopAdminStore } from "../../src/lib/shop-admin/store";
 import { SqliteShopAgentStore } from "../../src/lib/shop-agent/store";
 import { canonicalUserId } from "../../src/lib/user-identity";
-import { SHOP_AGENT_SESSION_COOKIE } from "../../src/lib/shop-agent/auth";
 import type { SessionUser } from "../../src/lib/auth";
+
+// The cookie names stay literals here on purpose: the server module that
+// defines them (shop-agent/auth) imports next/headers, which only exists
+// inside a Next.js bundle — importing it from a Playwright worker would
+// make the spec unloadable. The store-side contract tests pin the real
+// constant, so a rename can never drift silently.
+const SHOP_AGENT_SESSION_COOKIE_NAME = "valmont_shop_agent_session";
 
 const e2eDataDir = path.resolve(process.env.E2E_DATA_DIR ?? ".e2e-data");
 setSqliteChatStoreForTests(
@@ -59,15 +65,22 @@ test.describe("shop agent wallet checkout", () => {
     baseURL,
   }) => {
     // A Command Center bundle shop with agents enabled, like 7a seeds it.
-    const shop = await new SqliteStudioDraftStore().create(
-      agency,
-      createDefaultBrief({
+    // The default brief leaves payments off ("not accepting orders yet"),
+    // so flip them on before the create — the buy page 409s without them.
+    const brief = {
+      ...createDefaultBrief({
         businessName: "Stage 7b Data GH",
         category: "data-bundles",
         plan: "command_center",
         items: starterBundleCatalogue(),
       }),
-    );
+    };
+    brief.payments = {
+      ...brief.payments,
+      enabled: true,
+      methods: ["valmont_pay"] as never,
+    };
+    const shop = await new SqliteStudioDraftStore().create(agency, brief);
     const adminStore = new SqliteShopAdminStore();
     const ownerInvite = await adminStore.createOwnerInvite({
       draftId: shop.id,
@@ -106,7 +119,12 @@ test.describe("shop agent wallet checkout", () => {
 
     // The agent's home: server-rendered discounted price, one Order button
     // per bundle row.
-    await cookies(context, baseURL!, SHOP_AGENT_SESSION_COOKIE, agentToken);
+    await cookies(
+      context,
+      baseURL!,
+      SHOP_AGENT_SESSION_COOKIE_NAME,
+      agentToken,
+    );
     await page.goto(`/a/${shop.id}`);
     await expect(page.getByTestId("agent-balance")).toContainText("GH₵50.00");
     await expect(page.getByTestId("agent-nav-orders")).toBeVisible();
