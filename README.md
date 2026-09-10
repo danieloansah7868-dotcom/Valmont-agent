@@ -331,6 +331,14 @@ Command Center data-bundles shops can give resellers their own agent login. Owne
 
 Only the shop owner can add or disable agents, set the shop-wide discount, or add and remove wallet credit. Members cannot unlock wallet actions with a permission box, and `wallets.topup` remains reserved. Every manual wallet change is one signed, append-only ledger entry in integer pesewas; a deduction is rejected atomically when it would make the balance negative. Agent passwords, session values and invite/reset tokens are hashed, and agent sessions last 30 days. The five agent tables are excluded from backups. Agent invites need `RESEND_API_KEY`; when email is not configured the owner page explains that Valmont must enable it and never displays the raw invite link.
 
+### Agent wallet checkout (Stage 7b)
+
+Stage 7b lets an agent **buy from the wallet**. Each bundle row on the agent home page keeps its discounted price and gains an order panel: the agent types the customer's number, sees what the wallet will be charged and what it looks like afterwards, and confirms. `POST /api/a/<SHOP-ID>/orders` recomputes the price on the server (catalogue price minus the shop's agent discount — the browser never sends a price), checks the wallet the same way a deduction is checked, debits it and writes exactly one signed `purchase` ledger entry alongside the balance change in ONE transaction, creates the order as `agent_wallet`, marks it paid through the single channel that sets `paidAt`, and runs the same delivery engine as the public checkout (simulator in test mode, the shop's own TechChief key once connected). Insufficient balance, stopped sales, paused bundles, unknown items, basket caps and the live-delivery guard all refuse **before** any order row exists.
+
+The agent gets an **Orders** nav link: `/a/<SHOP-ID>/orders` lists only their own orders, each order page shows the status, the recipient number they typed, the balance after the purchase and live delivery progress — no retry or mark buttons, those stay with the owner. The owner sees an **Agent** badge on wallet-paid order rows in `/manage/<SHOP-ID>`, "Paid from agent wallet - Reseller" on the order, and — owner-only — **Refund to wallet**, which credits the purchase amount back once per order (one `refund` entry, enforced by a partial unique index) and moves the order to Refunded. Refund while paid or delivered; every ledger row for an order links to it from both statement pages.
+
+`agent_wallet` is NOT in `PAYMENT_METHODS`: it is not selectable in Studio → Payments, is refused by the public checkout like any unknown method, and public orders never carry `agent_id`. The order's access code stays server-side — the agent (and the API response) never sees it; unsigned guest pages already show only statuses.
+
 ### Brand Kit (Stage B)
 
 A client who has **no brand yet** can get one in minutes. In the Studio wizard, right under the business-name field, the agency opens the collapsed **"No brand yet? Create one"** card and answers four questions — what the business sells, which town it is based in, how the brand should feel (trusted / friendly / premium / young), and up to three words the name must include. One **Suggest a brand** click (a single model call, two only when the safety filter below eats too many names) returns five name ideas with a one-line meaning and a tagline each, plus three colour palettes sized to the existing theme registry.
@@ -462,3 +470,10 @@ an independent login, see bundles at the shop-wide agent discount, and see a
 wallet balance and append-only statement. The shop owner is the only person
 who can add or remove wallet credit; each change is one ledger entry. Stage 7a
 does not include buying or online wallet top-ups.
+
+Stage 7b adds buying from the wallet: `POST /api/a/SHOP-ID/orders`, the
+agent **Orders** pages, per-order purchase/refund ledger entries (single
+transaction, once-per-order enforced by partial unique indexes), and the
+owner-only **Refund to wallet** on an agent order. See the Stage 7b threat
+notes in `docs/SECURITY.md` and migration `0018_agent_orders.sql` in
+`docs/PRODUCTION.md`.

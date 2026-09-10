@@ -1,9 +1,20 @@
+import Link from "next/link";
 import { requireShopAgentSession } from "@/lib/shop-agent/auth";
 import { getShopAgentStore } from "@/lib/shop-agent/store";
 import { formatMoney } from "@/lib/studio/money";
 import { formatAccra } from "@/lib/studio/format";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * What one wallet row is called. Credits and deductions keep the exact 7a
+ * wording; Stage 7b's order-bound rows name the order and link to it.
+ */
+function entryLabel(kind: string, amount: number): string {
+  if (kind === "purchase") return "Purchase";
+  if (kind === "refund") return "Refund";
+  return amount >= 0 ? "Credit added" : "Credit removed";
+}
 
 export default async function AgentWalletPage({
   params,
@@ -16,6 +27,7 @@ export default async function AgentWalletPage({
     `/a/${encodeURIComponent(id)}/wallet`,
   );
   const entries = await getShopAgentStore().listEntries(session.agent.id, 100);
+  const home = `/a/${encodeURIComponent(id)}`;
   return (
     <div className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6">
       <h1 className="text-2xl font-bold text-navy">Wallet statement</h1>
@@ -43,11 +55,25 @@ export default async function AgentWalletPage({
                       : "font-semibold text-red-700"
                   }
                 >
-                  {entry.amount >= 0 ? "Credit added" : "Credit removed"}{" "}
+                  {entryLabel(entry.kind, entry.amount)}{" "}
                   {formatMoney(entry.amount)}
                 </span>
                 <span>Balance after: {formatMoney(entry.balanceAfter)}</span>
-                <span className="text-slate">{entry.note || "—"}</span>
+                <span className="text-slate">
+                  {entry.orderId &&
+                  (entry.kind === "purchase" || entry.kind === "refund") ? (
+                    <Link
+                      href={`${home}/orders/${encodeURIComponent(entry.orderId)}`}
+                      className="font-semibold text-copper-700 hover:underline"
+                      data-testid="agent-entry-order-link"
+                    >
+                      {entry.kind === "purchase" ? "Purchase" : "Refund"} -
+                      Order {entry.orderId.slice(0, 8)}
+                    </Link>
+                  ) : (
+                    entry.note || "—"
+                  )}
+                </span>
               </li>
             ))}
           </ul>

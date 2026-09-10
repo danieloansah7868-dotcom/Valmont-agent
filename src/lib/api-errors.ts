@@ -313,3 +313,46 @@ export class WalletInsufficientError extends ConflictError {
     this.name = "WalletInsufficientError";
   }
 }
+
+/**
+ * Stage 7b — a second refund for the same order into the same wallet. Raised
+ * by the wallet ledger itself (and mapped from the partial unique index), so
+ * the money can never be credited twice even when two refunds race.
+ */
+export class WalletAlreadyRefundedError extends ConflictError {
+  constructor(message = "This order was already refunded to the wallet.") {
+    super(message);
+    this.name = "WalletAlreadyRefundedError";
+  }
+}
+
+/**
+ * Stage 7b hardening — an order id already carries a wallet ledger entry
+ * that belongs to a DIFFERENT agent. That is not the caller's idempotent
+ * replay (same agent + same order returns the same entry); it is a foreign
+ * key collision, so the wallet must refuse rather than hand back the other
+ * agent's entry — adoption would silently charge one agent's order to
+ * another wallet. Real routes can never produce this (the buy route mints
+ * the order id and stamps the same agent on order and entry in one flow);
+ * the store enforces it anyway so no future caller can.
+ */
+export class WalletOrderConflictError extends ConflictError {
+  constructor(
+    message = "This order already has a wallet entry from another agent.",
+  ) {
+    super(message);
+    this.name = "WalletOrderConflictError";
+  }
+}
+
+/**
+ * Stage 7b — the order simply is not a wallet-paid agent order (a public
+ * checkout order, or an agent order whose purchase entry is missing), so
+ * there is nothing a wallet refund could return.
+ */
+export class AgentOrderNotRefundableError extends ConflictError {
+  constructor(message = "This order cannot be refunded to a wallet.") {
+    super(message);
+    this.name = "AgentOrderNotRefundableError";
+  }
+}

@@ -5,6 +5,8 @@ import type {
   BundleDeliveryRecord,
   DeliveryStatus,
 } from "@/lib/studio/bundle-delivery";
+import { AGENT_WALLET_PAYMENT_METHOD } from "@/lib/shop-agent/orders";
+import { PAYMENT_METHODS } from "@/lib/studio/site-brief/schema";
 
 /**
  * "MTN 5GB × 2" for a bundle line, "<name> × <qty>" for anything else. The
@@ -21,6 +23,19 @@ export function shopOrderLineLabel(line: OrderLine): string {
       : null;
   const head = network && size ? `${network} ${size}` : line.name;
   return `${head} × ${line.quantity}`;
+}
+
+/**
+ * Stage 7b — a payment method as a person reads it. `agent_wallet` is NOT in
+ * PAYMENT_METHODS on purpose (R7: never selectable in Studio or on the public
+ * storefront), so a raw lookup would print the machine string "agent_wallet"
+ * back at the owner — this label keeps those orders readable while every
+ * known method keeps its PAYMENT_METHODS label, and anything unknown still
+ * falls back to the raw string rather than inventing a name.
+ */
+export function paymentMethodLabel(method: string): string {
+  if (method === AGENT_WALLET_PAYMENT_METHOD) return "Agent wallet";
+  return PAYMENT_METHODS.find((entry) => entry.id === method)?.label ?? method;
 }
 
 /**

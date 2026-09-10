@@ -34,7 +34,9 @@ import {
   BadRequestError,
   ShopAgentCapError,
   ShopAgentExistsError,
+  WalletAlreadyRefundedError,
   WalletInsufficientError,
+  WalletOrderConflictError,
 } from "@/lib/api-errors";
 import { MAX_AGENT_DISCOUNT_PERCENT } from "./pricing";
 
@@ -144,6 +146,40 @@ export interface ShopAgentStore {
     note?: string;
     createdBy: string;
   }): Promise<WalletEntry>;
+  /**
+   * Stage 7b — the ONLY way a purchase is debited (R3). One transaction:
+   * checks the idempotency key (a purchase entry for this order already
+   *   exists → return it, change nothing), debits the balance with a
+   *   conditional UPDATE (`balance_minor >= amount` — a race can never
+   *   overdraw), and appends exactly one `purchase` entry (negative amount,
+   *   `order_id` set) inside the same transaction. Throws
+   *   WalletInsufficientError when the balance cannot cover the amount.
+   */
+  purchase(input: {
+    agentId: string;
+    orderId: string;
+    amountMinor: number;
+    createdBy: string;
+  }): Promise<WalletEntry>;
+  /**
+   * Stage 7b — the ONLY way a refund is credited (R8). Same transaction
+   * shape as {@link ShopAgentStore.purchase} but adds the amount back with a
+   * positive `refund` entry. Throws WalletAlreadyRefundedError when this
+   * order already has a refund entry — also when the partial unique index
+   * fires — so the wallet is never credited twice for one order.
+   */
+  refund(input: {
+    agentId: string;
+    orderId: string;
+    amountMinor: number;
+    createdBy: string;
+    note?: string;
+  }): Promise<WalletEntry>;
+  /** One entry of a kind for one order (the idempotency lookups), or null. */
+  getEntryForOrder(
+    orderId: string,
+    kind: ShopWalletEntryKind,
+  ): Promise<WalletEntry | null>;
   listEntries(agentId: string, limit?: number): Promise<WalletEntry[]>;
   getSettings(draftId: string): Promise<{ discountPercent: number }>;
   setDiscountPercent(
@@ -235,12 +271,25 @@ function sortAgents(agents: ShopAgent[]): ShopAgent[] {
   );
 }
 
-function isUniqueViolation(error: unknown): boolean {
+// Exported for the wallet's own store tests (the Postgres-gated file
+// exercises it directly); still module-internal for every real caller.
+export function isUniqueViolation(error: unknown): boolean {
   let current: unknown = error;
   for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
     const code = "code" in current ? String(current.code) : "";
-    if (code === "23505" || /unique|duplicate/i.test(current.message))
+    if (code === "23505") return true;
+    // A drizzle QueryError wrapper reports only "Failed query: …" on its own
+    // layer — the constraint evidence (SQLSTATE 23505, or the driver's
+    // UNIQUE/duplicate message) always lives on `error.cause` (same note as
+    // shop-admin's helper). The wrapper's own text is NOT evidence: an error
+    // that merely *recites* a UNIQUE violation on its outer layer, without a
+    // constraint error underneath, must never be mistaken for one — wallet
+    // ledger decisions (adopt the existing entry? hard-conflict a refund?)
+    // ride on this answer, so a fake must fall through to a plain throw.
+    const isQueryWrapper = current.message.startsWith("Failed query:");
+    if (!isQueryWrapper && /unique|duplicate/i.test(current.message)) {
       return true;
+    }
     current = current.cause;
   }
   return false;
@@ -276,7 +325,10 @@ export function ensureShopAgentSchema(db: DatabaseSync): void {
       phone TEXT,
       status TEXT NOT NULL DEFAULT 'invited',
       password_hash TEXT,
-      balance_minor INTEGER NOT NULL DEFAULT 0,
+      -- Stage 7b: the CHECK backs the conditional UPDATE's guarantee that a
+      -- wallet balance never goes negative (Postgres: 0019's constraint;
+      -- pre-existing SQLite files lean on the conditional UPDATE alone).
+      balance_minor INTEGER NOT NULL DEFAULT 0 CHECK (balance_minor >= 0),
       invited_by TEXT,
       last_login_at TEXT,
       created_at TEXT NOT NULL,
@@ -306,7 +358,10 @@ export function ensureShopAgentSchema(db: DatabaseSync): void {
       draft_id TEXT NOT NULL,
       agent_id TEXT NOT NULL REFERENCES studio_shop_agents(id) ON DELETE CASCADE,
       kind TEXT NOT NULL,
-      amount_minor INTEGER NOT NULL,
+      -- Stage 7b: the ledger only ever moves money — no zero-amount row can
+      -- exist (assertWalletAmount is the application gate; this CHECK is the
+      -- database's own, matching 0019's Postgres constraint).
+      amount_minor INTEGER NOT NULL CHECK (amount_minor <> 0),
       balance_after_minor INTEGER NOT NULL,
       order_id TEXT,
       note TEXT,
@@ -315,6 +370,12 @@ export function ensureShopAgentSchema(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS studio_shop_wallet_entries_agent_created_idx ON studio_shop_wallet_entries(agent_id, created_at);
     CREATE INDEX IF NOT EXISTS studio_shop_wallet_entries_draft_created_idx ON studio_shop_wallet_entries(draft_id, created_at);
+    -- Stage 7b: at most ONE purchase entry and ONE refund entry per order,
+    -- enforced by the database itself. The names must match the partial
+    -- indexes in the Postgres migration SQL (0018_agent_orders.sql) so a
+    -- SQLite → Postgres drift check sees the same schema.
+    CREATE UNIQUE INDEX IF NOT EXISTS studio_shop_wallet_entries_order_purchase_unique ON studio_shop_wallet_entries(order_id) WHERE kind = 'purchase';
+    CREATE UNIQUE INDEX IF NOT EXISTS studio_shop_wallet_entries_order_refund_unique ON studio_shop_wallet_entries(order_id) WHERE kind = 'refund';
     CREATE TABLE IF NOT EXISTS studio_shop_agent_settings (
       draft_id TEXT PRIMARY KEY,
       discount_percent INTEGER NOT NULL DEFAULT 0,
@@ -768,6 +829,148 @@ export class SqliteShopAgentStore implements ShopAgentStore {
     createdBy: string;
   }): Promise<WalletEntry> {
     return this.wallet(input, true);
+  }
+  private entryForOrder(
+    orderId: string,
+    kind: ShopWalletEntryKind,
+  ): SqliteEntryRow | undefined {
+    return this.db
+      .prepare(
+        "SELECT * FROM studio_shop_wallet_entries WHERE order_id = ? AND kind = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      )
+      .get(orderId, kind) as unknown as SqliteEntryRow | undefined;
+  }
+  async getEntryForOrder(
+    orderId: string,
+    kind: ShopWalletEntryKind,
+  ): Promise<WalletEntry | null> {
+    const row = this.entryForOrder(orderId, kind);
+    return row ? this.entry(row) : null;
+  }
+  private orderEntry(
+    input: {
+      agentId: string;
+      orderId: string;
+      amountMinor: number;
+      createdBy: string;
+      note?: string;
+    },
+    kind: "purchase" | "refund",
+  ): WalletEntry {
+    assertWalletAmount(input.amountMinor);
+    const db = this.db;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      // Idempotency key first: a purchase replay returns the existing entry
+      // unchanged; a refund replay is a hard conflict, never a second
+      // credit. Both are pinned to THIS agent: a key that belongs to another
+      // agent is a collision (WalletOrderConflictError), never adoption.
+      const existing = this.entryForOrder(input.orderId, kind);
+      if (existing) {
+        if (existing.agent_id !== input.agentId) {
+          throw new WalletOrderConflictError();
+        }
+        if (kind === "refund") throw new WalletAlreadyRefundedError();
+        db.exec("COMMIT");
+        return this.entry(existing);
+      }
+      const agent = this.validateAgent(input.agentId);
+      const signed =
+        kind === "purchase" ? -input.amountMinor : input.amountMinor;
+      const updated =
+        kind === "purchase"
+          ? (db
+              .prepare(
+                "UPDATE studio_shop_agents SET balance_minor = balance_minor - ?, updated_at = ? WHERE id = ? AND balance_minor >= ? RETURNING balance_minor",
+              )
+              .get(
+                input.amountMinor,
+                new Date().toISOString(),
+                input.agentId,
+                input.amountMinor,
+              ) as { balance_minor: number } | undefined)
+          : (db
+              .prepare(
+                "UPDATE studio_shop_agents SET balance_minor = balance_minor + ?, updated_at = ? WHERE id = ? RETURNING balance_minor",
+              )
+              .get(
+                input.amountMinor,
+                new Date().toISOString(),
+                input.agentId,
+              ) as { balance_minor: number } | undefined);
+      // The purchase UPDATE is conditional on the balance covering the
+      // amount, so a lost race (or a stale pre-check) draws zero rows and
+      // nothing is debited; the refund UPDATE always lands on a live agent.
+      if (!updated) throw new WalletInsufficientError();
+      const id = randomUUID();
+      const createdAt = new Date().toISOString();
+      try {
+        db.prepare(
+          `INSERT INTO studio_shop_wallet_entries(
+          id, draft_id, agent_id, kind, amount_minor, balance_after_minor,
+          order_id, note, created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          id,
+          agent.draft_id,
+          input.agentId,
+          kind,
+          signed,
+          updated.balance_minor,
+          input.orderId,
+          input.note ?? null,
+          input.createdBy,
+          createdAt,
+        );
+      } catch (error) {
+        // The partial unique index caught a write the existence check raced
+        // with: a purchase settles on the entry that won, a refund conflicts.
+        // The re-read is pinned to THIS agent, exactly like the Postgres
+        // engine: a foreign order id that happens to collide with another
+        // agent's ledger row must be a plain error, never wallet adoption.
+        if (isUniqueViolation(error)) {
+          const winner = this.entryForOrder(input.orderId, kind);
+          if (winner) {
+            if (winner.agent_id !== input.agentId) {
+              throw new WalletOrderConflictError();
+            }
+            if (kind === "refund") throw new WalletAlreadyRefundedError();
+            db.exec("ROLLBACK");
+            return this.entry(winner);
+          }
+        }
+        throw error;
+      }
+      const entry = db
+        .prepare("SELECT * FROM studio_shop_wallet_entries WHERE id = ?")
+        .get(id);
+      db.exec("COMMIT");
+      return this.entry(entry);
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* preserve original error */
+      }
+      throw error;
+    }
+  }
+  async purchase(input: {
+    agentId: string;
+    orderId: string;
+    amountMinor: number;
+    createdBy: string;
+  }): Promise<WalletEntry> {
+    return this.orderEntry(input, "purchase");
+  }
+  async refund(input: {
+    agentId: string;
+    orderId: string;
+    amountMinor: number;
+    createdBy: string;
+    note?: string;
+  }): Promise<WalletEntry> {
+    return this.orderEntry(input, "refund");
   }
   async listEntries(agentId: string, limit = 100): Promise<WalletEntry[]> {
     const safeLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
@@ -1226,6 +1429,138 @@ export class PostgresShopAgentStore implements ShopAgentStore {
       if (!entry) throw new Error("Wallet entry could not be written");
       return pgEntry(entry);
     });
+  }
+  async getEntryForOrder(
+    orderId: string,
+    kind: ShopWalletEntryKind,
+  ): Promise<WalletEntry | null> {
+    const [row] = await getDatabase()
+      .select()
+      .from(studioShopWalletEntries)
+      .where(
+        and(
+          eq(studioShopWalletEntries.orderId, orderId),
+          eq(studioShopWalletEntries.kind, kind),
+        ),
+      )
+      .limit(1);
+    return row ? pgEntry(row) : null;
+  }
+  private async orderEntry(
+    input: {
+      agentId: string;
+      orderId: string;
+      amountMinor: number;
+      createdBy: string;
+      note?: string;
+    },
+    kind: "purchase" | "refund",
+  ): Promise<WalletEntry> {
+    assertWalletAmount(input.amountMinor);
+    try {
+      return await getDatabase().transaction(async (tx) => {
+        const [existing] = await tx
+          .select()
+          .from(studioShopWalletEntries)
+          .where(
+            and(
+              eq(studioShopWalletEntries.orderId, input.orderId),
+              eq(studioShopWalletEntries.kind, kind),
+            ),
+          )
+          .limit(1);
+        // Idempotency key: a purchase replay returns what it already wrote;
+        // a refund replay is a hard conflict, never a second credit. Both
+        // pinned to THIS agent — a foreign key is a collision, not a replay
+        // (same rule as the SQLite engine; WalletOrderConflictError, 409).
+        if (existing) {
+          if (existing.agentId !== input.agentId) {
+            throw new WalletOrderConflictError();
+          }
+          if (kind === "refund") throw new WalletAlreadyRefundedError();
+          return pgEntry(existing);
+        }
+        const [agent] = await tx
+          .select()
+          .from(studioShopAgents)
+          .where(eq(studioShopAgents.id, input.agentId))
+          .limit(1);
+        if (!agent) throw new Error("Shop agent no longer exists");
+        const updated = await tx
+          .update(studioShopAgents)
+          .set({
+            balanceMinor:
+              kind === "purchase"
+                ? sql`${studioShopAgents.balanceMinor} - ${input.amountMinor}`
+                : sql`${studioShopAgents.balanceMinor} + ${input.amountMinor}`,
+            updatedAt: new Date(),
+          })
+          .where(
+            kind === "purchase"
+              ? and(
+                  eq(studioShopAgents.id, input.agentId),
+                  gte(studioShopAgents.balanceMinor, input.amountMinor),
+                )
+              : eq(studioShopAgents.id, input.agentId),
+          )
+          .returning({ balanceMinor: studioShopAgents.balanceMinor });
+        // The purchase UPDATE is conditional on the balance covering the
+        // amount: a raced second buyer updates zero rows and nothing moves.
+        if (!updated[0]) throw new WalletInsufficientError();
+        const [entry] = await tx
+          .insert(studioShopWalletEntries)
+          .values({
+            draftId: agent.draftId,
+            agentId: input.agentId,
+            kind,
+            amountMinor:
+              kind === "purchase" ? -input.amountMinor : input.amountMinor,
+            balanceAfterMinor: updated[0].balanceMinor,
+            orderId: input.orderId,
+            note: input.note,
+            createdBy: input.createdBy,
+          })
+          .returning();
+        if (!entry) throw new Error("Wallet entry could not be written");
+        return pgEntry(entry);
+      });
+    } catch (error) {
+      // The partial unique index settled a write race that READ COMMITTED
+      // could not see: the rolled-back loser maps onto the same answer as
+      // the existence check — purchase: the winner's entry. The re-read is
+      // pinned to THIS agent: a foreign order id colliding with some other
+      // agent's entry must be a plain error — wallet identity never crosses,
+      // and a QueryError-shaped error that merely recites a UNIQUE violation
+      // (see isUniqueViolation's wrapper guard) can never rewrite the ledger.
+      if (isUniqueViolation(error)) {
+        const winner = await this.getEntryForOrder(input.orderId, kind);
+        if (winner) {
+          if (winner.agentId !== input.agentId) {
+            throw new WalletOrderConflictError();
+          }
+          if (kind === "refund") throw new WalletAlreadyRefundedError();
+          return winner;
+        }
+      }
+      throw error;
+    }
+  }
+  async purchase(input: {
+    agentId: string;
+    orderId: string;
+    amountMinor: number;
+    createdBy: string;
+  }): Promise<WalletEntry> {
+    return this.orderEntry(input, "purchase");
+  }
+  async refund(input: {
+    agentId: string;
+    orderId: string;
+    amountMinor: number;
+    createdBy: string;
+    note?: string;
+  }): Promise<WalletEntry> {
+    return this.orderEntry(input, "refund");
   }
   async listEntries(agentId: string, limit = 100): Promise<WalletEntry[]> {
     const safeLimit = Math.max(1, Math.min(100, Math.trunc(limit)));

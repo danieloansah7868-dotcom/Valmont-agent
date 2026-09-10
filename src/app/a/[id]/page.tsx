@@ -1,6 +1,7 @@
 import { requireShopAgentSession } from "@/lib/shop-agent/auth";
 import { getShopAgentStore } from "@/lib/shop-agent/store";
 import { agentPrice } from "@/lib/shop-agent/pricing";
+import { AgentBuyPanel } from "@/components/shop-agent/buy";
 import {
   groupBundlesByNetwork,
   bundleNetworkLabel,
@@ -65,33 +66,49 @@ export default async function AgentHomePage({
                   {bundleNetworkLabel(network)}
                 </h2>
                 <ul className="mt-2 grid gap-2 sm:grid-cols-2">
-                  {grouped[network].map((item) => (
-                    <li
-                      key={item.id}
-                      className="rounded-xl border border-line bg-white p-4"
-                      data-testid="agent-bundle-row"
-                    >
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="font-semibold text-navy">
-                          {item.name}
-                        </span>
-                        <span className="text-sm text-slate line-through">
-                          {formatMoney(item.price ?? 0)}
-                        </span>
-                      </div>
-                      <p
-                        className="mt-1 text-lg font-bold text-copper-700"
-                        data-testid="agent-bundle-price"
+                  {grouped[network].map((item) => {
+                    // The price the panel previews and the server re-derives
+                    // — the browser only ever shows it, never posts it (R1).
+                    const price = agentPrice(
+                      item.price ?? 0,
+                      settings.discountPercent,
+                    );
+                    return (
+                      <li
+                        key={item.id}
+                        className="rounded-xl border border-line bg-white p-4"
+                        data-testid="agent-bundle-row"
                       >
-                        {formatMoney(
-                          agentPrice(item.price ?? 0, settings.discountPercent),
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="font-semibold text-navy">
+                            {item.name}
+                          </span>
+                          <span className="text-sm text-slate line-through">
+                            {formatMoney(item.price ?? 0)}
+                          </span>
+                        </div>
+                        <p
+                          className="mt-1 text-lg font-bold text-copper-700"
+                          data-testid="agent-bundle-price"
+                        >
+                          {formatMoney(price)}
+                        </p>
+                        {item.description && (
+                          <p className="text-xs text-slate">
+                            {item.description}
+                          </p>
                         )}
-                      </p>
-                      {item.description && (
-                        <p className="text-xs text-slate">{item.description}</p>
-                      )}
-                    </li>
-                  ))}
+                        <AgentBuyPanel
+                          draftId={id}
+                          itemId={item.id}
+                          itemName={item.name}
+                          unitPrice={price}
+                          balance={session.agent.balance}
+                          businessName={draft.brief.businessName}
+                        />
+                      </li>
+                    );
+                  })}
                 </ul>
               </section>
             ),

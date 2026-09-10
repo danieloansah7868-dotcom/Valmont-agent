@@ -917,7 +917,19 @@ deliberately NOT started by the 6d PR. Notes for whoever picks it up:
 
 ## Stage 7
 
-- **7b:** agents buy from their wallet at the agent price through the same
-  delivery engine, with agent orders in the admin and “Refund to wallet”.
-- **7c:** agents top up online through Valmont Pay.
+- **7a (done):** agent logins, wallet credit/debit by the owner, statements.
+- **7b (done):** agents buy from their wallet at the agent price through the
+  same delivery engine — server-side pricing at the shop discount, one
+  purchase ledger entry per order in one transaction, per-order partial
+  unique indexes, agent **Orders** pages, the owner's agent-order badge and
+  owner-only **Refund to wallet** — with `agent_wallet` kept out of every
+  payment-method picker.
+- **7c (next):** agents top up online through Valmont Pay. Notes for whoever
+  picks it up: the top-up path must reuse the ledger (`credit`), never the
+  balance column directly; a webhook-verified top-up is the only acceptable
+  source of new money; the buy route's rate-limit and CSRF patterns carry
+  over as-is.
 - Agent session and token `purgeExpired` exists in the store but is not scheduled yet.
+- A future report could join `studio_orders.agent_id` to the sales & margin
+  dashboard for a per-agent commission view; today agent orders simply show
+  up among the shop's orders with the Agent badge.

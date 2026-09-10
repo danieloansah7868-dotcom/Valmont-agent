@@ -476,3 +476,25 @@ Configure `RESEND_API_KEY` and `NOTIFY_EMAIL_FROM` for agent invites and reset
 messages. Without email configuration the server does not deliver links; the
 owner-side UI explains that Valmont must enable email. Stages 7b (wallet
 purchases) and 7c (Valmont Pay online top-ups) are not part of this migration.
+
+## Stage 7b deployment
+
+Run migration `0018_agent_orders` (after `0017_shop_agents`) before enabling
+the agent Buy panel on PostgreSQL deployments. The migration is additive:
+
+- `ALTER TABLE "studio_orders" ADD COLUMN "agent_id" text;` — nullable; every
+  pre-Stage-7b order reads as a public order.
+- `CREATE INDEX "studio_orders_agent_created_idx"` for the agent's own
+  Orders list.
+- Two partial unique indexes on `studio_shop_wallet_entries(order_id)` —
+  `WHERE kind = 'purchase'` and `WHERE kind = 'refund'` — so a double-spend
+  or double-refund can never write a second ledger row, even under a race.
+
+On PostgreSQL the money pledge lives in these indexes; on SQLite the same
+columns and indexes are created idempotently by `ensureOrdersSchema` /
+`ensureShopAgentSchema` on first use, so no out-of-band step is required
+there. No new environment variables and no new providers: in payment test
+mode the agent flow runs through the simulator like every other order, and
+in live mode it needs the same per-shop delivery answer (verified TechChief
+key or manual hand-delivery) the public checkout requires. Stage 7c (Valmont
+Pay online top-ups) is NOT part of this migration.

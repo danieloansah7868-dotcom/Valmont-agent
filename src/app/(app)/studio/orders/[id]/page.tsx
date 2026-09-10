@@ -6,7 +6,7 @@ import { getOrdersStore } from "@/lib/studio/orders";
 import { STATUS_BADGE_CLASS, STATUS_LABELS } from "@/lib/studio/order-status";
 import { formatMoney } from "@/lib/studio/valmont-pay";
 import { formatAccra } from "@/lib/studio/format";
-import { PAYMENT_METHODS } from "@/lib/studio/site-brief/schema";
+import { paymentMethodLabel } from "@/lib/shop-admin/order-view";
 import { OrderActions } from "@/components/studio/order-actions";
 import { PaymentModeBadge } from "@/components/studio/payment-mode-badge";
 import {
@@ -79,9 +79,9 @@ export default async function OrderDetailPage({
     );
   }
 
-  const methodLabel =
-    PAYMENT_METHODS.find((method) => method.id === order.paymentMethod)
-      ?.label ?? order.paymentMethod;
+  // Stage 7b: "agent_wallet" reads "Agent wallet"; every known method keeps
+  // its PAYMENT_METHODS label, anything else falls back to the raw string.
+  const methodLabel = paymentMethodLabel(order.paymentMethod);
 
   return (
     <div className="mx-auto w-full max-w-[720px] p-4 sm:p-6">
