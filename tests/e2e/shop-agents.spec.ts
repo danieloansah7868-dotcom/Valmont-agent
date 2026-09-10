@@ -111,16 +111,10 @@ test.describe("shop agents", () => {
         path: "/",
       },
     ]);
-    const acceptanceResponse = await page.goto(
-      `/a/${shop.id}/accept-invite?token=${encodeURIComponent(inviteToken.token)}`,
-    );
-    const acceptanceForm = page.getByTestId("agent-accept-name");
-    if ((await acceptanceForm.count()) === 0) {
-      throw new Error(
-        `Agent acceptance form missing: status=${acceptanceResponse?.status()} url=${page.url()} body=${(await page.locator("body").innerText()).slice(0, 500)}`,
-      );
-    }
-    await acceptanceForm.fill("Reseller");
+    const inviteUrl = `/a/${shop.id}/accept-invite?token=${encodeURIComponent(inviteToken.token)}`;
+    await page.goto(inviteUrl);
+    await expect(page.getByTestId("agent-accept-name")).toBeVisible();
+    await page.getByTestId("agent-accept-name").fill("Reseller");
     await page
       .getByTestId("agent-accept-password")
       .fill("correct horse battery");
@@ -150,6 +144,13 @@ test.describe("shop agents", () => {
     await expect(page.getByTestId("agent-balance")).toContainText("GH₵30.00");
     await page.goto(`/a/${shop.id}/wallet`);
     await expect(page.getByTestId("agent-entry-row")).toHaveCount(2);
+
+    const usedInvitePage = await context.newPage();
+    await usedInvitePage.goto(inviteUrl);
+    await expect(
+      usedInvitePage.getByTestId("agent-invite-invalid"),
+    ).toBeVisible();
+    await usedInvitePage.close();
   });
 
   test("members and non-Command-Center shops cannot see agents", async ({

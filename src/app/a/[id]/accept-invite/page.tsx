@@ -13,19 +13,15 @@ export default async function AgentAcceptInvitePage({
 }) {
   const { id } = await params;
   const { token } = await searchParams;
-  const preview = token ? await getShopAgentStore().peekInvite(token) : null;
-  // The POST route is the authority for token validity. Render the form for a
-  // well-shaped token even if this read races a separate SQLite connection;
-  // submission still rejects expired, used, or cross-shop tokens without
-  // revealing any account details.
-  const canSubmit = Boolean(token && token.length >= 16);
+  const invited = token ? await getShopAgentStore().peekInvite(token) : null;
+  const preview = invited && invited.draftId === id ? invited : null;
   return (
     <section className="mx-auto flex w-full max-w-[440px] justify-center px-4 py-10 sm:px-6 sm:py-16">
       <div className="card w-full p-6 sm:p-8">
         <p className="text-xs font-bold tracking-[0.16em] text-copper-700 uppercase">
           Agent portal
         </p>
-        {canSubmit && token ? (
+        {preview && token ? (
           <>
             <h1 className="mt-2 text-2xl font-bold tracking-[-0.03em] text-navy">
               Welcome{preview ? `, ${preview.name}` : ""}
@@ -54,7 +50,10 @@ export default async function AgentAcceptInvitePage({
           </>
         ) : (
           <>
-            <h1 className="mt-2 text-2xl font-bold tracking-[-0.03em] text-navy">
+            <h1
+              className="mt-2 text-2xl font-bold tracking-[-0.03em] text-navy"
+              data-testid="agent-invite-invalid"
+            >
               This link is invalid or has expired
             </h1>
             <p className="mt-2 text-sm leading-6 text-slate">

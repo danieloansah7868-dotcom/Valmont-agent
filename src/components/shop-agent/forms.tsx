@@ -103,6 +103,7 @@ export function AgentLoginForm({
       <button
         className="btn-primary w-full"
         disabled={busy}
+        type="submit"
         data-testid="agent-login-submit"
       >
         {busy ? "Signing in…" : "Sign in"}
@@ -159,6 +160,9 @@ export function AgentAcceptInviteForm({
         <input
           className="input"
           id="agent-accept-name"
+          data-testid="agent-accept-name"
+          type="text"
+          autoComplete="name"
           required
           maxLength={120}
           value={name}
@@ -172,6 +176,7 @@ export function AgentAcceptInviteForm({
         <input
           className="input"
           id="agent-accept-password"
+          data-testid="agent-accept-password"
           type="password"
           autoComplete="new-password"
           minLength={10}
@@ -189,6 +194,7 @@ export function AgentAcceptInviteForm({
         <input
           className="input"
           id="agent-accept-confirm"
+          data-testid="agent-accept-confirm"
           type="password"
           minLength={10}
           maxLength={128}
@@ -198,7 +204,12 @@ export function AgentAcceptInviteForm({
         />
       </div>
       <Message error={error} />
-      <button className="btn-primary w-full" disabled={busy}>
+      <button
+        className="btn-primary w-full"
+        disabled={busy}
+        type="submit"
+        data-testid="agent-accept-submit"
+      >
         {busy ? "Saving…" : "Set password and sign in"}
       </button>
     </form>
@@ -228,7 +239,11 @@ export function AgentForgotPasswordForm({ draftId }: { draftId: string }) {
     }
   }
   return (
-    <form className="grid gap-4" onSubmit={submit}>
+    <form
+      className="grid gap-4"
+      onSubmit={submit}
+      data-testid="agent-forgot-form"
+    >
       <div>
         <label className="label" htmlFor="agent-forgot-email">
           Email address
@@ -236,6 +251,7 @@ export function AgentForgotPasswordForm({ draftId }: { draftId: string }) {
         <input
           className="input"
           id="agent-forgot-email"
+          data-testid="agent-forgot-email"
           type="email"
           required
           value={email}
@@ -243,7 +259,12 @@ export function AgentForgotPasswordForm({ draftId }: { draftId: string }) {
         />
       </div>
       <Message error={error} success={success} />
-      <button className="btn-primary w-full" disabled={busy}>
+      <button
+        className="btn-primary w-full"
+        disabled={busy}
+        type="submit"
+        data-testid="agent-forgot-submit"
+      >
         {busy ? "Sending…" : "Send reset link"}
       </button>
     </form>
@@ -283,7 +304,11 @@ export function AgentResetPasswordForm({
     }
   }
   return (
-    <form className="grid gap-4" onSubmit={submit}>
+    <form
+      className="grid gap-4"
+      onSubmit={submit}
+      data-testid="agent-reset-form"
+    >
       <div>
         <label className="label" htmlFor="agent-reset-password">
           Choose a new password
@@ -291,6 +316,7 @@ export function AgentResetPasswordForm({
         <input
           className="input"
           id="agent-reset-password"
+          data-testid="agent-reset-password"
           type="password"
           minLength={10}
           maxLength={128}
@@ -307,6 +333,7 @@ export function AgentResetPasswordForm({
         <input
           className="input"
           id="agent-reset-confirm"
+          data-testid="agent-reset-confirm"
           type="password"
           minLength={10}
           maxLength={128}
@@ -316,7 +343,12 @@ export function AgentResetPasswordForm({
         />
       </div>
       <Message error={error} />
-      <button className="btn-primary w-full" disabled={busy}>
+      <button
+        className="btn-primary w-full"
+        disabled={busy}
+        type="submit"
+        data-testid="agent-reset-submit"
+      >
         {busy ? "Saving…" : "Set new password and sign in"}
       </button>
     </form>
