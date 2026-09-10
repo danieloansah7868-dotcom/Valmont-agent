@@ -1,18 +1,25 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireShopAdminSession } from "@/lib/shop-admin/auth";
-import { shopOrderLineLabel } from "@/lib/shop-admin/order-view";
+import {
+  paymentMethodLabel,
+  shopOrderLineLabel,
+} from "@/lib/shop-admin/order-view";
 import { can } from "@/lib/shop-admin/permissions";
+import { getShopAdminStore } from "@/lib/shop-admin/store";
 import {
   publicGetDraft,
   publicGetDraftOwnerId,
 } from "@/lib/studio/draft-public";
 import { planOf } from "@/lib/studio/plans";
 import { getOrdersStore } from "@/lib/studio/orders";
-import { STATUS_BADGE_CLASS, STATUS_LABELS } from "@/lib/studio/order-status";
+import {
+  canTransition,
+  STATUS_BADGE_CLASS,
+  STATUS_LABELS,
+} from "@/lib/studio/order-status";
 import { formatMoney } from "@/lib/studio/money";
 import { formatAccra } from "@/lib/studio/format";
-import { PAYMENT_METHODS } from "@/lib/studio/site-brief/schema";
 import {
   deliveryStatusLabel,
   getBundleDeliveriesStore,
@@ -25,6 +32,12 @@ import {
   DeliveryOrderActions,
   DeliveryRowActions,
 } from "@/components/shop-admin/delivery-actions";
+import { RefundToWalletButton } from "@/components/shop-admin/refund-wallet";
+import {
+  AGENT_WALLET_PAYMENT_METHOD,
+  settleAgentOrder,
+} from "@/lib/shop-agent/orders";
+import { getShopAgentStore } from "@/lib/shop-agent/store";
 
 export const dynamic = "force-dynamic";
 
@@ -65,8 +78,37 @@ export default async function ShopOrderDetailPage({
 
   const ownerId = await publicGetDraftOwnerId(id);
   if (!ownerId) notFound();
-  const order = await getOrdersStore().getForOwner(ownerId, orderId);
-  if (!order || order.draftId !== id) notFound();
+  const found = await getOrdersStore().getForOwner(ownerId, orderId);
+  if (!found || found.draftId !== id) notFound();
+  // Stage 7b: a crash between the agent's wallet debit and markPaid
+  // self-heals here — settleAgentOrder is a no-op for every other order.
+  const order = await settleAgentOrder(found);
+
+  // Stage 7b wallet context: who paid, what the purchase entry was, and —
+  // after a refund — who sent the money back and when. The agent block and
+  // the Refund button are owner-only (the agents pages are owner-only too);
+  // members keep the same read-only page they always had.
+  const isOwner = session.admin.role === "owner";
+  const isAgentOrder =
+    order.paymentMethod === AGENT_WALLET_PAYMENT_METHOD &&
+    Boolean(order.agentId);
+  const walletStore = getShopAgentStore();
+  const agent = order.agentId ? await walletStore.getById(order.agentId) : null;
+  const purchaseEntry = isAgentOrder
+    ? await walletStore.getEntryForOrder(order.id, "purchase")
+    : null;
+  const refundEntry = isAgentOrder
+    ? await walletStore.getEntryForOrder(order.id, "refund")
+    : null;
+  let refundActor = "";
+  if (refundEntry) {
+    const admins = await getShopAdminStore().listForDraft(id);
+    const actor = admins.find((admin) => admin.id === refundEntry.createdBy);
+    refundActor = actor?.name || actor?.email || refundEntry.createdBy;
+  }
+  const refundAmount = purchaseEntry
+    ? Math.abs(purchaseEntry.amount)
+    : order.total;
 
   const deliveries = order.recipientPhone
     ? await getBundleDeliveriesStore().listForOrder(order.id)
@@ -86,9 +128,7 @@ export default async function ShopOrderDetailPage({
       (unitsPerLine.get(delivery.lineIndex) ?? 0) + 1,
     );
   }
-  const methodLabel =
-    PAYMENT_METHODS.find((method) => method.id === order.paymentMethod)
-      ?.label ?? order.paymentMethod;
+  const methodLabel = paymentMethodLabel(order.paymentMethod);
 
   return (
     <div className="mx-auto w-full max-w-[720px] px-4 py-6 sm:px-6">
@@ -152,6 +192,44 @@ export default async function ShopOrderDetailPage({
           </div>
         </dl>
       </section>
+
+      {isAgentOrder && (isOwner || refundEntry) && (
+        <section className="mt-4 rounded-xl border border-line bg-white p-4">
+          {isOwner && (
+            <p className="text-sm" data-testid="shop-order-agent">
+              Paid from agent wallet - {agent?.name ?? "the agent"}
+              {order.agentId && (
+                <>
+                  {" · "}
+                  <Link
+                    href={`${base}/agents/${encodeURIComponent(order.agentId)}`}
+                    className="font-semibold text-copper-700 hover:underline"
+                    data-testid="shop-order-agent-link"
+                  >
+                    Open agent
+                  </Link>
+                </>
+              )}
+            </p>
+          )}
+          {isOwner && canTransition(order.status, "refunded") && (
+            <RefundToWalletButton
+              draftId={id}
+              orderId={order.id}
+              confirmText={`Return GHS ${refundAmount.toFixed(2)} to ${agent?.name ?? "the agent"}'s wallet? This cannot be undone.`}
+            />
+          )}
+          {refundEntry && (
+            <p
+              className="mt-2 text-sm font-semibold text-slate-700"
+              data-testid="shop-order-refund-note"
+            >
+              Refunded to wallet on {formatAccra(refundEntry.createdAt)} by{" "}
+              {refundActor}
+            </p>
+          )}
+        </section>
+      )}
 
       <section className="mt-4 rounded-xl border border-line bg-white p-4">
         <h2 className="text-sm font-semibold text-navy">Bundles</h2>

@@ -1162,5 +1162,62 @@ one entry and the stored balance equals that entry's `balance_after`; L2 keeps
 the balance non-negative; L3 exposes no entry update or delete operation; L4
 allows only the shop owner to write credit or deduct entries; and L5 limits
 entries to integer minor units from one pesewa through GH₵5,000. The gate is
-`category === "data-bundles"` plus `planAllows(plan, "wallets")`. Buying and
-online top-ups are deferred to Stages 7b and 7c.
+`category === "data-bundles"` plus `planAllows(plan, "wallets")`.
+
+## Stage 7b — agent wallet checkout, agent orders, refund to wallet
+
+Stage 7b lets the agent spend from the wallet, offline from the public
+checkout. `POST /api/a/[shop-id]/orders` follows the public checkout's
+refusals in order, then: merges duplicate lines, re-prices from the server's
+catalogue copy at the shop's agent discount (R1 — the browser only sends
+item ids, quantities and the recipient number), applies the bundle caps,
+re-reads the FRESH agent row for the balance (R2 — never the session), and
+stamps `paymentMode` from `onlinePaymentAvailability()` with the same live
+guard (needs `live` delivery or manual hand-delivery) as checkout. Every
+refusal lands before any order row exists (R5).
+
+Money moves only through two ledger methods added in Stage 7b:
+`purchase({agentId, orderId, amountMinor, createdBy})` is THE way checkout
+money leaves a wallet (R3): a single transaction checks the idempotency key
+(a purchase entry already exists for this order → return it, change
+nothing), debits with a conditional `balance_minor >= amount` UPDATE so a
+race can never overdraw, and appends one `purchase` entry. `refund(...)` is
+THE way money is returned (R8): same shape, positive amount, once per order
+— a second refund raises `WalletAlreadyRefundedError` (409), and a raced one
+loses to partial unique indexes on `studio_shop_wallet_entries(order_id)`
+split by kind. Two new classes live in `src/lib/api-errors.ts`:
+`WalletAlreadyRefundedError` and `AgentOrderNotRefundableError`.
+
+The order carries `paymentMethod = "agent_wallet"` (deliberately NOT in
+`PAYMENT_METHODS`, so it is never selectable in Studio → Payments or on the
+public storefront, R7), a nullable `agent_id` text column (migration
+`0018_agent_orders`, mirrored by `ensureColumn`/`ensureShopAgentSchema` for
+SQLite), and a server-generated 32-hex access code the agent never sees (R9,
+no payment link). It is marked paid — via `OrdersStore.markPaid` only, so
+`paidAt` is set and the transitions stay honest (R4) — through
+`settleAgentOrder(order)` in `src/lib/shop-agent/orders.ts`: when an order
+is wallet-paid, still `pending`/`payment_failed`, and HAS its purchase
+entry, the wallet demonstrably paid and the crash window between debit and
+mark gets closed idempotently; the agent order page and the admin order page
+call it on load, before the same `recheckBundleDeliveriesForOrder` pass the
+guest confirmation uses. Dispatch is awaited inside a swallow (the real
+engine: simulator in test mode; the shop's own verified TechChief key, or
+manual rows on Starter) — a top-up problem never unsettles a paid order; the
+owner's Retry and Refund cover it.
+
+Agent surface: an **Orders** nav link, `/a/[shop-id]/orders` (newest first),
+and `/a/[shop-id]/orders/[orderId]`, scoped by `agent_id` in the store
+itself — another agent's order id is a plain 404 and no entry point returns
+the access code (R9). The wallet statement reads `Purchase - Order
+xxxxxxxx` / `Refund - Order xxxxxxxxx` with links into those pages.
+
+Owner surface: an **Agent** badge on wallet-paid rows of `/manage/[id]`,
+"Paid from agent wallet - name" with a link to the agent (owner-only, since
+agents pages are owner-only), the method label `Agent wallet` from
+`paymentMethodLabel` in `src/lib/shop-admin/order-view.ts` (used there, on
+the agent statement page, and in the Studio order view), and **Refund to
+wallet** (`POST /api/manage/[id]/orders/[orderId]/refund-wallet`): owner
+role only — a member with every permission box ticked still gets
+`ShopOwnerOnlyError` (403) — partial-unique once-per-order credit through
+`refund(...)`, then `updateStatus → refunded`. The merchant alert e-mail
+gains exactly one line, "Paid from agent wallet", only for these orders.

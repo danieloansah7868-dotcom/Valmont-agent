@@ -1,4 +1,4 @@
-import { desc } from "drizzle-orm";
+import { desc, sql } from "drizzle-orm";
 import {
   bigint,
   boolean,
@@ -423,11 +423,18 @@ export const studioOrders = pgTable(
       .notNull()
       .defaultNow(),
     merchantNote: text("merchant_note"),
+    /**
+     * Stage 7b — set only on orders an agent paid from their own wallet
+     * (`payment_method = "agent_wallet"`). Null on every public order, so
+     * nothing about the public checkout changes (R10).
+     */
+    agentId: text("agent_id"),
   },
   (table) => [
     index("studio_orders_owner_created_idx").on(table.ownerId, table.createdAt),
     index("studio_orders_draft_idx").on(table.draftId),
     index("studio_orders_customer_account_idx").on(table.customerAccountId),
+    index("studio_orders_agent_created_idx").on(table.agentId, table.createdAt),
     uniqueIndex("studio_orders_access_code_idx").on(table.accessCode),
   ],
 );
@@ -773,6 +780,15 @@ export const studioShopWalletEntries = pgTable(
       table.draftId,
       table.createdAt,
     ),
+    // Stage 7b — at most one purchase entry and one refund entry per order,
+    // enforced by the database itself: a raced double refund or a replayed
+    // buy can never write a second ledger row (R3, R8).
+    uniqueIndex("studio_shop_wallet_entries_order_purchase_unique")
+      .on(table.orderId)
+      .where(sql`kind = 'purchase'`),
+    uniqueIndex("studio_shop_wallet_entries_order_refund_unique")
+      .on(table.orderId)
+      .where(sql`kind = 'refund'`),
   ],
 );
 

@@ -127,6 +127,13 @@
       "when": 1789084800000,
       "tag": "0017_shop_agents",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1789171200000,
+      "tag": "0018_agent_orders",
+      "breakpoints": true
     }
   ]
 }

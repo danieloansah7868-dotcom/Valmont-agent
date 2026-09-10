@@ -26,6 +26,9 @@ export function orderAlertText(
     `New order at ${brief.businessName}`,
     `Ref ${order.id.slice(0, 8)} · ${total}`,
     `${order.customerName} · ${order.customerPhone}`,
+    // Stage 7b — exactly one extra line, and only for wallet-paid agent
+    // orders; every other order's alert stays byte-for-byte the same.
+    order.paymentMethod === "agent_wallet" ? "Paid from agent wallet" : null,
     order.recipientPhone ? `Send to: ${order.recipientPhone}` : null,
     linesSummary(order),
     order.customerAddress ? `Deliver to: ${order.customerAddress}` : null,
@@ -55,6 +58,13 @@ export function orderAlertHtml(
   <p>${escapeHtml(order.customerName)} · ${escapeHtml(order.customerPhone)}${
     order.customerEmail ? ` · ${escapeHtml(order.customerEmail)}` : ""
   }</p>
+  ${
+    // Stage 7b — one line for wallet-paid agent orders only; everything
+    // else renders exactly as it always did.
+    order.paymentMethod === "agent_wallet"
+      ? `<p>Paid from agent wallet</p>`
+      : ""
+  }
   ${
     order.recipientPhone
       ? `<p>Send to: ${escapeHtml(order.recipientPhone)}</p>`

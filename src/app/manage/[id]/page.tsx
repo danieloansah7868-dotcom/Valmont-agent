@@ -142,6 +142,15 @@ export default async function ShopOrdersPage({
                 </div>
                 <div className="flex items-center gap-3">
                   <PaymentModeBadge mode={order.paymentMode} />
+                  {order.paymentMethod === "agent_wallet" && (
+                    <span
+                      className="rounded-full border border-copper-300 bg-copper-50 px-2 py-0.5 text-[10px] font-bold tracking-wide text-copper-700 uppercase"
+                      title="Bought by an agent, paid from the agent's wallet"
+                      data-testid="shop-order-agent-badge"
+                    >
+                      Agent
+                    </span>
+                  )}
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
                       STATUS_BADGE_CLASS[order.status] ??

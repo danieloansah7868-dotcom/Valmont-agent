@@ -313,3 +313,27 @@ export class WalletInsufficientError extends ConflictError {
     this.name = "WalletInsufficientError";
   }
 }
+
+/**
+ * Stage 7b — a second refund for the same order into the same wallet. Raised
+ * by the wallet ledger itself (and mapped from the partial unique index), so
+ * the money can never be credited twice even when two refunds race.
+ */
+export class WalletAlreadyRefundedError extends ConflictError {
+  constructor(message = "This order was already refunded to the wallet.") {
+    super(message);
+    this.name = "WalletAlreadyRefundedError";
+  }
+}
+
+/**
+ * Stage 7b — the order simply is not a wallet-paid agent order (a public
+ * checkout order, or an agent order whose purchase entry is missing), so
+ * there is nothing a wallet refund could return.
+ */
+export class AgentOrderNotRefundableError extends ConflictError {
+  constructor(message = "This order cannot be refunded to a wallet.") {
+    super(message);
+    this.name = "AgentOrderNotRefundableError";
+  }
+}

@@ -105,6 +105,11 @@ export interface OrderRecord {
   createdAt: string;
   updatedAt: string;
   merchantNote?: string;
+  /**
+   * Stage 7b — the shop agent who paid for this order from their wallet
+   * (`paymentMethod === "agent_wallet"`). Undefined on every public order.
+   */
+  agentId?: string;
   statusHistory: StatusEvent[];
 }
 
@@ -129,6 +134,8 @@ export interface NewOrderInput {
   /** Defaults to `live` when omitted so cash/manual orders are never hidden. */
   paymentMode?: OrderPaymentMode;
   merchantNote?: string;
+  /** Stage 7b agent orders only; public checkout never sends it. */
+  agentId?: string;
 }
 
 export interface ListOrdersOptions {
@@ -136,6 +143,8 @@ export interface ListOrdersOptions {
   filter?: OrderFilterId;
   /** Optional owner-scoped business (draft) filter. */
   draftId?: string;
+  /** Stage 7b — restrict to the orders one agent bought from their wallet. */
+  agentId?: string;
   /** Inclusive lower bound for created_at, as an ISO timestamp. */
   createdAfter?: string;
   /** Exclusive upper bound for created_at, as an ISO timestamp. */
@@ -233,6 +242,17 @@ export interface OrdersStore {
     customerAccountId: string,
     limit?: number,
   ): Promise<OrderRecord[]>;
+  /**
+   * Stage 7b — an agent's own wallet-paid orders, newest first. Scoped by
+   * `agent_id` in the SQL itself: another agent's orders cannot be listed.
+   */
+  listForAgent(agentId: string, limit?: number): Promise<OrderRecord[]>;
+  /**
+   * Stage 7b — one order, returned only when it belongs to this agent.
+   * Anything else (unknown, or another agent's) is null, which the caller
+   * turns into a 404 (R9).
+   */
+  getForAgent(agentId: string, orderId: string): Promise<OrderRecord | null>;
   /** Claims only an unclaimed order, or returns the already-linked order. */
   claimForCustomer(
     customerAccountId: string,
@@ -254,6 +274,7 @@ interface NormalizedListOrdersOptions {
   limit: number;
   filter: OrderFilterId;
   draftId?: string;
+  agentId?: string;
   createdAfter?: string;
   createdBefore?: string;
 }
@@ -266,6 +287,7 @@ function normalizeListOptions(
       limit: options,
       filter: "all",
       draftId: undefined,
+      agentId: undefined,
       createdAfter: undefined,
       createdBefore: undefined,
     };
@@ -274,6 +296,7 @@ function normalizeListOptions(
     limit: options?.limit ?? 10,
     filter: options?.filter ?? "all",
     draftId: options?.draftId,
+    agentId: options?.agentId,
     createdAfter: options?.createdAfter,
     createdBefore: options?.createdBefore,
   };
@@ -312,6 +335,8 @@ interface OrderRow {
   created_at: string;
   updated_at: string;
   merchant_note: string | null;
+  /** Stage 7b — nullable; old databases gain it through ensureColumn below. */
+  agent_id: string | null;
   status_history_json: string | null;
 }
 
@@ -350,6 +375,7 @@ function rowToOrder(row: OrderRow): OrderRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     merchantNote: row.merchant_note ?? undefined,
+    agentId: row.agent_id ?? undefined,
     statusHistory: parseHistory(row.status_history_json),
   };
 }
@@ -418,8 +444,14 @@ export function ensureOrdersSchema(db: DatabaseSync): void {
   ensureColumn(db, "customer_account_id", "TEXT", existing);
   ensureColumn(db, "payment_mode", "TEXT NOT NULL DEFAULT 'live'", existing);
   ensureColumn(db, "recipient_phone", "TEXT", existing);
+  // Stage 7b: orders an agent paid from their wallet carry the agent id.
+  // A database created before 0018 upgrades in place on first use.
+  ensureColumn(db, "agent_id", "TEXT", existing);
   db.exec(
     "CREATE INDEX IF NOT EXISTS studio_orders_customer_account ON studio_orders(customer_account_id)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS studio_orders_agent_created_idx ON studio_orders(agent_id, created_at)",
   );
 }
 
@@ -440,9 +472,9 @@ export class SqliteOrdersStore implements OrdersStore {
           id, owner_id, draft_id, access_code, status, currency,
           subtotal, delivery_fee, total, lines_json,
           customer_name, customer_phone, recipient_phone, customer_email, customer_address,
-          customer_account_id, payment_method, payment_mode, merchant_note,
+          customer_account_id, payment_method, payment_mode, merchant_note, agent_id,
           created_at, updated_at, status_history_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -464,6 +496,8 @@ export class SqliteOrdersStore implements OrdersStore {
         input.paymentMethod,
         input.paymentMode ?? "live",
         input.merchantNote ?? null,
+        // paid_at stays out of this statement: only markPaid may set it (R4).
+        input.agentId ?? null,
         now,
         now,
         JSON.stringify(history),
@@ -510,13 +544,17 @@ export class SqliteOrdersStore implements OrdersStore {
     ownerId: string,
     options?: number | ListOrdersOptions,
   ): Promise<OrderRecord[]> {
-    const { limit, filter, draftId, createdAfter, createdBefore } =
+    const { limit, filter, draftId, agentId, createdAfter, createdBefore } =
       normalizeListOptions(options);
     const conditions = ["owner_id = ?"];
     const parameters: Array<string | number> = [ownerId];
     if (draftId) {
       conditions.push("draft_id = ?");
       parameters.push(draftId);
+    }
+    if (agentId) {
+      conditions.push("agent_id = ?");
+      parameters.push(agentId);
     }
     if (createdAfter) {
       conditions.push("created_at >= ?");
@@ -550,6 +588,26 @@ export class SqliteOrdersStore implements OrdersStore {
       )
       .all(customerAccountId, boundedLimit) as unknown as OrderRow[];
     return rows.map(rowToOrder);
+  }
+
+  async listForAgent(agentId: string, limit = 20): Promise<OrderRecord[]> {
+    const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 100);
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM studio_orders WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+      )
+      .all(agentId, boundedLimit) as unknown as OrderRow[];
+    return rows.map(rowToOrder);
+  }
+
+  async getForAgent(
+    agentId: string,
+    orderId: string,
+  ): Promise<OrderRecord | null> {
+    const row = this.db
+      .prepare("SELECT * FROM studio_orders WHERE id = ? AND agent_id = ?")
+      .get(orderId, agentId) as unknown as OrderRow | undefined;
+    return row ? rowToOrder(row) : null;
   }
 
   async claimForCustomer(
@@ -694,6 +752,7 @@ function pgRowToOrder(row: typeof studioOrders.$inferSelect): OrderRecord {
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     merchantNote: row.merchantNote ?? undefined,
+    agentId: row.agentId ?? undefined,
     statusHistory: parseHistory(row.statusHistory as StatusEvent[] | null),
   };
 }
@@ -722,6 +781,8 @@ export class PostgresOrdersStore implements OrdersStore {
         paymentMethod: input.paymentMethod,
         paymentMode: input.paymentMode ?? "live",
         merchantNote: input.merchantNote ?? null,
+        // paidAt is never written here — only markPaid sets it (R4).
+        agentId: input.agentId ?? null,
         statusHistory: appendHistory([], input.status, now.toISOString()),
       })
       .returning();
@@ -776,10 +837,11 @@ export class PostgresOrdersStore implements OrdersStore {
     ownerId: string,
     options?: number | ListOrdersOptions,
   ): Promise<OrderRecord[]> {
-    const { limit, filter, draftId, createdAfter, createdBefore } =
+    const { limit, filter, draftId, agentId, createdAfter, createdBefore } =
       normalizeListOptions(options);
     const conditions = [eq(studioOrders.ownerId, ownerId)];
     if (draftId) conditions.push(eq(studioOrders.draftId, draftId));
+    if (agentId) conditions.push(eq(studioOrders.agentId, agentId));
     if (createdAfter) {
       conditions.push(gte(studioOrders.createdAt, new Date(createdAfter)));
     }
@@ -812,6 +874,31 @@ export class PostgresOrdersStore implements OrdersStore {
       .orderBy(desc(studioOrders.createdAt))
       .limit(boundedLimit);
     return rows.map(pgRowToOrder);
+  }
+
+  async listForAgent(agentId: string, limit = 20): Promise<OrderRecord[]> {
+    const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 100);
+    const rows = await getDatabase()
+      .select()
+      .from(studioOrders)
+      .where(eq(studioOrders.agentId, agentId))
+      .orderBy(desc(studioOrders.createdAt))
+      .limit(boundedLimit);
+    return rows.map(pgRowToOrder);
+  }
+
+  async getForAgent(
+    agentId: string,
+    orderId: string,
+  ): Promise<OrderRecord | null> {
+    const [row] = await getDatabase()
+      .select()
+      .from(studioOrders)
+      .where(
+        and(eq(studioOrders.id, orderId), eq(studioOrders.agentId, agentId)),
+      )
+      .limit(1);
+    return row ? pgRowToOrder(row) : null;
   }
 
   async claimForCustomer(

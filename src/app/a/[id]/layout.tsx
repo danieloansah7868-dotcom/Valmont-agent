@@ -48,6 +48,13 @@ export default async function ShopAgentLayout({
                   Home
                 </Link>
                 <Link
+                  href={`${home}/orders`}
+                  className="rounded-md px-2.5 py-1.5 text-navy hover:bg-ivory-100"
+                  data-testid="agent-nav-orders"
+                >
+                  Orders
+                </Link>
+                <Link
                   href={`${home}/wallet`}
                   className="rounded-md px-2.5 py-1.5 text-navy hover:bg-ivory-100"
                 >
