@@ -585,3 +585,14 @@ past total as a permanent fact — use the latest CI run on the pull request.
 CI runs the unit, integration, PostgreSQL, Playwright and container-build jobs
 on every push and pull request via `.github/workflows/ci.yml`; there is no
 longer any workflow that needs to be moved or activated by a human.
+
+## Stage 7a agent security
+
+Agent sessions use the `valmont_shop_agent_session` HTTP-only, SameSite=Lax
+cookie with a 30-day lifetime. Passwords use the reviewed scrypt primitives;
+only password hashes, SHA-256 token hashes, and append-only wallet entries are
+stored. Admin invite and reset responses never include the one-time link.
+Only the shop owner session can call the wallet credit or deduct routes;
+members cannot unlock money by holding a team permission. The reserved
+`wallets.topup` permission remains reserved and is never grantable. Agent
+routes and pages are unavailable outside Command Center data-bundle shops.

@@ -681,6 +681,111 @@ export const studioShopAdminTokens = pgTable(
   (table) => [index("studio_shop_admin_tokens_admin_idx").on(table.adminId)],
 );
 
+/** Stage 7a agent logins and the append-only shop wallet ledger. */
+export const studioShopAgents = pgTable(
+  "studio_shop_agents",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    draftId: uuid("draft_id")
+      .notNull()
+      .references(() => studioDrafts.id, { onDelete: "cascade" }),
+    email: text("email").notNull(),
+    name: text("name").notNull(),
+    phone: text("phone"),
+    status: text("status").notNull().default("invited"),
+    passwordHash: text("password_hash"),
+    balanceMinor: integer("balance_minor").notNull().default(0),
+    invitedBy: text("invited_by"),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("studio_shop_agents_draft_email_unique").on(
+      table.draftId,
+      table.email,
+    ),
+    index("studio_shop_agents_draft_idx").on(table.draftId),
+  ],
+);
+
+export const studioShopAgentSessions = pgTable(
+  "studio_shop_agent_sessions",
+  {
+    tokenHash: text("token_hash").primaryKey(),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => studioShopAgents.id, { onDelete: "cascade" }),
+    draftId: uuid("draft_id").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [index("studio_shop_agent_sessions_agent_idx").on(table.agentId)],
+);
+
+export const studioShopAgentTokens = pgTable(
+  "studio_shop_agent_tokens",
+  {
+    tokenHash: text("token_hash").primaryKey(),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => studioShopAgents.id, { onDelete: "cascade" }),
+    purpose: text("purpose").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [index("studio_shop_agent_tokens_agent_idx").on(table.agentId)],
+);
+
+export const studioShopWalletEntries = pgTable(
+  "studio_shop_wallet_entries",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    draftId: uuid("draft_id").notNull(),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => studioShopAgents.id, { onDelete: "cascade" }),
+    kind: text("kind").notNull(),
+    amountMinor: integer("amount_minor").notNull(),
+    balanceAfterMinor: integer("balance_after_minor").notNull(),
+    orderId: uuid("order_id"),
+    note: text("note"),
+    createdBy: text("created_by").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("studio_shop_wallet_entries_agent_created_idx").on(
+      table.agentId,
+      table.createdAt,
+    ),
+    index("studio_shop_wallet_entries_draft_created_idx").on(
+      table.draftId,
+      table.createdAt,
+    ),
+  ],
+);
+
+export const studioShopAgentSettings = pgTable("studio_shop_agent_settings", {
+  draftId: uuid("draft_id")
+    .primaryKey()
+    .references(() => studioDrafts.id, { onDelete: "cascade" }),
+  discountPercent: integer("discount_percent").notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
 /**
  * Studio payment settings — a single row (id always 1) holding the Valmont
  * Pay account details saved on the Studio → Settings → Payments page. The

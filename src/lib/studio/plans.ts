@@ -42,8 +42,8 @@ export const PLAN_PRICE_LABELS: Record<PlanId, string> = {
 
 /**
  * The features a package can switch on. `auto_dispatch` is the TechChief
- * supplier API with automatic sending; `wallets` is reserved for Stage 7 and
- * must not be offered anywhere yet (no UI, no route may grant it).
+ * supplier API with automatic sending; `wallets` is Stage 7: the owner-only
+ * Agents page and the agent portal (7a); no permission box may ever grant it
  */
 export const PLAN_FEATURES = [
   "auto_dispatch",

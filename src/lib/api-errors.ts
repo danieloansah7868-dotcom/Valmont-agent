@@ -263,3 +263,53 @@ export class ShopOwnerLockedError extends ForbiddenError {
     this.name = "ShopOwnerLockedError";
   }
 }
+
+/** Stage 7a agent login and wallet errors. */
+export class ShopAgentNotSignedInError extends UnauthorizedError {
+  constructor(message = "Please sign in to continue.") {
+    super(message);
+    this.name = "ShopAgentNotSignedInError";
+  }
+}
+
+export class InvalidShopAgentCredentialsError extends UnauthorizedError {
+  constructor(message = "Email or password is incorrect.") {
+    super(message);
+    this.name = "InvalidShopAgentCredentialsError";
+  }
+}
+
+export class InvalidShopAgentLinkError extends BadRequestError {
+  constructor(message = "This link is invalid or has expired.") {
+    super(message);
+    this.name = "InvalidShopAgentLinkError";
+  }
+}
+
+export class ShopAgentExistsError extends ConflictError {
+  constructor(message = "Someone with that email is already an agent here.") {
+    super(message);
+    this.name = "ShopAgentExistsError";
+  }
+}
+
+export class ShopAgentCapError extends ConflictError {
+  constructor(message = "This shop already has 50 agents.") {
+    super(message);
+    this.name = "ShopAgentCapError";
+  }
+}
+
+export class ShopAgentAlreadyActiveError extends ConflictError {
+  constructor(message = "This agent has already set a password.") {
+    super(message);
+    this.name = "ShopAgentAlreadyActiveError";
+  }
+}
+
+export class WalletInsufficientError extends ConflictError {
+  constructor(message = "The wallet does not have that much.") {
+    super(message);
+    this.name = "WalletInsufficientError";
+  }
+}

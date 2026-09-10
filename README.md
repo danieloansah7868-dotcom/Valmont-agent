@@ -448,3 +448,11 @@ schedules 11 tests across 2 projects (22 scheduled tests). Do not treat a
 past test count as a permanent fact — use the latest CI run on the pull request.
 
 The production Docker image does **not** install browser binaries.
+
+### Stage 7a: agent logins and wallets
+
+Command Center shops can invite up to 50 agents at `/a/SHOP-ID`. Agents have
+an independent login, see bundles at the shop-wide agent discount, and see a
+wallet balance and append-only statement. The shop owner is the only person
+who can add or remove wallet credit; each change is one ledger entry. Stage 7a
+does not include buying or online wallet top-ups.

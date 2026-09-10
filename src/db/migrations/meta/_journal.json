@@ -120,6 +120,13 @@
       "when": 1788825600000,
       "tag": "0016_delivery_api_price",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1789084800000,
+      "tag": "0017_shop_agents",
+      "breakpoints": true
     }
   ]
 }
