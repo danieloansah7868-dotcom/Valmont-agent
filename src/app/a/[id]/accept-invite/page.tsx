@@ -14,27 +14,41 @@ export default async function AgentAcceptInvitePage({
   const { id } = await params;
   const { token } = await searchParams;
   const preview = token ? await getShopAgentStore().peekInvite(token) : null;
-  const valid = preview && preview.draftId === id;
+  // The POST route is the authority for token validity. Render the form for a
+  // well-shaped token even if this read races a separate SQLite connection;
+  // submission still rejects expired, used, or cross-shop tokens without
+  // revealing any account details.
+  const canSubmit = Boolean(token && token.length >= 16);
   return (
     <section className="mx-auto flex w-full max-w-[440px] justify-center px-4 py-10 sm:px-6 sm:py-16">
       <div className="card w-full p-6 sm:p-8">
         <p className="text-xs font-bold tracking-[0.16em] text-copper-700 uppercase">
           Agent portal
         </p>
-        {valid && token ? (
+        {canSubmit && token ? (
           <>
             <h1 className="mt-2 text-2xl font-bold tracking-[-0.03em] text-navy">
-              Welcome, {preview.name}
+              Welcome{preview ? `, ${preview.name}` : ""}
             </h1>
             <p className="mt-2 text-sm leading-6 text-slate">
-              Choose the password you will use to sign in as{" "}
-              <span className="font-semibold text-navy">{preview.email}</span>.
+              Choose the password you will use to sign in
+              {preview ? (
+                <>
+                  {" "}
+                  as{" "}
+                  <span className="font-semibold text-navy">
+                    {preview.email}
+                  </span>
+                </>
+              ) : (
+                "."
+              )}
             </p>
             <div className="mt-6">
               <AgentAcceptInviteForm
                 draftId={id}
                 token={token}
-                initialName={preview.name}
+                initialName={preview?.name ?? ""}
               />
             </div>
           </>

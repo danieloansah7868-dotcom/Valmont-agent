@@ -114,6 +114,7 @@ test.describe("shop agents", () => {
     await page.goto(
       `/a/${shop.id}/accept-invite?token=${encodeURIComponent(inviteToken.token)}`,
     );
+    await page.getByTestId("agent-accept-name").fill("Reseller");
     await page
       .getByTestId("agent-accept-password")
       .fill("correct horse battery");
