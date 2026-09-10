@@ -2,6 +2,7 @@ import { desc, sql } from "drizzle-orm";
 import {
   bigint,
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -717,6 +718,14 @@ export const studioShopAgents = pgTable(
       table.email,
     ),
     index("studio_shop_agents_draft_idx").on(table.draftId),
+    // Stage 7b — a wallet balance can never go negative. The store's
+    // conditional UPDATE (`balance_minor >= amount`) is the fast path; this
+    // CHECK is the database's own last word when anything else ever writes
+    // the column.
+    check(
+      "studio_shop_agents_balance_non_negative",
+      sql`${table.balanceMinor} >= 0`,
+    ),
   ],
 );
 
@@ -789,6 +798,13 @@ export const studioShopWalletEntries = pgTable(
     uniqueIndex("studio_shop_wallet_entries_order_refund_unique")
       .on(table.orderId)
       .where(sql`kind = 'refund'`),
+    // Stage 7b — the ledger is append-only AND every row moves money: no
+    // zero-amount entry can ever exist, here or on SQLite's fresh-create
+    // schema (assertWalletAmount in the store is the application gate).
+    check(
+      "studio_shop_wallet_entries_amount_nonzero",
+      sql`${table.amountMinor} <> 0`,
+    ),
   ],
 );
 

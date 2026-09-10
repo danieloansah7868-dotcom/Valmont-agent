@@ -36,6 +36,7 @@ import {
   ShopAgentExistsError,
   WalletAlreadyRefundedError,
   WalletInsufficientError,
+  WalletOrderConflictError,
 } from "@/lib/api-errors";
 import { MAX_AGENT_DISCOUNT_PERCENT } from "./pricing";
 
@@ -270,12 +271,25 @@ function sortAgents(agents: ShopAgent[]): ShopAgent[] {
   );
 }
 
-function isUniqueViolation(error: unknown): boolean {
+// Exported for the wallet's own store tests (the Postgres-gated file
+// exercises it directly); still module-internal for every real caller.
+export function isUniqueViolation(error: unknown): boolean {
   let current: unknown = error;
   for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
     const code = "code" in current ? String(current.code) : "";
-    if (code === "23505" || /unique|duplicate/i.test(current.message))
+    if (code === "23505") return true;
+    // A drizzle QueryError wrapper reports only "Failed query: …" on its own
+    // layer — the constraint evidence (SQLSTATE 23505, or the driver's
+    // UNIQUE/duplicate message) always lives on `error.cause` (same note as
+    // shop-admin's helper). The wrapper's own text is NOT evidence: an error
+    // that merely *recites* a UNIQUE violation on its outer layer, without a
+    // constraint error underneath, must never be mistaken for one — wallet
+    // ledger decisions (adopt the existing entry? hard-conflict a refund?)
+    // ride on this answer, so a fake must fall through to a plain throw.
+    const isQueryWrapper = current.message.startsWith("Failed query:");
+    if (!isQueryWrapper && /unique|duplicate/i.test(current.message)) {
       return true;
+    }
     current = current.cause;
   }
   return false;
@@ -311,7 +325,10 @@ export function ensureShopAgentSchema(db: DatabaseSync): void {
       phone TEXT,
       status TEXT NOT NULL DEFAULT 'invited',
       password_hash TEXT,
-      balance_minor INTEGER NOT NULL DEFAULT 0,
+      -- Stage 7b: the CHECK backs the conditional UPDATE's guarantee that a
+      -- wallet balance never goes negative (Postgres: 0019's constraint;
+      -- pre-existing SQLite files lean on the conditional UPDATE alone).
+      balance_minor INTEGER NOT NULL DEFAULT 0 CHECK (balance_minor >= 0),
       invited_by TEXT,
       last_login_at TEXT,
       created_at TEXT NOT NULL,
@@ -341,7 +358,10 @@ export function ensureShopAgentSchema(db: DatabaseSync): void {
       draft_id TEXT NOT NULL,
       agent_id TEXT NOT NULL REFERENCES studio_shop_agents(id) ON DELETE CASCADE,
       kind TEXT NOT NULL,
-      amount_minor INTEGER NOT NULL,
+      -- Stage 7b: the ledger only ever moves money — no zero-amount row can
+      -- exist (assertWalletAmount is the application gate; this CHECK is the
+      -- database's own, matching 0019's Postgres constraint).
+      amount_minor INTEGER NOT NULL CHECK (amount_minor <> 0),
       balance_after_minor INTEGER NOT NULL,
       order_id TEXT,
       note TEXT,
@@ -350,6 +370,10 @@ export function ensureShopAgentSchema(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS studio_shop_wallet_entries_agent_created_idx ON studio_shop_wallet_entries(agent_id, created_at);
     CREATE INDEX IF NOT EXISTS studio_shop_wallet_entries_draft_created_idx ON studio_shop_wallet_entries(draft_id, created_at);
+    -- Stage 7b: at most ONE purchase entry and ONE refund entry per order,
+    -- enforced by the database itself. The names must match the partial
+    -- indexes in the Postgres migration SQL (0018_agent_orders.sql) so a
+    -- SQLite → Postgres drift check sees the same schema.
     CREATE UNIQUE INDEX IF NOT EXISTS studio_shop_wallet_entries_order_purchase_unique ON studio_shop_wallet_entries(order_id) WHERE kind = 'purchase';
     CREATE UNIQUE INDEX IF NOT EXISTS studio_shop_wallet_entries_order_refund_unique ON studio_shop_wallet_entries(order_id) WHERE kind = 'refund';
     CREATE TABLE IF NOT EXISTS studio_shop_agent_settings (
@@ -838,9 +862,14 @@ export class SqliteShopAgentStore implements ShopAgentStore {
     db.exec("BEGIN IMMEDIATE");
     try {
       // Idempotency key first: a purchase replay returns the existing entry
-      // unchanged; a refund replay is a hard conflict, never a second credit.
+      // unchanged; a refund replay is a hard conflict, never a second
+      // credit. Both are pinned to THIS agent: a key that belongs to another
+      // agent is a collision (WalletOrderConflictError), never adoption.
       const existing = this.entryForOrder(input.orderId, kind);
       if (existing) {
+        if (existing.agent_id !== input.agentId) {
+          throw new WalletOrderConflictError();
+        }
         if (kind === "refund") throw new WalletAlreadyRefundedError();
         db.exec("COMMIT");
         return this.entry(existing);
@@ -896,10 +925,16 @@ export class SqliteShopAgentStore implements ShopAgentStore {
       } catch (error) {
         // The partial unique index caught a write the existence check raced
         // with: a purchase settles on the entry that won, a refund conflicts.
+        // The re-read is pinned to THIS agent, exactly like the Postgres
+        // engine: a foreign order id that happens to collide with another
+        // agent's ledger row must be a plain error, never wallet adoption.
         if (isUniqueViolation(error)) {
-          if (kind === "refund") throw new WalletAlreadyRefundedError();
           const winner = this.entryForOrder(input.orderId, kind);
           if (winner) {
+            if (winner.agent_id !== input.agentId) {
+              throw new WalletOrderConflictError();
+            }
+            if (kind === "refund") throw new WalletAlreadyRefundedError();
             db.exec("ROLLBACK");
             return this.entry(winner);
           }
@@ -1435,8 +1470,13 @@ export class PostgresShopAgentStore implements ShopAgentStore {
           )
           .limit(1);
         // Idempotency key: a purchase replay returns what it already wrote;
-        // a refund replay is a hard conflict, never a second credit.
+        // a refund replay is a hard conflict, never a second credit. Both
+        // pinned to THIS agent — a foreign key is a collision, not a replay
+        // (same rule as the SQLite engine; WalletOrderConflictError, 409).
         if (existing) {
+          if (existing.agentId !== input.agentId) {
+            throw new WalletOrderConflictError();
+          }
           if (kind === "refund") throw new WalletAlreadyRefundedError();
           return pgEntry(existing);
         }
@@ -1487,11 +1527,20 @@ export class PostgresShopAgentStore implements ShopAgentStore {
     } catch (error) {
       // The partial unique index settled a write race that READ COMMITTED
       // could not see: the rolled-back loser maps onto the same answer as
-      // the existence check — purchase: the winner's entry; refund: 409.
+      // the existence check — purchase: the winner's entry. The re-read is
+      // pinned to THIS agent: a foreign order id colliding with some other
+      // agent's entry must be a plain error — wallet identity never crosses,
+      // and a QueryError-shaped error that merely recites a UNIQUE violation
+      // (see isUniqueViolation's wrapper guard) can never rewrite the ledger.
       if (isUniqueViolation(error)) {
-        if (kind === "refund") throw new WalletAlreadyRefundedError();
         const winner = await this.getEntryForOrder(input.orderId, kind);
-        if (winner) return winner;
+        if (winner) {
+          if (winner.agentId !== input.agentId) {
+            throw new WalletOrderConflictError();
+          }
+          if (kind === "refund") throw new WalletAlreadyRefundedError();
+          return winner;
+        }
       }
       throw error;
     }

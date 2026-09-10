@@ -16,8 +16,10 @@ import {
   SqliteChatStore,
 } from "@/lib/chat-store";
 import {
+  BadRequestError,
   WalletAlreadyRefundedError,
   WalletInsufficientError,
+  WalletOrderConflictError,
 } from "@/lib/api-errors";
 import { SqliteShopAgentStore } from "./store";
 
@@ -256,5 +258,85 @@ describe("SqliteShopAgentStore refund", () => {
     expect(
       typeof (store as unknown as Record<string, unknown>).deleteEntry,
     ).toBe("undefined");
+  });
+
+  it("no ledger entry dies quietly: zero, negative and fractional amounts are refused before any write", async () => {
+    const agent = await credited();
+    const orderId = "22222222-3333-4444-8555-666666666666";
+    for (const amountMinor of [0, -1, 5.5, Number.MAX_SAFE_INTEGER + 1]) {
+      await expect(
+        store.purchase({
+          agentId: agent.id,
+          orderId,
+          amountMinor,
+          createdBy: agent.id,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestError);
+      await expect(
+        store.refund({
+          agentId: agent.id,
+          orderId,
+          amountMinor,
+          createdBy: "owner",
+        }),
+      ).rejects.toBeInstanceOf(BadRequestError);
+    }
+    await expect(
+      store.purchase({
+        agentId: agent.id,
+        orderId,
+        amountMinor: 0,
+        createdBy: agent.id,
+      }),
+    ).rejects.toThrow("Wallet amounts must be whole pesewas up to GHS 5,000.");
+    // Nothing moved: no entry, the balance is exactly what the credit left.
+    expect((await store.getById(agent.id))?.balance).toBe(50);
+    expect(await store.getEntryForOrder(orderId, "purchase")).toBeNull();
+    expect(await store.getEntryForOrder(orderId, "refund")).toBeNull();
+    expect(await store.listEntries(agent.id)).toHaveLength(1); // the credit
+  });
+
+  it("a purchase carrying an order id that collides with ANOTHER agent's entry is a hard error, never wallet adoption", async () => {
+    // Two different agents on the same shop, each with their own credit.
+    const first = await active("shop-a", "first@example.com");
+    await store.credit({
+      agentId: first.id,
+      amountMinor: 5000,
+      note: "opening",
+      createdBy: "owner",
+    });
+    const orderId = "22222222-3333-4444-8555-666666666666";
+    await store.purchase({
+      agentId: first.id,
+      orderId,
+      amountMinor: 920,
+      createdBy: first.id,
+    });
+    const second = await active("shop-a", "second@example.com");
+    await store.credit({
+      agentId: second.id,
+      amountMinor: 5000,
+      note: "opening",
+      createdBy: "owner",
+    });
+    // Even if a caller smuggled a foreign order id in, the loser must not be
+    // handed the other agent's ledger row — adoption would silently charge
+    // one agent's order to another wallet. The store refuses with its own
+    // 409-style collision error before any wallet write, in BOTH engines.
+    await expect(
+      store.purchase({
+        agentId: second.id,
+        orderId,
+        amountMinor: 100,
+        createdBy: second.id,
+      }),
+    ).rejects.toBeInstanceOf(WalletOrderConflictError);
+    // Rolled back completely: second wallet untouched, first entry unmoved.
+    expect((await store.getById(second.id))?.balance).toBe(50);
+    expect(await store.listEntries(second.id)).toHaveLength(1); // only its credit
+    const entry = await store.getEntryForOrder(orderId, "purchase");
+    expect(entry?.agentId).toBe(first.id);
+    expect(entry?.amount).toBe(-9.2);
+    expect((await store.getById(first.id))?.balance).toBe(40.8);
   });
 });

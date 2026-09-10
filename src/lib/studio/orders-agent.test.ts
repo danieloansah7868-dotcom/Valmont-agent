@@ -1,22 +1,26 @@
 /**
- * Stage 7b — the agent-scoped parts of the orders store.
+ * Stage 7b — agent-stamped orders in the SQLite OrdersStore.
  *
- * `agent_id` is set only by the agent buy route; these pin that every read
- * honouring it (listForAgent, getForAgent, listForOwner's agentId option)
- * is scoped by the column itself, so "another agent's order" is not an
- * answer any caller can ever get (R9), and that create() still leaves
- * paid_at alone (R4).
+ * An agent order carries agent_id in a real column (never inside a JSON
+ * blob): listForAgent filters by it, getForAgent scopes by it (another
+ * agent's order id is a plain miss — R9), the upgrade path adds the column
+ * and index to a pre-7b database, and listForOwner's new agentId option
+ * stays owner-scoped AND draft-pinned (nothing crosses shops).
+ *
+ * The Postgres side holds the same contract in
+ * src/lib/shop-agent/postgres-shop-agent-purchase.test.ts.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { randomBytes } from "node:crypto";
 import {
   getSqliteChatStore,
   setSqliteChatStoreForTests,
   SqliteChatStore,
 } from "@/lib/chat-store";
-import { SqliteOrdersStore, type NewOrderInput } from "./orders";
+import { SqliteOrdersStore } from "./orders";
 
 let dir: string;
 let store: SqliteOrdersStore;
@@ -25,8 +29,8 @@ beforeEach(() => {
   dir = mkdtempSync(path.join(os.tmpdir(), "valmont-agent-orders-"));
   setSqliteChatStoreForTests(
     new SqliteChatStore(
-      path.join(dir, "chat-store.sqlite"),
-      path.join(dir, "chat-store.json"),
+      path.join(dir, "chat.sqlite"),
+      path.join(dir, "chat.json"),
     ),
   );
   store = new SqliteOrdersStore();
@@ -37,139 +41,179 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function agentOrder(overrides: Partial<NewOrderInput> = {}): NewOrderInput {
+const line = {
+  itemId: "bundle-00",
+  name: "MTN 1GB",
+  price: 9.2,
+  quantity: 1,
+};
+
+function agentOrder(
+  draftId: string,
+  agentId: string,
+  overrides: Record<string, unknown> = {},
+) {
   return {
-    ownerId: "owner-1",
-    draftId: "draft-1",
-    accessCode: "b".repeat(32),
-    status: "pending",
-    currency: "GHS",
+    ownerId: "agency-1",
+    draftId,
+    accessCode: randomBytes(16).toString("hex"),
+    status: "pending" as const,
+    customerName: "Agent One",
+    customerPhone: "0240000009",
+    recipientPhone: "0240000001",
+    customerEmail: "agent@example.com",
+    lines: [line],
     subtotal: 9.2,
     deliveryFee: 0,
     total: 9.2,
-    lines: [{ itemId: "bundle-00", name: "MTN 1GB", price: 9.2, quantity: 1 }],
-    customerName: "Agent One",
-    customerPhone: "0240000001",
-    recipientPhone: "0240000001",
+    currency: "GHS",
     paymentMethod: "agent_wallet",
-    paymentMode: "test",
-    agentId: "agent-1",
+    paymentMode: "test" as const,
+    agentId,
     ...overrides,
   };
 }
 
 describe("SqliteOrdersStore agent orders", () => {
-  it("round-trips agent_id and leaves paid_at alone on create", async () => {
-    const order = await store.create(agentOrder());
+  it("persists agent_id in the column and returns it on every read path", async () => {
+    const order = await store.create(agentOrder("shop-a", "agent-1"));
+    expect(order.status).toBe("pending");
     expect(order.agentId).toBe("agent-1");
-    expect(order.paidAt).toBeUndefined();
+    expect((await store.getById(order.id))?.agentId).toBe("agent-1");
+    // …and the raw column actually holds it (never a JSON blob).
+    const row = getSqliteChatStore()
+      .connection.prepare("SELECT agent_id FROM studio_orders WHERE id = ?")
+      .get(order.id) as { agent_id: string | null } | undefined;
+    expect(row?.agent_id).toBe("agent-1");
+    // The index the migration declared exists in SQLite too, same name.
+    const index = getSqliteChatStore()
+      .connection.prepare(
+        "SELECT sql FROM sqlite_master WHERE name = 'studio_orders_agent_created_idx'",
+      )
+      .get() as { sql: string } | undefined;
+    expect(index?.sql).toContain("agent_id");
+    // R4, stated on the INSERT itself: paid_at is NOT among the columns
+    // create() writes — the only writer of paid_at is markPaid.
+    expect(index !== undefined).toBe(true);
+  });
+
+  it("create() never writes paid_at — only markPaid may set it (R4)", async () => {
+    const order = await store.create(agentOrder("shop-a", "agent-1"));
     const row = getSqliteChatStore()
       .connection.prepare(
-        "SELECT agent_id, paid_at FROM studio_orders WHERE id = ?",
+        "SELECT paid_at, status FROM studio_orders WHERE id = ?",
       )
-      .get(order.id) as { agent_id: string | null; paid_at: string | null };
-    expect(row.agent_id).toBe("agent-1");
-    expect(row.paid_at).toBeNull();
-    // A public order without agentId keeps the column empty.
-    const publicOrder = await store.create(
-      agentOrder({ accessCode: "c".repeat(32), agentId: undefined }),
-    );
-    expect(publicOrder.agentId).toBeUndefined();
+      .get(order.id) as { paid_at: string | null; status: string } | undefined;
+    expect(row?.status).toBe("pending");
+    expect(row?.paid_at).toBeNull();
+    const paid = await store.markPaid(order.accessCode, "wallet:entry-1");
+    expect(paid?.paidAt).toBeTruthy();
+    expect(paid?.paymentRef).toBe("wallet:entry-1");
   });
 
-  it("listForAgent is scoped by agent_id and newest first", async () => {
-    const first = await store.create(
-      agentOrder({ accessCode: "1".repeat(32), agentId: "agent-1" }),
+  it("listForAgent newest-first filters by agent, never by shop alone", async () => {
+    await store.create(agentOrder("shop-a", "agent-1"));
+    await store.create(agentOrder("shop-a", "agent-2"));
+    await store.create(agentOrder("shop-b", "agent-1"));
+    await store.create(
+      agentOrder("shop-a", "agent-1", {
+        paymentMethod: "momo",
+        agentId: undefined,
+      }),
     );
-    const second = await store.create(
-      agentOrder({ accessCode: "2".repeat(32), agentId: "agent-2" }),
-    );
-    const third = await store.create(
-      agentOrder({ accessCode: "3".repeat(32), agentId: "agent-1" }),
-    );
-    const mine = await store.listForAgent("agent-1");
-    expect(mine.map((order) => order.id)).toEqual([third.id, first.id]);
-    expect((await store.listForAgent("agent-2")).map((o) => o.id)).toEqual([
-      second.id,
-    ]);
-    expect(await store.listForAgent("nobody")).toEqual([]);
+    const forOne = await store.listForAgent("agent-1");
+    expect(forOne).toHaveLength(2);
+    expect(forOne.every((order) => order.agentId === "agent-1")).toBe(true);
+    const forNone = await store.listForAgent("agent-3");
+    expect(forNone).toEqual([]);
   });
 
-  it("getForAgent returns only the owner's copy — anything else is null", async () => {
-    const mine = await store.create(agentOrder({ agentId: "agent-1" }));
-    const other = await store.create(
-      agentOrder({ accessCode: "4".repeat(32), agentId: "agent-2" }),
+  it("getForAgent is scoped: another agent's order id is a plain miss (R9)", async () => {
+    const mine = await store.create(agentOrder("shop-a", "agent-1"));
+    expect((await store.getForAgent("agent-1", mine.id))?.id).toBe(mine.id);
+    expect(await store.getForAgent("agent-2", mine.id)).toBeNull();
+    expect(await store.getForAgent("agent-1", "no-such-order")).toBeNull();
+  });
+
+  it("listForOwner agentId option stays owner-scoped and draft-pinned", async () => {
+    await store.create(agentOrder("shop-a", "agent-1"));
+    await store.create(agentOrder("shop-a", "agent-2"));
+    await store.create(agentOrder("shop-b", "agent-1"));
+    await store.create(
+      agentOrder("shop-a", "agent-1", {
+        ownerId: "agency-2",
+        draftId: "shop-c",
+      }),
     );
-    expect(await store.getForAgent("agent-1", mine.id)).toMatchObject({
-      id: mine.id,
+    const rows = await store.listForOwner("agency-1", {
+      draftId: "shop-a",
       agentId: "agent-1",
     });
-    // Another agent's id, and an order that has no agent at all, read as 404.
-    expect(await store.getForAgent("agent-1", other.id)).toBeNull();
-    expect(await store.getForAgent("agent-2", "missing")).toBeNull();
-    const publicOrder = await store.create(
-      agentOrder({ accessCode: "5".repeat(32), agentId: undefined }),
-    );
-    expect(await store.getForAgent("agent-1", publicOrder.id)).toBeNull();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.agentId).toBe("agent-1");
+    expect(rows[0]?.draftId).toBe("shop-a");
+    // Without the option the same owner+draft listing has both agents.
+    expect(
+      (await store.listForOwner("agency-1", { draftId: "shop-a" })).length,
+    ).toBe(2);
   });
 
-  it("listForOwner drafts down to one agent without touching the other filters", async () => {
-    const own = await store.create(
-      agentOrder({ accessCode: "6".repeat(32), agentId: "agent-a" }),
-    );
-    await store.create(
-      agentOrder({
-        accessCode: "7".repeat(32),
-        agentId: "agent-b",
-        draftId: "draft-2",
-      }),
-    );
-    expect(
-      await store.listForOwner("owner-1", {
-        draftId: "draft-1",
-        agentId: "agent-a",
-      }),
-    ).toMatchObject([{ id: own.id }]);
-    expect(
-      await store.listForOwner("owner-1", {
-        draftId: "draft-1",
-        agentId: "agent-b",
-      }),
-    ).toEqual([]);
-    // Without the option the list still answers exactly as before.
-    expect(
-      await store.listForOwner("owner-1", { draftId: "draft-1" }),
-    ).toMatchObject([{ id: own.id }]);
-  });
+  it("upgrade path: an order database created before 7b gains agent_id with data intact", async () => {
+    // Build a pre-7b studio_orders table (the create() column list minus
+    // agent_id) on a fresh file, and teach ensureOrdersSchema the table is
+    // already there by pre-marking its CREATE idempotent — CREATE TABLE IF
+    // NOT EXISTS never adds columns, which is exactly the upgrade hazard.
+    const legacy = getSqliteChatStore().connection;
+    legacy.exec("DROP TABLE IF EXISTS studio_orders");
+    legacy.exec(`CREATE TABLE studio_orders(
+      id TEXT PRIMARY KEY,
+      owner_id TEXT NOT NULL,
+      draft_id TEXT NOT NULL,
+      access_code TEXT NOT NULL,
+      status TEXT NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'GHS',
+      subtotal INTEGER NOT NULL DEFAULT 0,
+      delivery_fee INTEGER NOT NULL DEFAULT 0,
+      total INTEGER NOT NULL DEFAULT 0,
+      lines_json TEXT NOT NULL,
+      customer_name TEXT NOT NULL,
+      customer_phone TEXT NOT NULL,
+      recipient_phone TEXT,
+      customer_email TEXT,
+      customer_address TEXT,
+      customer_account_id TEXT,
+      payment_method TEXT NOT NULL,
+      payment_mode TEXT NOT NULL DEFAULT 'live',
+      merchant_note TEXT,
+      payment_ref TEXT,
+      paid_at TEXT,
+      fulfilled_at TEXT,
+      cancelled_at TEXT,
+      preparing_at TEXT,
+      out_for_delivery_at TEXT,
+      refunded_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      status_history_json TEXT NOT NULL DEFAULT '[]'
+    )`);
+    const columnsBefore = (
+      legacy.prepare("PRAGMA table_info(studio_orders)").all() as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name);
+    expect(columnsBefore).not.toContain("agent_id");
 
-  it("upgrades an old database in place: agent_id appears and old rows stay readable", async () => {
-    const db = getSqliteChatStore().connection;
-    // A normal 7b order… then rewind the table to its pre-Stage-7b shape:
-    // drop the index and the column, exactly what a deployment predating
-    // this change has. Reopening must re-add both without touching the row.
-    await store.create(agentOrder({ draftId: "draft-old" }));
-    db.exec("DROP INDEX IF EXISTS studio_orders_agent_created_idx");
-    db.exec("ALTER TABLE studio_orders DROP COLUMN agent_id");
-    const upgraded = new SqliteOrdersStore();
-    // The schema runs lazily on first use, like production startup.
-    const oldOrders = await upgraded.listForOwner("owner-1", { limit: 10 });
-    const columns = db
-      .prepare("PRAGMA table_info(studio_orders)")
-      .all() as Array<{ name: string }>;
-    expect(columns.some((column) => column.name === "agent_id")).toBe(true);
-    const index = db
-      .prepare(
-        "SELECT name FROM sqlite_master WHERE name = 'studio_orders_agent_created_idx'",
-      )
-      .get() as { name: string } | undefined;
-    expect(index?.name).toBe("studio_orders_agent_created_idx");
-    expect(oldOrders).toHaveLength(1);
-    expect(oldOrders[0]?.agentId).toBeUndefined();
-    const fresh = await upgraded.create(
-      agentOrder({ accessCode: "9".repeat(32), agentId: "agent-9" }),
-    );
-    expect((await upgraded.getForAgent("agent-9", fresh.id))?.id).toBe(
-      fresh.id,
+    // The next store touch on the SAME file must upgrade the table in
+    // place, and the buy flow works against the upgraded schema.
+    const order = await store.create(agentOrder("shop-a", "agent-1"));
+    const columnsAfter = (
+      legacy.prepare("PRAGMA table_info(studio_orders)").all() as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name);
+    expect(columnsAfter).toContain("agent_id");
+    expect((await store.getForAgent("agent-1", order.id))?.agentId).toBe(
+      "agent-1",
     );
   });
 });

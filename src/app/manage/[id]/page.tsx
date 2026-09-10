@@ -2,6 +2,7 @@ import Link from "next/link";
 import { requireShopAdminSession } from "@/lib/shop-admin/auth";
 import { publicGetDraftOwnerId } from "@/lib/studio/draft-public";
 import { getOrdersStore } from "@/lib/studio/orders";
+import { AGENT_WALLET_PAYMENT_METHOD } from "@/lib/studio/agent-wallet";
 import {
   ORDER_FILTERS,
   STATUS_BADGE_CLASS,
@@ -142,7 +143,7 @@ export default async function ShopOrdersPage({
                 </div>
                 <div className="flex items-center gap-3">
                   <PaymentModeBadge mode={order.paymentMode} />
-                  {order.paymentMethod === "agent_wallet" && (
+                  {order.paymentMethod === AGENT_WALLET_PAYMENT_METHOD && (
                     <span
                       className="rounded-full border border-copper-300 bg-copper-50 px-2 py-0.5 text-[10px] font-bold tracking-wide text-copper-700 uppercase"
                       title="Bought by an agent, paid from the agent's wallet"

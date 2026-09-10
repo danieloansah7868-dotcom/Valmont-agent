@@ -1,6 +1,7 @@
 import { formatMoney } from "./valmont-pay";
 import { bundleNetworkLabel, formatDataMb } from "./bundles";
 import type { BundleDeliveryRecord } from "./bundle-delivery";
+import { AGENT_WALLET_PAYMENT_METHOD } from "./agent-wallet";
 import type { OrderRecord } from "./orders";
 import type { SiteBriefV1 } from "./site-brief/schema";
 import { checkRateLimit } from "@/lib/security";
@@ -27,8 +28,12 @@ export function orderAlertText(
     `Ref ${order.id.slice(0, 8)} · ${total}`,
     `${order.customerName} · ${order.customerPhone}`,
     // Stage 7b — exactly one extra line, and only for wallet-paid agent
-    // orders; every other order's alert stays byte-for-byte the same.
-    order.paymentMethod === "agent_wallet" ? "Paid from agent wallet" : null,
+    // orders; every other order's alert stays byte-for-byte the same. The
+    // comparison reads the shared constant, never a second copy of the
+    // string, so it can never drift from the value the buy route stamps.
+    order.paymentMethod === AGENT_WALLET_PAYMENT_METHOD
+      ? "Paid from agent wallet"
+      : null,
     order.recipientPhone ? `Send to: ${order.recipientPhone}` : null,
     linesSummary(order),
     order.customerAddress ? `Deliver to: ${order.customerAddress}` : null,
@@ -60,8 +65,9 @@ export function orderAlertHtml(
   }</p>
   ${
     // Stage 7b — one line for wallet-paid agent orders only; everything
-    // else renders exactly as it always did.
-    order.paymentMethod === "agent_wallet"
+    // else renders exactly as it always did. Same shared constant as the
+    // text version above — one definition, no drift.
+    order.paymentMethod === AGENT_WALLET_PAYMENT_METHOD
       ? `<p>Paid from agent wallet</p>`
       : ""
   }

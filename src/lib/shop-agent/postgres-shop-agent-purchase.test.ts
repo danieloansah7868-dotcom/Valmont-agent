@@ -5,11 +5,73 @@
  * These run against the CI-only throwaway database and skip locally:
  *
  *   STUDIO_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/valmont_test
+ *
+ * One pure guard test below is NOT gated: isUniqueViolation decides what a
+ * UNIQUE-shaped error does to the wallet ledger (adopt the existing entry?
+ * conflict the refund? plain 500?), and a drizzle QueryError whose outer
+ * "Failed query:" layer merely *recites* a UNIQUE violation must never be
+ * treated as a real one. That decision is engine-independent, so it runs
+ * everywhere.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { SessionUser } from "@/lib/auth";
 import type { OrderRecord } from "@/lib/studio/orders";
-import type { WalletEntry } from "./store";
+import { isUniqueViolation, type WalletEntry } from "./store";
+
+describe("agent wallet isUniqueViolation — the query-error guard", () => {
+  it("trues: native SQLite and genuine SQLSTATE/duplicate-key chains", () => {
+    // Native node:sqlite error — no wrapper, message is the evidence.
+    expect(
+      isUniqueViolation(
+        new Error(
+          "UNIQUE constraint failed: studio_shop_wallet_entries.order_id",
+        ),
+      ),
+    ).toBe(true);
+    // Real Postgres: drizzle QueryError ("Failed query: …") wrapping the
+    // driver error that carries the SQLSTATE and the duplicate-key text.
+    const driver = new Error(
+      'duplicate key value violates unique constraint "studio_shop_wallet_entries_order_purchase_unique"',
+    );
+    Object.assign(driver, { code: "23505" });
+    const wrapped = new Error(
+      "Failed query: insert into studio_shop_wallet_entries ...",
+    );
+    Object.assign(wrapped, { cause: driver });
+    expect(isUniqueViolation(wrapped)).toBe(true);
+    // A wrapper that itself carries SQLSTATE 23505 is precise evidence too.
+    const coded = new Error("Failed query: insert into ...");
+    Object.assign(coded, { code: "23505" });
+    expect(isUniqueViolation(coded)).toBe(true);
+    // A non-wrapper layer with the SQLite wording through a wrapper.
+    const sqliteCause = new Error(
+      "UNIQUE constraint failed: studio_shop_wallet_entries.order_id",
+    );
+    const sqliteWrapped = new Error("Failed query: insert into ...");
+    Object.assign(sqliteWrapped, { cause: sqliteCause });
+    expect(isUniqueViolation(sqliteWrapped)).toBe(true);
+  });
+
+  it("falses: a QueryError reciting UNIQUE on its outer layer with no constraint cause", () => {
+    // The fake: the whole "violation" lives in the wrapper's own prose; the
+    // real cause is something else entirely (here a network failure). If
+    // this matched, a wallet purchase could adopt another agent's ledger
+    // entry (or a refund skip its crediting) on the back of a mirage.
+    const fake = new Error(
+      "Failed query: insert into studio_shop_wallet_entries ... -- UNIQUE constraint failed: studio_shop_wallet_entries.order_id",
+    );
+    Object.assign(fake, { cause: new Error("connection reset by peer") });
+    expect(isUniqueViolation(fake)).toBe(false);
+    // No cause at all: recitation alone is never evidence.
+    const causeless = new Error(
+      "Failed query: insert ... something about a duplicate key ...",
+    );
+    expect(isUniqueViolation(causeless)).toBe(false);
+    // And plain unrelated errors still read false.
+    expect(isUniqueViolation(new Error("boom"))).toBe(false);
+    expect(isUniqueViolation("not even an Error")).toBe(false);
+  });
+});
 
 const connectionString = process.env.STUDIO_TEST_DATABASE_URL;
 const PASSWORD = "correct horse battery";

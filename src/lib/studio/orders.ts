@@ -29,6 +29,11 @@ export function isOrderPaymentMode(value: unknown): value is OrderPaymentMode {
   return value === "test" || value === "live";
 }
 
+// The single definition of the agent-wallet rail string lives in the leaf
+// module ./agent-wallet (see its header for why it is a leaf); re-exported
+// here so it also reads naturally next to OrderRecord.
+export { AGENT_WALLET_PAYMENT_METHOD } from "./agent-wallet";
+
 export interface StatusEvent {
   status: OrderStatus;
   at: string;

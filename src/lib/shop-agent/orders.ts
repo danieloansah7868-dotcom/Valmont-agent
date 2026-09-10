@@ -21,10 +21,15 @@
  * the delivery engine is idempotent (invariant I2).
  */
 import { dispatchBundleDeliveriesForOrder } from "@/lib/studio/bundle-delivery";
+import { AGENT_WALLET_PAYMENT_METHOD } from "@/lib/studio/agent-wallet";
 import { getOrdersStore, type OrderRecord } from "@/lib/studio/orders";
 import { getShopAgentStore } from "./store";
 
-export const AGENT_WALLET_PAYMENT_METHOD = "agent_wallet" as const;
+// Re-exported so every Stage 7b consumer keeps importing it from here while
+// the single definition lives in the studio/agent-wallet leaf — see its
+// header for why the leaf (and not this module, and not a hardcoded copy
+// anywhere) is the one source.
+export { AGENT_WALLET_PAYMENT_METHOD };
 
 export async function settleAgentOrder(
   order: OrderRecord,
@@ -38,7 +43,11 @@ export async function settleAgentOrder(
     order.id,
     "purchase",
   );
-  if (!entry) return order;
+  // Fail closed on a corrupted pairing: the wallet demonstrably paid only
+  // when the entry belongs to the agent stamped on the order. A mismatched
+  // key must never settle someone else's order (same refusal the ledger
+  // itself makes with WalletOrderConflictError).
+  if (!entry || entry.agentId !== order.agentId) return order;
   const paid = await getOrdersStore().markPaid(
     order.accessCode,
     `wallet:${entry.id}`,

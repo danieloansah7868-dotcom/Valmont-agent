@@ -134,6 +134,13 @@
       "when": 1789171200000,
       "tag": "0018_agent_orders",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1789257600000,
+      "tag": "0019_agent_wallet_constraints",
+      "breakpoints": true
     }
   ]
 }
