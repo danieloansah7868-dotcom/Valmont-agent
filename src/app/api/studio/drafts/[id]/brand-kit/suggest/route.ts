@@ -18,8 +18,8 @@ import {
 /**
  * POST /api/studio/drafts/[id]/brand-kit/suggest
  *
- * Answers { names[], palettes[] } for the wizard's "No brand yet? Create
- * one" card. Suggestions only — nothing here is written to the brief.
+ * Answers { names[], palettes[] } for the wizard's "Brand kit" sidebar
+ * card. Suggestions only — nothing here is written to the brief.
  *
  * Every suggest is one paid model call (two only when protected-brand
  * filtering leaves fewer than three names), so the hourly budget runs before
