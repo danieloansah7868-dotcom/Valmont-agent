@@ -9,6 +9,7 @@
  */
 import {
   ACCEPTED_MIME_TYPES,
+  ACCEPTED_BRAND_LOGO_MIMES,
   MAX_LOGO_BYTES,
   MAX_PHOTO_BYTES,
   MAX_PHOTOS,
@@ -85,15 +86,19 @@ export function validateUploadedImage(input: {
   if (typeof input.fileName !== "string" || !input.fileName.trim()) {
     throw new UploadRejected("Missing file name.");
   }
-  if (typeof input.mime !== "string" || !ACCEPTED_MIME_TYPES.has(input.mime)) {
+  const allowedMimes =
+    input.kind === "logo" ? ACCEPTED_BRAND_LOGO_MIMES : ACCEPTED_MIME_TYPES;
+  if (typeof input.mime !== "string" || !allowedMimes.has(input.mime)) {
     throw new UploadRejected(
-      "Unsupported image type. Use PNG, JPEG, WebP or GIF.",
+      input.kind === "logo"
+        ? "That file type is not supported — use PNG, JPEG or WebP."
+        : "Unsupported image type. Use PNG, JPEG, WebP or GIF.",
     );
   }
   const width = typeof input.width === "number" ? Math.round(input.width) : 0;
   const height =
     typeof input.height === "number" ? Math.round(input.height) : 0;
-  if (width < 1 || height < 1 || width > 4000 || height > 4000) {
+  if (width < 1 || height < 1 || width > 8000 || height > 8000) {
     throw new UploadRejected("Image dimensions are invalid.");
   }
 
@@ -123,7 +128,7 @@ export function validateUploadedImage(input: {
   if (bytes.length > maxBytes) {
     throw new UploadRejected(
       input.kind === "logo"
-        ? `Logo is too large (max ${Math.round(MAX_LOGO_BYTES / 1024)} KB).`
+        ? "That file is too large — logos can be up to 10MB."
         : `Photo is too large (max ${Math.round(MAX_PHOTO_BYTES / 1024)} KB).`,
     );
   }

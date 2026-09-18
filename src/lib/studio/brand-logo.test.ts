@@ -1,14 +1,19 @@
 /**
  * Stage B — the deterministic text-logo renderer. Pure string assertions:
  * same input, same SVG, no network, all text escaped.
+ * Now with icons and font choices — still instant + offline, inline SVG only.
  */
 import { describe, expect, it } from "vitest";
 import {
-  BRAND_LOGO_FONT_STACK,
+  BRAND_LOGO_FONTS,
+  BRAND_LOGO_ICONS,
   BRAND_LOGO_LAYOUTS,
   brandInitials,
+  brandLogoFontById,
   brandLogoSize,
   escapeSvgText,
+  isBrandLogoFontId,
+  isBrandLogoIcon,
   isBrandLogoLayout,
   renderBrandLogo,
 } from "./brand-logo";
@@ -27,7 +32,9 @@ describe("renderBrandLogo — the three layouts", () => {
     expect(svg).toContain("circle");
     expect(svg).toContain(INPUT.accent);
     expect(svg).toContain(INPUT.surface);
-    expect(svg).toContain(`font-family="${BRAND_LOGO_FONT_STACK}"`);
+    // Font stack now comes from chosen font — default modern still contains Inter
+    expect(svg).toContain(`font-family="`);
+    expect(svg).toContain("Inter");
     expect(svg).not.toContain(">AV</text>");
   });
 
@@ -77,6 +84,97 @@ describe("renderBrandLogo — the three layouts", () => {
       layout: "stacked",
     });
     expect(svg).toContain('fill="#111827">AV</text>');
+  });
+});
+
+describe("renderBrandLogo — icons and fonts", () => {
+  it("renders all icon+font+layout combos as valid XML with escaped name", () => {
+    for (const icon of BRAND_LOGO_ICONS) {
+      for (const font of BRAND_LOGO_FONTS) {
+        for (const layout of BRAND_LOGO_LAYOUTS) {
+          const svg = renderBrandLogo({
+            ...INPUT,
+            layout,
+            icon,
+            font: font.id,
+            name: `Adom & Sons <Test>`,
+          });
+          // Valid XML: starts with <svg and ends with </svg>
+          expect(svg.startsWith("<svg")).toBe(true);
+          expect(svg.endsWith("</svg>")).toBe(true);
+          // Escaped name — no raw <script> or unescaped &
+          expect(svg).not.toContain("<Test>");
+          expect(svg).toContain("Adom &amp; Sons &lt;Test&gt;");
+          // Font stack appears
+          expect(svg).toContain(font.stack.split(",")[0]!.trim().replace(/'/g, "").slice(0, 6));
+          // Icon path appears only in badge layouts when icon != none
+          if (icon !== "none" && layout !== "wordmark") {
+            expect(svg).toContain("<path");
+          }
+        }
+      }
+    }
+  });
+
+  it("icon appears in badge layouts next to/above name, not in wordmark", () => {
+    const badge = renderBrandLogo({
+      ...INPUT,
+      layout: "badge",
+      icon: "fish",
+      font: "modern",
+    });
+    expect(badge).toContain("<path");
+    // Fish path contains Q or M
+    expect(badge).toContain("M3 12");
+
+    const stacked = renderBrandLogo({
+      ...INPUT,
+      layout: "stacked",
+      icon: "bolt",
+      font: "classic",
+    });
+    expect(stacked).toContain("<path");
+    expect(stacked).toContain("M13 2");
+
+    const wordmark = renderBrandLogo({
+      ...INPUT,
+      layout: "wordmark",
+      icon: "fish",
+      font: "modern",
+    });
+    // Wordmark ignores icon — should not contain icon path, only circle dot
+    expect(wordmark).not.toContain("M3 12");
+    expect(wordmark).toContain("<circle");
+  });
+
+  it("font choices use safe cross-platform stacks", () => {
+    for (const font of BRAND_LOGO_FONTS) {
+      const svg = renderBrandLogo({
+        ...INPUT,
+        layout: "badge",
+        font: font.id,
+      });
+      expect(svg).toContain(`font-family="${font.stack}"`);
+      expect(svg).toContain(`font-weight="${font.weight}"`);
+    }
+    expect(BRAND_LOGO_FONTS.length).toBeGreaterThanOrEqual(3);
+    expect(BRAND_LOGO_FONTS.length).toBeLessThanOrEqual(5);
+  });
+
+  it("recognises all icons and fonts", () => {
+    for (const icon of BRAND_LOGO_ICONS) {
+      expect(isBrandLogoIcon(icon)).toBe(true);
+    }
+    expect(isBrandLogoIcon("unicorn")).toBe(false);
+    for (const font of BRAND_LOGO_FONTS) {
+      expect(isBrandLogoFontId(font.id)).toBe(true);
+    }
+    expect(isBrandLogoFontId("comic")).toBe(false);
+  });
+
+  it("brandLogoFontById falls back to modern", () => {
+    expect(brandLogoFontById("modern").id).toBe("modern");
+    expect(brandLogoFontById("unknown").id).toBe("modern");
   });
 });
 

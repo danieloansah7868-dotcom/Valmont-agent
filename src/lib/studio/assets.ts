@@ -5,21 +5,27 @@
  * record (or PostgreSQL jsonb column) holds the whole draft — no separate
  * binary table, no filesystem writes, and backup/import carries every asset
  * automatically because `buildBackup`/`importStudioDrafts` already serialize
- * the brief wholesale. The limits below are deliberately tight: the brief is
- * small business planning data, not an asset pipeline, and stuffing megabytes
- * into a JSON column bloats every autosave.
+ * the brief wholesale. The limits below balance quality and cost: a custom
+ * logo may be up to 10MB (plain-English error), photos stay smaller, and the
+ * total budget keeps the brief from bloating every autosave.
  */
 
-export const MAX_LOGO_BYTES = 512 * 1024; // 512 KB
+export const MAX_LOGO_BYTES = 10 * 1024 * 1024; // 10 MB — custom logo upload (Brand Kit)
 export const MAX_PHOTO_BYTES = 1024 * 1024; // 1 MB per photo
 export const MAX_PHOTOS = 8;
 /** Total across logo + all photos for one draft. */
-export const MAX_TOTAL_ASSET_BYTES = 3 * 1024 * 1024; // 3 MB
+export const MAX_TOTAL_ASSET_BYTES = 15 * 1024 * 1024; // 15 MB — logo 10MB + photos
 export const ACCEPTED_MIME_TYPES = new Set([
   "image/png",
   "image/jpeg",
   "image/webp",
   "image/gif",
+]);
+/** Brand-kit custom logo upload accepts PNG/JPEG/WebP only (no GIF, no SVG). */
+export const ACCEPTED_BRAND_LOGO_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
 ]);
 /** Side length used when downscaling photos server-side. */
 export const PHOTO_MAX_SIDE = 1600;
