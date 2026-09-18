@@ -1,4 +1,23 @@
 import Link from "next/link";
+import {
+  ArrowRight,
+  BedDouble,
+  Briefcase,
+  Building2,
+  CalendarCheck,
+  Compass,
+  GraduationCap,
+  HeartHandshake,
+  Home,
+  LayoutDashboard,
+  Palette,
+  Scissors,
+  ShoppingBag,
+  Stethoscope,
+  Utensils,
+  Wand2,
+  Zap,
+} from "lucide-react";
 import { requireSessionUser } from "@/lib/auth";
 import { getStudioDraftStore } from "@/lib/studio/draft-store";
 import { getDomainStore } from "@/lib/studio/domains";
@@ -16,6 +35,26 @@ import { resolvePaymentConfig } from "@/lib/studio/payment-settings";
 import { formatAccra } from "@/lib/studio/format";
 
 export const dynamic = "force-dynamic";
+
+const CATEGORY_ICONS: Record<string, React.ElementType> = {
+  "online-shop": ShoppingBag,
+  "data-bundles": Zap,
+  "business-profile": Building2,
+  school: GraduationCap,
+  church: HeartHandshake,
+  restaurant: Utensils,
+  hotel: BedDouble,
+  salon: Scissors,
+  clinic: Stethoscope,
+  "real-estate": Home,
+  "travel-tourism": Compass,
+  ngo: HeartHandshake,
+  portfolio: Palette,
+  consultant: Briefcase,
+  booking: CalendarCheck,
+  "customer-portal": LayoutDashboard,
+  custom: Wand2,
+};
 
 const COMPLETION_BADGE_CLASS: Record<"ready" | "in-progress", string> = {
   ready: "bg-pass-soft text-pass-strong",
@@ -56,6 +95,7 @@ export default async function StudioPage({
   const starters = categories.map((category) => ({
     id: category.id,
     label: category.label,
+    description: category.description,
     templateLabel:
       getTemplate(defaultTemplateForCategory(category.id))?.label ?? "",
   }));
@@ -238,24 +278,45 @@ export default async function StudioPage({
           in step 3 of the wizard.
         </p>
         <ul
-          className="mt-3 grid gap-2 sm:grid-cols-2"
+          className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
           data-testid="template-starters"
         >
-          {starters.map((starter) => (
-            <li key={starter.id}>
-              <Link
-                href={`/studio/drafts/new?type=${starter.id}`}
-                className="flex h-full flex-col rounded-xl border border-line bg-white p-3 hover:border-copper"
-              >
-                <span className="text-sm font-semibold text-navy">
-                  {starter.label}
-                </span>
-                <span className="mt-1 text-xs text-slate-600">
-                  Starts on “{starter.templateLabel}”
-                </span>
-              </Link>
-            </li>
-          ))}
+          {starters.map((starter) => {
+            const Icon = CATEGORY_ICONS[starter.id] ?? Wand2;
+            return (
+              <li key={starter.id}>
+                <Link
+                  href={`/studio/drafts/new?type=${starter.id}`}
+                  className="card card-hover group relative flex h-full flex-col p-5"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="flex size-10 items-center justify-center rounded-xl bg-brandblue-50 text-brandblue ring-1 ring-inset ring-brandblue-100 transition-colors group-hover:bg-copper-50 group-hover:text-copper-700 group-hover:ring-copper-300">
+                      <Icon
+                        className="size-5"
+                        strokeWidth={1.9}
+                        aria-hidden="true"
+                      />
+                    </span>
+                    <span className="rounded-full bg-ivory-100 px-2 py-0.5 text-[10px] font-bold tracking-wide text-slate uppercase ring-1 ring-inset ring-line">
+                      Template
+                    </span>
+                  </div>
+
+                  <h3 className="mt-3.5 text-[15px] font-bold tracking-[-0.01em] text-navy">
+                    {starter.label}
+                  </h3>
+                  <p className="mt-1 flex-1 text-[12.5px] leading-5 text-slate">
+                    {starter.description}
+                  </p>
+
+                  <span className="mt-3.5 inline-flex items-center gap-1 text-[12px] font-bold text-brandblue transition-colors group-hover:text-copper-700">
+                    Starts on “{starter.templateLabel}”
+                    <ArrowRight className="size-3.5" aria-hidden="true" />
+                  </span>
+                </Link>
+              </li>
+            );
+          })}
         </ul>
       </section>
 

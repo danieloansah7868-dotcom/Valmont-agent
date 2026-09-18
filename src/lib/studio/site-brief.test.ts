@@ -30,7 +30,7 @@ import {
   everyCategoryHasATemplate,
   templates,
 } from "./templates";
-import { CATEGORY_IDS } from "./categories";
+import { CATEGORY_IDS, ECOM_SUBCATEGORIES } from "./categories";
 
 /** A brief with real (non-placeholder) answers in every required field. */
 function completeBrief(): SiteBriefV1 {
@@ -179,6 +179,19 @@ describe("site brief: shop subtype rules", () => {
         ecomSubcategory: "not-a-subtype",
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts every registered shop subtype for an online shop", () => {
+    for (const sub of ECOM_SUBCATEGORIES) {
+      expect(
+        siteBriefSchemaV1.safeParse({
+          ...completeBrief(),
+          category: "online-shop",
+          selectedTemplate: defaultTemplateForCategory("online-shop"),
+          ecomSubcategory: sub,
+        }).success,
+      ).toBe(true);
+    }
   });
 });
 
