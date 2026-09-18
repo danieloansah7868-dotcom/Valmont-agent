@@ -18,10 +18,7 @@ import {
   type BrandLogoIcon,
   type BrandLogoFontId,
 } from "@/lib/studio/brand-logo";
-import {
-  ACCEPTED_BRAND_LOGO_MIMES,
-  MAX_LOGO_BYTES,
-} from "@/lib/studio/assets";
+import { ACCEPTED_BRAND_LOGO_MIMES, MAX_LOGO_BYTES } from "@/lib/studio/assets";
 import { dataUrlByteLength, resizeImage } from "./resize-image";
 
 /**
@@ -34,6 +31,12 @@ import { dataUrlByteLength, resizeImage } from "./resize-image";
  * Now also: richer generated logos (icon + font choices) and "Upload your
  * own logo" (PNG/JPEG/WebP up to 10MB, client+server validated, stored via
  * draft-assets).
+ *
+ * The card has two halves. The AI half (four questions, then name and palette
+ * ideas) is transient by design. The second half — "Design the logo yourself"
+ * — calls the model never: icon, font, the three layouts, the upload and the
+ * brand sheet all render whether or not a suggest has ever succeeded, so a
+ * degraded provider cannot take the offline tools away with it.
  */
 
 const FEELINGS = ["trusted", "friendly", "premium", "young"] as const;
@@ -52,6 +55,14 @@ const LAYOUT_LABELS: Record<(typeof LAYOUTS)[number], string> = {
   badge: "Badge beside the name",
   stacked: "Badge above the name",
 };
+
+/**
+ * The one extra sentence a failed suggest leaves behind. The icon and font
+ * choices, the three layouts, the upload and the brand sheet are all offline,
+ * so a degraded model provider must never read as "no logo today".
+ */
+const DIY_TOOLS_STILL_WORK =
+  "The logo tools below still work without the AI — choose an icon and a font, save a layout, or upload your own logo.";
 
 const ICON_LABELS: Record<BrandLogoIcon, string> = {
   none: "No icon",
@@ -243,7 +254,10 @@ export function BrandKitCard({
         name: brief.businessName,
         expectedRevision: revisionRef.current,
       });
-      adoptDraft(updated, "Logo saved to this draft. Uploading a custom logo will replace it, and vice versa.");
+      adoptDraft(
+        updated,
+        "Logo saved to this draft. Uploading a custom logo will replace it, and vice versa.",
+      );
     } catch (cause) {
       setError(describeError(cause));
     } finally {
@@ -300,7 +314,11 @@ export function BrandKitCard({
           },
         }),
       });
-      let data: { brief?: { assets?: { logo?: unknown } }; revision?: number; error?: string } = {};
+      let data: {
+        brief?: { assets?: { logo?: unknown } };
+        revision?: number;
+        error?: string;
+      } = {};
       try {
         data = (await response.json()) as typeof data;
       } catch {}
@@ -312,10 +330,15 @@ export function BrandKitCard({
       // The assets route returns StudioDraft JSON.
       const draft = data as unknown as StudioDraft;
       if (draft.revision) {
-        adoptDraft(draft, "Custom logo uploaded. It replaces any generated logo, and saving a generated logo will replace it.");
+        adoptDraft(
+          draft,
+          "Custom logo uploaded. It replaces any generated logo, and saving a generated logo will replace it.",
+        );
       } else {
         // Fallback: treat as success, but we need to get updated draft via separate fetch? For simplicity, show notice.
-        setNotice("Custom logo uploaded. It replaces any generated logo, and saving a generated logo will replace it.");
+        setNotice(
+          "Custom logo uploaded. It replaces any generated logo, and saving a generated logo will replace it.",
+        );
       }
     } catch (cause) {
       const msg = cause instanceof Error ? cause.message : "Upload failed.";
@@ -342,7 +365,11 @@ export function BrandKitCard({
           headers: { "x-valmont-csrf": csrfToken() },
         },
       );
-      let data: { error?: string; revision?: number; brief?: { assets?: unknown } } = {};
+      let data: {
+        error?: string;
+        revision?: number;
+        brief?: { assets?: unknown };
+      } = {};
       try {
         data = (await response.json()) as typeof data;
       } catch {}
@@ -403,114 +430,125 @@ export function BrandKitCard({
                 <span className="text-sm">Client paid the add-on</span>
               </label>
             </div>
-          ) : modelMissing ? (
-            <p
-              className="rounded bg-amber-50 p-2 text-sm text-amber-900"
-              role="status"
-            >
-              {error ||
-                "AI branding is not configured on this server. Visit Settings (/settings) to configure MODEL_API_KEY."}
-            </p>
           ) : (
             <>
-              <p className="text-xs text-slate-600">
-                Answer four short questions and Valmont suggests names, a
-                tagline and colours. Nothing is saved to the brief until you
-                click a &quot;Use this&quot; button — the agency always decides.
-              </p>
-
-              <fieldset className="grid gap-3">
-                <legend className="text-sm font-semibold">
-                  About the business
-                </legend>
-                <div className="grid gap-1">
-                  <label htmlFor="brand-what" className="text-sm">
-                    What does the business sell or do?
-                  </label>
-                  <input
-                    id="brand-what"
-                    type="text"
-                    maxLength={300}
-                    value={whatTheySell}
-                    onChange={(event) => setWhatTheySell(event.target.value)}
-                    placeholder="e.g. Fresh kenkey and fish"
-                    className="w-full rounded-lg border border-line px-3 py-2 text-base"
-                  />
-                </div>
-                <div className="grid gap-1">
-                  <label htmlFor="brand-town" className="text-sm">
-                    Which town is it based in?
-                  </label>
-                  <input
-                    id="brand-town"
-                    type="text"
-                    maxLength={60}
-                    value={town}
-                    onChange={(event) => setTown(event.target.value)}
-                    placeholder="e.g. Koforidua"
-                    className="w-full rounded-lg border border-line px-3 py-2 text-base"
-                  />
-                </div>
-                <div className="grid gap-1">
-                  <label htmlFor="brand-feeling" className="text-sm">
-                    How should the brand feel?
-                  </label>
-                  <select
-                    id="brand-feeling"
-                    value={feeling}
-                    onChange={(event) =>
-                      setFeeling(event.target.value as Feeling)
-                    }
-                    className="w-full rounded-lg border border-line px-3 py-2 text-base"
-                  >
-                    {FEELINGS.map((option) => (
-                      <option key={option} value={option}>
-                        {FEELING_LABELS[option]}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="grid gap-1">
-                  <label htmlFor="brand-must-include" className="text-sm">
-                    Words the name must include (optional)
-                  </label>
-                  <input
-                    id="brand-must-include"
-                    type="text"
-                    value={mustInclude}
-                    onChange={(event) => setMustInclude(event.target.value)}
-                    placeholder="e.g. adom, gold"
-                    aria-describedby="brand-must-include-hint"
-                    className="w-full rounded-lg border border-line px-3 py-2 text-base"
-                  />
-                  <p
-                    id="brand-must-include-hint"
-                    className="text-xs text-slate-500"
-                  >
-                    Up to 3 short words, separated by commas.
-                  </p>
-                </div>
-                <div>
-                  <button
-                    type="button"
-                    data-testid="brand-kit-suggest"
-                    disabled={!canSuggest}
-                    onClick={() => void suggest()}
-                    className="btn-primary min-h-10 px-4 text-sm disabled:opacity-60"
-                  >
-                    {busy?.kind === "suggest" ? "Thinking…" : "Suggest a brand"}
-                  </button>
-                </div>
-              </fieldset>
-
-              {error && (
+              {modelMissing ? (
                 <p
-                  role="alert"
-                  className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800"
+                  className="rounded bg-amber-50 p-2 text-sm text-amber-900"
+                  role="status"
                 >
-                  {error}
+                  {error ||
+                    "AI branding is not configured on this server. Visit Settings (/settings) to configure MODEL_API_KEY."}{" "}
+                  {DIY_TOOLS_STILL_WORK}
                 </p>
+              ) : (
+                <>
+                  <p className="text-xs text-slate-600">
+                    Answer four short questions and Valmont suggests names, a
+                    tagline and colours. Nothing is saved to the brief until you
+                    click a &quot;Use this&quot; button — the agency always
+                    decides.
+                  </p>
+
+                  <fieldset className="grid gap-3">
+                    <legend className="text-sm font-semibold">
+                      About the business
+                    </legend>
+                    <div className="grid gap-1">
+                      <label htmlFor="brand-what" className="text-sm">
+                        What does the business sell or do?
+                      </label>
+                      <input
+                        id="brand-what"
+                        type="text"
+                        maxLength={300}
+                        value={whatTheySell}
+                        onChange={(event) =>
+                          setWhatTheySell(event.target.value)
+                        }
+                        placeholder="e.g. Fresh kenkey and fish"
+                        className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                      />
+                    </div>
+                    <div className="grid gap-1">
+                      <label htmlFor="brand-town" className="text-sm">
+                        Which town is it based in?
+                      </label>
+                      <input
+                        id="brand-town"
+                        type="text"
+                        maxLength={60}
+                        value={town}
+                        onChange={(event) => setTown(event.target.value)}
+                        placeholder="e.g. Koforidua"
+                        className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                      />
+                    </div>
+                    <div className="grid gap-1">
+                      <label htmlFor="brand-feeling" className="text-sm">
+                        How should the brand feel?
+                      </label>
+                      <select
+                        id="brand-feeling"
+                        value={feeling}
+                        onChange={(event) =>
+                          setFeeling(event.target.value as Feeling)
+                        }
+                        className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                      >
+                        {FEELINGS.map((option) => (
+                          <option key={option} value={option}>
+                            {FEELING_LABELS[option]}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="grid gap-1">
+                      <label htmlFor="brand-must-include" className="text-sm">
+                        Words the name must include (optional)
+                      </label>
+                      <input
+                        id="brand-must-include"
+                        type="text"
+                        value={mustInclude}
+                        onChange={(event) => setMustInclude(event.target.value)}
+                        placeholder="e.g. adom, gold"
+                        aria-describedby="brand-must-include-hint"
+                        className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                      />
+                      <p
+                        id="brand-must-include-hint"
+                        className="text-xs text-slate-500"
+                      >
+                        Up to 3 short words, separated by commas.
+                      </p>
+                    </div>
+                    <div>
+                      <button
+                        type="button"
+                        data-testid="brand-kit-suggest"
+                        disabled={!canSuggest}
+                        onClick={() => void suggest()}
+                        className="btn-primary min-h-10 px-4 text-sm disabled:opacity-60"
+                      >
+                        {busy?.kind === "suggest"
+                          ? "Thinking…"
+                          : "Suggest a brand"}
+                      </button>
+                    </div>
+                  </fieldset>
+
+                  {error && (
+                    <p
+                      role="alert"
+                      className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800"
+                    >
+                      {error} {DIY_TOOLS_STILL_WORK}
+                    </p>
+                  )}
+                </>
               )}
+
               {notice && (
                 <p
                   role="status"
@@ -632,6 +670,7 @@ export function BrandKitCard({
                           </button>
                           <button
                             type="button"
+                            data-testid={`brand-palette-use-${index}`}
                             disabled={busy !== null}
                             onClick={() =>
                               void apply(
@@ -660,191 +699,197 @@ export function BrandKitCard({
                 </div>
               )}
 
-              {names !== null && (
-                <div className="grid gap-3">
-                  <h3 className="text-sm font-semibold">Logo options</h3>
+              {/* The offline half of the card. Nothing here calls the model,
+                  so it stays put when the suggestions above fail or were
+                  never requested. */}
+              <div className="grid gap-3" data-testid="brand-kit-diy">
+                <h3 className="text-sm font-semibold">
+                  Design the logo yourself
+                </h3>
+                <p className="text-xs text-slate-500">
+                  These tools never call the AI, so they work whether or not the
+                  suggestions above do. Pick an icon and a font style, then save
+                  one of the three layouts — or upload your own logo. Saving a
+                  logo puts it in this draft&apos;s logo slot; uploading a
+                  custom logo replaces the generated one, and vice versa.
+                </p>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-1">
+                    <label htmlFor="brand-logo-icon" className="text-sm">
+                      Icon
+                    </label>
+                    <select
+                      id="brand-logo-icon"
+                      data-testid="brand-logo-icon"
+                      value={logoIcon}
+                      onChange={(e) =>
+                        setLogoIcon(e.target.value as BrandLogoIcon)
+                      }
+                      className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                    >
+                      {BRAND_LOGO_ICONS.map((ic) => (
+                        <option key={ic} value={ic}>
+                          {ICON_LABELS[ic]}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="grid gap-1">
+                    <label htmlFor="brand-logo-font" className="text-sm">
+                      Font style
+                    </label>
+                    <select
+                      id="brand-logo-font"
+                      data-testid="brand-logo-font"
+                      value={logoFont}
+                      onChange={(e) =>
+                        setLogoFont(e.target.value as BrandLogoFontId)
+                      }
+                      className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                    >
+                      {BRAND_LOGO_FONTS.map((f) => (
+                        <option key={f.id} value={f.id}>
+                          {f.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-3">
+                  {LAYOUTS.map((layout) => (
+                    <article
+                      key={layout}
+                      className="grid content-start gap-2 rounded-lg border border-line p-3"
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        data-testid={`brand-logo-preview-${layout}`}
+                        src={logoSvgUrl(layout)}
+                        alt={`${brief.businessName} as a ${layout} logo`}
+                        className="w-full rounded border border-slate-100"
+                      />
+                      <p className="text-xs text-slate-600">
+                        {LAYOUT_LABELS[layout]}
+                      </p>
+                      <button
+                        type="button"
+                        data-testid={`brand-logo-${layout}`}
+                        disabled={busy !== null}
+                        onClick={() => void saveLogo(layout)}
+                        className="btn-secondary min-h-10 px-2 text-xs disabled:opacity-60"
+                      >
+                        {busy?.kind === "logo" && busy.layout === layout
+                          ? "Saving…"
+                          : "Save as logo"}
+                      </button>
+                    </article>
+                  ))}
+                </div>
+
+                <div className="grid gap-3 rounded-lg border border-line p-3">
+                  <h4 className="text-sm font-semibold">
+                    Upload your own logo
+                  </h4>
                   <p className="text-xs text-slate-500">
-                    Pick an icon and font style to make the generated logo
-                    richer. Saving a logo puts it in this draft&apos;s logo
-                    slot. Uploading a custom logo replaces the generated one,
-                    and vice versa.
+                    Upload a PNG, JPEG or WebP file up to 10MB. We check the
+                    file type and size in your browser and again on the server.
+                    Uploading replaces any generated logo, and saving a
+                    generated logo will replace your upload. SVG uploads are not
+                    accepted — we leave SVG out to keep logos safe.
                   </p>
 
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="grid gap-1">
-                      <label htmlFor="brand-logo-icon" className="text-sm">
-                        Icon
-                      </label>
-                      <select
-                        id="brand-logo-icon"
-                        data-testid="brand-logo-icon"
-                        value={logoIcon}
-                        onChange={(e) =>
-                          setLogoIcon(e.target.value as BrandLogoIcon)
-                        }
-                        className="w-full rounded-lg border border-line px-3 py-2 text-base"
-                      >
-                        {BRAND_LOGO_ICONS.map((ic) => (
-                          <option key={ic} value={ic}>
-                            {ICON_LABELS[ic]}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="grid gap-1">
-                      <label htmlFor="brand-logo-font" className="text-sm">
-                        Font style
-                      </label>
-                      <select
-                        id="brand-logo-font"
-                        data-testid="brand-logo-font"
-                        value={logoFont}
-                        onChange={(e) =>
-                          setLogoFont(e.target.value as BrandLogoFontId)
-                        }
-                        className="w-full rounded-lg border border-line px-3 py-2 text-base"
-                      >
-                        {BRAND_LOGO_FONTS.map((f) => (
-                          <option key={f.id} value={f.id}>
-                            {f.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-
-                  <div className="grid gap-3 sm:grid-cols-3">
-                    {LAYOUTS.map((layout) => (
-                      <article
-                        key={layout}
-                        className="grid content-start gap-2 rounded-lg border border-line p-3"
-                      >
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={logoSvgUrl(layout)}
-                          alt={`${brief.businessName} as a ${layout} logo`}
-                          className="w-full rounded border border-slate-100"
-                        />
-                        <p className="text-xs text-slate-600">
-                          {LAYOUT_LABELS[layout]}
+                  {currentLogo ? (
+                    <div className="flex items-center gap-3 rounded-lg border border-line bg-white p-2">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        data-testid="custom-logo-preview"
+                        src={currentLogo.dataUrl}
+                        alt="Current logo"
+                        className="h-16 w-16 rounded-md object-contain ring-1 ring-line"
+                      />
+                      <div className="text-xs text-slate-600">
+                        <p className="font-semibold text-navy">
+                          {currentLogo.fileName}
+                        </p>
+                        <p>
+                          {currentLogo.width}×{currentLogo.height} ·{" "}
+                          {formatBytes(currentLogo.size)}
                         </p>
                         <button
                           type="button"
-                          data-testid={`brand-logo-${layout}`}
+                          onClick={() => void removeCustomLogo()}
                           disabled={busy !== null}
-                          onClick={() => void saveLogo(layout)}
-                          className="btn-secondary min-h-10 px-2 text-xs disabled:opacity-60"
+                          data-testid="remove-custom-logo"
+                          className="mt-1 text-red-700 underline disabled:opacity-50"
                         >
-                          {busy?.kind === "logo" && busy.layout === layout
-                            ? "Saving…"
-                            : "Save as logo"}
+                          {busy?.kind === "remove-logo"
+                            ? "Removing…"
+                            : "Remove logo"}
                         </button>
-                      </article>
-                    ))}
-                  </div>
-
-                  <div className="grid gap-3 rounded-lg border border-line p-3">
-                    <h4 className="text-sm font-semibold">
-                      Upload your own logo
-                    </h4>
-                    <p className="text-xs text-slate-500">
-                      Upload a PNG, JPEG or WebP file up to 10MB. We check the
-                      file type and size in your browser and again on the
-                      server. Uploading replaces any generated logo, and saving
-                      a generated logo will replace your upload. SVG uploads are
-                      not accepted — we leave SVG out to keep logos safe.
-                    </p>
-
-                    {currentLogo ? (
-                      <div className="flex items-center gap-3 rounded-lg border border-line bg-white p-2">
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={currentLogo.dataUrl}
-                          alt="Current logo"
-                          className="h-16 w-16 rounded-md object-contain ring-1 ring-line"
-                        />
-                        <div className="text-xs text-slate-600">
-                          <p className="font-semibold text-navy">
-                            {currentLogo.fileName}
-                          </p>
-                          <p>
-                            {currentLogo.width}×{currentLogo.height} ·{" "}
-                            {formatBytes(currentLogo.size)}
-                          </p>
-                          <button
-                            type="button"
-                            onClick={() => void removeCustomLogo()}
-                            disabled={busy !== null}
-                            data-testid="remove-custom-logo"
-                            className="mt-1 text-red-700 underline disabled:opacity-50"
-                          >
-                            {busy?.kind === "remove-logo"
-                              ? "Removing…"
-                              : "Remove logo"}
-                          </button>
-                        </div>
                       </div>
-                    ) : null}
-
-                    <div className="flex flex-wrap items-center gap-3">
-                      <button
-                        type="button"
-                        data-testid="upload-custom-logo"
-                        disabled={busy !== null}
-                        onClick={() => customLogoInputRef.current?.click()}
-                        className="min-h-10 rounded-md border border-line bg-white px-3 text-sm font-semibold text-navy hover:bg-slate-50 disabled:opacity-60"
-                      >
-                        {busy?.kind === "custom-logo"
-                          ? "Uploading…"
-                          : currentLogo
-                            ? "Replace logo"
-                            : "Upload logo"}
-                      </button>
-                      <input
-                        ref={customLogoInputRef}
-                        type="file"
-                        accept={Array.from(ACCEPTED_BRAND_LOGO_MIMES).join(",")}
-                        className="hidden"
-                        data-testid="custom-logo-input"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (file) void uploadCustomLogo(file);
-                          // Reset so same file can be picked again
-                          e.currentTarget.value = "";
-                        }}
-                      />
-                      <span className="text-xs text-slate-500">
-                        PNG, JPEG or WebP, up to 10MB.
-                      </span>
                     </div>
+                  ) : null}
 
-                    {customLogoError && (
-                      <p
-                        role="alert"
-                        className="rounded-lg border border-red-300 bg-red-50 p-2 text-sm text-red-800"
-                      >
-                        {customLogoError}
-                      </p>
-                    )}
-                  </div>
-
-                  <div>
-                    <a
-                      data-testid="brand-kit-sheet"
-                      href={`${baseUrl}/sheet`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-primary inline-flex min-h-10 items-center px-4 text-sm"
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      data-testid="upload-custom-logo"
+                      disabled={busy !== null}
+                      onClick={() => customLogoInputRef.current?.click()}
+                      className="min-h-10 rounded-md border border-line bg-white px-3 text-sm font-semibold text-navy hover:bg-slate-50 disabled:opacity-60"
                     >
-                      Download brand sheet
-                    </a>
-                    <p className="mt-1 text-xs text-slate-500">
-                      One page with the logo, name, tagline, colours and font —
-                      ready to share or print.
-                    </p>
+                      {busy?.kind === "custom-logo"
+                        ? "Uploading…"
+                        : currentLogo
+                          ? "Replace logo"
+                          : "Upload logo"}
+                    </button>
+                    <input
+                      ref={customLogoInputRef}
+                      type="file"
+                      accept={Array.from(ACCEPTED_BRAND_LOGO_MIMES).join(",")}
+                      className="hidden"
+                      data-testid="custom-logo-input"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) void uploadCustomLogo(file);
+                        // Reset so same file can be picked again
+                        e.currentTarget.value = "";
+                      }}
+                    />
+                    <span className="text-xs text-slate-500">
+                      PNG, JPEG or WebP, up to 10MB.
+                    </span>
                   </div>
+
+                  {customLogoError && (
+                    <p
+                      role="alert"
+                      className="rounded-lg border border-red-300 bg-red-50 p-2 text-sm text-red-800"
+                    >
+                      {customLogoError}
+                    </p>
+                  )}
                 </div>
-              )}
+
+                <div>
+                  <a
+                    data-testid="brand-kit-sheet"
+                    href={`${baseUrl}/sheet`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="btn-primary inline-flex min-h-10 items-center px-4 text-sm"
+                  >
+                    Download brand sheet
+                  </a>
+                  <p className="mt-1 text-xs text-slate-500">
+                    One page with the logo, name, tagline, colours and font —
+                    ready to share or print.
+                  </p>
+                </div>
+              </div>
             </>
           )}
         </div>

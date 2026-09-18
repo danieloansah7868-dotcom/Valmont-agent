@@ -550,47 +550,50 @@ describe("brand kit — fallback to plain when structured modes are refused", ()
       "Oseikrom Deals",
     ]);
 
-    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      const fmt = (body.response_format as { type?: string } | undefined)?.type;
-      if (fmt === "json_schema") {
-        return new Response(
-          JSON.stringify({
-            error: {
-              code: "high_demand",
-              message: "This model is currently experiencing high demand",
-            },
-          }),
-          { status: 429, headers: { "content-type": "application/json" } },
-        );
-      }
-      if (fmt === "json_object") {
-        return new Response(
-          JSON.stringify({
-            error: {
-              code: "unsupported",
-              message: "json_object not supported",
-            },
-          }),
-          { status: 400, headers: { "content-type": "application/json" } },
-        );
-      }
-      // plain — return canned output as plain text JSON inside content
-      return new Response(
-        JSON.stringify({
-          choices: [
-            {
-              finish_reason: "stop",
-              message: {
-                content: JSON.stringify(canned),
+    const fetcher = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        const fmt = (body.response_format as { type?: string } | undefined)
+          ?.type;
+        if (fmt === "json_schema") {
+          return new Response(
+            JSON.stringify({
+              error: {
+                code: "high_demand",
+                message: "This model is currently experiencing high demand",
               },
-            },
-          ],
-          usage: {},
-        }),
-        { status: 200 },
-      );
-    });
+            }),
+            { status: 429, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (fmt === "json_object") {
+          return new Response(
+            JSON.stringify({
+              error: {
+                code: "unsupported",
+                message: "json_object not supported",
+              },
+            }),
+            { status: 400, headers: { "content-type": "application/json" } },
+          );
+        }
+        // plain — return canned output as plain text JSON inside content
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                finish_reason: "stop",
+                message: {
+                  content: JSON.stringify(canned),
+                },
+              },
+            ],
+            usage: {},
+          }),
+          { status: 200 },
+        );
+      },
+    );
 
     const provider = new OpenAICompatibleProvider({
       apiKey: "key",
@@ -608,10 +611,14 @@ describe("brand kit — fallback to plain when structured modes are refused", ()
 
     const logs = consoleSpy.mock.calls.map((c) => String(c[0]));
     expect(
-      logs.some((l) => l.includes("json_schema") && l.includes("ModelProviderError")),
+      logs.some(
+        (l) => l.includes("json_schema") && l.includes("ModelProviderError"),
+      ),
     ).toBe(true);
     expect(
-      logs.some((l) => l.includes("json_object") && l.includes("ModelProviderError")),
+      logs.some(
+        (l) => l.includes("json_object") && l.includes("ModelProviderError"),
+      ),
     ).toBe(true);
 
     consoleSpy.mockRestore();

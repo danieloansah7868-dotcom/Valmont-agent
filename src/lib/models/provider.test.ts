@@ -380,9 +380,7 @@ describe("model provider abstraction", () => {
       fetcher,
     });
 
-    const consoleSpy = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => {});
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const result = await provider.structured({
       schemaName: "answer",

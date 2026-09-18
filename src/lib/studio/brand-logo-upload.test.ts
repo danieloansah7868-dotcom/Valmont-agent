@@ -137,7 +137,7 @@ describe("custom logo upload — rejects oversize and wrong type", () => {
 
   it("rejects malicious SVG if someone tries to smuggle it as PNG mime (magic mismatch)", () => {
     // Data URL claims PNG but content is SVG text — magic check should fail
-    const svgPayload = Buffer.from('<svg><script>alert(1)</script></svg>');
+    const svgPayload = Buffer.from("<svg><script>alert(1)</script></svg>");
     const dataUrl = `data:image/png;base64,${svgPayload.toString("base64")}`;
     expect(() =>
       validateUploadedImage({
@@ -159,7 +159,9 @@ describe("uploaded logo appears in brand sheet", () => {
       tagline: "Everyday essentials",
     }) as SiteBriefV1;
     // Simulate uploaded logo in assets
-    (brief as unknown as { assets: { logo: unknown; photos: unknown[] } }).assets = {
+    (
+      brief as unknown as { assets: { logo: unknown; photos: unknown[] } }
+    ).assets = {
       logo: {
         dataUrl: PNG_DATA_URL,
         fileName: "custom-logo.png",
