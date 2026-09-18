@@ -67,10 +67,10 @@ export function isBrandLogoFontId(value: unknown): value is BrandLogoFontId {
   );
 }
 
-export function brandLogoFontById(id: string): (typeof BRAND_LOGO_FONTS)[number] {
-  return (
-    BRAND_LOGO_FONTS.find((f) => f.id === id) ?? BRAND_LOGO_FONTS[0]!
-  );
+export function brandLogoFontById(
+  id: string,
+): (typeof BRAND_LOGO_FONTS)[number] {
+  return BRAND_LOGO_FONTS.find((f) => f.id === id) ?? BRAND_LOGO_FONTS[0]!;
 }
 
 /** Curated icons for common Ghana business types — simple inline SVG glyphs. */

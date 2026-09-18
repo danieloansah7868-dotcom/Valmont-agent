@@ -106,7 +106,9 @@ describe("renderBrandLogo — icons and fonts", () => {
           expect(svg).not.toContain("<Test>");
           expect(svg).toContain("Adom &amp; Sons &lt;Test&gt;");
           // Font stack appears
-          expect(svg).toContain(font.stack.split(",")[0]!.trim().replace(/'/g, "").slice(0, 6));
+          expect(svg).toContain(
+            font.stack.split(",")[0]!.trim().replace(/'/g, "").slice(0, 6),
+          );
           // Icon path appears only in badge layouts when icon != none
           if (icon !== "none" && layout !== "wordmark") {
             expect(svg).toContain("<path");
