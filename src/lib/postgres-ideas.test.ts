@@ -91,6 +91,26 @@ describe.runIf(connectionString)("PostgreSQL idea store", () => {
     expect(untouched[0].title).toBe("Renamed");
   });
 
+  it("listPublic crosses account boundaries for the public portfolio", async () => {
+    await store.create(userA, { title: "A's public idea" });
+    await store.create(userB, { title: "B's public idea" });
+
+    const all = await store.listPublic();
+    const ours = all.filter(
+      (idea: { userId: string }) =>
+        idea.userId === userA || idea.userId === userB,
+    );
+    expect(ours.map((idea: { title: string }) => idea.title).sort()).toEqual([
+      "A's public idea",
+      "B's public idea",
+    ]);
+
+    // The signed-in list stays scoped to its own account.
+    const listA = await store.list(userA);
+    expect(listA).toHaveLength(1);
+    expect(listA[0].title).toBe("A's public idea");
+  });
+
   it("deletes the caller's idea and refuses another user's", async () => {
     const idea = await store.create(userA, { title: "Doomed" });
     expect(await store.remove(userB, idea.id)).toBe(false);

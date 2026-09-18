@@ -9,6 +9,7 @@ import {
   Database,
   Globe,
   Layers,
+  Lightbulb,
   Megaphone,
   MessageSquare,
   PlugZap,
@@ -19,8 +20,9 @@ import {
   Zap,
 } from "lucide-react";
 import { Logo, LogoMark } from "@/components/logo";
+import { getIdeaStore, type IdeaRecord } from "@/lib/idea-store";
 
-export const dynamic = "force-static";
+export const dynamic = "force-dynamic";
 
 type Venture = {
   slug: string;
@@ -43,6 +45,8 @@ const ventures: Venture[] = [
       "A fast, reliable payments layer for sending, receiving, and settling money across wallets, cards, and accounts.",
     icon: Wallet,
     category: "Fintech",
+    external: "https://valmontpay.app",
+    live: true,
   },
   {
     slug: "valmont-data",
@@ -61,6 +65,8 @@ const ventures: Venture[] = [
       "Electrical installation, maintenance, and smart-power solutions for homes, businesses, and industrial sites.",
     icon: PlugZap,
     category: "Services",
+    external: "https://valmontelectricals.com",
+    live: true,
   },
   {
     slug: "valmont-gadgets",
@@ -70,6 +76,8 @@ const ventures: Venture[] = [
       "Curated phones, accessories, and smart devices — sourced, checked, and supported with real after-sales care.",
     icon: Cpu,
     category: "Retail",
+    external: "https://gadgets.com",
+    live: true,
   },
   {
     slug: "valmont-web",
@@ -79,6 +87,8 @@ const ventures: Venture[] = [
       "Design and engineering for fast, responsive websites and web apps that look sharp and convert visitors.",
     icon: Globe,
     category: "Web",
+    external: "https://valmontweb.com",
+    live: true,
   },
   {
     slug: "valmont-ecosystem",
@@ -118,7 +128,6 @@ const ventures: Venture[] = [
     icon: MessageSquare,
     category: "AI / Chat",
     href: "/chat",
-    live: true,
   },
   {
     slug: "valmont-ads",
@@ -202,7 +211,11 @@ function VentureCard({ venture }: { venture: Venture }) {
 
       {isLink && (
         <span className="mt-5 inline-flex items-center gap-1.5 text-[13px] font-bold text-brandblue transition-colors group-hover:text-copper-700">
-          {venture.href === "/agent" ? "Open the agent" : "Learn more"}
+          {venture.external
+            ? "Visit website"
+            : venture.href === "/agent"
+              ? "Open the agent"
+              : "Learn more"}
           {venture.external ? (
             <ArrowUpRight className="size-3.5" aria-hidden="true" />
           ) : (
@@ -214,8 +227,68 @@ function VentureCard({ venture }: { venture: Venture }) {
   );
 }
 
-export default function PortfolioPage() {
+const IDEA_STATUS_LABELS: Record<IdeaRecord["status"], string> = {
+  building: "Building",
+  planned: "Planned",
+  idea: "Idea",
+  done: "Done",
+  dropped: "Dropped",
+};
+
+function showcaseDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString("en-GB", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function IdeaShowcaseCard({ idea }: { idea: IdeaRecord }) {
+  return (
+    <article
+      data-testid={`portfolio-idea-${idea.id}`}
+      className="card flex h-full flex-col p-6"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <span className="flex size-11 items-center justify-center rounded-xl bg-copper-50 text-copper-700 ring-1 ring-inset ring-copper-300">
+          <Lightbulb className="size-5" strokeWidth={1.9} aria-hidden="true" />
+        </span>
+        <span className="rounded-full bg-ivory-100 px-2.5 py-1 text-[10px] font-bold tracking-wide text-slate uppercase ring-1 ring-inset ring-line">
+          {IDEA_STATUS_LABELS[idea.status]}
+        </span>
+      </div>
+
+      <h3 className="mt-5 text-[17px] font-bold break-words tracking-[-0.015em] text-navy">
+        {idea.title}
+      </h3>
+      {idea.details ? (
+        <p className="mt-3 flex-1 text-[13.5px] leading-6 break-words whitespace-pre-wrap text-slate">
+          {idea.details}
+        </p>
+      ) : (
+        <div className="flex-1" />
+      )}
+
+      <span className="mt-5 text-[11px] font-semibold text-slate">
+        {showcaseDate(idea.updatedAt)}
+      </span>
+    </article>
+  );
+}
+
+export default async function PortfolioPage() {
   const liveCount = ventures.filter((v) => v.live).length;
+
+  // Every saved idea appears here, newest first — ideas are public by
+  // design. A notebook read must never take the portfolio down with it.
+  let publicIdeas: IdeaRecord[] = [];
+  try {
+    publicIdeas = await getIdeaStore().listPublic();
+  } catch {
+    publicIdeas = [];
+  }
 
   return (
     <main className="min-h-screen overflow-hidden bg-ivory-50">
@@ -257,6 +330,11 @@ export default function PortfolioPage() {
             <a href="#ventures" className="btn-quiet text-[13px]">
               Ventures
             </a>
+            {publicIdeas.length > 0 && (
+              <a href="#ideas" className="btn-quiet text-[13px]">
+                Ideas
+              </a>
+            )}
             <a href="#about" className="btn-quiet text-[13px]">
               About
             </a>
@@ -463,6 +541,37 @@ export default function PortfolioPage() {
           ))}
         </div>
       </section>
+
+      {/* Ideas — everything from the notebook, straight onto the portfolio */}
+      {publicIdeas.length > 0 && (
+        <section
+          id="ideas"
+          className="scroll-mt-24 border-y border-line bg-white"
+        >
+          <div className="mx-auto max-w-[1180px] px-5 py-20 sm:px-8 sm:py-24">
+            <div className="flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-end">
+              <div>
+                <p className="text-[11px] font-bold tracking-[0.16em] text-copper-700 uppercase">
+                  From the idea board
+                </p>
+                <h2 className="text-balance mt-3 max-w-[640px] text-[34px] leading-[1.08] font-[750] tracking-[-0.03em] text-navy sm:text-[44px]">
+                  Ideas &amp; future plans.
+                </h2>
+              </div>
+              <p className="max-w-[360px] text-[14px] leading-6 text-slate">
+                Straight from the notebook — what Valmont is thinking about,
+                building, and planning next.
+              </p>
+            </div>
+
+            <div className="mt-12 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+              {publicIdeas.map((idea) => (
+                <IdeaShowcaseCard key={idea.id} idea={idea} />
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* Featured: Valmont Agent */}
       <section className="relative overflow-hidden bg-navy text-ivory">
