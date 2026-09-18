@@ -384,7 +384,7 @@ describe("brand-kit suggest — budget and configuration", () => {
     expect(models.requests).toHaveLength(10);
   });
 
-  it("answers 503 when no model is configured on the server", async () => {
+  it("answers 503 when no model is configured on the server with actionable copy", async () => {
     const draft = await createDraft();
     models.provider = null;
 
@@ -393,6 +393,48 @@ describe("brand-kit suggest — budget and configuration", () => {
 
     expect(response.status).toBe(503);
     expect(String(data.error)).toContain("MODEL_API_KEY");
+    expect(String(data.error)).toContain("Settings (/settings)");
+  });
+
+  it("answers 502 and logs when the model provider fails", async () => {
+    const draft = await createDraft();
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    models.provider = {
+      id: "fake",
+      model: "fake-1",
+      supportsStreaming: false,
+      chat: () => {
+        throw new Error("not used");
+      },
+      structured: async () => {
+        const { ModelProviderError } =
+          await import("@/lib/models/openai-compatible");
+        throw new ModelProviderError({
+          provider: "openai-compatible",
+          code: "invalid_schema",
+          message: "Provider rejected schema with 400",
+          status: 400,
+          retryable: false,
+        });
+      },
+      stream(): AsyncIterable<never> {
+        throw new Error("not used");
+      },
+    };
+
+    try {
+      const response = await suggest(draft.id);
+      const data = await response.json();
+
+      expect(response.status).toBe(502);
+      expect(String(data.error)).toContain("The model provider failed");
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[brand-kit/suggest] ModelProviderError"),
+      );
+    } finally {
+      consoleSpy.mockRestore();
+    }
   });
 });
 

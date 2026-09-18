@@ -18,7 +18,7 @@ import type { ModelMessage, ModelProvider } from "@/lib/models/types";
 import { checkRateLimit } from "@/lib/security";
 import { RateLimitError } from "@/lib/api-errors";
 import { isCategoryId } from "./categories";
-import { HEX_COLOR_RE, THEME_IDS, isThemeId } from "./themes";
+import { HEX_COLOR_RE, THEME_IDS, isThemeId, type ThemeId } from "./themes";
 
 /** The four moods the agency can steer the suggestions with. */
 export const BRAND_KIT_FEELINGS = [
@@ -29,7 +29,42 @@ export const BRAND_KIT_FEELINGS = [
 ] as const;
 export type BrandKitFeeling = (typeof BRAND_KIT_FEELINGS)[number];
 
-const hexColor = z.string().regex(HEX_COLOR_RE, "Colour must be #RRGGBB");
+export function normalizeHexColor(value: string, fallback = "#091534"): string {
+  const trimmed = value.trim();
+  if (HEX_COLOR_RE.test(trimmed)) return trimmed;
+  if (/^#[0-9A-Fa-f]{3}$/.test(trimmed)) {
+    const r = trimmed[1],
+      g = trimmed[2],
+      b = trimmed[3];
+    return `#${r}${r}${g}${g}${b}${b}`;
+  }
+  if (/^[0-9A-Fa-f]{6}$/.test(trimmed)) {
+    return `#${trimmed}`;
+  }
+  return fallback;
+}
+
+export function normalizeThemeId(value: string): ThemeId {
+  const trimmed = value.trim().toLowerCase();
+  if (isThemeId(trimmed)) return trimmed;
+  for (const tid of THEME_IDS) {
+    if (
+      tid === trimmed ||
+      tid.includes(trimmed) ||
+      trimmed.includes(tid) ||
+      trimmed.includes(tid.split("-")[0]!)
+    ) {
+      return tid;
+    }
+  }
+  return "clean-corporate";
+}
+
+const hexColor = z
+  .string()
+  .trim()
+  .transform((val) => normalizeHexColor(val, "#091534"))
+  .refine((val) => HEX_COLOR_RE.test(val), "Colour must be #RRGGBB");
 
 /**
  * The four questions the wizard asks before suggesting. These — and nothing
@@ -65,31 +100,41 @@ export const brandKitNameSchema = z.object({
     .string()
     .trim()
     .min(2)
-    .max(30)
-    .regex(
-      /^[A-Za-z0-9 &']+$/,
-      "Name may use letters, digits, spaces, & and '",
+    .max(50)
+    .transform((val) => val.replace(/["*]/g, "").trim())
+    .refine(
+      (val) => /^[A-Za-z0-9 &'. -]+$/.test(val),
+      "Name may use letters, digits, spaces, &, ', -, and .",
     ),
-  meaning: z.string().max(120),
-  tagline: z.string().max(80),
+  meaning: z
+    .string()
+    .trim()
+    .transform((val) => val.slice(0, 120)),
+  tagline: z
+    .string()
+    .trim()
+    .transform((val) => val.slice(0, 80)),
 });
 export type BrandKitNameIdea = z.infer<typeof brandKitNameSchema>;
 
 /** One AI palette. Every colour is strict #RRGGBB, like the brief itself. */
 export const brandKitPaletteSchema = z.object({
-  label: z.string().trim().min(1).max(40),
+  label: z
+    .string()
+    .trim()
+    .transform((val) => val.slice(0, 40) || "Brand Palette"),
   primary: hexColor,
   accent: hexColor,
   surface: hexColor,
   text: hexColor,
-  themeId: z.string().refine(isThemeId, "Unknown theme"),
+  themeId: z.string().trim().transform(normalizeThemeId),
 });
 export type BrandKitPalette = z.infer<typeof brandKitPaletteSchema>;
 
 /** Exactly what the model is asked for — and all it may answer. */
 export const brandKitOutputSchema = z.object({
-  names: z.array(brandKitNameSchema).length(5),
-  palettes: z.array(brandKitPaletteSchema).length(3),
+  names: z.array(brandKitNameSchema).min(1),
+  palettes: z.array(brandKitPaletteSchema).min(1),
 });
 export type BrandKitOutput = z.infer<typeof brandKitOutputSchema>;
 
@@ -367,6 +412,9 @@ async function askOnce(
     // the caller's own invalid input keeps surfacing as the Zod error that
     // becomes a 400.
     if (error instanceof z.ZodError) {
+      console.error(
+        `[brand-kit] Model output failed schema validation: ${JSON.stringify(error.issues)}`,
+      );
       throw new Error(
         "The model returned a brand suggestion we could not use.",
       );
