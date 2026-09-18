@@ -6,7 +6,8 @@
  *  - saved ideas render in the "Ideas & future plans" section, newest first
  *    straight from the store,
  *  - with zero ideas (or a store that cannot be read) the section and its
- *    nav link stay hidden and the page still renders,
+ *    nav link stay hidden and the page still renders, but the navy
+ *    "Connected by design" grid always shows an Ideas tile linking to #ideas,
  *  - the active ventures link out to their real websites,
  *  - only genuinely live ventures carry the LIVE badge (Chat is not live).
  *
@@ -65,16 +66,18 @@ describe("portfolio landing page", () => {
     expect(html).toContain("portfolio-idea-idea-2");
     expect(html).toContain("Building");
     expect(html).toContain("Planned");
-    // The nav grows an Ideas link only when the section exists.
+    // The nav grows an Ideas link only when the section exists, plus the navy grid Ideas tile.
     expect(html).toContain('href="#ideas"');
   });
 
-  it("hides the ideas section and nav link when there are no ideas", async () => {
+  it("hides the ideas section and nav link when there are no ideas, but keeps the Ideas tile in the navy grid", async () => {
     mocks.listPublic.mockResolvedValue([]);
     const html = await renderPage();
 
     expect(html).not.toContain("From the idea board");
-    expect(html).not.toContain('href="#ideas"');
+    // The navy "Connected by design" grid now always shows an Ideas tile that links to #ideas
+    expect(html).toContain('href="#ideas"');
+    expect(html).toContain("Ideas");
     // The rest of the portfolio still renders.
     expect(html).toContain("The Ventures");
   });
@@ -85,6 +88,8 @@ describe("portfolio landing page", () => {
 
     expect(html).toContain("The Ventures");
     expect(html).not.toContain("From the idea board");
+    // Grid Ideas tile remains even when the store fails
+    expect(html).toContain('href="#ideas"');
   });
 
   it("links the active ventures to their real websites", async () => {

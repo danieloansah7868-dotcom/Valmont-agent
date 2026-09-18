@@ -20,8 +20,8 @@ export default async function IdeasPage() {
             Ideas &amp; future plans
           </h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-slate">
-            Everything saved here is shown on the public portfolio. Nothing here
-            is sent to the chat model.
+            Ideas you save appear on your public portfolio page. Only you can
+            add or edit them. Nothing here is sent to the chat model.
           </p>
         </div>
         <Lightbulb className="size-8 text-copper" aria-hidden="true" />
