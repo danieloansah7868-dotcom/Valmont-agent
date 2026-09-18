@@ -1,3 +1,4 @@
+import { redactSecrets } from "@/lib/redact";
 import type {
   ChatRequest,
   ModelError,
@@ -234,8 +235,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
     request: StructuredRequest<T>,
   ): Promise<ModelResponse & { data: T }> {
     const schema = compatibleJsonSchema(request.jsonSchema);
+    const baseBody = this.requestBody(request, false);
     const bodyWithSchema = {
-      ...this.requestBody(request, false),
+      ...baseBody,
       response_format: {
         type: "json_schema",
         json_schema: {
@@ -245,33 +247,45 @@ export class OpenAICompatibleProvider implements ModelProvider {
         },
       },
     };
+    const bodyWithObject = {
+      ...baseBody,
+      response_format: { type: "json_object" },
+    };
+    const plainBody = baseBody;
 
-    let rawResponse: OpenAIResponse;
-    try {
-      rawResponse = await this.post(bodyWithSchema, request.signal);
-    } catch (error) {
-      // If the provider rejected the json_schema response_format (e.g. Groq,
-      // Mistral, or older OpenAI-compatible proxies that only support json_object
-      // or reject strict schema parameters), retry with json_object.
-      if (
-        error instanceof ModelProviderError &&
-        error.status === 400 &&
-        /response_format|json_schema|schema/i.test(error.message)
-      ) {
-        const fallbackBody = {
-          ...this.requestBody(request, false),
-          response_format: { type: "json_object" },
-        };
-        try {
-          rawResponse = await this.post(fallbackBody, request.signal);
-        } catch {
-          // If json_object is also rejected, retry without response_format
-          const plainBody = this.requestBody(request, false);
-          rawResponse = await this.post(plainBody, request.signal);
+    const attempts: Array<{ tier: string; body: Record<string, unknown> }> = [
+      { tier: "json_schema", body: bodyWithSchema },
+      { tier: "json_object", body: bodyWithObject },
+      { tier: "plain", body: plainBody },
+    ];
+
+    let rawResponse: OpenAIResponse | null = null;
+    let lastError: unknown = null;
+
+    for (let i = 0; i < attempts.length; i++) {
+      const { tier, body } = attempts[i]!;
+      try {
+        rawResponse = await this.post(body, request.signal);
+        break;
+      } catch (error) {
+        lastError = error;
+        if (error instanceof ModelProviderError) {
+          console.error(
+            `[structured] ${tier} tier failed: ${error.constructor.name}: ${redactSecrets(error.message)}`,
+          );
+          if (i === attempts.length - 1) {
+            throw error;
+          }
+          // Fall through to next tier — any provider that can serve chat
+          // can serve brand suggestions via the plain tier.
+        } else {
+          throw error;
         }
-      } else {
-        throw error;
       }
+    }
+
+    if (!rawResponse) {
+      throw lastError;
     }
 
     const response = this.normalize(rawResponse);

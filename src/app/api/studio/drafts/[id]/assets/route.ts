@@ -9,7 +9,8 @@ import { siteBriefSchemaV1 } from "@/lib/studio/site-brief/schema";
 import { readBoundedJson } from "@/lib/bounded-json";
 // Images are sent as base64 data URLs which grow ~33% over raw bytes,
 // so allow a larger cap for the upload endpoint than the text-only PATCH.
-const ASSET_BODY_LIMIT_BYTES = 2_500_000; // ~2.5 MB
+// Logos may be up to 10MB raw (~13.3MB base64) — keep body limit generous.
+const ASSET_BODY_LIMIT_BYTES = 20_000_000; // 20 MB
 import {
   checkAssetBudget,
   validateUploadedImage,
@@ -32,11 +33,11 @@ const uploadBodySchema = z.object({
   kind: z.enum(["logo", "photo"]),
   expectedRevision: z.number().int().min(1),
   image: z.object({
-    dataUrl: z.string().max(1_600_000),
+    dataUrl: z.string().max(20_000_000),
     fileName: z.string().max(200),
     mime: z.string().max(50),
-    width: z.number().min(1).max(4000),
-    height: z.number().min(1).max(4000),
+    width: z.number().min(1).max(8000),
+    height: z.number().min(1).max(8000),
   }),
 });
 

@@ -14,6 +14,8 @@ import {
 import {
   brandLogoSize,
   isBrandLogoLayout,
+  isBrandLogoIcon,
+  isBrandLogoFontId,
   renderBrandLogo,
 } from "@/lib/studio/brand-logo";
 import { brandSlug } from "@/lib/studio/brand-kit";
@@ -25,17 +27,18 @@ import {
 /**
  * POST /api/studio/drafts/[id]/brand-kit/logo
  *
- * Renders the chosen text-logo layout, rasterises it to PNG with next/og
- * (the same library the opengraph image uses, never larger than the 600px
- * logo limit), and saves it into brief.assets.logo exactly like a hand
- * upload through /assets does — the same validation helper, the same budget
- * check, the same optimistic-concurrency update.
+ * Renders the chosen text-logo layout (now with optional icon + font),
+ * rasterises it to PNG with next/og (same library the opengraph image uses,
+ * never larger than the 600px logo limit), and saves it into
+ * brief.assets.logo exactly like a hand upload through /assets does.
  */
 const logoBodySchema = z.object({
   expectedRevision: z.number().int().min(1),
   layout: z.string().refine(isBrandLogoLayout, "Unknown logo layout"),
   name: z.string().trim().min(2).max(60),
   initials: z.string().trim().max(3).optional(),
+  icon: z.string().refine(isBrandLogoIcon, "Unknown logo icon").optional(),
+  font: z.string().refine(isBrandLogoFontId, "Unknown font style").optional(),
   palette: z.object({
     primary: z.string().regex(HEX_COLOR_RE, "Color must be #RRGGBB"),
     accent: z.string().regex(HEX_COLOR_RE, "Color must be #RRGGBB"),
@@ -64,6 +67,8 @@ export async function POST(
       accent: parsed.palette.accent,
       surface: parsed.palette.surface,
       layout: parsed.layout,
+      icon: parsed.icon as never,
+      font: parsed.font as never,
     });
     const { width, height } = brandLogoSize(parsed.layout);
 

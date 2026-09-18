@@ -452,6 +452,19 @@ export default async function PortfolioPage() {
                     </div>
                   );
                 })}
+                <a
+                  href="#ideas"
+                  className="flex flex-col items-center gap-2 rounded-xl border border-ivory/10 bg-ivory/5 p-3 text-center transition-colors hover:bg-ivory/10"
+                >
+                  <Lightbulb
+                    className="size-5 text-ivory/80"
+                    strokeWidth={1.8}
+                    aria-hidden="true"
+                  />
+                  <span className="text-[10px] leading-tight font-bold text-ivory/90">
+                    Ideas
+                  </span>
+                </a>
               </div>
 
               <div className="mt-6 rounded-xl border border-ivory/10 bg-navy-900/60 p-4">

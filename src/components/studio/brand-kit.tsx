@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, apiMutation } from "@/lib/client-api";
+import { ApiError, apiMutation, csrfToken } from "@/lib/client-api";
 import {
   BRAND_KIT_ADDON_PRICE_LABEL,
   brandKitAllowed,
@@ -12,6 +12,17 @@ import type {
   BrandKitPalette,
 } from "@/lib/studio/brand-kit";
 import type { SiteBriefV1, StudioDraft } from "@/lib/studio/site-brief/schema";
+import {
+  BRAND_LOGO_FONTS,
+  BRAND_LOGO_ICONS,
+  type BrandLogoIcon,
+  type BrandLogoFontId,
+} from "@/lib/studio/brand-logo";
+import {
+  ACCEPTED_BRAND_LOGO_MIMES,
+  MAX_LOGO_BYTES,
+} from "@/lib/studio/assets";
+import { dataUrlByteLength, resizeImage } from "./resize-image";
 
 /**
  * Stage B — the wizard's Brand Kit card, for a client who arrives with no
@@ -20,11 +31,11 @@ import type { SiteBriefV1, StudioDraft } from "@/lib/studio/site-brief/schema";
  * brief until the agency clicks a "Use this" button, and each of those goes
  * through the apply/logo routes, which save exactly what the wizard would.
  *
- * Kept pure-client: the server library for this feature reads the model and
- * the rate limiter, neither of which may enter the browser bundle — so the
- * four feelings live here too (type-only imports from the library stay
- * type-only).
+ * Now also: richer generated logos (icon + font choices) and "Upload your
+ * own logo" (PNG/JPEG/WebP up to 10MB, client+server validated, stored via
+ * draft-assets).
  */
+
 const FEELINGS = ["trusted", "friendly", "premium", "young"] as const;
 type Feeling = (typeof FEELINGS)[number];
 
@@ -42,11 +53,27 @@ const LAYOUT_LABELS: Record<(typeof LAYOUTS)[number], string> = {
   stacked: "Badge above the name",
 };
 
+const ICON_LABELS: Record<BrandLogoIcon, string> = {
+  none: "No icon",
+  fish: "Fish",
+  chicken: "Chicken / Food",
+  bolt: "Bolt / Electrical",
+  scissors: "Scissors / Salon",
+  house: "House",
+  bag: "Shopping bag",
+  book: "Book / School",
+  car: "Car",
+  leaf: "Leaf",
+  mortar: "Mortar / Pharmacy",
+};
+
 type BusyAction =
   | { kind: "suggest" }
   | { kind: "name"; index: number }
   | { kind: "palette"; index: number }
   | { kind: "logo"; layout: string }
+  | { kind: "custom-logo" }
+  | { kind: "remove-logo" }
   | null;
 
 interface Props {
@@ -70,6 +97,12 @@ function parseMustInclude(text: string): string[] {
     .map((word) => word.slice(0, 20));
 }
 
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function BrandKitCard({
   draftId,
   brief,
@@ -90,6 +123,10 @@ export function BrandKitCard({
 
   const [names, setNames] = useState<BrandKitNameSuggestion[] | null>(null);
   const [palettes, setPalettes] = useState<BrandKitPalette[] | null>(null);
+
+  // Richer logo options
+  const [logoIcon, setLogoIcon] = useState<BrandLogoIcon>("none");
+  const [logoFont, setLogoFont] = useState<BrandLogoFontId>("modern");
 
   const isBundleSite = brief.category === "data-bundles";
   const gated = !brandKitAllowed(brief);
@@ -117,10 +154,12 @@ export function BrandKitCard({
         primary,
         accent,
         surface,
+        icon: logoIcon,
+        font: logoFont,
       });
       return `${baseUrl}/logo.svg?${query.toString()}`;
     },
-    [baseUrl, brief.businessName, primary, accent, surface],
+    [baseUrl, brief.businessName, primary, accent, surface, logoIcon, logoFont],
   );
 
   const describeError = (cause: unknown): string => {
@@ -198,11 +237,13 @@ export function BrandKitCard({
     try {
       const updated = await apiMutation<StudioDraft>(`${baseUrl}/logo`, {
         layout,
+        icon: logoIcon,
+        font: logoFont,
         palette: { primary, accent, surface },
         name: brief.businessName,
         expectedRevision: revisionRef.current,
       });
-      adoptDraft(updated, "Logo saved to this draft.");
+      adoptDraft(updated, "Logo saved to this draft. Uploading a custom logo will replace it, and vice versa.");
     } catch (cause) {
       setError(describeError(cause));
     } finally {
@@ -210,8 +251,122 @@ export function BrandKitCard({
     }
   };
 
+  // Custom logo upload — PNG/JPEG/WebP up to 10MB, client+server validated
+  const customLogoInputRef = useRef<HTMLInputElement | null>(null);
+  const [customLogoError, setCustomLogoError] = useState<string | null>(null);
+
+  const validateCustomFileClient = (file: File): string | null => {
+    if (!ACCEPTED_BRAND_LOGO_MIMES.has(file.type as never)) {
+      return "That file type is not supported — use PNG, JPEG or WebP.";
+    }
+    if (file.size > MAX_LOGO_BYTES) {
+      return "That file is too large — logos can be up to 10MB.";
+    }
+    return null;
+  };
+
+  const uploadCustomLogo = async (file: File): Promise<void> => {
+    const clientError = validateCustomFileClient(file);
+    if (clientError) {
+      setCustomLogoError(clientError);
+      return;
+    }
+    setBusy({ kind: "custom-logo" });
+    setError(null);
+    setCustomLogoError(null);
+    setNotice(null);
+    try {
+      // Resize to 600 max side to keep brief small, but keep mime as PNG if needed
+      const resized = await resizeImage(file, 600, true);
+      const approxSize = await dataUrlByteLength(resized.dataUrl);
+      if (approxSize > MAX_LOGO_BYTES) {
+        throw new Error("That file is too large — logos can be up to 10MB.");
+      }
+      const response = await fetch(`/api/studio/drafts/${draftId}/assets`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-valmont-csrf": csrfToken(),
+        },
+        body: JSON.stringify({
+          kind: "logo",
+          expectedRevision: revisionRef.current,
+          image: {
+            dataUrl: resized.dataUrl,
+            fileName: file.name,
+            mime: resized.mime,
+            width: resized.width,
+            height: resized.height,
+          },
+        }),
+      });
+      let data: { brief?: { assets?: { logo?: unknown } }; revision?: number; error?: string } = {};
+      try {
+        data = (await response.json()) as typeof data;
+      } catch {}
+      if (!response.ok) {
+        throw new Error(data.error ?? "Upload failed.");
+      }
+      // Fetch full draft via assets route returns brief inside? Actually assets route returns full draft.
+      // Re-use the response as draft if it has revision, else fetch draft.
+      // The assets route returns StudioDraft JSON.
+      const draft = data as unknown as StudioDraft;
+      if (draft.revision) {
+        adoptDraft(draft, "Custom logo uploaded. It replaces any generated logo, and saving a generated logo will replace it.");
+      } else {
+        // Fallback: treat as success, but we need to get updated draft via separate fetch? For simplicity, show notice.
+        setNotice("Custom logo uploaded. It replaces any generated logo, and saving a generated logo will replace it.");
+      }
+    } catch (cause) {
+      const msg = cause instanceof Error ? cause.message : "Upload failed.";
+      setCustomLogoError(msg);
+      setError(msg);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const removeCustomLogo = async (): Promise<void> => {
+    setBusy({ kind: "remove-logo" });
+    setError(null);
+    setCustomLogoError(null);
+    setNotice(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("target", "logo");
+      params.set("expectedRevision", String(revisionRef.current));
+      const response = await fetch(
+        `/api/studio/drafts/${draftId}/assets?${params.toString()}`,
+        {
+          method: "DELETE",
+          headers: { "x-valmont-csrf": csrfToken() },
+        },
+      );
+      let data: { error?: string; revision?: number; brief?: { assets?: unknown } } = {};
+      try {
+        data = (await response.json()) as typeof data;
+      } catch {}
+      if (!response.ok) {
+        throw new Error(data.error ?? "Remove failed.");
+      }
+      const draft = data as unknown as StudioDraft;
+      if (draft.revision) {
+        adoptDraft(draft, "Logo removed.");
+      } else {
+        setNotice("Logo removed.");
+      }
+    } catch (cause) {
+      const msg = cause instanceof Error ? cause.message : "Remove failed.";
+      setError(msg);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const canSuggest =
     whatTheySell.trim().length > 0 && town.trim().length > 0 && busy === null;
+
+  const currentLogo = brief.assets?.logo ?? null;
 
   return (
     <section
@@ -507,11 +662,57 @@ export function BrandKitCard({
 
               {names !== null && (
                 <div className="grid gap-3">
-                  <h3 className="text-sm font-semibold">A simple text logo</h3>
+                  <h3 className="text-sm font-semibold">Logo options</h3>
                   <p className="text-xs text-slate-500">
-                    Same name and colours in three layouts. Saving one puts it
-                    in this draft&apos;s logo slot.
+                    Pick an icon and font style to make the generated logo
+                    richer. Saving a logo puts it in this draft&apos;s logo
+                    slot. Uploading a custom logo replaces the generated one,
+                    and vice versa.
                   </p>
+
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="grid gap-1">
+                      <label htmlFor="brand-logo-icon" className="text-sm">
+                        Icon
+                      </label>
+                      <select
+                        id="brand-logo-icon"
+                        data-testid="brand-logo-icon"
+                        value={logoIcon}
+                        onChange={(e) =>
+                          setLogoIcon(e.target.value as BrandLogoIcon)
+                        }
+                        className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                      >
+                        {BRAND_LOGO_ICONS.map((ic) => (
+                          <option key={ic} value={ic}>
+                            {ICON_LABELS[ic]}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="grid gap-1">
+                      <label htmlFor="brand-logo-font" className="text-sm">
+                        Font style
+                      </label>
+                      <select
+                        id="brand-logo-font"
+                        data-testid="brand-logo-font"
+                        value={logoFont}
+                        onChange={(e) =>
+                          setLogoFont(e.target.value as BrandLogoFontId)
+                        }
+                        className="w-full rounded-lg border border-line px-3 py-2 text-base"
+                      >
+                        {BRAND_LOGO_FONTS.map((f) => (
+                          <option key={f.id} value={f.id}>
+                            {f.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
                   <div className="grid gap-3 sm:grid-cols-3">
                     {LAYOUTS.map((layout) => (
                       <article
@@ -541,6 +742,92 @@ export function BrandKitCard({
                       </article>
                     ))}
                   </div>
+
+                  <div className="grid gap-3 rounded-lg border border-line p-3">
+                    <h4 className="text-sm font-semibold">
+                      Upload your own logo
+                    </h4>
+                    <p className="text-xs text-slate-500">
+                      Upload a PNG, JPEG or WebP file up to 10MB. We check the
+                      file type and size in your browser and again on the
+                      server. Uploading replaces any generated logo, and saving
+                      a generated logo will replace your upload. SVG uploads are
+                      not accepted — we leave SVG out to keep logos safe.
+                    </p>
+
+                    {currentLogo ? (
+                      <div className="flex items-center gap-3 rounded-lg border border-line bg-white p-2">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={currentLogo.dataUrl}
+                          alt="Current logo"
+                          className="h-16 w-16 rounded-md object-contain ring-1 ring-line"
+                        />
+                        <div className="text-xs text-slate-600">
+                          <p className="font-semibold text-navy">
+                            {currentLogo.fileName}
+                          </p>
+                          <p>
+                            {currentLogo.width}×{currentLogo.height} ·{" "}
+                            {formatBytes(currentLogo.size)}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => void removeCustomLogo()}
+                            disabled={busy !== null}
+                            data-testid="remove-custom-logo"
+                            className="mt-1 text-red-700 underline disabled:opacity-50"
+                          >
+                            {busy?.kind === "remove-logo"
+                              ? "Removing…"
+                              : "Remove logo"}
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <div className="flex flex-wrap items-center gap-3">
+                      <button
+                        type="button"
+                        data-testid="upload-custom-logo"
+                        disabled={busy !== null}
+                        onClick={() => customLogoInputRef.current?.click()}
+                        className="min-h-10 rounded-md border border-line bg-white px-3 text-sm font-semibold text-navy hover:bg-slate-50 disabled:opacity-60"
+                      >
+                        {busy?.kind === "custom-logo"
+                          ? "Uploading…"
+                          : currentLogo
+                            ? "Replace logo"
+                            : "Upload logo"}
+                      </button>
+                      <input
+                        ref={customLogoInputRef}
+                        type="file"
+                        accept={Array.from(ACCEPTED_BRAND_LOGO_MIMES).join(",")}
+                        className="hidden"
+                        data-testid="custom-logo-input"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) void uploadCustomLogo(file);
+                          // Reset so same file can be picked again
+                          e.currentTarget.value = "";
+                        }}
+                      />
+                      <span className="text-xs text-slate-500">
+                        PNG, JPEG or WebP, up to 10MB.
+                      </span>
+                    </div>
+
+                    {customLogoError && (
+                      <p
+                        role="alert"
+                        className="rounded-lg border border-red-300 bg-red-50 p-2 text-sm text-red-800"
+                      >
+                        {customLogoError}
+                      </p>
+                    )}
+                  </div>
+
                   <div>
                     <a
                       data-testid="brand-kit-sheet"

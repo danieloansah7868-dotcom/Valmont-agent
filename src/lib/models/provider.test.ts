@@ -326,4 +326,117 @@ describe("model provider abstraction", () => {
       code: "400",
     });
   });
+
+  it("falls back to plain chat-identical shape when json_schema and json_object are refused, and logs the tier", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetcher = vi.fn(async (_input: FetchInput, init?: FetchInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const fmt = (body.response_format as { type?: string } | undefined)?.type;
+      if (fmt === "json_schema") {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "invalid_request_error",
+              message: "This model is currently experiencing high demand",
+            },
+          }),
+          { status: 429, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (fmt === "json_object") {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "invalid_request_error",
+              message:
+                "response_format json_object is not supported by this model",
+            },
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
+      // plain — chat-identical shape, no response_format
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              finish_reason: "stop",
+              message: {
+                content: 'Here is the result:\n```json\n{"answer": 123}\n```',
+              },
+            },
+          ],
+          usage: {},
+        }),
+        { status: 200 },
+      );
+    });
+
+    const provider = new OpenAICompatibleProvider({
+      apiKey: "key",
+      baseUrl: "https://model.example/v1",
+      model: "model",
+      fetcher,
+    });
+
+    const consoleSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+
+    const result = await provider.structured({
+      schemaName: "answer",
+      jsonSchema: { type: "object" },
+      messages: [{ role: "user", content: "give json" }],
+      temperature: 0.8,
+      maxTokens: 1200,
+      validate(value) {
+        return value as { answer: number };
+      },
+    });
+
+    expect(result.data).toEqual({ answer: 123 });
+    expect(bodies).toHaveLength(3);
+
+    // Tier 1: json_schema — has response_format json_schema + strict schema
+    expect((bodies[0]!.response_format as { type: string }).type).toBe(
+      "json_schema",
+    );
+    // Tier 2: json_object — has response_format json_object
+    expect((bodies[1]!.response_format as { type: string }).type).toBe(
+      "json_object",
+    );
+    // Tier 3: plain — no response_format, chat-identical shape
+    expect(bodies[2]!.response_format).toBeUndefined();
+    expect(bodies[2]!.model).toBe("model");
+    expect(bodies[2]!.stream).toBe(false);
+    expect(bodies[2]!.temperature).toBe(0.8);
+    expect(bodies[2]!.max_tokens).toBe(1200);
+
+    // Diff vs chat(): chat() body is {model, messages, temperature, max_tokens, stream}
+    // json_schema body adds response_format.json_schema; json_object adds response_format json_object; plain matches chat
+    const chatBody = {
+      model: "model",
+      messages: [{ role: "user", content: "give json" }],
+      temperature: 0.8,
+      max_tokens: 1200,
+      stream: false,
+    };
+    expect(bodies[2]).toEqual(chatBody);
+
+    // Logging names the tier
+    const logs = consoleSpy.mock.calls.map((c) => String(c[0]));
+    expect(
+      logs.some(
+        (l) => l.includes("json_schema") && l.includes("ModelProviderError"),
+      ),
+    ).toBe(true);
+    expect(
+      logs.some(
+        (l) => l.includes("json_object") && l.includes("ModelProviderError"),
+      ),
+    ).toBe(true);
+
+    consoleSpy.mockRestore();
+  });
 });

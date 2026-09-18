@@ -36,6 +36,7 @@ import {
 import { RateLimitError } from "@/lib/api-errors";
 import { resetRateLimitForTests } from "@/lib/security";
 import { THEME_IDS } from "./themes";
+import { OpenAICompatibleProvider } from "@/lib/models/openai-compatible";
 
 /** A palette that always passes validation and already reads well. */
 function palette(overrides: Partial<BrandKitPalette> = {}): BrandKitPalette {
@@ -536,5 +537,83 @@ describe("the hourly suggest budget", () => {
     } finally {
       resetRateLimitForTests();
     }
+  });
+});
+
+describe("brand kit — fallback to plain when structured modes are refused", () => {
+  it("provider refusing json_schema+json_object but answering plain text still returns suggestions and logs tier", async () => {
+    const canned = makeOutput([
+      "Adom Mart",
+      "Adepa Styles",
+      "Kof Corner",
+      "Nhyira Press",
+      "Oseikrom Deals",
+    ]);
+
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      const fmt = (body.response_format as { type?: string } | undefined)?.type;
+      if (fmt === "json_schema") {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "high_demand",
+              message: "This model is currently experiencing high demand",
+            },
+          }),
+          { status: 429, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (fmt === "json_object") {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "unsupported",
+              message: "json_object not supported",
+            },
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
+      // plain — return canned output as plain text JSON inside content
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              finish_reason: "stop",
+              message: {
+                content: JSON.stringify(canned),
+              },
+            },
+          ],
+          usage: {},
+        }),
+        { status: 200 },
+      );
+    });
+
+    const provider = new OpenAICompatibleProvider({
+      apiKey: "key",
+      baseUrl: "https://model.example/v1",
+      model: "test-model",
+      fetcher,
+    });
+
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const suggestion = await suggestBrandKit(BASE_INPUT, provider);
+
+    expect(suggestion.names).toHaveLength(5);
+    expect(suggestion.palettes).toHaveLength(3);
+
+    const logs = consoleSpy.mock.calls.map((c) => String(c[0]));
+    expect(
+      logs.some((l) => l.includes("json_schema") && l.includes("ModelProviderError")),
+    ).toBe(true);
+    expect(
+      logs.some((l) => l.includes("json_object") && l.includes("ModelProviderError")),
+    ).toBe(true);
+
+    consoleSpy.mockRestore();
   });
 });
