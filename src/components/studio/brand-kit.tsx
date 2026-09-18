@@ -230,9 +230,10 @@ export function BrandKitCard({
           {isBundleSite && gated ? (
             <div className="grid gap-2">
               <p className="text-sm">
-                The Brand Kit — names, tagline, colours and a simple logo — is
-                not included in this shop&apos;s package. It is available as an
-                add-on ({BRAND_KIT_ADDON_PRICE_LABEL}).
+                The Brand kit — names, tagline, colours and a simple logo — is
+                not included in this shop&apos;s package. Choose the Command
+                Center package in step 2 to include it, or tick the box below if
+                the client paid for the {BRAND_KIT_ADDON_PRICE_LABEL}.
               </p>
               <label className="flex items-center gap-2">
                 <input

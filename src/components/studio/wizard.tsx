@@ -896,17 +896,10 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
                 value={brief.businessName}
                 onChange={(value) => update({ businessName: value })}
               />
-              {/* Stage B: a brand for a client who has none yet. Collapsed;
-                  every suggestion waits for a "Use this" click before the
-                  brief changes. Bundle shops on smaller packages see the
-                  add-on tick box instead of the tools. */}
-              <BrandKitCard
-                draftId={id}
-                brief={brief}
-                expectedRevision={serverRevision}
-                onDraftUpdated={adoptServerDraft}
-                onAddonChange={(checked) => update({ brandKitAddon: checked })}
-              />
+              {/* Stage B: the Brand Kit tools live in the right sidebar, next to
+                  the Custom domain card, so they are visible on every step.
+                  Bundle shops on smaller packages see the add-on tick box
+                  instead of the tools. */}
               <TextField
                 id="tagline"
                 label="Tagline"
@@ -1547,6 +1540,21 @@ export function Wizard({ id, initial }: { id: string; initial: StudioDraft }) {
           </section>
 
           <CustomDomainCard draftId={id} />
+
+          {/* Stage B: a brand for a client who has none yet. In the sidebar
+              (not on one step) so it is visible wherever the owner looks.
+              Collapsed; every suggestion waits for a "Use this" click before
+              the brief changes. Bundle shops on smaller packages see the
+              add-on tick box instead of the tools. */}
+          <div className="mt-4">
+            <BrandKitCard
+              draftId={id}
+              brief={brief}
+              expectedRevision={serverRevision}
+              onDraftUpdated={adoptServerDraft}
+              onAddonChange={(checked) => update({ brandKitAddon: checked })}
+            />
+          </div>
 
           {/* Stage 5: only a data-bundles shop has bundles to deliver, so only
               it gets the TechChief connection card. Stage 6a: the card also
