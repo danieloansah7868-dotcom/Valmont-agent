@@ -68,27 +68,88 @@ function jsonTypeOf(value: unknown): string | undefined {
   return undefined;
 }
 
+const STRICT_INCOMPATIBLE_KEYS = new Set([
+  "pattern",
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "uniqueItems",
+]);
+
+/**
+ * Strips markdown code fences or surrounding text so JSON parsing is resilient
+ * when models wrap structured output in ```json ... ``` blocks.
+ */
+export function extractJsonText(content: string): string {
+  const trimmed = content.trim();
+  const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  if (fence && fence[1]) return fence[1].trim();
+
+  // If there are unclosed or partial code fences
+  if (trimmed.startsWith("```")) {
+    const lines = trimmed.split("\n");
+    if (lines[0]?.startsWith("```")) lines.shift();
+    if (lines[lines.length - 1]?.startsWith("```")) lines.pop();
+    const candidate = lines.join("\n").trim();
+    if (candidate.startsWith("{") || candidate.startsWith("[")) {
+      return candidate;
+    }
+  }
+
+  // If the model returned conversational text around a JSON object/array
+  const firstBrace = trimmed.indexOf("{");
+  const firstBracket = trimmed.indexOf("[");
+  let start = -1;
+  if (firstBrace !== -1 && firstBracket !== -1) {
+    start = Math.min(firstBrace, firstBracket);
+  } else if (firstBrace !== -1) {
+    start = firstBrace;
+  } else if (firstBracket !== -1) {
+    start = firstBracket;
+  }
+
+  if (start !== -1) {
+    const lastBrace = trimmed.lastIndexOf("}");
+    const lastBracket = trimmed.lastIndexOf("]");
+    const end = Math.max(lastBrace, lastBracket);
+    if (end > start) {
+      return trimmed.slice(start, end + 1);
+    }
+  }
+
+  return trimmed;
+}
+
 /**
  * OpenAI-compatible providers implement different JSON Schema subsets.
- * Gemini rejects `const`, but accepts an enum containing one value. Normalize
- * recursively while callers continue to enforce the original runtime contract.
+ * Gemini rejects `const`, but accepts an enum containing one value.
+ * OpenAI strict mode rejects validation constraints (pattern, minLength, maxItems).
+ * Normalize recursively while callers continue to enforce the original runtime contract.
  */
-function compatibleJsonSchema(
+export function compatibleJsonSchema(
   schema: Record<string, unknown>,
 ): Record<string, unknown> {
   const normalized = Object.fromEntries(
-    Object.entries(schema).map(([key, value]) => [
-      key,
-      Array.isArray(value)
-        ? value.map((item) =>
-            item && typeof item === "object" && !Array.isArray(item)
-              ? compatibleJsonSchema(item as Record<string, unknown>)
-              : item,
-          )
-        : value && typeof value === "object"
-          ? compatibleJsonSchema(value as Record<string, unknown>)
-          : value,
-    ]),
+    Object.entries(schema)
+      .filter(([key]) => !STRICT_INCOMPATIBLE_KEYS.has(key))
+      .map(([key, value]) => [
+        key,
+        Array.isArray(value)
+          ? value.map((item) =>
+              item && typeof item === "object" && !Array.isArray(item)
+                ? compatibleJsonSchema(item as Record<string, unknown>)
+                : item,
+            )
+          : value && typeof value === "object"
+            ? compatibleJsonSchema(value as Record<string, unknown>)
+            : value,
+      ]),
   );
 
   if (Object.prototype.hasOwnProperty.call(normalized, "const")) {
@@ -172,21 +233,51 @@ export class OpenAICompatibleProvider implements ModelProvider {
   async structured<T>(
     request: StructuredRequest<T>,
   ): Promise<ModelResponse & { data: T }> {
-    const body = {
+    const schema = compatibleJsonSchema(request.jsonSchema);
+    const bodyWithSchema = {
       ...this.requestBody(request, false),
       response_format: {
         type: "json_schema",
         json_schema: {
           name: request.schemaName,
           strict: true,
-          schema: compatibleJsonSchema(request.jsonSchema),
+          schema,
         },
       },
     };
-    const response = this.normalize(await this.post(body, request.signal));
+
+    let rawResponse: OpenAIResponse;
+    try {
+      rawResponse = await this.post(bodyWithSchema, request.signal);
+    } catch (error) {
+      // If the provider rejected the json_schema response_format (e.g. Groq,
+      // Mistral, or older OpenAI-compatible proxies that only support json_object
+      // or reject strict schema parameters), retry with json_object.
+      if (
+        error instanceof ModelProviderError &&
+        error.status === 400 &&
+        /response_format|json_schema|schema/i.test(error.message)
+      ) {
+        const fallbackBody = {
+          ...this.requestBody(request, false),
+          response_format: { type: "json_object" },
+        };
+        try {
+          rawResponse = await this.post(fallbackBody, request.signal);
+        } catch {
+          // If json_object is also rejected, retry without response_format
+          const plainBody = this.requestBody(request, false);
+          rawResponse = await this.post(plainBody, request.signal);
+        }
+      } else {
+        throw error;
+      }
+    }
+
+    const response = this.normalize(rawResponse);
     let parsed: unknown;
     try {
-      parsed = JSON.parse(response.content);
+      parsed = JSON.parse(extractJsonText(response.content));
     } catch {
       throw new ModelProviderError({
         provider: this.id,

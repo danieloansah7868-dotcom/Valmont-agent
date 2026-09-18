@@ -127,7 +127,10 @@ export function BrandKitCard({
     if (cause instanceof ApiError) {
       if (cause.status === 503) {
         setModelMissing(true);
-        return "AI branding is not configured on this server.";
+        return (
+          cause.message ||
+          "MODEL_API_KEY is not configured. Visit Settings (/settings) to configure your model provider."
+        );
       }
       if (cause.status === 409) {
         return "This draft was changed somewhere else. Reload the page, then try again.";
@@ -250,7 +253,8 @@ export function BrandKitCard({
               className="rounded bg-amber-50 p-2 text-sm text-amber-900"
               role="status"
             >
-              AI branding is not configured on this server.
+              {error ||
+                "AI branding is not configured on this server. Visit Settings (/settings) to configure MODEL_API_KEY."}
             </p>
           ) : (
             <>

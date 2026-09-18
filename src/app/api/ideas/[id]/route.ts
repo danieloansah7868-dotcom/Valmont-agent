@@ -1,16 +1,18 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { readBoundedJson } from "@/lib/bounded-json";
+import { DRAFT_BODY_LIMIT_BYTES, readBoundedJson } from "@/lib/bounded-json";
 import { assertApiRateLimit, safeApiError } from "@/lib/api";
 import { requireApiSessionUser } from "@/lib/auth";
 import { assertCsrf, redactSecrets } from "@/lib/security";
 import { BadRequestError, NotFoundError } from "@/lib/api-errors";
 import { getIdeaStore, IDEA_PRIORITIES, IDEA_STATUSES } from "@/lib/idea-store";
 
+// Generous on purpose: the ideas notebook holds long written-out plans, so
+// the bounds exist to stop API abuse, not to stop Danny mid-paragraph.
 const ideaPatch = z
   .object({
-    title: z.string().trim().min(1).max(120).optional(),
-    details: z.string().trim().max(4000).optional(),
+    title: z.string().trim().min(1).max(500).optional(),
+    details: z.string().trim().max(100_000).optional(),
     status: z.enum(IDEA_STATUSES).optional(),
     priority: z.coerce.number().int().min(1).max(3).optional(),
   })
@@ -32,7 +34,9 @@ export async function PATCH(
     assertApiRateLimit(request, "idea-write", 30);
     const user = await requireApiSessionUser();
     const { id } = await context.params;
-    const input = ideaPatch.parse(await readBoundedJson(request, 16_000));
+    const input = ideaPatch.parse(
+      await readBoundedJson(request, DRAFT_BODY_LIMIT_BYTES),
+    );
     const title =
       input.title === undefined ? undefined : redactSecrets(input.title);
     const details =

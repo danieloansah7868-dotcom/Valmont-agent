@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { requireSessionUser } from "@/lib/auth";
 import { NewDraftForm } from "@/components/studio/new-draft-form";
-import { isCategoryId } from "@/lib/studio/categories";
+import { isCategoryId, isEcomSubcategoryId } from "@/lib/studio/categories";
 import {
   defaultTemplateForCategory,
   getTemplate,
@@ -21,11 +21,12 @@ export const dynamic = "force-dynamic";
 export default async function NewDraftPage({
   searchParams,
 }: {
-  searchParams: Promise<{ type?: string }>;
+  searchParams: Promise<{ type?: string; sub?: string }>;
 }) {
   await requireSessionUser();
-  const { type } = await searchParams;
+  const { type, sub } = await searchParams;
   const initialCategory = type && isCategoryId(type) ? type : undefined;
+  const initialSubcategory = sub && isEcomSubcategoryId(sub) ? sub : undefined;
   const starterTemplate = initialCategory
     ? getTemplate(defaultTemplateForCategory(initialCategory))
     : undefined;
@@ -48,7 +49,10 @@ export default async function NewDraftPage({
         </p>
       )}
       <div className="mt-6 rounded-xl border border-line bg-white p-4 sm:p-6">
-        <NewDraftForm initialCategory={initialCategory} />
+        <NewDraftForm
+          initialCategory={initialCategory}
+          initialSubcategory={initialSubcategory}
+        />
       </div>
     </div>
   );

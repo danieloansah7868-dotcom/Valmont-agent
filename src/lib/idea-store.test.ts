@@ -71,6 +71,17 @@ describe("SqliteIdeaStore", () => {
     expect(listB.map((idea) => idea.title)).toEqual(["Not mine"]);
   });
 
+  it("listPublic returns every user's ideas, newest update first", async () => {
+    await store.create("user-a", { title: "First" });
+    // Small delay so the ISO timestamps differ.
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await store.create("user-b", { title: "Second" });
+
+    const all = await store.listPublic();
+    expect(all.map((idea) => idea.title)).toEqual(["Second", "First"]);
+    expect(all.map((idea) => idea.userId)).toEqual(["user-b", "user-a"]);
+  });
+
   it("patches individual fields and bumps updated_at", async () => {
     const idea = await store.create("user-a", {
       title: "Rename me",

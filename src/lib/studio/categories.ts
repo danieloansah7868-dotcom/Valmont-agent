@@ -25,10 +25,12 @@ export const ECOM_SUBCATEGORIES = [
   "gadgets",
   "electrical",
   "supermarket",
+  "general-store",
   "beauty",
   "food",
   "pharmacy",
   "furniture",
+  "automotive",
   "single-brand",
   "multi-category",
 ] as const;
@@ -185,8 +187,14 @@ export function isCategoryId(v: string): v is CategoryId {
 }
 /** Human wording for a shop subtype, e.g. "bags-shoes" -> "Bags & shoes". */
 export function ecomSubcategoryLabel(id: EcomSubcategoryId): string {
-  const words = id.replace(/-/g, " & ");
-  return words.charAt(0).toUpperCase() + words.slice(1);
+  // Some ids do not read sensibly with the "&" join, so they get plain words.
+  const overrides: Partial<Record<EcomSubcategoryId, string>> = {
+    "general-store": "General store",
+    "single-brand": "Single brand",
+    "multi-category": "Multi category",
+  };
+  const label = overrides[id] ?? id.replace(/-/g, " & ");
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
 export function isEcomSubcategoryId(v: string): v is EcomSubcategoryId {

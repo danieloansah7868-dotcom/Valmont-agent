@@ -26,8 +26,10 @@ import type { StudioDraft } from "@/lib/studio/site-brief/schema";
  */
 export function NewDraftForm({
   initialCategory,
+  initialSubcategory,
 }: {
   initialCategory?: CategoryId;
+  initialSubcategory?: EcomSubcategoryId;
 }) {
   const router = useRouter();
   const [businessName, setBusinessName] = useState("");
@@ -36,7 +38,7 @@ export function NewDraftForm({
   );
   const [ecomSubcategory, setEcomSubcategory] = useState<
     EcomSubcategoryId | ""
-  >("");
+  >(initialSubcategory ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 

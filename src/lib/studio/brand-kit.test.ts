@@ -25,8 +25,11 @@ import {
   domainCandidates,
   fixPaletteContrast,
   nameIsBlocked,
+  normalizeHexColor,
+  normalizeThemeId,
   readableTextOn,
   suggestBrandKit,
+  brandKitOutputSchema,
   type BrandKitOutput,
   type BrandKitPalette,
 } from "./brand-kit";
@@ -452,6 +455,48 @@ describe("small helpers", () => {
     expect(brandSlug("Adom & Sons")).toBe("adomsons");
     expect(brandSlug("Nana-Nhyira 24")).toBe("nananhyira24");
     expect(brandSlug("Charley's Kitchen")).toBe("charleyskitchen");
+  });
+
+  it("normalizes hex colours robustly", () => {
+    expect(normalizeHexColor("#FFF")).toBe("#FFFFFF");
+    expect(normalizeHexColor("#091534")).toBe("#091534");
+    expect(normalizeHexColor("091534")).toBe("#091534");
+    expect(normalizeHexColor("invalid", "#123456")).toBe("#123456");
+  });
+
+  it("normalizes theme ids with fuzzy fallback", () => {
+    expect(normalizeThemeId("modern-bold")).toBe("modern-bold");
+    expect(normalizeThemeId("modern")).toBe("modern-bold");
+    expect(normalizeThemeId("clean")).toBe("clean-corporate");
+    expect(normalizeThemeId("corporate")).toBe("clean-corporate");
+    expect(normalizeThemeId("completely-unknown")).toBe("clean-corporate");
+  });
+
+  it("parses output with hyphens in names and truncates long taglines", () => {
+    const raw = {
+      names: [
+        {
+          name: "Adom-Tech Hub",
+          meaning: "Meaning for Adom-Tech Hub",
+          tagline: "A".repeat(150),
+        },
+      ],
+      palettes: [
+        {
+          label: "Palette 1",
+          primary: "#123",
+          accent: "#456",
+          surface: "#789",
+          text: "#000",
+          themeId: "modern",
+        },
+      ],
+    };
+    const parsed = brandKitOutputSchema.parse(raw);
+    expect(parsed.names[0]!.name).toBe("Adom-Tech Hub");
+    expect(parsed.names[0]!.tagline.length).toBeLessThanOrEqual(80);
+    expect(parsed.palettes[0]!.primary).toBe("#112233");
+    expect(parsed.palettes[0]!.themeId).toBe("modern-bold");
   });
 
   it("offers the two hand-check domains", () => {

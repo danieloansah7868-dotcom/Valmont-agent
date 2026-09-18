@@ -6,12 +6,16 @@ import { ideas } from "@/db/schema";
 import { getSqliteChatStore } from "@/lib/chat-store";
 
 /**
- * The owner's private notebook of ideas and future plans.
+ * The owner's notebook of ideas and future plans.
  *
- * Ideas are scoped to the signed-in account exactly like chat memories: every
- * query binds the user id, and an id that belongs to another account is
- * invisible — updates return null and deletions return false. Nothing stored
- * here is ever fed to the chat model.
+ * Ideas are PUBLIC by design: every saved idea is shown on the portfolio
+ * landing page's "Ideas & future plans" section (owner's decision). The
+ * signed-in Ideas page and the API routes remain scoped to the account that
+ * wrote each idea — every query binds the user id, and an id that belongs to
+ * another account is invisible: updates return null and deletions return
+ * false. Only `listPublic` reads across accounts, and it exists solely to
+ * feed the public portfolio. Nothing stored here is ever fed to the chat
+ * model.
  */
 export const IDEA_STATUSES = [
   "idea",
@@ -57,6 +61,11 @@ export type IdeaPatch = Partial<
 
 export interface IdeaStore {
   list(userId: string): Promise<IdeaRecord[]>;
+  /**
+   * Every idea across every account, newest update first — feeds the public
+   * portfolio section. The only read that crosses account boundaries.
+   */
+  listPublic(): Promise<IdeaRecord[]>;
   create(userId: string, input: NewIdeaInput): Promise<IdeaRecord>;
   update(
     userId: string,
@@ -125,6 +134,13 @@ export class SqliteIdeaStore implements IdeaStore {
     const rows = this.db
       .prepare("SELECT * FROM ideas WHERE user_id = ? ORDER BY updated_at DESC")
       .all(userId) as Array<Record<string, unknown>>;
+    return rows.map(ideaFromRow);
+  }
+
+  async listPublic(): Promise<IdeaRecord[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM ideas ORDER BY updated_at DESC")
+      .all() as Array<Record<string, unknown>>;
     return rows.map(ideaFromRow);
   }
 
@@ -237,8 +253,8 @@ export class SqliteIdeaStore implements IdeaStore {
       insert.run(
         id,
         userId,
-        idea.title.slice(0, 120),
-        idea.details.slice(0, 4000),
+        idea.title.slice(0, 500),
+        idea.details.slice(0, 100_000),
         isIdeaStatus(idea.status) ? idea.status : "idea",
         IDEA_PRIORITIES.includes(idea.priority) ? idea.priority : 2,
         idea.createdAt,
@@ -257,6 +273,14 @@ export class PostgresIdeaStore implements IdeaStore {
       .select()
       .from(ideas)
       .where(eq(ideas.userId, userId))
+      .orderBy(desc(ideas.updatedAt));
+    return rows.map(pgRowToIdea);
+  }
+
+  async listPublic(): Promise<IdeaRecord[]> {
+    const rows = await getDatabase()
+      .select()
+      .from(ideas)
       .orderBy(desc(ideas.updatedAt));
     return rows.map(pgRowToIdea);
   }

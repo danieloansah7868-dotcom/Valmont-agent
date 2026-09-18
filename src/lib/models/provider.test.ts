@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { createModelProvider, tryCreateModelProvider } from "@/lib/models";
 import {
+  compatibleJsonSchema,
+  extractJsonText,
   extractMessageText,
   OpenAICompatibleProvider,
 } from "@/lib/models/openai-compatible";
@@ -23,6 +25,55 @@ describe("extractMessageText", () => {
     ).toBe("Hello Valmont");
     expect(extractMessageText("plain")).toBe("plain");
     expect(extractMessageText(null)).toBe("");
+  });
+});
+
+describe("extractJsonText", () => {
+  it("unwraps markdown json code fences", () => {
+    expect(extractJsonText('```json\n{"hello": "world"}\n```')).toBe(
+      '{"hello": "world"}',
+    );
+    expect(extractJsonText('```\n{"hello": "world"}\n```')).toBe(
+      '{"hello": "world"}',
+    );
+  });
+
+  it("extracts json surrounded by conversational preamble", () => {
+    expect(
+      extractJsonText('Here is the json output:\n{"a": 1}\nHope this helps!'),
+    ).toBe('{"a": 1}');
+  });
+});
+
+describe("compatibleJsonSchema", () => {
+  it("strips OpenAI strict-incompatible validation keywords", () => {
+    const raw = {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          minLength: 2,
+          maxLength: 30,
+          pattern: "^[A-Z]",
+        },
+        tags: {
+          type: "array",
+          minItems: 1,
+          maxItems: 5,
+          items: { type: "string" },
+        },
+        count: { type: "integer", minimum: 1, maximum: 10 },
+      },
+      required: ["name"],
+    };
+    const stripped = compatibleJsonSchema(raw);
+    expect(JSON.stringify(stripped)).not.toContain("pattern");
+    expect(JSON.stringify(stripped)).not.toContain("minLength");
+    expect(JSON.stringify(stripped)).not.toContain("maxLength");
+    expect(JSON.stringify(stripped)).not.toContain("minItems");
+    expect(JSON.stringify(stripped)).not.toContain("maxItems");
+    expect(JSON.stringify(stripped)).not.toContain("minimum");
+    expect(JSON.stringify(stripped)).not.toContain("maximum");
   });
 });
 
@@ -159,6 +210,84 @@ describe("model provider abstraction", () => {
       requestBody.response_format.json_schema.schema.properties.operation,
     ).toEqual({ enum: ["write"], type: "string" });
     expect(JSON.stringify(requestBody)).not.toContain('"const"');
+  });
+
+  it("handles structured output wrapped in markdown code fences", async () => {
+    const fetcher = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              finish_reason: "stop",
+              message: { content: '```json\n{"answer": 99}\n```' },
+            },
+          ],
+          usage: {},
+        }),
+        { status: 200 },
+      );
+    });
+    const provider = new OpenAICompatibleProvider({
+      apiKey: "key",
+      baseUrl: "https://model.example/v1",
+      model: "model",
+      fetcher,
+    });
+    const result = await provider.structured({
+      schemaName: "answer",
+      jsonSchema: { type: "object" },
+      messages: [],
+      validate(value) {
+        return value as { answer: number };
+      },
+    });
+    expect(result.data).toEqual({ answer: 99 });
+  });
+
+  it("retries with json_object when the provider rejects json_schema with 400", async () => {
+    let callCount = 0;
+    const fetcher = vi.fn(async (_input: FetchInput, init?: FetchInit) => {
+      callCount += 1;
+      const body = JSON.parse(String(init?.body)) as {
+        response_format?: { type: string };
+      };
+      if (body.response_format?.type === "json_schema") {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "invalid_request_error",
+              message: "response_format 'json_schema' is not supported",
+            },
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            { finish_reason: "stop", message: { content: '{"answer": 77}' } },
+          ],
+          usage: {},
+        }),
+        { status: 200 },
+      );
+    });
+    const provider = new OpenAICompatibleProvider({
+      apiKey: "key",
+      baseUrl: "https://model.example/v1",
+      model: "model",
+      fetcher,
+    });
+    const result = await provider.structured({
+      schemaName: "answer",
+      jsonSchema: { type: "object" },
+      messages: [],
+      validate(value) {
+        return value as { answer: number };
+      },
+    });
+    expect(result.data).toEqual({ answer: 77 });
+    expect(callCount).toBe(2);
   });
 
   it("surfaces messages from Gemini array-wrapped provider errors", async () => {
