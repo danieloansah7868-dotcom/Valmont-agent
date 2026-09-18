@@ -222,7 +222,6 @@ export function IdeaBoard({ initialIdeas }: { initialIdeas: IdeaRecord[] }) {
             data-testid="idea-title"
             className="input mt-1 w-full"
             type="text"
-            maxLength={120}
             placeholder="What is the idea?"
             value={form.title}
             onChange={(event) =>
@@ -241,9 +240,8 @@ export function IdeaBoard({ initialIdeas }: { initialIdeas: IdeaRecord[] }) {
             id="idea-details"
             data-testid="idea-details"
             className="textarea mt-1 w-full"
-            rows={4}
-            maxLength={4000}
-            placeholder="Why it matters, what it depends on, anything to remember."
+            rows={6}
+            placeholder="Why it matters, what it depends on, anything to remember. Write as much as you need."
             value={form.details}
             onChange={(event) =>
               setForm((current) => ({
@@ -344,7 +342,6 @@ export function IdeaBoard({ initialIdeas }: { initialIdeas: IdeaRecord[] }) {
                           <input
                             className="input w-full"
                             type="text"
-                            maxLength={120}
                             aria-label="Edit idea title"
                             value={editForm.title}
                             onChange={(event) =>
@@ -356,8 +353,7 @@ export function IdeaBoard({ initialIdeas }: { initialIdeas: IdeaRecord[] }) {
                           />
                           <textarea
                             className="textarea w-full"
-                            rows={4}
-                            maxLength={4000}
+                            rows={6}
                             aria-label="Edit idea details"
                             value={editForm.details}
                             onChange={(event) =>

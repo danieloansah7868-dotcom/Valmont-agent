@@ -91,10 +91,42 @@ describe("POST /api/ideas", () => {
     expect(mocks.create).not.toHaveBeenCalled();
   });
 
-  it("answers 400 for a title longer than 120 characters", async () => {
-    const response = await POST(postRequest({ title: "a".repeat(121) }));
+  it("answers 400 for a title longer than 500 characters", async () => {
+    const response = await POST(postRequest({ title: "a".repeat(501) }));
     expect(response.status).toBe(400);
     expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("answers 400 for details longer than 100,000 characters", async () => {
+    const response = await POST(
+      postRequest({ title: "Good title", details: "d".repeat(100_001) }),
+    );
+    expect(response.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("accepts a full-size title (500) and details (100,000)", async () => {
+    const title = "t".repeat(500);
+    const details = "d".repeat(100_000);
+    mocks.create.mockImplementationOnce(async (_userId, input) => ({
+      id: "idea-long",
+      userId: "user-1",
+      title: input.title,
+      details: input.details ?? "",
+      status: "idea",
+      priority: 2,
+      createdAt: "2026-09-18T00:00:00.000Z",
+      updatedAt: "2026-09-18T00:00:00.000Z",
+    }));
+    const response = await POST(postRequest({ title, details }));
+    expect(response.status).toBe(201);
+    expect(mocks.create).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({
+        title: expect.stringMatching(/^t{500}$/),
+        details: expect.stringMatching(/^d{100000}$/),
+      }),
+    );
   });
 
   it("answers 400 for an unknown status", async () => {

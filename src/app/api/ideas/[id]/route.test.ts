@@ -99,13 +99,39 @@ describe("PATCH /api/ideas/[id]", () => {
     expect(mocks.update).not.toHaveBeenCalled();
   });
 
-  it("answers 400 for a 121-character title", async () => {
+  it("answers 400 for a 501-character title", async () => {
     const response = await PATCH(
-      request("PATCH", "idea-1", { title: "b".repeat(121) }),
+      request("PATCH", "idea-1", { title: "b".repeat(501) }),
       context("idea-1"),
     );
     expect(response.status).toBe(400);
     expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("answers 400 for details longer than 100,000 characters", async () => {
+    const response = await PATCH(
+      request("PATCH", "idea-1", { details: "d".repeat(100_001) }),
+      context("idea-1"),
+    );
+    expect(response.status).toBe(400);
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("accepts a full-size details field (100,000 characters)", async () => {
+    mocks.update.mockImplementationOnce(async (_userId, _id, patch) =>
+      storedIdea(patch),
+    );
+    const response = await PATCH(
+      request("PATCH", "idea-1", { details: "d".repeat(100_000) }),
+      context("idea-1"),
+    );
+    expect(response.status).toBe(200);
+    expect(mocks.update).toHaveBeenCalledWith("user-1", "idea-1", {
+      title: undefined,
+      details: expect.stringMatching(/^d{100000}$/),
+      status: undefined,
+      priority: undefined,
+    });
   });
 
   it("answers 400 for a bad status", async () => {

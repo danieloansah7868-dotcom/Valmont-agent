@@ -237,8 +237,8 @@ export class SqliteIdeaStore implements IdeaStore {
       insert.run(
         id,
         userId,
-        idea.title.slice(0, 120),
-        idea.details.slice(0, 4000),
+        idea.title.slice(0, 500),
+        idea.details.slice(0, 100_000),
         isIdeaStatus(idea.status) ? idea.status : "idea",
         IDEA_PRIORITIES.includes(idea.priority) ? idea.priority : 2,
         idea.createdAt,
