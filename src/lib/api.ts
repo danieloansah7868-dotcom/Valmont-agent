@@ -131,7 +131,19 @@ const GENERIC_FAILURE =
 
 const GENERIC_BAD_REQUEST = "Invalid request";
 
-export function safeApiError(error: unknown) {
+/**
+ * The copy an unrecognised error gets from a route that has one. The
+ * classification above (typed ApiError pass-through, Zod 400s, bad-JSON
+ * 400s, internal-leak screening) is unchanged; only the terminal "we do not
+ * know what this was" branches use it, so a Studio surface can offer honest,
+ * retry-safe copy instead of the shared bare shrug.
+ */
+export interface SafeApiErrorFallback {
+  message: string;
+  status: number;
+}
+
+export function safeApiError(error: unknown, fallback?: SafeApiErrorFallback) {
   // Strict: only explicit ApiError instances are trusted for status/message.
   if (error instanceof ApiError) {
     const message = error.message;
@@ -160,13 +172,20 @@ export function safeApiError(error: unknown) {
     return NextResponse.json({ error: GENERIC_BAD_REQUEST }, { status: 400 });
   }
 
-  // Unrecognised failures that expose internals become an opaque 500.
+  // Unrecognised failures that expose internals become an opaque 500 — the
+  // route's honest fallback copy when it has one, the generic otherwise.
   if (leaksInternals(message)) {
-    return NextResponse.json({ error: GENERIC_FAILURE }, { status: 500 });
+    return NextResponse.json(
+      { error: fallback?.message ?? GENERIC_FAILURE },
+      { status: fallback?.status ?? 500 },
+    );
   }
 
   // Everything else — arbitrary Errors, plain objects with status, DB errors,
   // network errors, stack traces — is opaque 500. This prevents
   // status-property injection and message-text heuristics.
-  return NextResponse.json({ error: GENERIC_FAILURE }, { status: 500 });
+  return NextResponse.json(
+    { error: fallback?.message ?? GENERIC_FAILURE },
+    { status: fallback?.status ?? 500 },
+  );
 }

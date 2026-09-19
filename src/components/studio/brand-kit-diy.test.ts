@@ -304,6 +304,97 @@ describe("Brand kit — the DIY logo tools", () => {
     expect(queryTestId(container, "brand-logo-preview-badge")).not.toBeNull();
   });
 
+  it("renders the friendly 504 timeout copy, and keeps the DIY tools", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(
+          {
+            error:
+              "The AI is taking too long right now — the model provider is busy or slow. Wait a minute and try again.",
+          },
+          504,
+        ),
+      ),
+    );
+
+    const container = await mountCard(createDefaultBrief());
+    await openCard(container);
+    await answerQuestions(container);
+    await clickTestId(container, "brand-kit-suggest");
+
+    const alert = container.querySelector("[role='alert']");
+    // The honest timeout copy: too long, provider busy, wait and retry …
+    expect(alert?.textContent).toContain("taking too long");
+    expect(alert?.textContent).toContain("Wait a minute and try again");
+    // … plus the standing reassurance that the offline tools survived.
+    expect(alert?.textContent).toContain(DIY_SENTENCE);
+    // And the old naked shrug is gone from the card.
+    expect(container.textContent).not.toContain("Something went wrong");
+
+    // A slow provider is not a dead provider: every offline tool survives.
+    expect(queryTestId(container, "brand-kit-diy")).not.toBeNull();
+    expect(
+      queryTestId(container, "brand-logo-preview-wordmark"),
+    ).not.toBeNull();
+    expect(queryTestId(container, "upload-custom-logo")).not.toBeNull();
+    expect(queryTestId(container, "brand-kit-sheet")).not.toBeNull();
+  });
+
+  it("renders honest, retry-safe copy for an unknown server error — no shrug", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(
+          {
+            error:
+              "Something unexpected happened on our side. It is safe to try again.",
+          },
+          500,
+        ),
+      ),
+    );
+
+    const container = await mountCard(createDefaultBrief());
+    await openCard(container);
+    await answerQuestions(container);
+    await clickTestId(container, "brand-kit-suggest");
+
+    const alert = container.querySelector("[role='alert']");
+    expect(alert?.textContent).toContain("unexpected");
+    expect(alert?.textContent).toContain("safe to try again");
+    expect(alert?.textContent).toContain(DIY_SENTENCE);
+    expect(container.textContent).not.toContain("Something went wrong");
+
+    expect(queryTestId(container, "brand-kit-diy")).not.toBeNull();
+  });
+
+  it("is still honest when the browser itself cannot reach the server", async () => {
+    // Not an ApiError at all — the fetch never got a response (offline, a
+    // proxy gave up, or the call's own client-side timeout fired).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("Failed to fetch");
+      }),
+    );
+
+    const container = await mountCard(createDefaultBrief());
+    await openCard(container);
+    await answerQuestions(container);
+    await clickTestId(container, "brand-kit-suggest");
+
+    const alert = container.querySelector("[role='alert']");
+    expect(alert?.textContent).toContain(
+      "Something unexpected happened while we were talking to the server",
+    );
+    expect(alert?.textContent).toContain("safe to try again");
+    expect(alert?.textContent).toContain(DIY_SENTENCE);
+    expect(container.textContent).not.toContain("Something went wrong");
+
+    expect(queryTestId(container, "brand-kit-diy")).not.toBeNull();
+  });
+
   it("redraws all three previews when the icon or the font changes", async () => {
     const container = await mountCard(createDefaultBrief());
     await openCard(container);
