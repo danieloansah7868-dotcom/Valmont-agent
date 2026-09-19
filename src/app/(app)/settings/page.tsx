@@ -22,10 +22,23 @@ import { tryCreateModelProvider } from "@/lib/models";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * The optional "spare brain" rows. A blank key is the documented default: the
+ * backup is off and every model call goes to the primary provider.
+ */
+const BACKUP_MODEL_VARIABLES = [
+  "MODEL_BACKUP_API_KEY",
+  "MODEL_BACKUP_BASE_URL",
+  "MODEL_BACKUP_NAME",
+] as const;
+
 export default async function SettingsPage() {
   const user = await requireSessionUser();
   const model = tryCreateModelProvider();
   const modelReady = Boolean(model);
+  // The backup only exists when its key is set — the URL and model name are
+  // refinements of that key, not switches of their own.
+  const backupConfigured = Boolean(process.env.MODEL_BACKUP_API_KEY?.trim());
   const githubReady = githubConfigured();
   const databaseReady = Boolean(process.env.DATABASE_URL);
   const customerEmailReady = customerEmailConfigured();
@@ -128,7 +141,11 @@ export default async function SettingsPage() {
             title="Model provider"
             description={
               modelReady && model
-                ? `${model.id} · ${model.model} · credentials loaded server-side`
+                ? `${model.id} · ${model.model} · credentials loaded server-side${
+                    backupConfigured
+                      ? " · backup brain ready for retries when the main AI is busy"
+                      : ""
+                  }`
                 : "MODEL_API_KEY is not set. Tasks cannot generate plans or patches."
             }
             ready={modelReady}
@@ -187,24 +204,35 @@ export default async function SettingsPage() {
               ["MODEL_API_KEY", Boolean(process.env.MODEL_API_KEY)],
               ["DATABASE_URL", databaseReady],
             ].map(([name, set]) => (
-              <div
+              <VariableRow
                 key={String(name)}
-                className="flex items-center justify-between rounded-lg bg-ivory-50 px-3 py-2"
-              >
-                <code className="text-[10px] font-semibold text-navy">
-                  {String(name)}
-                </code>
-                <span
-                  className={`text-[9px] font-bold ${set ? "text-pass" : "text-slate-400"}`}
-                >
-                  {set ? "SET" : "NOT SET"}
-                </span>
-              </div>
+                name={String(name)}
+                set={Boolean(set)}
+              />
+            ))}
+          </div>
+          <div className="mt-4 flex items-center gap-2">
+            <span className="text-[9px] font-bold tracking-wide text-slate-400 uppercase">
+              Optional backup brain
+            </span>
+            <span className="h-px flex-1 bg-line" aria-hidden="true" />
+          </div>
+          <div className="mt-2 space-y-2">
+            {BACKUP_MODEL_VARIABLES.map((name) => (
+              <VariableRow
+                key={name}
+                name={name}
+                set={Boolean(process.env[name]?.trim())}
+                optional
+              />
             ))}
           </div>
           <p className="mt-4 text-[10px] leading-4 text-slate">
-            Values are never displayed. Configure them in{" "}
-            <code>.env.local</code> using <code>.env.example</code>.
+            If the main AI is busy, rate-limited or down, the same request is
+            quietly retried on the backup. With these unset, nothing changes:
+            every call still goes to the main provider. Values are never
+            displayed. Configure them in <code>.env.local</code> using{" "}
+            <code>.env.example</code>.
           </p>
         </div>
 
@@ -270,6 +298,35 @@ export default async function SettingsPage() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** One environment variable as a name plus SET / NOT SET — never a value. */
+function VariableRow({
+  name,
+  set,
+  optional = false,
+}: {
+  name: string;
+  set: boolean;
+  optional?: boolean;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-lg bg-ivory-50 px-3 py-2">
+      <code className="text-[10px] font-semibold text-navy">{name}</code>
+      <span className="flex shrink-0 items-center gap-2">
+        {optional && (
+          <span className="rounded-full bg-white px-1.5 py-0.5 text-[8px] font-bold text-slate-400 ring-1 ring-inset ring-line">
+            OPTIONAL
+          </span>
+        )}
+        <span
+          className={`text-[9px] font-bold ${set ? "text-pass" : "text-slate-400"}`}
+        >
+          {set ? "SET" : "NOT SET"}
+        </span>
+      </span>
     </div>
   );
 }

@@ -47,6 +47,10 @@ services:
       MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.openai.com/v1}
       MODEL_API_KEY: ${MODEL_API_KEY:-}
       MODEL_NAME: ${MODEL_NAME:-gpt-4.1-mini}
+      # Optional backup brain: blank keeps every request on the primary.
+      MODEL_BACKUP_API_KEY: ${MODEL_BACKUP_API_KEY:-}
+      MODEL_BACKUP_BASE_URL: ${MODEL_BACKUP_BASE_URL:-}
+      MODEL_BACKUP_NAME: ${MODEL_BACKUP_NAME:-}
       # Merchant + customer email (order alerts, verification, password reset).
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       NOTIFY_EMAIL_FROM: ${NOTIFY_EMAIL_FROM:-}

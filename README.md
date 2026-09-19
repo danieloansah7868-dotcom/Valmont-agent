@@ -81,6 +81,9 @@ Valmont requires `SESSION_SECRET`, the GitHub OAuth pair, and `MODEL_API_KEY`. N
 | `MODEL_BASE_URL`             | OpenAI-compatible `/v1` base URL                                                               |
 | `MODEL_API_KEY`              | Server-only model API key                                                                      |
 | `MODEL_NAME`                 | Provider model identifier                                                                      |
+| `MODEL_BACKUP_API_KEY`       | Optional backup model key; when set, a transient primary failure retries once on the backup    |
+| `MODEL_BACKUP_BASE_URL`      | Optional backup `/v1` base URL; defaults to `MODEL_BASE_URL`                                   |
+| `MODEL_BACKUP_NAME`          | Optional backup model identifier; defaults to `MODEL_NAME`                                     |
 | `VALMONT_COMMAND_TIMEOUT_MS` | Per-command validation timeout (default 180000)                                                |
 
 See `.env.example` for placeholders and the optional Studio, payments,
@@ -116,6 +119,14 @@ MODEL_NAME=gpt-4.1-mini
 ```
 
 Credentials are read only in server modules. Add another provider by implementing `ModelProvider` in `src/lib/models`; the workflow does not need to change.
+
+A free or busy primary provider gets a spare brain: set `MODEL_BACKUP_API_KEY`
+(and `MODEL_BACKUP_BASE_URL` / `MODEL_BACKUP_NAME` when the backup is a
+different host, e.g. Groq or OpenRouter) and a request the primary refuses with
+429/5xx, a network error or a timeout is retried once on the backup. The log
+names the reason (`[models] primary failed (…), using backup`). A 400/401/403
+never fails over — a wrong key or a rejected request still fails loudly. Leave
+the backup key unset and every call goes to the primary exactly as before.
 
 ### Chat with Valmont
 
