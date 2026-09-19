@@ -24,6 +24,7 @@ import type {
   StructuredRequest,
 } from "@/lib/models/types";
 import { PACKAGE_NOT_INCLUDED_MESSAGE } from "@/lib/studio/plans";
+import { BRAND_KIT_MODEL_TIMEOUT_MS } from "@/lib/studio/brand-kit";
 import { MAX_LOGO_BYTES } from "@/lib/studio/assets";
 import { SqliteStudioDraftStore } from "@/lib/studio/draft-store";
 import { createDefaultBrief } from "@/lib/studio/site-brief/defaults";
@@ -432,6 +433,103 @@ describe("brand-kit suggest — budget and configuration", () => {
       expect(consoleSpy).toHaveBeenCalledWith(
         expect.stringContaining("[brand-kit/suggest] ModelProviderError"),
       );
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it("keeps the model timeout budget at or above 30s for chunky JSON", async () => {
+    // A suggest asks for five names with meanings and taglines plus three
+    // palettes under a strict schema — a busy provider legitimately needs
+    // tens of seconds, so the floor is 30s. The client bound sits above it.
+    expect(BRAND_KIT_MODEL_TIMEOUT_MS).toBeGreaterThanOrEqual(30_000);
+  });
+});
+
+describe("brand-kit suggest — failure copy (no naked shrug)", () => {
+  /** A provider that throws exactly one given error on its first call. */
+  function failingModel(error: unknown): ModelProvider {
+    return {
+      id: "fake",
+      model: "fake-1",
+      supportsStreaming: false,
+      chat: () => {
+        throw new Error("not used");
+      },
+      structured: async () => {
+        throw error;
+      },
+      stream(): AsyncIterable<never> {
+        throw new Error("not used");
+      },
+    };
+  }
+
+  it("maps a timeout abort (TimeoutError) to a friendly 504", async () => {
+    const draft = await createDraft();
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // What AbortSignal.timeout actually rejects fetch with.
+    models.provider = failingModel(
+      new DOMException(
+        "The operation was aborted due to timeout",
+        "TimeoutError",
+      ),
+    );
+
+    try {
+      const response = await suggest(draft.id);
+      const data = await response.json();
+
+      expect(response.status).toBe(504);
+      expect(String(data.error)).toContain("taking too long");
+      expect(String(data.error)).toContain("Wait a minute and try again");
+      expect(String(data.error)).not.toContain("Something went wrong");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it("maps a plain abort (AbortError) to the same friendly 504", async () => {
+    const draft = await createDraft();
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    models.provider = failingModel(
+      new DOMException("The operation was aborted.", "AbortError"),
+    );
+
+    try {
+      const response = await suggest(draft.id);
+      const data = await response.json();
+
+      expect(response.status).toBe(504);
+      expect(String(data.error)).toContain("Wait a minute and try again");
+      expect(String(data.error)).not.toContain("Something went wrong");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it("answers an honest, retry-safe 500 — never the old generic shrug — for unknown errors", async () => {
+    const draft = await createDraft();
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    models.provider = failingModel(
+      new Error("weird internal failure: postgres://host/db ECONNREFUSED"),
+    );
+
+    try {
+      const response = await suggest(draft.id);
+      const data = await response.json();
+
+      expect(response.status).toBe(500);
+      const message = String(data.error);
+      // Says it is unexpected and safe to retry …
+      expect(message).toMatch(/unexpected/i);
+      expect(message).toMatch(/safe to try again/i);
+      // … and never the naked shrug, and never the internals.
+      expect(message).not.toContain("Something went wrong handling that");
+      expect(message).not.toMatch(/postgres|ECONNREFUSED|weird internal/i);
     } finally {
       consoleSpy.mockRestore();
     }

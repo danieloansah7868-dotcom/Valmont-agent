@@ -347,7 +347,18 @@ export function whiteOnPrimaryContrast(palette: BrandKitPalette): number {
 export const BRAND_KIT_SCHEMA_NAME = "brand_kit_suggestions";
 export const BRAND_KIT_TEMPERATURE = 0.8;
 export const BRAND_KIT_MAX_TOKENS = 1200;
-export const BRAND_KIT_MODEL_TIMEOUT_MS = 20_000;
+/**
+ * Server-side abort for one suggest model call. The answer is chunky one-shot
+ * JSON — five names with meanings and taglines plus three palettes, under a
+ * strict schema, up to 1200 output tokens — and a busy or slow provider can
+ * legitimately need tens of seconds for it, so the floor is 30s: below that,
+ * a healthy-but-slow call dies and the agency gets a timeout instead of a
+ * brand. When the abort does fire, the route answers 504 with plain-English
+ * retry guidance, and the card's own client bound (SUGGEST_CLIENT_TIMEOUT_MS)
+ * sits just above this value so the server's copy, not a raw browser abort,
+ * is what the agency reads.
+ */
+export const BRAND_KIT_MODEL_TIMEOUT_MS = 30_000;
 
 /**
  * Builds the exact conversation the model sees. Plain, Ghana-flavoured, no

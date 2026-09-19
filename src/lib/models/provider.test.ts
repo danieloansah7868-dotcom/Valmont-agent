@@ -290,6 +290,39 @@ describe("model provider abstraction", () => {
     expect(callCount).toBe(2);
   });
 
+  it("lets an aborted fetch propagate as-is without burning the other tiers", async () => {
+    // What AbortSignal.timeout rejects fetch with: a DOMException, NOT a
+    // ModelProviderError. It must not be mistaken for a tier the provider can
+    // fall back from — a timed-out provider is not going to answer faster on
+    // the next attempt, and the caller maps the abort to a friendly 504.
+    const abortError = new DOMException(
+      "The operation was aborted due to timeout",
+      "TimeoutError",
+    );
+    const fetcher = vi.fn(async (input: FetchInput, init?: FetchInit) => {
+      void input;
+      void init;
+      throw abortError;
+    });
+    const provider = new OpenAICompatibleProvider({
+      apiKey: "key",
+      baseUrl: "https://model.example/v1",
+      model: "model",
+      fetcher,
+    });
+
+    await expect(
+      provider.structured({
+        schemaName: "answer",
+        jsonSchema: { type: "object" },
+        messages: [],
+        validate: (value) => value,
+      }),
+    ).rejects.toBe(abortError);
+
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("surfaces messages from Gemini array-wrapped provider errors", async () => {
     const fetcher = vi.fn(async (input: FetchInput, init?: FetchInit) => {
       void input;

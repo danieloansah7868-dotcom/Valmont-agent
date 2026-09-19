@@ -64,6 +64,18 @@ const LAYOUT_LABELS: Record<(typeof LAYOUTS)[number], string> = {
 const DIY_TOOLS_STILL_WORK =
   "The logo tools below still work without the AI — choose an icon and a font, save a layout, or upload your own logo.";
 
+/**
+ * The UI's own bound for one suggest — "Thinking…" must end even when a proxy
+ * swallows the server's response and the browser would otherwise wait
+ * forever. It sits deliberately above the server's model-call abort
+ * (BRAND_KIT_MODEL_TIMEOUT_MS = 30s) so that on a live connection the
+ * server's friendly 504 is what the agency reads, and a raw browser abort is
+ * the last resort, never the expectation. When it does fire, the fetch
+ * rejects without an ApiError and describeError answers with the honest
+ * "unexpected, safe to retry" copy below.
+ */
+const SUGGEST_CLIENT_TIMEOUT_MS = 35_000;
+
 const ICON_LABELS: Record<BrandLogoIcon, string> = {
   none: "No icon",
   fish: "Fish",
@@ -187,7 +199,11 @@ export function BrandKitCard({
       }
       return cause.message;
     }
-    return "Something went wrong. Please try again.";
+    // A failure outside the API's own error shape — the browser could not
+    // reach the server at all (offline, a proxy gave up, or this call's own
+    // timeout fired). Still safe to retry: a suggest is a read, so nothing is
+    // ever double-charged or half-written.
+    return "Something unexpected happened while we were talking to the server. It is safe to try again.";
   };
 
   const adoptDraft = (draft: StudioDraft, message: string) => {
@@ -204,13 +220,18 @@ export function BrandKitCard({
       const answer = await apiMutation<{
         names: BrandKitNameSuggestion[];
         palettes: BrandKitPalette[];
-      }>(`${baseUrl}/suggest`, {
-        whatTheySell: whatTheySell.trim(),
-        town: town.trim(),
-        feeling,
-        mustInclude: parseMustInclude(mustInclude),
-        category: brief.category,
-      });
+      }>(
+        `${baseUrl}/suggest`,
+        {
+          whatTheySell: whatTheySell.trim(),
+          town: town.trim(),
+          feeling,
+          mustInclude: parseMustInclude(mustInclude),
+          category: brief.category,
+        },
+        // The UI must not wait longer than this, even on a hung connection.
+        { timeoutMs: SUGGEST_CLIENT_TIMEOUT_MS },
+      );
       setNames(answer.names);
       setPalettes(answer.palettes);
     } catch (cause) {

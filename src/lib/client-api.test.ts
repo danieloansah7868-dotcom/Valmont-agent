@@ -125,3 +125,77 @@ describe("successful requests", () => {
     expect(headers["x-valmont-csrf"]).toBe("token-abc");
   });
 });
+
+describe("per-call timeout", () => {
+  it("passes no abort signal when no timeout is given", async () => {
+    const fetchMock = mockFetch(200, {});
+    await apiMutation("/api/studio/drafts", {});
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(init.signal).toBeUndefined();
+  });
+
+  it("aborts the fetch when timeoutMs fires, and the caller sees a plain abort", async () => {
+    vi.useFakeTimers();
+    try {
+      // Mimics real fetch: it hangs until its signal aborts it.
+      let captured: RequestInit | undefined;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((_input: string, init: RequestInit) => {
+          captured = init;
+          return new Promise<Response>((_resolve, reject) => {
+            (init.signal as AbortSignal | undefined)?.addEventListener(
+              "abort",
+              () =>
+                reject(
+                  new DOMException("The operation was aborted.", "AbortError"),
+                ),
+            );
+          });
+        }),
+      );
+
+      const pending = apiMutation(
+        "/api/studio/drafts/x",
+        {},
+        {
+          timeoutMs: 150,
+        },
+      );
+      const rejection = pending.then(
+        () => {
+          throw new Error("expected the request to be aborted");
+        },
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(150);
+
+      expect(captured?.signal).toBeInstanceOf(AbortSignal);
+      const error = (await rejection) as Error;
+      expect(error.name).toBe("AbortError");
+      // NOT an ApiError: callers read it as a network-level failure,
+      // which is safe to retry.
+      expect(error).not.toBeInstanceOf(ApiError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets a call finish well before its timeout, without the timer firing", async () => {
+    vi.useFakeTimers();
+    try {
+      mockFetch(200, { id: "draft-1" });
+      const result = await apiMutation(
+        "/api/studio/drafts",
+        { a: 1 },
+        {
+          timeoutMs: 10_000,
+        },
+      );
+      expect(result).toEqual({ id: "draft-1" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
